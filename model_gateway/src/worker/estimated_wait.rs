@@ -9,10 +9,7 @@ use std::{
     time::Instant,
 };
 
-use axum::{
-    http::{header::RETRY_AFTER, HeaderValue},
-    response::Response,
-};
+use axum::response::Response;
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
@@ -20,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use super::Worker;
 use crate::{
     config::{ConfigError, ConfigResult},
-    routers::{common::retry::mark_non_retryable, error},
+    routers::common::overload,
 };
 
 /// All defaults are starting points for calibration, not capacity guarantees.
@@ -314,12 +311,7 @@ impl AdmissionGuard<'_> {
         }
         metrics::counter!("smg_estimated_wait_rejections_total", "model" => model.to_owned())
             .increment(1);
-        let mut response = error::too_many_requests("estimated_wait_exceeded", format!("All eligible workers for model '{model}' are at or above the estimated wait budget ({threshold}s)"));
-        response
-            .headers_mut()
-            .insert(RETRY_AFTER, HeaderValue::from(1));
-        mark_non_retryable(&mut response);
-        Err(response)
+        Err(overload::shed_estimated_wait(model, threshold))
     }
 
     pub(crate) fn credit(&mut self, worker: &Arc<dyn Worker>, tokens: Option<&[u32]>) {
@@ -336,16 +328,19 @@ impl AdmissionGuard<'_> {
 mod tests {
     use std::{sync::Barrier, time::Duration};
 
-    use axum::http::StatusCode;
+    use axum::http::{header::RETRY_AFTER, StatusCode};
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerStatus};
 
     use super::*;
     use crate::{
         config::PolicyConfig,
         policies::PolicyRegistry,
-        routers::common::{
-            placement::{self, PlacementFailure, PlacementInputs},
-            retry::is_retryable_response,
+        routers::{
+            common::{
+                placement::{self, PlacementFailure, PlacementInputs},
+                retry::is_retryable_response,
+            },
+            error,
         },
         worker::{BasicWorkerBuilder, ConnectionMode, PdPairIndex, WorkerRegistry, WorkerType},
     };
@@ -508,10 +503,10 @@ mod tests {
         assert!(admission.begin().unwrap().check(&pool, "m").is_ok());
         publish(&admission, &b, 200);
         let shed = admission.begin().unwrap().check(&pool, "m").unwrap_err();
-        assert_eq!(shed.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             shed.headers().get(error::HEADER_X_SMG_ERROR_CODE).unwrap(),
-            "estimated_wait_exceeded"
+            "worker_overload_protection_shed"
         );
         assert!(shed.headers().contains_key(RETRY_AFTER));
         assert!(!is_retryable_response(&shed));
@@ -684,7 +679,7 @@ mod tests {
         .unwrap();
         match failure.verdict {
             PlacementFailure::AllOverloaded(shed) => {
-                assert_eq!(shed.status(), StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
             }
             _ => panic!("expected an admission shed"),
         }

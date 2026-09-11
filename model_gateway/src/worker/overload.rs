@@ -17,6 +17,9 @@ pub const DEFAULT_TOKEN_USAGE_CEILING: f64 = 0.9;
 /// so the request is shed immediately instead of queued.
 pub const BRANCH_ALL_OVERLOADED_SHED: &str = "all_overloaded_shed";
 
+/// Every eligible worker meets or exceeds the estimated-wait budget.
+pub const BRANCH_ESTIMATED_WAIT_SHED: &str = "estimated_wait_shed";
+
 /// Decision-log branch: the single worker already chosen crossed the threshold
 /// between selection and dispatch. Distinct from the fleet-wide shed above —
 /// here every other worker may well be idle.
