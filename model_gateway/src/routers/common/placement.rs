@@ -140,7 +140,7 @@ pub(crate) fn select_single(
     pool: RoutingPool,
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
-) -> Option<Arc<dyn Worker>> {
+) -> Result<Option<Arc<dyn Worker>>, Response> {
     let candidates = candidates(registry, model_id, pool, wire);
     select_from(registry, policies, model_id, candidates.as_slice(), inputs)
 }
@@ -154,7 +154,11 @@ pub(crate) fn select_from(
     model_id: &str,
     candidates: &[Arc<dyn Worker>],
     inputs: PlacementInputs<'_>,
-) -> Option<Arc<dyn Worker>> {
+) -> Result<Option<Arc<dyn Worker>>, Response> {
+    let mut admission = registry.estimated_wait.begin();
+    if let Some(guard) = &admission {
+        guard.check(candidates, model_id)?;
+    }
     let policy = policies.get_policy_or_default(model_id);
 
     // Most policies already apply the complete availability predicate. Give
@@ -173,7 +177,7 @@ pub(crate) fn select_from(
         &filtered
     };
     if available.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Cached hash ring for consistent hashing (O(log n) lookup).
@@ -181,7 +185,7 @@ pub(crate) fn select_from(
 
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
-    let idx = policies.select_worker(
+    let Some(idx) = policies.select_worker(
         &policy,
         available,
         &SelectWorkerInfo {
@@ -194,7 +198,9 @@ pub(crate) fn select_from(
             hash_ring,
             leg: WorkerLeg::Single,
         },
-    )?;
+    ) else {
+        return Ok(None);
+    };
     let selected = available[idx].clone();
 
     Metrics::record_worker_selection(
@@ -204,7 +210,10 @@ pub(crate) fn select_from(
         policy.name(),
     );
 
-    Some(selected)
+    if let Some(guard) = &mut admission {
+        guard.credit(&selected, inputs.tokens);
+    }
+    Ok(Some(selected))
 }
 
 /// Classify a failed single-worker placement from the same pool it drew from.
@@ -306,6 +315,17 @@ pub(crate) fn select_pair(
 
     // Independent prefill/decode policies so stateful ones (round robin) do
     // not share a counter; each leg tags the sticky key with its own prefix.
+    let mut admission = registry.estimated_wait.begin();
+    if let Some(guard) = &admission {
+        for (pool, leg) in [(&prefill, WorkerLeg::Prefill), (&decode, WorkerLeg::Decode)] {
+            guard.check(pool, model_id).map_err(|shed| {
+                Box::new(PairFailure {
+                    leg,
+                    verdict: PlacementFailure::AllOverloaded(shed),
+                })
+            })?;
+        }
+    }
     let prefill_policy = policies.get_prefill_policy();
     let decode_policy = policies.get_decode_policy();
     let hash_ring = registry.get_hash_ring(model_id);
@@ -350,6 +370,10 @@ pub(crate) fn select_pair(
         decode_policy.name(),
     );
 
+    if let Some(guard) = &mut admission {
+        guard.credit(&selected_prefill, inputs.tokens);
+        guard.credit(&selected_decode, inputs.tokens);
+    }
     Ok(Pair {
         prefill: selected_prefill,
         decode: selected_decode,
@@ -622,6 +646,7 @@ mod tests {
             &only_second,
             PlacementInputs::default(),
         )
+        .unwrap()
         .expect("the narrowed slice still has a worker");
         assert_eq!(selected.url(), "http://h:2");
         assert!(matches!(
@@ -643,6 +668,7 @@ mod tests {
             None,
             PlacementInputs::default(),
         )
+        .unwrap()
         .expect("the HTTP worker is selectable from its own pool");
         assert_eq!(selected.url(), "http://h:1");
 
@@ -656,6 +682,7 @@ mod tests {
             None,
             PlacementInputs::default(),
         )
+        .unwrap()
         .is_none());
         assert!(matches!(
             single_failure(&registry, MODEL, RoutingPool::GrpcPipelineRegular, None),

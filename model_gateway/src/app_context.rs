@@ -618,6 +618,11 @@ impl AppContextBuilder {
             .as_ref()
             .ok_or_else(|| "policy_registry must be set before load monitor".to_string())?
             .clone();
+        self.worker_registry
+            .as_ref()
+            .ok_or_else(|| "worker_registry must be set before load monitor".to_string())?
+            .estimated_wait
+            .configure(config.estimated_wait.clone());
         let monitor = Arc::new(WorkerMonitor::new(
             self.worker_registry
                 .as_ref()

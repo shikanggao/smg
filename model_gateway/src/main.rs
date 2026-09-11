@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use smg::worker::estimated_wait::EstimatedWaitConfig;
 
 // Jemalloc as the global allocator: glibc malloc retains freed pages badly
 // under the gateway's allocation churn. Prefixed symbols only — vendored C
@@ -295,6 +296,30 @@ struct CliArgs {
     /// unset.
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     worker_overload_protection: bool,
+
+    /// Estimated wait budget in seconds; unset disables admission.
+    #[arg(long, help_heading = "Routing Policy")]
+    max_estimated_wait_secs: Option<f64>,
+
+    /// KV pressure weight in seconds.
+    #[arg(long, default_value_t = 0.15, help_heading = "Routing Policy")]
+    estimated_wait_kv_pressure_weight: f64,
+
+    /// Dispatch tokens when routed input tokens are unavailable.
+    #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
+    estimated_wait_mean_prefill_tokens: u32,
+
+    /// Calibrated fallback generation throughput in tokens/s.
+    #[arg(long, default_value_t = 2000.0, help_heading = "Routing Policy")]
+    estimated_wait_default_throughput: f64,
+
+    /// Calibrated queued tokens per waiting request; zero disables proxy.
+    #[arg(long, default_value_t = 0, help_heading = "Routing Policy")]
+    estimated_wait_queue_tokens_per_request: u32,
+
+    /// Maximum usable load snapshot age in seconds; older data fails open.
+    #[arg(long, default_value_t = 30.0, help_heading = "Routing Policy")]
+    estimated_wait_max_snapshot_age_secs: f64,
 
     /// Queued-request count at or above which a worker is considered
     /// overloaded and excluded from routing until the signal recovers; when
@@ -1815,6 +1840,15 @@ impl CliArgs {
             .job_queue_concurrency(self.job_queue_concurrency)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .disable_load_monitoring(self.disable_load_monitoring)
+            .estimated_wait(EstimatedWaitConfig {
+                max_estimated_wait_secs: self.max_estimated_wait_secs,
+                estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
+                estimated_wait_mean_prefill_tokens: self.estimated_wait_mean_prefill_tokens,
+                estimated_wait_default_throughput: self.estimated_wait_default_throughput,
+                estimated_wait_queue_tokens_per_request: self
+                    .estimated_wait_queue_tokens_per_request,
+                estimated_wait_max_snapshot_age_secs: self.estimated_wait_max_snapshot_age_secs,
+            })
             .worker_overload_protection(self.worker_overload_protection)
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
             .worker_overload_token_usage(self.worker_overload_token_usage)
@@ -2506,6 +2540,33 @@ mod tests {
     /// The overload thresholds must reach `RouterConfig` and survive nesting
     /// into `ServerConfig.router_config` — the consumer (load monitor) reads
     /// them off `RouterConfig`. Two-path config-plumbing guard.
+    #[test]
+    fn estimated_wait_options_flow_into_server_config() {
+        let cli = cli_args_from(&[
+            "--max-estimated-wait-secs",
+            "12",
+            "--estimated-wait-queue-tokens-per-request",
+            "2048",
+            "--estimated-wait-default-throughput",
+            "500",
+            "--estimated-wait-kv-pressure-weight",
+            "0.4",
+            "--estimated-wait-mean-prefill-tokens",
+            "800",
+            "--estimated-wait-max-snapshot-age-secs",
+            "8",
+        ]);
+        let config = cli.to_router_config(vec![], vec![]).unwrap();
+        let server = cli.to_server_config(config).unwrap();
+        let config = &server.router_config.estimated_wait;
+        assert_eq!(config.max_estimated_wait_secs, Some(12.0));
+        assert_eq!(config.estimated_wait_queue_tokens_per_request, 2048);
+        assert_eq!(config.estimated_wait_default_throughput, 500.0);
+        assert_eq!(config.estimated_wait_kv_pressure_weight, 0.4);
+        assert_eq!(config.estimated_wait_mean_prefill_tokens, 800);
+        assert_eq!(config.estimated_wait_max_snapshot_age_secs, 8.0);
+    }
+
     #[test]
     fn worker_overload_thresholds_flow_into_both_configs() {
         let cli = cli_args_from(&[

@@ -244,7 +244,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Result<Option<Arc<dyn Worker>>, Response> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
         placement::select_single(
@@ -501,8 +501,9 @@ impl Router {
                 view.cache_namespace,
             )
         }) {
-            Some(w) => w,
-            None => {
+            Err(shed) => return shed,
+            Ok(Some(w)) => w,
+            Ok(None) => {
                 // The verdict is judged from exactly the pool selection drew
                 // from, wildcard model included: that is what makes the shed
                 // fire for a model-less `/generate` and for a model that is
@@ -802,7 +803,7 @@ impl Router {
             record_pre_send_error(&resp);
             return resp;
         }
-        let Some(worker) = placement::select_from(
+        let selection = placement::select_from(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
@@ -814,27 +815,35 @@ impl Router {
                 rid_key: None,
                 cache_namespace: None,
             },
-        ) else {
-            // Judged from the same candidates whether the pre-filter emptied
-            // or a self-filtering policy missed on an all-overloaded pool, so
-            // a shed keeps its Retry-After, retryability and metric.
-            let resp = match placement::failure_from(&non_dp_workers, model_id) {
-                PlacementFailure::AllOverloaded(shed) => shed,
-                PlacementFailure::NoCandidates
-                | PlacementFailure::Unavailable
-                | PlacementFailure::PolicyDeclined(_) => {
-                    // The verdict cannot tell a policy miss from a drained
-                    // pool; the pool can.
-                    let message = if non_dp_workers.iter().any(|w| w.is_available()) {
-                        "Policy returned no eligible worker"
-                    } else {
-                        "All workers are unavailable (circuit breaker open or unhealthy)"
-                    };
-                    error::service_unavailable("no_available_workers", message)
-                }
-            };
-            record_pre_send_error(&resp);
-            return resp;
+        );
+        let worker = match selection {
+            Err(shed) => {
+                record_pre_send_error(&shed);
+                return shed;
+            }
+            Ok(Some(worker)) => worker,
+            Ok(None) => {
+                // Judged from the same candidates whether the pre-filter emptied
+                // or a self-filtering policy missed on an all-overloaded pool, so
+                // a shed keeps its Retry-After, retryability and metric.
+                let resp = match placement::failure_from(&non_dp_workers, model_id) {
+                    PlacementFailure::AllOverloaded(shed) => shed,
+                    PlacementFailure::NoCandidates
+                    | PlacementFailure::Unavailable
+                    | PlacementFailure::PolicyDeclined(_) => {
+                        // The verdict cannot tell a policy miss from a drained
+                        // pool; the pool can.
+                        let message = if non_dp_workers.iter().any(|w| w.is_available()) {
+                            "Policy returned no eligible worker"
+                        } else {
+                            "All workers are unavailable (circuit breaker open or unhealthy)"
+                        };
+                        error::service_unavailable("no_available_workers", message)
+                    }
+                };
+                record_pre_send_error(&resp);
+                return resp;
+            }
         };
 
         // Same dispatch-time re-check the regular path takes. A transcription
@@ -1639,16 +1648,21 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
-        let Some(worker) = self.select_worker_for_model(
+        let selection = self.select_worker_for_model(
             model_id,
             None,
             hinted_tokens.as_deref(),
             Some(req.headers()),
             None,
             None,
-        ) else {
-            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
-            return Err(req);
+        );
+        let worker = match selection {
+            Err(shed) => return Ok(shed),
+            Ok(Some(worker)) => worker,
+            Ok(None) => {
+                Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
+                return Err(req);
+            }
         };
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
@@ -2312,6 +2326,7 @@ mod tests {
                 None,
                 None,
             )
+            .unwrap()
             .unwrap();
         assert!(selected.is_available());
 
@@ -2327,7 +2342,63 @@ mod tests {
                 None,
                 None
             )
+            .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn estimated_wait_returns_429_before_http_dispatch_without_internal_retry() {
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+        let router = create_test_regular_router();
+        router
+            .worker_registry
+            .estimated_wait
+            .configure(EstimatedWaitConfig {
+                max_estimated_wait_secs: Some(1.0),
+                ..Default::default()
+            });
+        for worker in router.worker_registry.get_all() {
+            let stamp = router.worker_registry.estimated_wait.poll_started(&worker);
+            let load = WorkerLoadResponse {
+                loads: vec![SchedulerLoadSnapshot {
+                    num_waiting_uncached_tokens: Some(2000),
+                    gen_throughput: 2000.0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            router.worker_registry.estimated_wait.publish(
+                &worker,
+                Some(&load),
+                stamp,
+                Instant::now(),
+            );
+        }
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.route_typed_request(
+                None,
+                DropProbeRequest {
+                    text: "shed".to_owned(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            ),
+        )
+        .await
+        .expect("must shed without contacting workers or waiting for retries");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "estimated_wait_exceeded"
+        );
+        assert!(!is_retryable_response(&response));
     }
 
     #[tokio::test]

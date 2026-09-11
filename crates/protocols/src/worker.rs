@@ -1276,9 +1276,10 @@ pub struct SchedulerLoadSnapshot {
     pub dp_rank: i32,
     pub num_running_reqs: i32,
     pub num_waiting_reqs: i32,
-    /// Queued token-work: waiting-queue tokens not yet served from cache. 0 when
-    /// the backend does not report it — callers degrade gracefully.
-    pub num_waiting_uncached_tokens: i32,
+    /// Queued uncached token-work. None means unavailable; Some(0) is an
+    /// exact empty/cached queue and must not be replaced by a request proxy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_waiting_uncached_tokens: Option<i32>,
     pub num_total_reqs: i32,
     pub num_used_tokens: i32,
     pub max_total_num_tokens: i32,
@@ -1416,7 +1417,7 @@ impl WorkerLoadResponse {
     pub fn total_waiting_uncached_tokens(&self) -> i64 {
         self.loads
             .iter()
-            .map(|l| l.num_waiting_uncached_tokens as i64)
+            .map(|l| i64::from(l.num_waiting_uncached_tokens.unwrap_or(0)))
             .sum()
     }
 

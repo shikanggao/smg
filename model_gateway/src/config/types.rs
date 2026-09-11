@@ -11,12 +11,14 @@ pub use smg_data_connector::{
 use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
     tenant::DEFAULT_TENANT_HEADER_NAME,
-    worker::{ConnectionMode, RuntimeType},
+    worker::{estimated_wait::EstimatedWaitConfig, ConnectionMode, RuntimeType},
 };
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
+    #[serde(flatten)]
+    pub estimated_wait: EstimatedWaitConfig,
     pub mode: RoutingMode,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
@@ -1065,6 +1067,7 @@ impl Default for RouterConfig {
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
             disable_load_monitoring: false,
+            estimated_wait: Default::default(),
             worker_overload_protection: false,
             worker_overload_waiting_requests: None,
             worker_overload_token_usage: None,

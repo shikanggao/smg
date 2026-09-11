@@ -4,6 +4,7 @@ pub mod builder;
 pub mod capacity;
 pub mod circuit_breaker;
 pub mod error;
+pub mod estimated_wait;
 pub mod event;
 pub mod hash_ring;
 pub mod http_client;

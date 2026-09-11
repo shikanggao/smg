@@ -635,6 +635,36 @@ class TestParseRouterArgs:
         assert defaults.worker_overload_protection is False
         assert defaults.disable_load_monitoring is False
 
+    def test_estimated_wait_flags_and_prefixed_aliases(self):
+        for prefix in ("", "router-"):
+            parser = argparse.ArgumentParser()
+            RouterArgs.add_cli_args(parser, use_router_prefix=bool(prefix))
+            namespace = parser.parse_args(
+                [
+                    f"--{prefix}max-estimated-wait-secs",
+                    "12",
+                    f"--{prefix}estimated-wait-queue-tokens-per-request",
+                    "2048",
+                    f"--{prefix}estimated-wait-default-throughput",
+                    "500",
+                    f"--{prefix}estimated-wait-kv-pressure-weight",
+                    "0.4",
+                    f"--{prefix}estimated-wait-mean-prefill-tokens",
+                    "800",
+                    f"--{prefix}estimated-wait-max-snapshot-age-secs",
+                    "8",
+                ]
+            )
+            args = RouterArgs.from_cli_args(namespace, use_router_prefix=bool(prefix))
+            assert args.max_estimated_wait_secs == 12.0
+            assert args.estimated_wait_queue_tokens_per_request == 2048
+            assert args.estimated_wait_default_throughput == 500.0
+            assert args.estimated_wait_kv_pressure_weight == 0.4
+            assert args.estimated_wait_mean_prefill_tokens == 800
+            assert args.estimated_wait_max_snapshot_age_secs == 8.0
+        assert RouterArgs().max_estimated_wait_secs is None
+        assert RouterArgs().estimated_wait_queue_tokens_per_request == 0
+
     def test_prefixed_overload_protection_and_monitoring_flags(self):
         """The --router-prefixed aliases reach the same fields."""
         parser = argparse.ArgumentParser()
@@ -1440,6 +1470,12 @@ class TestRouterArgsFieldOrder:
         "kv_connector_annotation",
         "kv_engine_id_annotation",
         "mm_per_request_image_limit",
+        "max_estimated_wait_secs",
+        "estimated_wait_kv_pressure_weight",
+        "estimated_wait_mean_prefill_tokens",
+        "estimated_wait_default_throughput",
+        "estimated_wait_queue_tokens_per_request",
+        "estimated_wait_max_snapshot_age_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

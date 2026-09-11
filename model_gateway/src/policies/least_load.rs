@@ -570,7 +570,7 @@ mod tests {
                 dp_rank: 0,
                 num_running_reqs: 0,
                 num_waiting_reqs: 0,
-                num_waiting_uncached_tokens,
+                num_waiting_uncached_tokens: Some(num_waiting_uncached_tokens),
                 num_total_reqs: 0,
                 num_used_tokens: 0,
                 max_total_num_tokens: 0,

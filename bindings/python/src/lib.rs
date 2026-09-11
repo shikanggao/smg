@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
+use smg::worker::estimated_wait::EstimatedWaitConfig;
 
 // Jemalloc for all Rust-side allocations in the extension. Prefixed symbols
 // leave CPython's allocators untouched; disable_initial_exec_tls is required
@@ -528,6 +529,12 @@ struct Router {
     kv_connector_annotation: String,
     kv_engine_id_annotation: String,
     mm_per_request_image_limit: Option<usize>,
+    max_estimated_wait_secs: Option<f64>,
+    estimated_wait_kv_pressure_weight: f64,
+    estimated_wait_mean_prefill_tokens: u32,
+    estimated_wait_default_throughput: f64,
+    estimated_wait_queue_tokens_per_request: u32,
+    estimated_wait_max_snapshot_age_secs: f64,
 }
 
 impl Router {
@@ -845,6 +852,15 @@ impl Router {
             .job_queue_concurrency(self.job_queue_concurrency)
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
             .worker_overload_token_usage(self.worker_overload_token_usage)
+            .estimated_wait(EstimatedWaitConfig {
+                max_estimated_wait_secs: self.max_estimated_wait_secs,
+                estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
+                estimated_wait_mean_prefill_tokens: self.estimated_wait_mean_prefill_tokens,
+                estimated_wait_default_throughput: self.estimated_wait_default_throughput,
+                estimated_wait_queue_tokens_per_request: self
+                    .estimated_wait_queue_tokens_per_request,
+                estimated_wait_max_snapshot_age_secs: self.estimated_wait_max_snapshot_age_secs,
+            })
             .worker_overload_protection(self.worker_overload_protection)
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
@@ -1098,6 +1114,12 @@ impl Router {
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
         mm_per_request_image_limit = None,
+        max_estimated_wait_secs = None,
+        estimated_wait_kv_pressure_weight = 0.15,
+        estimated_wait_mean_prefill_tokens = 1024,
+        estimated_wait_default_throughput = 2000.0,
+        estimated_wait_queue_tokens_per_request = 0,
+        estimated_wait_max_snapshot_age_secs = 30.0,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1251,6 +1273,12 @@ impl Router {
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
         mm_per_request_image_limit: Option<usize>,
+        max_estimated_wait_secs: Option<f64>,
+        estimated_wait_kv_pressure_weight: f64,
+        estimated_wait_mean_prefill_tokens: u32,
+        estimated_wait_default_throughput: f64,
+        estimated_wait_queue_tokens_per_request: u32,
+        estimated_wait_max_snapshot_age_secs: f64,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1418,6 +1446,12 @@ impl Router {
             kv_connector_annotation,
             kv_engine_id_annotation,
             mm_per_request_image_limit,
+            max_estimated_wait_secs,
+            estimated_wait_kv_pressure_weight,
+            estimated_wait_mean_prefill_tokens,
+            estimated_wait_default_throughput,
+            estimated_wait_queue_tokens_per_request,
+            estimated_wait_max_snapshot_age_secs,
         })
     }
 

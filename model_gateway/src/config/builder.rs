@@ -9,7 +9,7 @@ use super::{
     RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
-use crate::worker::{ConnectionMode, RuntimeType};
+use crate::worker::{estimated_wait::EstimatedWaitConfig, ConnectionMode, RuntimeType};
 
 /// Builder for RouterConfig that wraps the config itself
 /// This eliminates field duplication and stays in sync automatically
@@ -265,6 +265,11 @@ impl RouterConfigBuilder {
 
     pub fn disable_load_monitoring(mut self, disabled: bool) -> Self {
         self.config.disable_load_monitoring = disabled;
+        self
+    }
+
+    pub fn estimated_wait(mut self, config: EstimatedWaitConfig) -> Self {
+        self.config.estimated_wait = config;
         self
     }
 
