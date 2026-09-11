@@ -344,10 +344,10 @@ mod tests {
         config::PolicyConfig,
         policies::PolicyRegistry,
         routers::common::{
-            placement::{self, PairCandidates, PlacementFailure, PlacementInputs},
+            placement::{self, PlacementFailure, PlacementInputs},
             retry::is_retryable_response,
         },
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerRegistry, WorkerType},
+        worker::{BasicWorkerBuilder, ConnectionMode, PdPairIndex, WorkerRegistry, WorkerType},
     };
 
     fn config() -> EstimatedWaitConfig {
@@ -671,10 +671,11 @@ mod tests {
             &registry,
             &policies,
             "m",
-            PairCandidates {
-                prefill: std::slice::from_ref(&prefill),
-                decode: std::slice::from_ref(&decode),
-            },
+            &PdPairIndex::build(
+                vec![prefill.clone()].into(),
+                vec![decode.clone()].into(),
+                policies.pd_pairing_mode(),
+            ),
             None,
             false,
             PlacementInputs::default(),
