@@ -76,12 +76,12 @@ pub fn shed_if_all_overloaded(candidates: &[Arc<dyn Worker>], model_id: &str) ->
 /// Reject a pool whose eligible workers all meet or exceed its estimated-wait budget.
 /// Share the overload response contract while preserving a distinct decision
 /// branch and message for the calibrated admission guard.
-pub(crate) fn shed_estimated_wait(model_id: &str, threshold_secs: f64) -> Response {
+pub(crate) fn shed_estimated_wait(model_id: &str) -> Response {
     shed(
         BRANCH_ESTIMATED_WAIT_SHED,
         STAGE_SELECTION,
         "none",
-        format!("All eligible workers for model '{model_id}' are at or above the estimated wait budget ({threshold_secs}s)"),
+        format!("All eligible workers for model '{model_id}' are at or above their estimated wait budgets"),
     )
 }
 
@@ -252,7 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn estimated_wait_uses_the_shared_overload_response_contract() {
-        let response = shed_estimated_wait("m", 2.5);
+        let response = shed_estimated_wait("m");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             response
@@ -279,7 +279,7 @@ mod tests {
         assert!(body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("estimated wait budget (2.5s)"));
+            .contains("estimated wait budgets"));
     }
 
     /// An empty pool is a 404/unavailable question for the caller, not a shed.

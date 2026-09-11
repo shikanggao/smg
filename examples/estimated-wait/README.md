@@ -13,8 +13,8 @@ wait_seconds = (queued_uncached_tokens + since_poll_dispatch_tokens) / throughpu
              + kv_weight * token_usage / (1 - token_usage)
 ```
 
-The minimum score across the candidate pool is compared inclusively to the
-budget. When every eligible worker in that pool is at or above the budget,
+Each worker's score is compared inclusively to its effective budget. When every
+eligible worker in the pool has a budget and is at or above it,
 this guard returns HTTP 503 with `worker_overload_protection_shed` in both the
 JSON error code and the `X-SMG-Error-Code` header, matching static overload
 protection. The message identifies the estimated-wait budget. The shared shed
@@ -31,7 +31,7 @@ builder's `estimated_wait(EstimatedWaitConfig)` method.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--max-estimated-wait-secs` | unset (disabled) | Calibrated wait budget in seconds |
+| `--max-estimated-wait-secs` | unset | Gateway wait budget; disabled unless a worker sets its own |
 | `--estimated-wait-queue-tokens-per-request` | 0 | Explicit waiting-request proxy; 0 disables it |
 | `--estimated-wait-default-throughput` | 2000 | Fallback aggregate generation tokens/s |
 | `--estimated-wait-mean-prefill-tokens` | 1024 | Dispatch credit when tokenized input is unavailable |
@@ -42,6 +42,22 @@ Defaults are calibration starting points, not measured model capacity. Positive
 budgets, throughput, dispatch estimates, and maximum age are required. Floating
 point values must be finite. The KV weight may be zero.
 
+A worker can override the gateway budget using the existing overload block:
+
+```json
+{
+  "url": "http://worker:8000",
+  "overload": { "max_estimated_wait_secs": 2.5 }
+}
+```
+
+The worker value takes precedence, and a worker budget alone enables admission
+for that worker even without `--max-estimated-wait-secs`. It is validated at
+registration and preserved through worker updates. Estimator parameters remain
+gateway-wide. A worker with no effective budget stays unprotected and prevents
+a pool-wide estimated-wait rejection, just as a worker below its budget does.
+The static waiting-request and KV ceilings are resolved independently.
+
 SGLang's native HTTP/gRPC loads preserve exact queued uncached tokens, including
 zero, aggregate throughput across ranks, and average rank KV usage. Missing
 queued tokens are converted from waiting requests only with an explicit proxy;
@@ -51,8 +67,14 @@ across samples, and uses the configured throughput fallback. Both vLLM KV metric
 names are supported. SGLang Prometheus fallback also requires a queue proxy.
 
 The load monitor runs even with `--disable-load-monitoring` when this guard is
-enabled. No network queries occur on admission. A mutex orders the pool check,
-selection, and credit. Tokenized input is credited when supplied by routing;
+enabled, including when only a worker override enables it. No network queries
+occur on admission. Rank aggregation, validity checks and queue/KV arithmetic
+run during load ingestion using the same arithmetic as least-load routing.
+Admission retains a compact prepared estimate, not another copy of the backend
+report. Ingestion and dispatch-credit updates latch the verdict; pool checks
+read the verdict and its age, stopping at the first permissive eligible worker.
+A mutex still orders the pool check, selection, and credit; this preserves
+concurrent admission semantics. Tokenized input is credited when supplied by routing;
 otherwise the mean prefill estimate is used. Selection reserves that credit
 until polling even if dispatch subsequently fails. Completions do not refund
 credit because the next snapshot reconciles engine state.
@@ -74,12 +96,19 @@ static guardrails enabled as appropriate. A stale low score is never used as a
 current capacity measurement. Fail-closed policy and hysteresis remain future
 decisions requiring availability and calibration evidence.
 
-Metrics, emitted when admission evaluates the pool:
+Worker gauges are updated on load publication and dispatch credit; snapshot
+age is the age at the latest such update, not a continuously advancing clock.
+Pool checks mark stale/unknown data unusable and emit an unknown counter when
+that is why they fail open. Early exit means the counter counts admission
+decisions, not every unknown worker in a pool. Rejections retain their separate
+counter and share the existing overload-shed response metrics.
+
+The threshold gauge now uses a worker label to reflect per-worker overrides:
 
 | Metric | Labels |
 | --- | --- |
 | `smg_estimated_wait_seconds` | worker |
-| `smg_estimated_wait_threshold_seconds` | model |
+| `smg_estimated_wait_threshold_seconds` | worker |
 | `smg_estimated_wait_snapshot_age_seconds` | worker |
 | `smg_estimated_wait_data_usable` | worker; 1 usable, 0 unknown/stale |
 | `smg_estimated_wait_queue_proxy` | worker; 1 proxy used |
@@ -88,7 +117,8 @@ Metrics, emitted when admission evaluates the pool:
 | `smg_estimated_wait_rejections_total` | model |
 
 Gate dashboards' last-known score/proxy/fallback gauges on `data_usable == 1`.
-Gauges are request-evaluation samples, not a background estimate for idle pools.
+Snapshot age is sampled on publication and credit; use poll health alongside
+these gauges when monitoring idle pools.
 
 ## Repeatable calibration procedure
 

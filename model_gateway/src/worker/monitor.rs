@@ -1088,7 +1088,9 @@ async fn group_monitor_loop(
             if !routing_needs_load
                 && !monitor.engine_metrics
                 && !overload_needs_load
-                && !monitor.worker_registry.estimated_wait.enabled()
+                && !workers
+                    .iter()
+                    .any(|w| monitor.worker_registry.estimated_wait.needs_load(w))
             {
                 debug!("Load monitoring disabled and nothing needs the data, skipping load fetch for group {group_key}");
                 drop(monitor);
@@ -1114,17 +1116,7 @@ async fn group_monitor_loop(
                             WorkerMonitor::fetch_backend_load(&worker).await
                         }
                     };
-                    if registry.get_by_url(worker.url()).is_some_and(|current| {
-                        Arc::ptr_eq(&current, &worker) && current.status() == WorkerStatus::Ready
-                    }) {
-                        registry.estimated_wait.publish(
-                            &worker,
-                            response.as_ref(),
-                            watermark,
-                            started,
-                        );
-                    }
-                    (worker, response)
+                    (worker, response, watermark, started)
                 }
             })
             .collect();
@@ -1134,7 +1126,7 @@ async fn group_monitor_loop(
         let mut group_loads: HashMap<String, WorkerLoadResponse> = HashMap::new();
         let mut group_dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
         let mut dp_evict: Vec<String> = Vec::new();
-        for (worker, response) in results {
+        for (worker, response, watermark, started) in results {
             let url = worker.url().to_string();
             // The overload predicate runs exactly here, once per report, never
             // on a request path, against the worker's effective thresholds
@@ -1148,6 +1140,17 @@ async fn group_monitor_loop(
                 monitor
                     .worker_registry
                     .set_worker_overloaded(&worker, verdict);
+            }
+            // Both guards consume this same report and the same lifecycle fence.
+            // Admission aggregates ranks here and latches a compact verdict;
+            // request handling only updates credit and checks freshness.
+            if monitor.worker_registry.is_current_ready(&worker) {
+                monitor.worker_registry.estimated_wait.publish(
+                    &worker,
+                    response.as_ref(),
+                    watermark,
+                    started,
+                );
             }
             if let Some(load) = response {
                 // Only feed the DP-rank cache from responses that carry real
@@ -1967,6 +1970,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(4),
                 token_usage: None,
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -1992,6 +1996,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(5),
                 token_usage: None,
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2017,6 +2022,33 @@ mod native_loads_tests {
     /// `--disable-load-monitoring`: without it the feature would silently
     /// never engage under a load-blind policy.
     #[tokio::test]
+    async fn estimated_wait_override_alone_polls_and_sheds_with_monitoring_disabled() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
+        let worker = vllm_worker_with_overload(
+            &stub.url,
+            OverloadUpdate {
+                max_estimated_wait_secs: Some(0.01),
+                ..Default::default()
+            },
+        );
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker.clone()).unwrap();
+        monitor.start_event_loop();
+        wait_until("estimated-wait ingestion to shed", || {
+            registry
+                .estimated_wait
+                .begin()
+                .unwrap()
+                .check(std::slice::from_ref(&worker), "a")
+                .is_err()
+        })
+        .await;
+        assert!(stub.probes.load(Ordering::SeqCst) > 0);
+        assert!(!worker.is_overloaded());
+    }
+
+    #[tokio::test]
     async fn overload_thresholds_alone_start_load_polling() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
         let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
@@ -2025,6 +2057,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: None,
                 token_usage: Some(0.2),
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2082,6 +2115,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(1),
                 token_usage: None,
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2107,6 +2141,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(1),
                 token_usage: None,
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);

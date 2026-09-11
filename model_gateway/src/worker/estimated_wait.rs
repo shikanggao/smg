@@ -5,7 +5,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, OnceLock, Weak},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock, Weak,
+    },
     time::Instant,
 };
 
@@ -14,7 +17,12 @@ use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
-use super::Worker;
+use super::{
+    expected_wait::{
+        ExpectedWait, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
+    },
+    Worker,
+};
 use crate::{
     config::{ConfigError, ConfigResult},
     routers::common::overload,
@@ -37,9 +45,9 @@ impl Default for EstimatedWaitConfig {
     fn default() -> Self {
         Self {
             max_estimated_wait_secs: None,
-            estimated_wait_kv_pressure_weight: 0.15,
-            estimated_wait_mean_prefill_tokens: 1024,
-            estimated_wait_default_throughput: 2000.0,
+            estimated_wait_kv_pressure_weight: DEFAULT_KV_PRESSURE_WEIGHT,
+            estimated_wait_mean_prefill_tokens: DEFAULT_MEAN_PREFILL_TOKENS,
+            estimated_wait_default_throughput: DEFAULT_THROUGHPUT,
             estimated_wait_queue_tokens_per_request: 0,
             estimated_wait_max_snapshot_age_secs: 30.0,
         }
@@ -91,7 +99,17 @@ impl EstimatedWaitConfig {
         Ok(())
     }
 
-    fn score(&self, load: &WorkerLoadResponse, dispatched: u64) -> Option<(f64, bool, bool)> {
+    /// Resolve worker overrides using the same metadata as the static guard.
+    fn threshold(&self, worker: &Arc<dyn Worker>) -> Option<f64> {
+        worker
+            .metadata()
+            .overload
+            .max_estimated_wait_secs
+            .or(self.max_estimated_wait_secs)
+    }
+
+    /// Runs only at load ingestion, never while selecting a worker.
+    fn prepare(&self, load: &WorkerLoadResponse) -> Option<PreparedWait> {
         if load.loads.is_empty()
             || (load.dp_rank_count > 0 && load.dp_rank_count as usize != load.loads.len())
             || load.loads.iter().any(|rank| {
@@ -126,11 +144,45 @@ impl EstimatedWaitConfig {
         } else {
             live
         };
-        let k = load.effective_token_usage().clamp(0.0, 0.999);
-        let wait = (queued + dispatched as f64) / throughput
-            + self.estimated_wait_kv_pressure_weight * k / (1.0 - k);
-        wait.is_finite().then_some((wait, proxy, fallback))
+        let estimate = ExpectedWait::new(
+            queued,
+            throughput,
+            load.effective_token_usage(),
+            self.estimated_wait_kv_pressure_weight,
+        );
+        estimate.seconds(0).is_finite().then_some(PreparedWait {
+            estimate,
+            proxy,
+            fallback,
+        })
     }
+
+    #[cfg(test)]
+    fn score(&self, load: &WorkerLoadResponse, dispatched: u64) -> Option<(f64, bool, bool)> {
+        let prepared = self.prepare(load)?;
+        let seconds = prepared.estimate.seconds(dispatched);
+        seconds
+            .is_finite()
+            .then_some((seconds, prepared.proxy, prepared.fallback))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreparedWait {
+    estimate: ExpectedWait,
+    proxy: bool,
+    fallback: bool,
+}
+
+#[derive(Debug)]
+struct Sample {
+    prepared: PreparedWait,
+    started: Instant,
+    watermark: u64,
+    threshold: f64,
+    // Latched on publication and dispatch, just like the static overload bit.
+    // The request path only reads it and checks freshness.
+    overloaded: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -138,24 +190,72 @@ struct Entry {
     source: Weak<dyn Worker>,
     generation: Arc<()>,
     total_dispatched: u64,
-    snapshot: Option<(WorkerLoadResponse, Instant, u64)>,
+    // Keep ordering even for failed polls, which must supersede older successes.
+    last_published: Option<Instant>,
+    sample: Option<Sample>,
+}
+
+impl Entry {
+    fn refresh(&mut self, worker: &Arc<dyn Worker>, max_age_secs: f64) {
+        if let Some(sample) = &mut self.sample {
+            let seconds = sample
+                .prepared
+                .estimate
+                .seconds(self.total_dispatched.saturating_sub(sample.watermark));
+            sample.overloaded = seconds.is_finite().then_some(seconds >= sample.threshold);
+            metrics::gauge!("smg_estimated_wait_seconds", "worker" => worker.url().to_owned())
+                .set(seconds);
+            metrics::gauge!("smg_estimated_wait_snapshot_age_seconds", "worker" => worker.url().to_owned()).set(sample.started.elapsed().as_secs_f64());
+        }
+        metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned()).set(
+            u8::from(self.sample.as_ref().is_some_and(|s| {
+                s.overloaded.is_some() && s.started.elapsed().as_secs_f64() <= max_age_secs
+            })),
+        );
+    }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct EstimatedWaitAdmission {
     config: OnceLock<EstimatedWaitConfig>,
+    // Registration/removal hooks maintain this even while monitoring is stopped.
+    // Disabling the gateway flag must not disable a worker's own override.
+    worker_overrides: AtomicUsize,
     entries: Mutex<HashMap<String, Entry>>,
 }
 
 impl EstimatedWaitAdmission {
     pub(crate) fn configure(&self, config: EstimatedWaitConfig) {
-        if config.max_estimated_wait_secs.is_some() {
-            let _ = self.config.set(config);
-        }
+        let _ = self.config.set(config);
+    }
+
+    fn config(&self) -> &EstimatedWaitConfig {
+        self.config.get_or_init(EstimatedWaitConfig::default)
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        self.config.get().is_some()
+        self.config
+            .get()
+            .is_some_and(|c| c.max_estimated_wait_secs.is_some())
+            || self.worker_overrides.load(Ordering::Acquire) > 0
+    }
+
+    pub(crate) fn needs_load(&self, worker: &Arc<dyn Worker>) -> bool {
+        self.config().threshold(worker).is_some()
+    }
+
+    /// Called under the registry's per-worker mutation lock, before publication.
+    pub(crate) fn worker_added(&self, worker: &Arc<dyn Worker>) {
+        if worker.metadata().overload.max_estimated_wait_secs.is_some() {
+            self.worker_overrides.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn worker_removed(&self, worker: &Arc<dyn Worker>) {
+        self.evict(worker);
+        if worker.metadata().overload.max_estimated_wait_secs.is_some() {
+            self.worker_overrides.fetch_sub(1, Ordering::Release);
+        }
     }
 
     fn entry<'a>(
@@ -168,21 +268,23 @@ impl EstimatedWaitAdmission {
                 source: Arc::downgrade(worker),
                 generation: Arc::new(()),
                 total_dispatched: 0,
-                snapshot: None,
+                last_published: None,
+                sample: None,
             });
         if !entry.source.ptr_eq(&Arc::downgrade(worker)) {
             *entry = Entry {
                 source: Arc::downgrade(worker),
                 generation: Arc::new(()),
                 total_dispatched: 0,
-                snapshot: None,
+                last_published: None,
+                sample: None,
             };
         }
         entry
     }
 
     pub(crate) fn poll_started(&self, worker: &Arc<dyn Worker>) -> Option<PollWatermark> {
-        if !self.enabled() {
+        if !self.needs_load(worker) {
             return None;
         }
         let mut entries = self.entries.lock();
@@ -203,27 +305,38 @@ impl EstimatedWaitAdmission {
         let Some(watermark) = watermark else {
             return;
         };
+        // Rank aggregation, validation and the queue/KV formula are report work,
+        // outside the admission transaction lock.
+        let config = self.config();
+        let prepared = load.and_then(|load| config.prepare(load));
+        let threshold = config.threshold(worker);
         let mut entries = self.entries.lock();
         let Some(entry) = entries.get_mut(worker.url()) else {
             return;
         };
-        // A late poll must not recreate evicted state, overwrite a replacement,
-        // or cross an unready -> ready transition of the same worker Arc.
         if !Arc::ptr_eq(&entry.generation, &watermark.generation)
-            || entry
-                .snapshot
-                .as_ref()
-                .is_some_and(|(_, sampled, _)| *sampled > started)
+            || entry.last_published.is_some_and(|last| last > started)
         {
             return;
         }
-        entry.snapshot = load.map(|load| (load.clone(), started, watermark.dispatched));
+        entry.last_published = Some(started);
+        entry.sample = prepared.zip(threshold).map(|(prepared, threshold)| Sample {
+            prepared,
+            started,
+            watermark: watermark.dispatched,
+            threshold,
+            overloaded: None,
+        });
+        if let Some(sample) = &entry.sample {
+            metrics::gauge!("smg_estimated_wait_threshold_seconds", "worker" => worker.url().to_owned()).set(sample.threshold);
+            metrics::gauge!("smg_estimated_wait_queue_proxy", "worker" => worker.url().to_owned())
+                .set(u8::from(sample.prepared.proxy));
+            metrics::gauge!("smg_estimated_wait_throughput_fallback", "worker" => worker.url().to_owned()).set(u8::from(sample.prepared.fallback));
+        }
+        entry.refresh(worker, config.estimated_wait_max_snapshot_age_secs);
     }
 
     pub(crate) fn evict(&self, worker: &Arc<dyn Worker>) {
-        if !self.enabled() {
-            return;
-        }
         let mut entries = self.entries.lock();
         if entries
             .get(worker.url())
@@ -243,11 +356,14 @@ impl EstimatedWaitAdmission {
         entries.clear();
     }
 
-    /// No lock or map scan when disabled. Hold the returned guard until every
-    /// required pool has passed, selection has completed, and credit is added.
+    /// Keep admission, selection and final credit atomic. Disabled fleets take
+    /// no lock. Report aggregation and validation are never done under this guard.
     pub(crate) fn begin(&self) -> Option<AdmissionGuard<'_>> {
+        if !self.enabled() {
+            return None;
+        }
         Some(AdmissionGuard {
-            config: self.config.get()?,
+            config: self.config(),
             entries: self.entries.lock(),
         })
     }
@@ -269,58 +385,62 @@ impl AdmissionGuard<'_> {
         candidates: &[Arc<dyn Worker>],
         model: &str,
     ) -> Result<(), Response> {
-        let threshold = self.config.max_estimated_wait_secs.unwrap_or(f64::INFINITY);
-        metrics::gauge!("smg_estimated_wait_threshold_seconds", "model" => model.to_owned())
-            .set(threshold);
-        let mut minimum = f64::INFINITY;
-        let mut unknown = false;
         let mut eligible = false;
         for worker in candidates.iter().filter(|w| w.is_available()) {
             eligible = true;
+            // One permissive worker is sufficient. In particular, an unprotected
+            // worker or unknown report must not allow its peers to prove saturation.
+            if self.config.threshold(worker).is_none() {
+                return Ok(());
+            }
             let entry = self
                 .entries
                 .get(worker.url())
                 .filter(|e| e.source.ptr_eq(&Arc::downgrade(worker)));
-            let snapshot = entry.and_then(|e| e.snapshot.as_ref());
-            let mut reason = "missing";
-            let score = snapshot.and_then(|(load, sampled, watermark)| {
-                let age = sampled.elapsed().as_secs_f64();
-                metrics::gauge!("smg_estimated_wait_snapshot_age_seconds", "worker" => worker.url().to_owned()).set(age);
-                if age > self.config.estimated_wait_max_snapshot_age_secs { reason = "stale"; return None; }
-                reason = "unusable";
-                let dispatched = entry.map_or(0, |e| e.total_dispatched.saturating_sub(*watermark));
-                self.config.score(load, dispatched)
-            });
-            metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned())
-                .set(u8::from(score.is_some()));
-            if let Some((wait, proxy, fallback)) = score {
-                metrics::gauge!("smg_estimated_wait_seconds", "worker" => worker.url().to_owned())
-                    .set(wait);
-                metrics::gauge!("smg_estimated_wait_queue_proxy", "worker" => worker.url().to_owned()).set(u8::from(proxy));
-                metrics::gauge!("smg_estimated_wait_throughput_fallback", "worker" => worker.url().to_owned()).set(u8::from(fallback));
-                minimum = minimum.min(wait);
-            } else {
-                unknown = true;
-                metrics::counter!("smg_estimated_wait_unknown_total", "model" => model.to_owned(), "reason" => reason)
-                    .increment(1);
+            let sample = entry.and_then(|entry| entry.sample.as_ref());
+            let verdict = match sample {
+                Some(sample)
+                    if sample.started.elapsed().as_secs_f64()
+                        > self.config.estimated_wait_max_snapshot_age_secs =>
+                {
+                    Err("stale")
+                }
+                Some(sample) => sample.overloaded.ok_or("unusable"),
+                None => Err(if entry.is_some_and(|e| e.last_published.is_some()) {
+                    "unusable"
+                } else {
+                    "missing"
+                }),
+            };
+            match verdict {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(reason) => {
+                    metrics::counter!("smg_estimated_wait_unknown_total", "model" => model.to_owned(), "reason" => reason).increment(1);
+                    metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned()).set(0.0);
+                    return Ok(());
+                }
             }
         }
-        // A partial pool cannot prove that every eligible worker is saturated.
-        if !eligible || unknown || minimum < threshold {
+        if !eligible {
             return Ok(());
         }
         metrics::counter!("smg_estimated_wait_rejections_total", "model" => model.to_owned())
             .increment(1);
-        Err(overload::shed_estimated_wait(model, threshold))
+        Err(overload::shed_estimated_wait(model))
     }
 
     pub(crate) fn credit(&mut self, worker: &Arc<dyn Worker>, tokens: Option<&[u32]>) {
+        if self.config.threshold(worker).is_none() {
+            return;
+        }
         let count = tokens.map_or_else(
             || u64::from(self.config.estimated_wait_mean_prefill_tokens),
             |t| t.len() as u64,
         );
         let entry = EstimatedWaitAdmission::entry(&mut self.entries, worker);
         entry.total_dispatched = entry.total_dispatched.saturating_add(count);
+        entry.refresh(worker, self.config.estimated_wait_max_snapshot_age_secs);
     }
 }
 
@@ -685,6 +805,129 @@ mod tests {
             guard.entries.get(prefill.url()).unwrap().total_dispatched,
             0
         );
+    }
+
+    #[test]
+    fn per_worker_budget_enables_admission_and_survives_monitor_reset() {
+        use openai_protocol::worker::OverloadUpdate;
+
+        let registry = WorkerRegistry::new();
+        registry
+            .estimated_wait
+            .configure(EstimatedWaitConfig::default());
+        assert!(registry.estimated_wait.begin().is_none());
+        let make_worker = |budget| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new("http://override:1")
+                    .status(WorkerStatus::Ready)
+                    .overload(OverloadUpdate {
+                        max_estimated_wait_secs: Some(budget),
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+        };
+        let worker = make_worker(2.0);
+        let id = registry.register(worker.clone()).unwrap();
+        assert!(registry.estimated_wait.needs_load(&worker));
+        publish(&registry.estimated_wait, &worker, 200);
+        assert!(registry
+            .estimated_wait
+            .begin()
+            .unwrap()
+            .check(std::slice::from_ref(&worker), "m")
+            .is_err());
+        assert!(
+            !worker.is_overloaded(),
+            "estimated admission must not alter the static veto"
+        );
+        registry.estimated_wait.clear();
+        assert!(
+            registry.estimated_wait.enabled(),
+            "monitor reset must retain worker configuration"
+        );
+        assert!(registry
+            .estimated_wait
+            .begin()
+            .unwrap()
+            .check(std::slice::from_ref(&worker), "m")
+            .is_ok());
+        publish(&registry.estimated_wait, &worker, 200);
+        let late = registry.estimated_wait.poll_started(&worker);
+        let replacement = make_worker(4.0);
+        assert!(registry.replace(&id, replacement.clone()));
+        publish(&registry.estimated_wait, &replacement, 200);
+        registry.estimated_wait.publish(
+            &worker,
+            Some(&load(Some(1000), 0, 100.0, 0.0)),
+            late,
+            Instant::now(),
+        );
+        assert!(registry
+            .estimated_wait
+            .begin()
+            .unwrap()
+            .check(std::slice::from_ref(&replacement), "m")
+            .is_ok());
+        registry.remove(&id).unwrap();
+        assert!(registry.estimated_wait.begin().is_none());
+    }
+
+    #[test]
+    fn worker_budget_overrides_gateway_and_unprotected_peer_fails_open() {
+        use openai_protocol::worker::OverloadUpdate;
+
+        let registry = WorkerRegistry::new();
+        registry.estimated_wait.configure(config());
+        let protected: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://override:2")
+                .status(WorkerStatus::Ready)
+                .overload(OverloadUpdate {
+                    max_estimated_wait_secs: Some(4.0),
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(protected.clone()).unwrap();
+        publish(&registry.estimated_wait, &protected, 300);
+        assert!(registry
+            .estimated_wait
+            .begin()
+            .unwrap()
+            .check(std::slice::from_ref(&protected), "m")
+            .is_ok());
+        publish(&registry.estimated_wait, &protected, 400);
+        assert!(registry
+            .estimated_wait
+            .begin()
+            .unwrap()
+            .check(std::slice::from_ref(&protected), "m")
+            .is_err());
+
+        let standalone = WorkerRegistry::new();
+        standalone.register(protected.clone()).unwrap();
+        publish(&standalone.estimated_wait, &protected, 400);
+        let unprotected = worker("http://unprotected:1");
+        assert!(!standalone.estimated_wait.needs_load(&unprotected));
+        assert!(standalone
+            .estimated_wait
+            .begin()
+            .unwrap()
+            .check(&[protected, unprotected], "m")
+            .is_ok());
+    }
+
+    #[test]
+    fn later_failed_poll_fences_an_older_successful_poll() {
+        let admission = EstimatedWaitAdmission::default();
+        admission.configure(config());
+        let worker = worker("http://ordering:1");
+        let started = Instant::now() - Duration::from_secs(1);
+        let old = admission.poll_started(&worker);
+        let new = admission.poll_started(&worker);
+        admission.publish(&worker, None, new, Instant::now());
+        admission.publish(&worker, Some(&load(Some(200), 0, 100.0, 0.0)), old, started);
+        assert!(admission.begin().unwrap().check(&[worker], "m").is_ok());
     }
 
     #[test]
