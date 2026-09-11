@@ -256,6 +256,7 @@ type ModelAliasIndex = Arc<DashMap<String, Arc<str>>>;
 /// Worker registry with model-based indexing
 #[derive(Debug)]
 pub struct WorkerRegistry {
+    pub(crate) estimated_wait: super::estimated_wait::EstimatedWaitAdmission,
     /// All workers indexed by ID
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
 
@@ -370,6 +371,7 @@ impl WorkerRegistry {
         // cannot grow without bound in practice.
         let (connect_signal_tx, connect_signal_rx) = mpsc::unbounded_channel();
         Self {
+            estimated_wait: Default::default(),
             workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::new()),
             global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {

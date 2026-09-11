@@ -12,12 +12,14 @@ use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
-    worker::{ConnectionMode, RuntimeType},
+    worker::{estimated_wait::EstimatedWaitConfig, ConnectionMode, RuntimeType},
 };
 
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
+    #[serde(flatten)]
+    pub estimated_wait: EstimatedWaitConfig,
     pub mode: RoutingMode,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
@@ -1138,6 +1140,7 @@ impl Default for RouterConfig {
             load_monitor_interval_secs: 10,
             pd_admission_wait_secs: default_pd_admission_wait_secs(),
             disable_load_monitoring: false,
+            estimated_wait: Default::default(),
             worker_overload_protection: false,
             worker_overload_waiting_requests: None,
             worker_overload_token_usage: None,

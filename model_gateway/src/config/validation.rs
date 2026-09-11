@@ -766,6 +766,7 @@ impl ConfigValidator {
         // these ranges are exactly the values that would veto every worker
         // unconditionally. Mirrors the CLI parsers for the config-file and
         // bindings paths.
+        config.estimated_wait.validate()?;
         if config.worker_overload_waiting_requests == Some(0) {
             return Err(ConfigError::InvalidValue {
                 field: "worker_overload_waiting_requests".to_string(),

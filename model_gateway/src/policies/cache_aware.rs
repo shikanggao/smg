@@ -2370,7 +2370,7 @@ mod tests {
     fn waiting_load(waiting_uncached: i32) -> WorkerLoadResponse {
         WorkerLoadResponse {
             loads: vec![SchedulerLoadSnapshot {
-                num_waiting_uncached_tokens: waiting_uncached,
+                num_waiting_uncached_tokens: Some(waiting_uncached),
                 ..Default::default()
             }],
             ..Default::default()
@@ -2397,7 +2397,7 @@ mod tests {
     ) -> WorkerLoadResponse {
         WorkerLoadResponse {
             loads: vec![SchedulerLoadSnapshot {
-                num_waiting_uncached_tokens: queued_tokens,
+                num_waiting_uncached_tokens: Some(queued_tokens),
                 token_usage,
                 gen_throughput,
                 ..Default::default()
