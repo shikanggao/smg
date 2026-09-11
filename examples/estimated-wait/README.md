@@ -14,10 +14,13 @@ wait_seconds = (queued_uncached_tokens + since_poll_dispatch_tokens) / throughpu
 ```
 
 The minimum score across the candidate pool is compared inclusively to the
-budget. HTTP 429 with error code `estimated_wait_exceeded` means every eligible
-worker in that pool is at or above the budget. It is marked non-retryable inside
-SMG and carries `Retry-After: 1`; clients should back off and jitter. Existing
-static overload guards retain their independent behavior and responses.
+budget. When every eligible worker in that pool is at or above the budget,
+this guard returns HTTP 503 with `worker_overload_protection_shed` in both the
+JSON error code and the `X-SMG-Error-Code` header, matching static overload
+protection. The message identifies the estimated-wait budget. The shared shed
+helper marks it non-retryable inside SMG and sets `Retry-After` to the configured
+load-monitor polling interval (at least one second); clients should back off
+and jitter. Static overload thresholds remain independent.
 
 ## Configuration
 
@@ -64,7 +67,7 @@ multiple independent routers do not share dispatch credit.
 ## Missing and stale data
 
 The initial policy is fail open. An empty eligible pool does not emit an
-estimated-wait 429; existing availability handling applies. If any eligible
+estimated-wait 503; existing availability handling applies. If any eligible
 worker has missing, stale, or unusable data, the pool cannot prove universal
 saturation and this guard admits. Keep engine limits and independently chosen
 static guardrails enabled as appropriate. A stale low score is never used as a
@@ -124,4 +127,4 @@ between profiles without rerunning this procedure.
 
 For functional tests without GPUs, run `cargo test -p smg --lib estimated_wait`.
 The concurrent placement test verifies that 16 simultaneous requests sharing a
-2-second budget admit exactly two 100-token requests at 100 tokens/s before 429.
+2-second budget admit exactly two 100-token requests at 100 tokens/s before 503.

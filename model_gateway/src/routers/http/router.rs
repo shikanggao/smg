@@ -2360,7 +2360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn estimated_wait_returns_429_before_http_dispatch_without_internal_retry() {
+    async fn estimated_wait_returns_503_before_http_dispatch_without_internal_retry() {
         use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
         use crate::worker::estimated_wait::EstimatedWaitConfig;
@@ -2403,13 +2403,13 @@ mod tests {
         )
         .await
         .expect("must shed without contacting workers or waiting for retries");
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             response
                 .headers()
                 .get(error::HEADER_X_SMG_ERROR_CODE)
                 .unwrap(),
-            "estimated_wait_exceeded"
+            "worker_overload_protection_shed"
         );
         assert!(!is_retryable_response(&response));
     }

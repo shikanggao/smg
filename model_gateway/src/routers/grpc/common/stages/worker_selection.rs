@@ -1201,7 +1201,7 @@ mod tests {
     /// the retry path (404 is not retryable).
 
     #[test]
-    fn estimated_wait_grpc_selection_propagates_429_and_credits_tokenized_input() {
+    fn estimated_wait_grpc_selection_propagates_503_and_credits_tokenized_input() {
         use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
         use crate::worker::estimated_wait::EstimatedWaitConfig;
@@ -1242,7 +1242,12 @@ mod tests {
         let shed = stage
             .select_single_worker("m", None, None, None, None, None, None)
             .unwrap_err();
-        assert_eq!(shed.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            shed.headers().get(error::HEADER_X_SMG_ERROR_CODE).unwrap(),
+            "worker_overload_protection_shed"
+        );
+        assert!(shed.headers().contains_key(http::header::RETRY_AFTER));
         assert!(!is_retryable_response(&shed));
     }
 
