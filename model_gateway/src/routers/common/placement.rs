@@ -371,25 +371,29 @@ pub(crate) fn select_pair(
         // confirmed estimated-wait veto. This lets the prefill policy choose
         // another compatibility cohort instead of shedding after it picks a
         // saturated one; unknown reports still fail open.
+        let mut cohort_shed = None;
         open.retain(|&i| {
             let decode: Vec<Arc<dyn Worker>> = pairs.partners[i]
                 .iter()
                 .filter(|d| partner_open(d, leg_runtime))
                 .cloned()
                 .collect();
-            guard.check(&decode, model_id).is_ok()
+            match guard.check(&decode, model_id) {
+                Ok(()) => true,
+                Err(shed) => {
+                    cohort_shed = Some(shed);
+                    false
+                }
+            }
         });
         if open.is_empty() {
-            let decode: Vec<Arc<dyn Worker>> = pairs
-                .decode_pool
-                .iter()
-                .filter(|d| partner_open(d, leg_runtime))
-                .cloned()
-                .collect();
-            guard
-                .check(&decode, model_id)
-                .map_err(|shed| fail(WorkerLeg::Decode, PlacementFailure::AllOverloaded(shed)))?;
-            return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
+            // Preserve a veto from the actual compatible cohorts. Rechecking
+            // the entire decode pool could include an incompatible idle worker.
+            let verdict = cohort_shed.map_or(
+                PlacementFailure::Unavailable,
+                PlacementFailure::AllOverloaded,
+            );
+            return Err(fail(WorkerLeg::Decode, verdict));
         }
     }
     let prefill: Vec<Arc<dyn Worker>> = open
@@ -583,73 +587,84 @@ mod tests {
 
         use crate::worker::estimated_wait::EstimatedWaitConfig;
 
-        let registry = pd_registry(&[
-            ("grpc://p:a", WorkerType::Prefill, Some("NixlConnector")),
-            ("grpc://d:a", WorkerType::Decode, Some("NixlConnector")),
-            ("grpc://d:b", WorkerType::Decode, Some("MooncakeConnector")),
-        ]);
-        registry.estimated_wait.configure(EstimatedWaitConfig {
-            max_estimated_wait_secs: Some(1.0),
-            estimated_wait_mean_prefill_tokens: 100,
-            ..Default::default()
-        });
-        let policies = cohort_policies();
-        let pairs = pairs_of(&registry, &policies);
-        let publish = |worker: &Arc<dyn Worker>, queued| {
-            let stamp = registry.estimated_wait.poll_started(worker);
-            registry.estimated_wait.publish(
-                worker,
-                Some(&WorkerLoadResponse {
-                    loads: vec![SchedulerLoadSnapshot {
-                        num_waiting_uncached_tokens: queued,
-                        gen_throughput: 100.0,
+        for shadow in [false, true] {
+            let registry = pd_registry(&[
+                ("grpc://p:a", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://d:a", WorkerType::Decode, Some("NixlConnector")),
+                ("grpc://d:b", WorkerType::Decode, Some("MooncakeConnector")),
+            ]);
+            registry.estimated_wait.configure(EstimatedWaitConfig {
+                max_estimated_wait_secs: Some(1.0),
+                estimated_wait_shadow: shadow,
+                estimated_wait_mean_prefill_tokens: 100,
+                ..Default::default()
+            });
+            let policies = cohort_policies();
+            let pairs = pairs_of(&registry, &policies);
+            let publish = |worker: &Arc<dyn Worker>, queued| {
+                let stamp = registry.estimated_wait.poll_started(worker);
+                registry.estimated_wait.publish(
+                    worker,
+                    Some(&WorkerLoadResponse {
+                        loads: vec![SchedulerLoadSnapshot {
+                            num_waiting_uncached_tokens: queued,
+                            gen_throughput: 100.0,
+                            ..Default::default()
+                        }],
                         ..Default::default()
-                    }],
-                    ..Default::default()
-                }),
-                stamp,
-                Instant::now(),
-            );
-        };
-        for worker in pairs.prefill_pool.iter() {
-            publish(worker, 0);
-        }
-        for worker in pairs.decode_pool.iter() {
-            publish(worker, if worker.url() == "grpc://d:a" { 100 } else { 0 });
-        }
-        // The idle decode speaks another transport and cannot bypass shedding.
-        let failure = pair_from(&registry, &policies).err().expect("decode shed");
-        assert!(matches!(failure.leg, WorkerLeg::Decode));
-        assert!(matches!(
-            failure.verdict,
-            PlacementFailure::AllOverloaded(_)
-        ));
+                    }),
+                    stamp,
+                    Instant::now(),
+                );
+            };
+            for worker in pairs.prefill_pool.iter() {
+                publish(worker, 0);
+            }
+            for worker in pairs.decode_pool.iter() {
+                publish(worker, if worker.url() == "grpc://d:a" { 100 } else { 0 });
+            }
+            if shadow {
+                // Continue placement even after both legs accrue over-budget credit.
+                for _ in 0..3 {
+                    assert!(pair_from(&registry, &policies).is_ok());
+                }
+                continue;
+            }
+            // The idle decode speaks another transport and cannot bypass shedding.
+            let failure = pair_from(&registry, &policies).err().expect("decode shed");
+            assert!(matches!(failure.leg, WorkerLeg::Decode));
+            assert!(matches!(
+                failure.verdict,
+                PlacementFailure::AllOverloaded(_)
+            ));
 
-        let decode = pairs
-            .decode_pool
-            .iter()
-            .find(|w| w.url() == "grpc://d:a")
-            .unwrap();
-        publish(decode, 0);
-        // A rejected placement must not have consumed the prefill's budget.
-        assert!(pair_from(&registry, &policies).is_ok());
-        let failure = pair_from(&registry, &policies)
-            .err()
-            .expect("prefill credited");
-        assert!(matches!(failure.leg, WorkerLeg::Prefill));
-        assert!(matches!(
-            failure.verdict,
-            PlacementFailure::AllOverloaded(_)
-        ));
-        publish(&pairs.prefill_pool[0], 0);
-        let failure = pair_from(&registry, &policies)
-            .err()
-            .expect("decode credited");
-        assert!(matches!(failure.leg, WorkerLeg::Decode));
-        assert!(matches!(
-            failure.verdict,
-            PlacementFailure::AllOverloaded(_)
-        ));
+            let decode = pairs
+                .decode_pool
+                .iter()
+                .find(|w| w.url() == "grpc://d:a")
+                .unwrap();
+            publish(decode, 0);
+            // A rejected placement must not have consumed the prefill's budget.
+            assert!(pair_from(&registry, &policies).is_ok());
+            // Cohort pruning checks decode credit before the prefill pool.
+            let failure = pair_from(&registry, &policies)
+                .err()
+                .expect("decode credited");
+            assert!(matches!(failure.leg, WorkerLeg::Decode));
+            assert!(matches!(
+                failure.verdict,
+                PlacementFailure::AllOverloaded(_)
+            ));
+            publish(decode, 0);
+            let failure = pair_from(&registry, &policies)
+                .err()
+                .expect("prefill credited");
+            assert!(matches!(failure.leg, WorkerLeg::Prefill));
+            assert!(matches!(
+                failure.verdict,
+                PlacementFailure::AllOverloaded(_)
+            ));
+        }
     }
 
     #[test]

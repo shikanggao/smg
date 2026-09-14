@@ -302,6 +302,11 @@ struct CliArgs {
     #[arg(long, help_heading = "Routing Policy")]
     max_estimated_wait_secs: Option<f64>,
 
+    /// Observe would-reject decisions without enforcing estimated-wait budgets.
+    /// Requires a gateway or worker wait budget; static protection is unchanged.
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    estimated_wait_shadow: bool,
+
     /// KV pressure weight in seconds.
     #[arg(long, default_value_t = 0.15, help_heading = "Routing Policy")]
     estimated_wait_kv_pressure_weight: f64,
@@ -1883,6 +1888,7 @@ impl CliArgs {
             .disable_load_monitoring(self.disable_load_monitoring)
             .estimated_wait(EstimatedWaitConfig {
                 max_estimated_wait_secs: self.max_estimated_wait_secs,
+                estimated_wait_shadow: self.estimated_wait_shadow,
                 estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
                 estimated_wait_mean_prefill_tokens: self.estimated_wait_mean_prefill_tokens,
                 estimated_wait_default_throughput: self.estimated_wait_default_throughput,
@@ -2606,6 +2612,7 @@ mod tests {
         let cli = cli_args_from(&[
             "--max-estimated-wait-secs",
             "12",
+            "--estimated-wait-shadow",
             "--estimated-wait-queue-tokens-per-request",
             "2048",
             "--estimated-wait-default-throughput",
@@ -2621,6 +2628,8 @@ mod tests {
         let server = cli.to_server_config(config).unwrap();
         let config = &server.router_config.estimated_wait;
         assert_eq!(config.max_estimated_wait_secs, Some(12.0));
+        assert!(config.estimated_wait_shadow);
+        assert!(!cli_args_from(&[]).estimated_wait_shadow);
         assert_eq!(config.estimated_wait_queue_tokens_per_request, 2048);
         assert_eq!(config.estimated_wait_default_throughput, 500.0);
         assert_eq!(config.estimated_wait_kv_pressure_weight, 0.4);

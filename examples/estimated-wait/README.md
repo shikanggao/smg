@@ -15,7 +15,7 @@ wait_seconds = (queued_uncached_tokens + since_poll_dispatch_tokens) / throughpu
 
 Each worker's score is compared inclusively to its effective budget. When every
 eligible worker in the pool has a budget and is at or above it,
-this guard returns HTTP 503 with `worker_overload_protection_shed` in both the
+enforcement mode returns HTTP 503 with `worker_overload_protection_shed` in both the
 JSON error code and the `X-SMG-Error-Code` header, matching static overload
 protection. The message identifies the estimated-wait budget. The shared shed
 helper marks it non-retryable inside SMG and sets `Retry-After` to the configured
@@ -32,6 +32,7 @@ builder's `estimated_wait(EstimatedWaitConfig)` method.
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--max-estimated-wait-secs` | unset | Gateway wait budget; disabled unless a worker sets its own |
+| `--estimated-wait-shadow` | false | Record would-reject decisions and continue routing |
 | `--estimated-wait-queue-tokens-per-request` | 0 | Explicit waiting-request proxy; 0 disables it |
 | `--estimated-wait-default-throughput` | 2000 | Fallback aggregate generation tokens/s |
 | `--estimated-wait-mean-prefill-tokens` | 1024 | Dispatch credit when tokenized input is unavailable |
@@ -59,8 +60,11 @@ a pool-wide estimated-wait rejection, just as a worker below its budget does.
 The static waiting-request and KV ceilings are resolved independently.
 
 SGLang's native HTTP/gRPC loads preserve exact queued uncached tokens, including
-zero, aggregate throughput across ranks, and average rank KV usage. Missing
-queued tokens are converted from waiting requests only with an explicit proxy;
+zero, aggregate throughput across ranks, and average rank KV usage. The numeric
+queue-token field retains wire compatibility; an explicit
+`num_waiting_uncached_tokens_available: false` marks it unavailable. An omitted
+availability flag keeps the legacy interpretation that the numeric field is
+usable. Unavailable tokens are converted from waiting requests only with an explicit proxy;
 partial rank reports use that proxy only for ranks lacking token data. vLLM's
 Prometheus path requires waiting-request and KV gauges, uses maximum KV usage
 across samples, and uses the configured throughput fallback. Both vLLM KV metric
@@ -114,11 +118,50 @@ The threshold gauge now uses a worker label to reflect per-worker overrides:
 | `smg_estimated_wait_queue_proxy` | worker; 1 proxy used |
 | `smg_estimated_wait_throughput_fallback` | worker; 1 fallback used |
 | `smg_estimated_wait_unknown_total` | model, reason: missing/stale/unusable |
-| `smg_estimated_wait_rejections_total` | model |
+| `smg_estimated_wait_rejections_total` | model; enforced pool rejections |
+| `smg_estimated_wait_shadow_rejections_total` | model; would-reject pool checks in shadow mode |
 
 Gate dashboards' last-known score/proxy/fallback gauges on `data_usable == 1`.
 Snapshot age is sampled on publication and credit; use poll health alongside
 these gauges when monitoring idle pools.
+
+## Start in shadow mode
+
+Set `--estimated-wait-shadow` together with a realistic gateway wait budget or
+per-worker budgets to observe the estimator before enforcing it. For example,
+append these options to your existing launch command (values are illustrative):
+
+```sh
+--max-estimated-wait-secs 2.5 --estimated-wait-shadow
+```
+
+For vLLM, also configure a calibrated nonzero
+`--estimated-wait-queue-tokens-per-request`; missing queued tokens with the
+zero default remain unknown. Check `smg_estimated_wait_data_usable` and
+`smg_estimated_wait_unknown_total` so missing data is not mistaken for spare
+capacity.
+
+Shadow mode uses the same polling, threshold resolution, sample freshness,
+ledger lock and dispatch credit as enforcement. When an eligible pool would
+be rejected, it increments `smg_estimated_wait_shadow_rejections_total` and
+continues normal worker selection. It never emits an estimated-wait 503 or
+increments `smg_estimated_wait_rejections_total`. Independent static overload,
+health, circuit-breaker and other admission checks still apply. A lower
+per-worker budget affects the shadow decision but cannot turn on enforcement.
+The flag alone, without any gateway or worker wait budget, leaves the estimator
+disabled.
+
+The shadow counter counts pool checks, not unique requests: PD can record both
+prefill, decode and compatibility-cohort checks for one request. Because shadow traffic keeps flowing,
+its estimates reflect the admitted workload, not a simulation of queues after
+hypothetical rejections. Shadow mode has the same estimator overhead as
+enforcement and does not protect the backend from overload.
+
+After calibration, remove `--estimated-wait-shadow` (or set
+`estimated_wait_shadow` to `false` in configuration) and restart SMG to enforce
+the same budgets. Re-enable shadow mode to stop estimated-wait rejection while
+keeping observations. Remove all gateway and worker budgets to disable this
+estimator and its ledger lock entirely.
 
 ## Repeatable calibration procedure
 
@@ -133,7 +176,7 @@ between profiles without rerunning this procedure.
    shapes 1024/16, 1024/64, 2048/16, 1024/256, plus the production distribution,
    cache misses/hits, and multimodal traffic where applicable. Pin the seed and
    workload generator version. Request rate and concurrency are test controls.
-3. With an intentionally high non-binding wait budget, sweep offered load above
+3. With a candidate wait budget and `--estimated-wait-shadow`, sweep offered load above
    stable capacity on an isolated test deployment. Scrape SMG and engine metrics
    at or faster than load polling cadence; retain per-request queue delay, TTFT,
    TPOT, errors, and timestamps. A simulator can validate control flow but cannot
@@ -146,7 +189,7 @@ between profiles without rerunning this procedure.
    the profile has no feasible positive threshold. Do not derive it from the
    request timeout alone. Keep maximum snapshot age consistent with poll cadence
    and the measured staleness margin.
-6. Enforce the fitted budget. Verify rejection at equality, no rejection while
+6. Remove `--estimated-wait-shadow` and enforce the fitted budget. Verify rejection at equality, no rejection while
    an eligible worker remains below budget, stable queues during overload,
    bounded TTFT/TPOT, no memory failure, and recovery after load drops. Include
    bursts, concurrent admissions, delayed/failed polls, worker replacement,

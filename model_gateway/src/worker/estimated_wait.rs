@@ -39,6 +39,8 @@ pub struct EstimatedWaitConfig {
     /// Zero disables the waiting-request compatibility proxy.
     pub estimated_wait_queue_tokens_per_request: u32,
     pub estimated_wait_max_snapshot_age_secs: f64,
+    /// Record would-reject decisions without enforcing estimated-wait budgets.
+    pub estimated_wait_shadow: bool,
 }
 
 impl Default for EstimatedWaitConfig {
@@ -50,6 +52,7 @@ impl Default for EstimatedWaitConfig {
             estimated_wait_default_throughput: DEFAULT_THROUGHPUT,
             estimated_wait_queue_tokens_per_request: 0,
             estimated_wait_max_snapshot_age_secs: 30.0,
+            estimated_wait_shadow: false,
         }
     }
 }
@@ -425,6 +428,11 @@ impl AdmissionGuard<'_> {
         if !eligible {
             return Ok(());
         }
+        if self.config.estimated_wait_shadow {
+            metrics::counter!("smg_estimated_wait_shadow_rejections_total", "model" => model.to_owned())
+                .increment(1);
+            return Ok(());
+        }
         metrics::counter!("smg_estimated_wait_rejections_total", "model" => model.to_owned())
             .increment(1);
         Err(overload::shed_estimated_wait(model))
@@ -487,7 +495,7 @@ mod tests {
         WorkerLoadResponse {
             loads: vec![SchedulerLoadSnapshot {
                 num_waiting_uncached_tokens: tokens.unwrap_or_default(),
-                num_waiting_uncached_tokens_available: tokens.map(|_| true),
+                num_waiting_uncached_tokens_available: Some(tokens.is_some()),
                 num_waiting_reqs: waiting,
                 gen_throughput: throughput,
                 token_usage: kv,
@@ -608,6 +616,11 @@ mod tests {
         assert!(config().validate().is_ok());
         let decoded: EstimatedWaitConfig = serde_json::from_str("{}").unwrap();
         assert!(decoded.max_estimated_wait_secs.is_none());
+        assert!(!decoded.estimated_wait_shadow);
+        let shadow: EstimatedWaitConfig =
+            serde_json::from_str(r#"{"estimated_wait_shadow":true}"#).unwrap();
+        assert!(shadow.estimated_wait_shadow);
+        assert!(shadow.max_estimated_wait_secs.is_none());
     }
 
     #[test]
@@ -642,6 +655,148 @@ mod tests {
         a.set_status(WorkerStatus::NotReady);
         assert!(admission.begin().unwrap().check(&pool, "m").is_ok());
         assert!(admission.begin().unwrap().check(&[], "m").is_ok());
+    }
+
+    #[test]
+    fn shadow_counts_only_would_reject_decisions_and_keeps_credit() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let registry = WorkerRegistry::new();
+            registry.estimated_wait.configure(EstimatedWaitConfig {
+                estimated_wait_shadow: true,
+                ..config()
+            });
+            let a = worker("http://a:1");
+            let b = worker("http://b:1");
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            let pool = [a.clone(), b.clone()];
+            publish(&registry.estimated_wait, &a, 200);
+            // Missing, below-budget, stale and empty pools are not would-rejects.
+            assert!(registry
+                .estimated_wait
+                .begin()
+                .unwrap()
+                .check(&pool, "m")
+                .is_ok());
+            publish(&registry.estimated_wait, &b, 199);
+            assert!(registry
+                .estimated_wait
+                .begin()
+                .unwrap()
+                .check(&pool, "m")
+                .is_ok());
+            publish(&registry.estimated_wait, &b, 200);
+            registry
+                .estimated_wait
+                .entries
+                .lock()
+                .get_mut(b.url())
+                .unwrap()
+                .sample
+                .as_mut()
+                .unwrap()
+                .started = Instant::now() - Duration::from_secs(31);
+            assert!(registry
+                .estimated_wait
+                .begin()
+                .unwrap()
+                .check(&pool, "m")
+                .is_ok());
+            assert!(registry
+                .estimated_wait
+                .begin()
+                .unwrap()
+                .check(&[], "m")
+                .is_ok());
+            assert!(!handle
+                .render()
+                .contains("smg_estimated_wait_shadow_rejections_total"));
+
+            // All workers at budget still reach policy selection and reserve credit.
+            publish(&registry.estimated_wait, &b, 200);
+            for _ in 0..4 {
+                assert!(placement::select_from(
+                    &registry,
+                    &policies,
+                    "m",
+                    &pool,
+                    PlacementInputs::default()
+                )
+                .unwrap()
+                .is_some());
+            }
+            let entries = registry.estimated_wait.entries.lock();
+            assert_eq!(
+                entries.values().map(|e| e.total_dispatched).sum::<u64>(),
+                400
+            );
+            drop(entries);
+            let rendered = handle.render();
+            assert!(
+                rendered.contains("smg_estimated_wait_shadow_rejections_total{model=\"m\"} 4"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("smg_estimated_wait_rejections_total"));
+
+            // Shadow mode does not remove the independent static veto.
+            a.set_overloaded(true);
+            b.set_overloaded(true);
+            assert!(placement::select_from(
+                &registry,
+                &policies,
+                "m",
+                &pool,
+                PlacementInputs::default()
+            )
+            .unwrap()
+            .is_none());
+            assert!(matches!(
+                placement::failure_from(&pool, "m"),
+                PlacementFailure::AllOverloaded(_)
+            ));
+        });
+    }
+
+    #[test]
+    fn shadow_requires_a_budget_and_observes_worker_only_overrides() {
+        use openai_protocol::worker::OverloadUpdate;
+
+        let registry = WorkerRegistry::new();
+        registry.estimated_wait.configure(EstimatedWaitConfig {
+            estimated_wait_shadow: true,
+            ..Default::default()
+        });
+        assert!(registry.estimated_wait.begin().is_none());
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://override:1")
+                .status(WorkerStatus::Ready)
+                .overload(OverloadUpdate {
+                    max_estimated_wait_secs: Some(2.0),
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(worker.clone()).unwrap();
+        assert!(registry.estimated_wait.needs_load(&worker));
+        publish(&registry.estimated_wait, &worker, 200);
+        assert!(registry
+            .estimated_wait
+            .begin()
+            .unwrap()
+            .check(std::slice::from_ref(&worker), "m")
+            .is_ok());
+        assert!(registry
+            .estimated_wait
+            .entries
+            .lock()
+            .get(worker.url())
+            .unwrap()
+            .sample
+            .as_ref()
+            .unwrap()
+            .overloaded
+            .unwrap());
     }
 
     #[test]
@@ -940,6 +1095,9 @@ mod tests {
         assert_eq!(absent.num_waiting_uncached_tokens, 0);
         assert_eq!(absent.num_waiting_uncached_tokens_available, None);
         assert_eq!(empty.num_waiting_uncached_tokens, 0);
-        assert_eq!(serde_json::to_value(&absent).unwrap()["num_waiting_uncached_tokens"], 0);
+        assert_eq!(
+            serde_json::to_value(&absent).unwrap()["num_waiting_uncached_tokens"],
+            0
+        );
     }
 }
