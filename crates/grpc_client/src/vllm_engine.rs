@@ -696,7 +696,8 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             num_running_reqs: load.num_running_reqs,
             num_waiting_reqs: load.num_waiting_reqs,
             // vLLM does not report queued token-work; require an explicit proxy.
-            num_waiting_uncached_tokens: None,
+            num_waiting_uncached_tokens: 0,
+            num_waiting_uncached_tokens_available: Some(false),
             num_total_reqs: load.num_total_reqs,
             num_used_tokens: load.num_used_tokens,
             max_total_num_tokens: load.max_total_num_tokens,

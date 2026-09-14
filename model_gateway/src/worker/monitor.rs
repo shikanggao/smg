@@ -781,6 +781,7 @@ impl WorkerMonitor {
         Some(Self::single_rank(SchedulerLoadSnapshot {
             num_running_reqs: m.sum("vllm:num_requests_running") as i32,
             num_waiting_reqs: m.sum("vllm:num_requests_waiting") as i32,
+            num_waiting_uncached_tokens_available: Some(false),
             token_usage: m.max(kv_usage),
             cache_hit_rate: m.mean("vllm:gpu_prefix_cache_hit_rate"),
             ..Default::default()
@@ -812,6 +813,7 @@ impl WorkerMonitor {
         Some(Self::single_rank(SchedulerLoadSnapshot {
             num_running_reqs: m.sum(&format!("{prefix}num_running_reqs")) as i32,
             num_waiting_reqs: m.sum(&format!("{prefix}num_queue_reqs")) as i32,
+            num_waiting_uncached_tokens_available: Some(false),
             token_usage: m.mean(&format!("{prefix}token_usage")),
             gen_throughput: m.sum(&format!("{prefix}gen_throughput")),
             cache_hit_rate: m.mean(&format!("{prefix}cache_hit_rate")),
@@ -2230,7 +2232,7 @@ mod native_loads_tests {
             .expect("load response");
 
         // `/metrics` cannot report queued tokens; only the native path can.
-        assert_eq!(resp.loads[0].num_waiting_uncached_tokens, Some(900));
+        assert_eq!(resp.loads[0].num_waiting_uncached_tokens, 900);
         assert_eq!(resp.loads[0].num_running_reqs, 3);
         assert_eq!(
             memo.get(worker.url()).and_then(|hit| hit.answered()),
@@ -2347,7 +2349,7 @@ mod native_loads_tests {
             let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
                 .await
                 .expect("load response");
-            assert_eq!(resp.loads[0].num_waiting_uncached_tokens, Some(900));
+            assert_eq!(resp.loads[0].num_waiting_uncached_tokens, 900);
         }
 
         assert_eq!(

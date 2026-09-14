@@ -1221,7 +1221,7 @@ mod tests {
         let stamp = registry.estimated_wait.poll_started(&worker);
         let load = WorkerLoadResponse {
             loads: vec![SchedulerLoadSnapshot {
-                num_waiting_uncached_tokens: Some(0),
+                num_waiting_uncached_tokens: 0,
                 gen_throughput: 100.0,
                 ..Default::default()
             }],

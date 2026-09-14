@@ -103,7 +103,7 @@ mod tests {
             dp_rank_count: 1,
             loads: vec![SchedulerLoadSnapshot {
                 dp_rank: 0,
-                num_waiting_uncached_tokens: Some(num_waiting_uncached_tokens),
+                num_waiting_uncached_tokens,
                 token_usage,
                 gen_throughput,
                 ..Default::default()

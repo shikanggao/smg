@@ -332,7 +332,7 @@ pub(crate) fn select_pair(
     // One pass: the open prefills on the leg's runtime, counting the
     // pairable ones the narrowing excluded so the exclusion leaves a trace.
     let mut excluded = 0usize;
-    let open: Vec<usize> = (0..pairs.prefill.len())
+    let mut open: Vec<usize> = (0..pairs.prefill.len())
         .filter(|&i| {
             let p = &pairs.prefill[i];
             if !eligible(p) {
@@ -363,14 +363,39 @@ pub(crate) fn select_pair(
             failure_from(&pairs.decode_pool, model_id),
         ));
     }
+    // Independent prefill/decode policies so stateful ones (round robin) do
+    // not share a counter; each leg tags the sticky key with its own prefix.
+    let mut admission = registry.estimated_wait.begin();
+    if let Some(guard) = &admission {
+        // Exclude a prefill only when every compatible decode has a fresh,
+        // confirmed estimated-wait veto. This lets the prefill policy choose
+        // another compatibility cohort instead of shedding after it picks a
+        // saturated one; unknown reports still fail open.
+        open.retain(|&i| {
+            let decode: Vec<Arc<dyn Worker>> = pairs.partners[i]
+                .iter()
+                .filter(|d| partner_open(d, leg_runtime))
+                .cloned()
+                .collect();
+            guard.check(&decode, model_id).is_ok()
+        });
+        if open.is_empty() {
+            let decode: Vec<Arc<dyn Worker>> = pairs
+                .decode_pool
+                .iter()
+                .filter(|d| partner_open(d, leg_runtime))
+                .cloned()
+                .collect();
+            guard
+                .check(&decode, model_id)
+                .map_err(|shed| fail(WorkerLeg::Decode, PlacementFailure::AllOverloaded(shed)))?;
+            return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
+        }
+    }
     let prefill: Vec<Arc<dyn Worker>> = open
         .iter()
         .map(|&i| Arc::clone(&pairs.prefill[i]))
         .collect();
-
-    // Independent prefill/decode policies so stateful ones (round robin) do
-    // not share a counter; each leg tags the sticky key with its own prefix.
-    let mut admission = registry.estimated_wait.begin();
     if let Some(guard) = &admission {
         guard
             .check(&prefill, model_id)
@@ -577,7 +602,7 @@ mod tests {
                 worker,
                 Some(&WorkerLoadResponse {
                     loads: vec![SchedulerLoadSnapshot {
-                        num_waiting_uncached_tokens: Some(queued),
+                        num_waiting_uncached_tokens: queued,
                         gen_throughput: 100.0,
                         ..Default::default()
                     }],
@@ -626,6 +651,50 @@ mod tests {
             failure.verdict,
             PlacementFailure::AllOverloaded(_)
         ));
+    }
+
+    #[test]
+    fn estimated_wait_uses_another_pd_cohort_when_one_decode_is_saturated() {
+        use std::time::Instant;
+
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+
+        let registry = pd_registry(&[
+            ("grpc://p:a", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:b", WorkerType::Prefill, Some("MooncakeConnector")),
+            ("grpc://d:a", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:b", WorkerType::Decode, Some("MooncakeConnector")),
+        ]);
+        registry.estimated_wait.configure(EstimatedWaitConfig {
+            max_estimated_wait_secs: Some(1.0),
+            estimated_wait_mean_prefill_tokens: 100,
+            ..Default::default()
+        });
+        let policies = cohort_policies();
+        let pairs = pairs_of(&registry, &policies);
+        for worker in pairs.prefill_pool.iter().chain(pairs.decode_pool.iter()) {
+            let queued = if worker.url() == "grpc://d:a" { 100 } else { 0 };
+            let stamp = registry.estimated_wait.poll_started(worker);
+            registry.estimated_wait.publish(
+                worker,
+                Some(&WorkerLoadResponse {
+                    loads: vec![SchedulerLoadSnapshot {
+                        num_waiting_uncached_tokens: queued,
+                        gen_throughput: 100.0,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                stamp,
+                Instant::now(),
+            );
+        }
+
+        let pair = pair_from(&registry, &policies).expect("the healthy cohort is selected");
+        assert_eq!(pair.prefill.url(), "grpc://p:b");
+        assert_eq!(pair.decode.url(), "grpc://d:b");
     }
 
     #[test]

@@ -1301,10 +1301,15 @@ pub struct SchedulerLoadSnapshot {
     pub dp_rank: i32,
     pub num_running_reqs: i32,
     pub num_waiting_reqs: i32,
-    /// Queued uncached token-work. None means unavailable; Some(0) is an
-    /// exact empty/cached queue and must not be replaced by a request proxy.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub num_waiting_uncached_tokens: Option<i32>,
+    /// Queued uncached token-work. Kept required for wire compatibility with
+    /// existing generated clients; use the companion flag to distinguish an
+    /// unavailable signal from an exact empty queue.
+    pub num_waiting_uncached_tokens: i32,
+    /// Whether `num_waiting_uncached_tokens` is reported by the backend.
+    /// Missing keeps the legacy interpretation that the required numeric field
+    /// is usable; backends that cannot report it set this to `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_waiting_uncached_tokens_available: Option<bool>,
     pub num_total_reqs: i32,
     pub num_used_tokens: i32,
     pub max_total_num_tokens: i32,
@@ -1442,7 +1447,7 @@ impl WorkerLoadResponse {
     pub fn total_waiting_uncached_tokens(&self) -> i64 {
         self.loads
             .iter()
-            .map(|l| i64::from(l.num_waiting_uncached_tokens.unwrap_or(0)))
+            .map(|l| i64::from(l.num_waiting_uncached_tokens))
             .sum()
     }
 
