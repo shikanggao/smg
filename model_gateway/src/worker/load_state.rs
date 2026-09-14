@@ -293,7 +293,7 @@ mod tests {
     fn load(waiting: i32) -> Arc<WorkerLoadResponse> {
         Arc::new(WorkerLoadResponse {
             loads: vec![SchedulerLoadSnapshot {
-                num_waiting_uncached_tokens: Some(waiting),
+                num_waiting_uncached_tokens: waiting,
                 ..Default::default()
             }],
             ..Default::default()

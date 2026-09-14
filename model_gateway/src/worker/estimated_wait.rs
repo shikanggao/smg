@@ -114,7 +114,7 @@ impl EstimatedWaitConfig {
             || (load.dp_rank_count > 0 && load.dp_rank_count as usize != load.loads.len())
             || load.loads.iter().any(|rank| {
                 rank.num_waiting_reqs < 0
-                    || rank.num_waiting_uncached_tokens.is_some_and(|n| n < 0)
+                    || rank.num_waiting_uncached_tokens < 0
                     || !rank.token_usage.is_finite()
             })
         {
@@ -123,9 +123,8 @@ impl EstimatedWaitConfig {
         let mut proxy = false;
         let mut queued = 0.0;
         for rank in &load.loads {
-            queued += match rank.num_waiting_uncached_tokens {
-                Some(tokens) => f64::from(tokens),
-                None => {
+            queued += match rank.num_waiting_uncached_tokens_available {
+                Some(false) => {
                     if self.estimated_wait_queue_tokens_per_request == 0 {
                         return None;
                     }
@@ -133,6 +132,7 @@ impl EstimatedWaitConfig {
                     f64::from(rank.num_waiting_reqs)
                         * f64::from(self.estimated_wait_queue_tokens_per_request)
                 }
+                _ => f64::from(rank.num_waiting_uncached_tokens),
             };
         }
         let live = load.total_gen_throughput();
@@ -486,7 +486,8 @@ mod tests {
     fn load(tokens: Option<i32>, waiting: i32, throughput: f64, kv: f64) -> WorkerLoadResponse {
         WorkerLoadResponse {
             loads: vec![SchedulerLoadSnapshot {
-                num_waiting_uncached_tokens: tokens,
+                num_waiting_uncached_tokens: tokens.unwrap_or_default(),
+                num_waiting_uncached_tokens_available: tokens.map(|_| true),
                 num_waiting_reqs: waiting,
                 gen_throughput: throughput,
                 token_usage: kv,
@@ -514,7 +515,7 @@ mod tests {
         };
         let mut state = load(Some(100), 80, 50.0, 0.25);
         state.loads.push(SchedulerLoadSnapshot {
-            num_waiting_uncached_tokens: Some(200),
+            num_waiting_uncached_tokens: 200,
             gen_throughput: 50.0,
             token_usage: 0.75,
             ..Default::default()
@@ -533,7 +534,8 @@ mod tests {
         config.estimated_wait_queue_tokens_per_request = 100;
         let mut state = load(Some(0), 10, 50.0, 0.0);
         state.loads.push(SchedulerLoadSnapshot {
-            num_waiting_uncached_tokens: None,
+            num_waiting_uncached_tokens: 0,
+            num_waiting_uncached_tokens_available: Some(false),
             num_waiting_reqs: 2,
             gen_throughput: 50.0,
             ..Default::default()
@@ -931,11 +933,13 @@ mod tests {
     }
 
     #[test]
-    fn native_json_preserves_absent_and_exact_zero_tokens() {
+    fn native_json_preserves_legacy_required_tokens() {
         let absent: SchedulerLoadSnapshot = serde_json::from_str("{}").unwrap();
         let empty: SchedulerLoadSnapshot =
             serde_json::from_str(r#"{"num_waiting_uncached_tokens":0}"#).unwrap();
-        assert_eq!(absent.num_waiting_uncached_tokens, None);
-        assert_eq!(empty.num_waiting_uncached_tokens, Some(0));
+        assert_eq!(absent.num_waiting_uncached_tokens, 0);
+        assert_eq!(absent.num_waiting_uncached_tokens_available, None);
+        assert_eq!(empty.num_waiting_uncached_tokens, 0);
+        assert_eq!(serde_json::to_value(&absent).unwrap()["num_waiting_uncached_tokens"], 0);
     }
 }

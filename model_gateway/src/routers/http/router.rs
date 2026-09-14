@@ -2376,7 +2376,7 @@ mod tests {
             let stamp = router.worker_registry.estimated_wait.poll_started(&worker);
             let load = WorkerLoadResponse {
                 loads: vec![SchedulerLoadSnapshot {
-                    num_waiting_uncached_tokens: Some(2000),
+                    num_waiting_uncached_tokens: 2000,
                     gen_throughput: 2000.0,
                     ..Default::default()
                 }],
