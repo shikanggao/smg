@@ -32,7 +32,7 @@ env:
 
 jobs:
   pre-commit:
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -64,7 +64,7 @@ jobs:
         run: pre-commit run --all-files --show-diff-on-failure
 
   python-lint:
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -91,7 +91,7 @@ jobs:
         run: mypy bindings/python/ --config-file mypy.ini
 
   grpc-proto-build-check:
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -133,7 +133,7 @@ jobs:
     # runner pool (which also tolerates the nvidia.com/gpu taint, so it can use
     # the abundant stranded CPU on GPU nodes) instead of competing for scarce
     # GPU runners.
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -226,7 +226,7 @@ jobs:
 
   python-unit-tests:
     needs: build-wheel
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -282,7 +282,7 @@ jobs:
         github.event_name != 'pull_request'
         || needs.detect-changes.outputs.rust-ci == 'true'
       )
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -388,7 +388,8 @@ jobs:
   # uploaded and summarized.
   benchmarks:
     needs: build-wheel
-    runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
+    if: vars.SMG_RUNNER_GPU_4 != ''
+    runs-on: ${{ vars.SMG_RUNNER_GPU_4 }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
     timeout-minutes: 36
@@ -613,6 +614,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && vars.SMG_RUNNER_GPU_1 != ''
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -668,6 +670,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && vars.SMG_RUNNER_GPU_1 != ''
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -711,6 +714,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && vars.SMG_RUNNER_GPU_2 != ''
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -759,6 +763,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && vars.SMG_RUNNER_GPU_1 != ''
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -790,6 +795,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && vars.SMG_RUNNER_GPU_1 != ''
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -821,6 +827,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && vars.SMG_RUNNER_GPU_1 != ''
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -843,6 +850,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && vars.SMG_RUNNER_GPU_1 != ''
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -881,6 +889,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && vars.SMG_RUNNER_GPU_1 != ''
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -904,6 +913,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && vars.SMG_RUNNER_GPU_2 != ''
       && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -954,6 +964,7 @@ jobs:
   e2e-4gpu-chat:
     name: e2e-4gpu-chat (${{ matrix.engine }})
     needs: [e2e-1gpu-chat]
+    if: vars.SMG_RUNNER_GPU_4 != ''
     strategy:
       fail-fast: false
       matrix:
@@ -980,6 +991,7 @@ jobs:
   e2e-4gpu-gateway:
     name: e2e-4gpu-gateway
     needs: [e2e-1gpu-gateway]
+    if: vars.SMG_RUNNER_GPU_4 != ''
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
@@ -993,6 +1005,7 @@ jobs:
   e2e-4gpu-epd:
     name: e2e-4gpu-epd (tokenspeed)
     needs: [e2e-1gpu-chat, detect-changes]
+    if: vars.SMG_RUNNER_GPU_4 != ''
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: tokenspeed
@@ -1016,6 +1029,7 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && vars.SMG_RUNNER_GPU_4 != ''
       && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1121,7 +1135,7 @@ jobs:
             timeout: 15
             setup_agentic_deps: true
 
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'ubuntu-latest' }}
     timeout-minutes: ${{ matrix.timeout }}
     env:
       E2E_VENDOR: ${{ matrix.vendor }}
@@ -1204,7 +1218,7 @@ jobs:
   go-unit-tests:
     name: go-unit-tests
     needs: build-wheel
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -1247,12 +1261,13 @@ jobs:
     if: >-
       always()
       && !cancelled()
+      && vars.SMG_RUNNER_GPU_1 != ''
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
               && (needs.detect-changes.outputs.common == 'true'
                   || needs.detect-changes.outputs.go-bindings == 'true')))
-    runs-on: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
+    runs-on: ${{ vars.SMG_RUNNER_GPU_1 }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     # 19 min on a quiet host (SGLang setup ~6.5 min, Go ~4 min, tests ~6.5
     # min); under runner contention the setup step reached 10 min and the
@@ -1391,7 +1406,7 @@ jobs:
   finish:
     needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
@@ -1470,7 +1485,7 @@ jobs:
 
   summarize-benchmarks:
     needs: [benchmarks]
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'ubuntu-latest' }}
     if: always() && contains(fromJSON('["success", "failure"]'), needs.benchmarks.result)
     permissions:
       contents: read
