@@ -692,7 +692,10 @@ mod tests {
             );
         }
 
-        let pair = pair_from(&registry, &policies).expect("the healthy cohort is selected");
+        let pair = match pair_from(&registry, &policies) {
+            Ok(pair) => pair,
+            Err(_) => panic!("the healthy cohort is selected"),
+        };
         assert_eq!(pair.prefill.url(), "grpc://p:b");
         assert_eq!(pair.decode.url(), "grpc://d:b");
     }
