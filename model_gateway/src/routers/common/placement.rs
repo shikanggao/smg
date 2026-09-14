@@ -144,7 +144,7 @@ pub(crate) fn select_single(
     pool: RoutingPool,
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
-) -> Option<Arc<dyn Worker>> {
+) -> Result<Option<Arc<dyn Worker>>, Response> {
     let candidates = candidates(registry, model_id, pool, wire);
     select_from(registry, policies, model_id, candidates.as_slice(), inputs)
 }
@@ -158,7 +158,11 @@ pub(crate) fn select_from(
     model_id: &str,
     candidates: &[Arc<dyn Worker>],
     inputs: PlacementInputs<'_>,
-) -> Option<Arc<dyn Worker>> {
+) -> Result<Option<Arc<dyn Worker>>, Response> {
+    let mut admission = registry.estimated_wait.begin();
+    if let Some(guard) = &admission {
+        guard.check(candidates, model_id)?;
+    }
     let policy = policies.get_policy_or_default(model_id);
 
     // Most policies already apply the complete availability predicate. Give
@@ -177,7 +181,7 @@ pub(crate) fn select_from(
         &filtered
     };
     if available.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // Cached hash ring for consistent hashing (O(log n) lookup).
@@ -185,7 +189,7 @@ pub(crate) fn select_from(
 
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
-    let idx = policies.select_worker(
+    let Some(idx) = policies.select_worker(
         &policy,
         available,
         &SelectWorkerInfo {
@@ -198,7 +202,9 @@ pub(crate) fn select_from(
             hash_ring,
             leg: WorkerLeg::Single,
         },
-    )?;
+    ) else {
+        return Ok(None);
+    };
     let selected = available[idx].clone();
 
     Metrics::record_worker_selection(
@@ -208,7 +214,10 @@ pub(crate) fn select_from(
         policy.name(),
     );
 
-    Some(selected)
+    if let Some(guard) = &mut admission {
+        guard.credit(&selected, inputs.tokens);
+    }
+    Ok(Some(selected))
 }
 
 /// Classify a failed single-worker placement from the same pool it drew from.
@@ -323,7 +332,7 @@ pub(crate) fn select_pair(
     // One pass: the open prefills on the leg's runtime, counting the
     // pairable ones the narrowing excluded so the exclusion leaves a trace.
     let mut excluded = 0usize;
-    let open: Vec<usize> = (0..pairs.prefill.len())
+    let mut open: Vec<usize> = (0..pairs.prefill.len())
         .filter(|&i| {
             let p = &pairs.prefill[i];
             if !eligible(p) {
@@ -354,13 +363,48 @@ pub(crate) fn select_pair(
             failure_from(&pairs.decode_pool, model_id),
         ));
     }
+    // Independent prefill/decode policies so stateful ones (round robin) do
+    // not share a counter; each leg tags the sticky key with its own prefix.
+    let mut admission = registry.estimated_wait.begin();
+    if let Some(guard) = &admission {
+        // Exclude a prefill only when every compatible decode has a fresh,
+        // confirmed estimated-wait veto. This lets the prefill policy choose
+        // another compatibility cohort instead of shedding after it picks a
+        // saturated one; unknown reports still fail open.
+        let mut cohort_shed = None;
+        open.retain(|&i| {
+            let decode: Vec<Arc<dyn Worker>> = pairs.partners[i]
+                .iter()
+                .filter(|d| partner_open(d, leg_runtime))
+                .cloned()
+                .collect();
+            match guard.check(&decode, model_id) {
+                Ok(()) => true,
+                Err(shed) => {
+                    cohort_shed = Some(shed);
+                    false
+                }
+            }
+        });
+        if open.is_empty() {
+            // Preserve a veto from the actual compatible cohorts. Rechecking
+            // the entire decode pool could include an incompatible idle worker.
+            let verdict = cohort_shed.map_or(
+                PlacementFailure::Unavailable,
+                PlacementFailure::AllOverloaded,
+            );
+            return Err(fail(WorkerLeg::Decode, verdict));
+        }
+    }
     let prefill: Vec<Arc<dyn Worker>> = open
         .iter()
         .map(|&i| Arc::clone(&pairs.prefill[i]))
         .collect();
-
-    // Independent prefill/decode policies so stateful ones (round robin) do
-    // not share a counter; each leg tags the sticky key with its own prefix.
+    if let Some(guard) = &admission {
+        guard
+            .check(&prefill, model_id)
+            .map_err(|shed| fail(WorkerLeg::Prefill, PlacementFailure::AllOverloaded(shed)))?;
+    }
     let prefill_policy = policies.get_prefill_policy();
     let decode_policy = policies.get_decode_policy();
     let hash_ring = registry.get_hash_ring(model_id);
@@ -400,6 +444,12 @@ pub(crate) fn select_pair(
         );
         return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
     }
+    // Judge only the selected prefill's compatible, available partners.
+    if let Some(guard) = &admission {
+        guard
+            .check(&decode, model_id)
+            .map_err(|shed| fail(WorkerLeg::Decode, PlacementFailure::AllOverloaded(shed)))?;
+    }
     info.leg = WorkerLeg::Decode;
     let Some(decode_idx) = policies.select_worker(&decode_policy, &decode, &info) else {
         return Err(declined(WorkerLeg::Decode, decode_policy.name()));
@@ -419,6 +469,10 @@ pub(crate) fn select_pair(
         decode_policy.name(),
     );
 
+    if let Some(guard) = &mut admission {
+        guard.credit(&selected_prefill, inputs.tokens);
+        guard.credit(&selected_decode, inputs.tokens);
+    }
     debug!(
         prefill = %selected_prefill.url(),
         decode = %selected_decode.url(),
@@ -524,6 +578,141 @@ mod tests {
             *hits.entry(pair.decode.url().to_string()).or_insert(0) += 1;
         }
         hits
+    }
+
+    #[test]
+    fn estimated_wait_checks_compatible_partners_and_credits_only_admitted_pairs() {
+        use std::time::Instant;
+
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+
+        for shadow in [false, true] {
+            let registry = pd_registry(&[
+                ("grpc://p:a", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://d:a", WorkerType::Decode, Some("NixlConnector")),
+                ("grpc://d:b", WorkerType::Decode, Some("MooncakeConnector")),
+            ]);
+            registry.estimated_wait.configure(EstimatedWaitConfig {
+                max_estimated_wait_secs: Some(1.0),
+                estimated_wait_shadow: shadow,
+                estimated_wait_mean_prefill_tokens: 100,
+                ..Default::default()
+            });
+            let policies = cohort_policies();
+            let pairs = pairs_of(&registry, &policies);
+            let publish = |worker: &Arc<dyn Worker>, queued| {
+                let stamp = registry.estimated_wait.poll_started(worker);
+                registry.estimated_wait.publish(
+                    worker,
+                    Some(&WorkerLoadResponse {
+                        loads: vec![SchedulerLoadSnapshot {
+                            num_waiting_uncached_tokens: queued,
+                            gen_throughput: 100.0,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    stamp,
+                    Instant::now(),
+                );
+            };
+            for worker in pairs.prefill_pool.iter() {
+                publish(worker, 0);
+            }
+            for worker in pairs.decode_pool.iter() {
+                publish(worker, if worker.url() == "grpc://d:a" { 100 } else { 0 });
+            }
+            if shadow {
+                // Continue placement even after both legs accrue over-budget credit.
+                for _ in 0..3 {
+                    assert!(pair_from(&registry, &policies).is_ok());
+                }
+                continue;
+            }
+            // The idle decode speaks another transport and cannot bypass shedding.
+            let failure = pair_from(&registry, &policies).err().expect("decode shed");
+            assert!(matches!(failure.leg, WorkerLeg::Decode));
+            assert!(matches!(
+                failure.verdict,
+                PlacementFailure::AllOverloaded(_)
+            ));
+
+            let decode = pairs
+                .decode_pool
+                .iter()
+                .find(|w| w.url() == "grpc://d:a")
+                .unwrap();
+            publish(decode, 0);
+            // A rejected placement must not have consumed the prefill's budget.
+            assert!(pair_from(&registry, &policies).is_ok());
+            // Cohort pruning checks decode credit before the prefill pool.
+            let failure = pair_from(&registry, &policies)
+                .err()
+                .expect("decode credited");
+            assert!(matches!(failure.leg, WorkerLeg::Decode));
+            assert!(matches!(
+                failure.verdict,
+                PlacementFailure::AllOverloaded(_)
+            ));
+            publish(decode, 0);
+            let failure = pair_from(&registry, &policies)
+                .err()
+                .expect("prefill credited");
+            assert!(matches!(failure.leg, WorkerLeg::Prefill));
+            assert!(matches!(
+                failure.verdict,
+                PlacementFailure::AllOverloaded(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn estimated_wait_uses_another_pd_cohort_when_one_decode_is_saturated() {
+        use std::time::Instant;
+
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+
+        let registry = pd_registry(&[
+            ("grpc://p:a", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:b", WorkerType::Prefill, Some("MooncakeConnector")),
+            ("grpc://d:a", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:b", WorkerType::Decode, Some("MooncakeConnector")),
+        ]);
+        registry.estimated_wait.configure(EstimatedWaitConfig {
+            max_estimated_wait_secs: Some(1.0),
+            estimated_wait_mean_prefill_tokens: 100,
+            ..Default::default()
+        });
+        let policies = cohort_policies();
+        let pairs = pairs_of(&registry, &policies);
+        for worker in pairs.prefill_pool.iter().chain(pairs.decode_pool.iter()) {
+            let queued = if worker.url() == "grpc://d:a" { 100 } else { 0 };
+            let stamp = registry.estimated_wait.poll_started(worker);
+            registry.estimated_wait.publish(
+                worker,
+                Some(&WorkerLoadResponse {
+                    loads: vec![SchedulerLoadSnapshot {
+                        num_waiting_uncached_tokens: queued,
+                        gen_throughput: 100.0,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                stamp,
+                Instant::now(),
+            );
+        }
+
+        let pair = match pair_from(&registry, &policies) {
+            Ok(pair) => pair,
+            Err(_) => panic!("the healthy cohort is selected"),
+        };
+        assert_eq!(pair.prefill.url(), "grpc://p:b");
+        assert_eq!(pair.decode.url(), "grpc://d:b");
     }
 
     #[test]
@@ -973,6 +1162,7 @@ mod tests {
             &only_second,
             PlacementInputs::default(),
         )
+        .unwrap()
         .expect("the narrowed slice still has a worker");
         assert_eq!(selected.url(), "http://h:2");
         assert!(matches!(
@@ -994,6 +1184,7 @@ mod tests {
             None,
             PlacementInputs::default(),
         )
+        .unwrap()
         .expect("the HTTP worker is selectable from its own pool");
         assert_eq!(selected.url(), "http://h:1");
 
@@ -1007,6 +1198,7 @@ mod tests {
             None,
             PlacementInputs::default(),
         )
+        .unwrap()
         .is_none());
         assert!(matches!(
             single_failure(&registry, MODEL, RoutingPool::GrpcPipelineRegular, None),

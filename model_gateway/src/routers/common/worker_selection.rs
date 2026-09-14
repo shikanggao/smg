@@ -58,7 +58,7 @@ impl<'a> WorkerSelector<'a> {
         &self,
         req: &SelectWorkerRequest<'_>,
     ) -> Result<Arc<dyn Worker>, Response> {
-        if let Some(worker) = self.find_best_worker(req) {
+        if let Some(worker) = self.find_best_worker(req)? {
             return Ok(worker);
         }
 
@@ -82,7 +82,7 @@ impl<'a> WorkerSelector<'a> {
         self.refresh_external_models(auth.as_ref(), req.router.as_ref())
             .await;
 
-        self.find_best_worker(req).ok_or_else(|| {
+        self.find_best_worker(req)?.ok_or_else(|| {
             if self.any_worker_supports_model(req) {
                 error::service_unavailable(
                     "service_unavailable",
@@ -124,10 +124,20 @@ impl<'a> WorkerSelector<'a> {
             .collect()
     }
 
-    fn find_best_worker(&self, req: &SelectWorkerRequest<'_>) -> Option<Arc<dyn Worker>> {
-        self.candidate_pool(req, true)
-            .into_iter()
-            .min_by_key(|w| w.load())
+    fn find_best_worker(
+        &self,
+        req: &SelectWorkerRequest<'_>,
+    ) -> Result<Option<Arc<dyn Worker>>, Response> {
+        let mut admission = self.registry.estimated_wait.begin();
+        let candidates = self.candidate_pool(req, true);
+        if let Some(guard) = &admission {
+            guard.check(&candidates, req.model_id)?;
+        }
+        let selected = candidates.into_iter().min_by_key(|w| w.load());
+        if let (Some(guard), Some(worker)) = (&mut admission, &selected) {
+            guard.credit(worker, None);
+        }
+        Ok(selected)
     }
 
     /// Shed when every worker this request could have selected is vetoed.

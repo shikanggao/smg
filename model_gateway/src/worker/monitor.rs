@@ -136,6 +136,21 @@ impl PromScrape {
         }
     }
 
+    fn max(&self, name: &str) -> f64 {
+        self.samples
+            .get(name)
+            .map(|v| {
+                v.iter().copied().fold(0.0_f64, |a, b| {
+                    if a.is_finite() && b.is_finite() {
+                        a.max(b)
+                    } else {
+                        f64::NAN
+                    }
+                })
+            })
+            .unwrap_or(0.0)
+    }
+
     /// True when at least one sample exists for `name`.
     fn has(&self, name: &str) -> bool {
         self.samples.get(name).is_some_and(|v| !v.is_empty())
@@ -481,6 +496,7 @@ impl WorkerMonitor {
         // per live URL: workers removed during the lag window would
         // otherwise leak entries, and the cost is one re-probe per
         // worker on a path that only runs on lag recovery.
+        self.worker_registry.estimated_wait.clear();
         self.load_state.clear();
         self.worker_load_manager.clear();
         self.native_loads_memo.clear();
@@ -603,6 +619,7 @@ impl WorkerMonitor {
         self.worker_registry.set_worker_overloaded(worker, false);
         self.worker_load_manager.remove_worker(url);
         self.native_loads_memo.remove(url);
+        self.worker_registry.estimated_wait.evict(worker);
         self.load_state.enqueue_eviction(Arc::clone(worker));
     }
 
@@ -757,10 +774,15 @@ impl WorkerMonitor {
             .into_iter()
             .find(|name| m.has(name))?;
 
+        let waiting = m.sum("vllm:num_requests_waiting");
+        if !m.has("vllm:num_requests_waiting") || !waiting.is_finite() || waiting < 0.0 {
+            return None;
+        }
         Some(Self::single_rank(SchedulerLoadSnapshot {
             num_running_reqs: m.sum("vllm:num_requests_running") as i32,
             num_waiting_reqs: m.sum("vllm:num_requests_waiting") as i32,
-            token_usage: m.mean(kv_usage),
+            num_waiting_uncached_tokens_available: Some(false),
+            token_usage: m.max(kv_usage),
             cache_hit_rate: m.mean("vllm:gpu_prefix_cache_hit_rate"),
             ..Default::default()
         }))
@@ -783,11 +805,17 @@ impl WorkerMonitor {
             .into_iter()
             .find(|p| m.has(&format!("{p}token_usage")))?;
 
+        let waiting_name = format!("{prefix}num_queue_reqs");
+        let waiting = m.sum(&waiting_name);
+        if !m.has(&waiting_name) || !waiting.is_finite() || waiting < 0.0 {
+            return None;
+        }
         Some(Self::single_rank(SchedulerLoadSnapshot {
             num_running_reqs: m.sum(&format!("{prefix}num_running_reqs")) as i32,
             num_waiting_reqs: m.sum(&format!("{prefix}num_queue_reqs")) as i32,
+            num_waiting_uncached_tokens_available: Some(false),
             token_usage: m.mean(&format!("{prefix}token_usage")),
-            gen_throughput: m.mean(&format!("{prefix}gen_throughput")),
+            gen_throughput: m.sum(&format!("{prefix}gen_throughput")),
             cache_hit_rate: m.mean(&format!("{prefix}cache_hit_rate")),
             utilization: m.mean(&format!("{prefix}utilization")),
             ..Default::default()
@@ -1059,7 +1087,13 @@ async fn group_monitor_loop(
             let routing_needs_load = !load_aware_policies.is_empty()
                 || monitor.policy_registry.get_dp_rank_policy().is_some();
             let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
-            if !routing_needs_load && !monitor.engine_metrics && !overload_needs_load {
+            if !routing_needs_load
+                && !monitor.engine_metrics
+                && !overload_needs_load
+                && !workers
+                    .iter()
+                    .any(|w| monitor.worker_registry.estimated_wait.needs_load(w))
+            {
                 debug!("Load monitoring disabled and nothing needs the data, skipping load fetch for group {group_key}");
                 drop(monitor);
                 continue;
@@ -1072,7 +1106,10 @@ async fn group_monitor_loop(
                 let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
                 let worker = Arc::clone(worker);
                 let connection_mode = group_key.connection_mode;
+                let registry = Arc::clone(&monitor.worker_registry);
                 async move {
+                    let started = std::time::Instant::now();
+                    let watermark = registry.estimated_wait.poll_started(&worker);
                     let response = match connection_mode {
                         ConnectionMode::Http => {
                             WorkerMonitor::fetch_http_load(&worker, Some(&native_loads_memo)).await
@@ -1081,7 +1118,7 @@ async fn group_monitor_loop(
                             WorkerMonitor::fetch_backend_load(&worker).await
                         }
                     };
-                    (worker, response)
+                    (worker, response, watermark, started)
                 }
             })
             .collect();
@@ -1091,7 +1128,7 @@ async fn group_monitor_loop(
         let mut group_loads: HashMap<String, WorkerLoadResponse> = HashMap::new();
         let mut group_dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
         let mut dp_evict: Vec<String> = Vec::new();
-        for (worker, response) in results {
+        for (worker, response, watermark, started) in results {
             let url = worker.url().to_string();
             // The overload predicate runs exactly here, once per report, never
             // on a request path, against the worker's effective thresholds
@@ -1105,6 +1142,17 @@ async fn group_monitor_loop(
                 monitor
                     .worker_registry
                     .set_worker_overloaded(&worker, verdict);
+            }
+            // Both guards consume this same report and the same lifecycle fence.
+            // Admission aggregates ranks here and latches a compact verdict;
+            // request handling only updates credit and checks freshness.
+            if monitor.worker_registry.is_current_ready(&worker) {
+                monitor.worker_registry.estimated_wait.publish(
+                    &worker,
+                    response.as_ref(),
+                    watermark,
+                    started,
+                );
             }
             if let Some(load) = response {
                 // Only feed the DP-rank cache from responses that carry real
@@ -1188,6 +1236,21 @@ async fn group_monitor_loop(
         // Drop the temporary strong reference so we do not keep the
         // monitor alive across the next `interval_timer.tick().await`.
         drop(monitor);
+    }
+}
+
+#[cfg(test)]
+mod estimated_wait_metrics_tests {
+    use super::PromScrape;
+
+    #[test]
+    fn maximum_kv_sample_preserves_saturation_and_invalid_data() {
+        let scrape = PromScrape::parse(
+            "vllm:kv_cache_usage_perc{rank=\"0\"} 0.99\nvllm:kv_cache_usage_perc{rank=\"1\"} 0.1",
+        );
+        assert_eq!(scrape.max("vllm:kv_cache_usage_perc"), 0.99);
+        let scrape = PromScrape::parse("kv 0.5\nkv NaN");
+        assert!(scrape.max("kv").is_nan());
     }
 }
 
@@ -1909,6 +1972,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(4),
                 token_usage: None,
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -1934,6 +1998,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(5),
                 token_usage: None,
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -1959,6 +2024,33 @@ mod native_loads_tests {
     /// `--disable-load-monitoring`: without it the feature would silently
     /// never engage under a load-blind policy.
     #[tokio::test]
+    async fn estimated_wait_override_alone_polls_and_sheds_with_monitoring_disabled() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
+        let worker = vllm_worker_with_overload(
+            &stub.url,
+            OverloadUpdate {
+                max_estimated_wait_secs: Some(0.01),
+                ..Default::default()
+            },
+        );
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker.clone()).unwrap();
+        monitor.start_event_loop();
+        wait_until("estimated-wait ingestion to shed", || {
+            registry
+                .estimated_wait
+                .begin()
+                .unwrap()
+                .check(std::slice::from_ref(&worker), "a")
+                .is_err()
+        })
+        .await;
+        assert!(stub.probes.load(Ordering::SeqCst) > 0);
+        assert!(!worker.is_overloaded());
+    }
+
+    #[tokio::test]
     async fn overload_thresholds_alone_start_load_polling() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
         let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
@@ -1967,6 +2059,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: None,
                 token_usage: Some(0.2),
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2024,6 +2117,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(1),
                 token_usage: None,
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2049,6 +2143,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(1),
                 token_usage: None,
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
