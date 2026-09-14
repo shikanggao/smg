@@ -541,6 +541,7 @@ struct Router {
     estimated_wait_default_throughput: f64,
     estimated_wait_queue_tokens_per_request: u32,
     estimated_wait_max_snapshot_age_secs: f64,
+    estimated_wait_shadow: bool,
 }
 
 impl Router {
@@ -860,6 +861,7 @@ impl Router {
             .worker_overload_token_usage(self.worker_overload_token_usage)
             .estimated_wait(EstimatedWaitConfig {
                 max_estimated_wait_secs: self.max_estimated_wait_secs,
+                estimated_wait_shadow: self.estimated_wait_shadow,
                 estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
                 estimated_wait_mean_prefill_tokens: self.estimated_wait_mean_prefill_tokens,
                 estimated_wait_default_throughput: self.estimated_wait_default_throughput,
@@ -1139,6 +1141,7 @@ impl Router {
         estimated_wait_default_throughput = 2000.0,
         estimated_wait_queue_tokens_per_request = 0,
         estimated_wait_max_snapshot_age_secs = 30.0,
+        estimated_wait_shadow = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1304,6 +1307,7 @@ impl Router {
         estimated_wait_default_throughput: f64,
         estimated_wait_queue_tokens_per_request: u32,
         estimated_wait_max_snapshot_age_secs: f64,
+        estimated_wait_shadow: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1481,6 +1485,7 @@ impl Router {
             estimated_wait_default_throughput,
             estimated_wait_queue_tokens_per_request,
             estimated_wait_max_snapshot_age_secs,
+            estimated_wait_shadow,
         })
     }
 

@@ -665,6 +665,7 @@ class TestParseRouterArgs:
             RouterArgs.add_cli_args(parser, use_router_prefix=bool(prefix))
             namespace = parser.parse_args(
                 [
+                    f"--{prefix}estimated-wait-shadow",
                     f"--{prefix}max-estimated-wait-secs",
                     "12",
                     f"--{prefix}estimated-wait-queue-tokens-per-request",
@@ -681,12 +682,14 @@ class TestParseRouterArgs:
             )
             args = RouterArgs.from_cli_args(namespace, use_router_prefix=bool(prefix))
             assert args.max_estimated_wait_secs == 12.0
+            assert args.estimated_wait_shadow is True
             assert args.estimated_wait_queue_tokens_per_request == 2048
             assert args.estimated_wait_default_throughput == 500.0
             assert args.estimated_wait_kv_pressure_weight == 0.4
             assert args.estimated_wait_mean_prefill_tokens == 800
             assert args.estimated_wait_max_snapshot_age_secs == 8.0
         assert RouterArgs().max_estimated_wait_secs is None
+        assert RouterArgs().estimated_wait_shadow is False
         assert RouterArgs().estimated_wait_queue_tokens_per_request == 0
 
     def test_prefixed_overload_protection_and_monitoring_flags(self):
@@ -1504,6 +1507,7 @@ class TestRouterArgsFieldOrder:
         "estimated_wait_default_throughput",
         "estimated_wait_queue_tokens_per_request",
         "estimated_wait_max_snapshot_age_secs",
+        "estimated_wait_shadow",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

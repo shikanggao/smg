@@ -263,6 +263,7 @@ class RouterArgs:
     estimated_wait_default_throughput: float = 2000.0
     estimated_wait_queue_tokens_per_request: int = 0
     estimated_wait_max_snapshot_age_secs: float = 30.0
+    estimated_wait_shadow: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -605,6 +606,13 @@ class RouterArgs:
                 " de-ranks the hottest backend within cache-aware affinity; this"
                 " flag removes the worker from routing entirely."
             ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-shadow",
+            action="store_true",
+            default=RouterArgs.estimated_wait_shadow,
+            help="Record would-reject decisions without enforcing estimated-wait budgets; "
+            "requires a gateway or worker wait budget; static protection is unchanged",
         )
         routing_group.add_argument(
             f"--{prefix}max-estimated-wait-secs",

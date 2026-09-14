@@ -20,6 +20,7 @@
   "operational_margin_secs": null,
   "router_config": {
     "max_estimated_wait_secs": null,
+    "estimated_wait_shadow": true,
     "estimated_wait_queue_tokens_per_request": null,
     "estimated_wait_default_throughput": null,
     "estimated_wait_mean_prefill_tokens": null,
