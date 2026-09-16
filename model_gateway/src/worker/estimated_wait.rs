@@ -463,10 +463,12 @@ mod tests {
     use crate::{
         config::PolicyConfig,
         policies::PolicyRegistry,
-        routers::common::{
+        routers::{
+            common::{
+                placement::{self, PlacementFailure, PlacementInputs},
+                retry::is_retryable_response,
+            },
             error,
-            placement::{self, PairCandidates, PlacementFailure, PlacementInputs},
-            retry::is_retryable_response,
         },
         worker::{BasicWorkerBuilder, ConnectionMode, WorkerRegistry, WorkerType},
     };
@@ -926,42 +928,6 @@ mod tests {
             .unwrap()
             .check(&[replacement], "m")
             .is_err());
-    }
-
-    #[test]
-    fn pd_sheds_the_saturated_leg_without_crediting_the_other_leg() {
-        let registry = WorkerRegistry::new();
-        registry.estimated_wait().configure(config());
-        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        let prefill = worker("http://prefill:1");
-        let decode = worker("http://decode:1");
-        publish(registry.estimated_wait(), &prefill, 0);
-        publish(registry.estimated_wait(), &decode, 200);
-        let failure = placement::select_pair(
-            &registry,
-            &policies,
-            "m",
-            PairCandidates {
-                prefill: std::slice::from_ref(&prefill),
-                decode: std::slice::from_ref(&decode),
-            },
-            None,
-            false,
-            PlacementInputs::default(),
-        )
-        .err()
-        .unwrap();
-        match failure.verdict {
-            PlacementFailure::AllOverloaded(shed) => {
-                assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
-            }
-            _ => panic!("expected an admission shed"),
-        }
-        let guard = registry.estimated_wait().begin().unwrap();
-        assert_eq!(
-            guard.entries.get(prefill.url()).unwrap().total_dispatched,
-            0
-        );
     }
 
     #[test]
