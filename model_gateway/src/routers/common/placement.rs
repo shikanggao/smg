@@ -401,14 +401,9 @@ pub(crate) fn select_pair(
         .map(|&i| Arc::clone(&pairs.prefill[i]))
         .collect();
     if let Some(guard) = &admission {
-        for (pool, leg) in [(&prefill, WorkerLeg::Prefill), (&decode, WorkerLeg::Decode)] {
-            guard.check(pool, model_id).map_err(|shed| {
-                Box::new(PairFailure {
-                    leg,
-                    verdict: PlacementFailure::AllOverloaded(shed),
-                })
-            })?;
-        }
+        guard
+            .check(&prefill, model_id)
+            .map_err(|shed| fail(WorkerLeg::Prefill, PlacementFailure::AllOverloaded(shed)))?;
     }
     let prefill_policy = policies.get_prefill_policy();
     let decode_policy = policies.get_decode_policy();
@@ -448,6 +443,12 @@ pub(crate) fn select_pair(
             "The selected prefill's partners went unavailable"
         );
         return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
+    }
+    // Judge only the selected prefill's compatible, available partners.
+    if let Some(guard) = &admission {
+        guard
+            .check(&decode, model_id)
+            .map_err(|shed| fail(WorkerLeg::Decode, PlacementFailure::AllOverloaded(shed)))?;
     }
     info.leg = WorkerLeg::Decode;
     let Some(decode_idx) = policies.select_worker(&decode_policy, &decode, &info) else {

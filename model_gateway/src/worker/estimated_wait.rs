@@ -464,9 +464,9 @@ mod tests {
         config::PolicyConfig,
         policies::PolicyRegistry,
         routers::common::{
+            error,
             placement::{self, PairCandidates, PlacementFailure, PlacementInputs},
             retry::is_retryable_response,
-            error,
         },
         worker::{BasicWorkerBuilder, ConnectionMode, WorkerRegistry, WorkerType},
     };
