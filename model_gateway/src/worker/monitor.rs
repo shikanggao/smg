@@ -748,14 +748,39 @@ impl WorkerMonitor {
             return NativeLoads::Inconclusive;
         }
 
-        match resp.json::<WorkerLoadResponse>().await {
-            Ok(response) if !response.loads.is_empty() => NativeLoads::Available(response),
+        match resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(Self::decode_native_loads)
+        {
+            Some(response) if !response.loads.is_empty() => NativeLoads::Available(response),
             // Our schema, no ranks reported yet — keep probing.
-            Ok(_) => NativeLoads::Inconclusive,
+            Some(_) => NativeLoads::Inconclusive,
             // A 200 that is not a load response means something else is
             // mounted here; that is as definitive as a 404.
-            Err(_) => NativeLoads::Absent,
+            None => NativeLoads::Absent,
         }
+    }
+
+    /// Preserve missing queue-token signals before the wire schema fills defaults.
+    pub(crate) fn decode_native_loads(mut value: serde_json::Value) -> Option<WorkerLoadResponse> {
+        if let Some(loads) = value
+            .get_mut("loads")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for load in loads {
+                if let Some(rank) = load.as_object_mut() {
+                    if !rank.contains_key("num_waiting_uncached_tokens") {
+                        rank.insert(
+                            "num_waiting_uncached_tokens_available".to_owned(),
+                            false.into(),
+                        );
+                    }
+                }
+            }
+        }
+        serde_json::from_value(value).ok()
     }
 
     /// vLLM HTTP: derive load from the Prometheus `/metrics` endpoint.

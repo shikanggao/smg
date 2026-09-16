@@ -371,28 +371,18 @@ pub(crate) fn select_pair(
         // confirmed estimated-wait veto. This lets the prefill policy choose
         // another compatibility cohort instead of shedding after it picks a
         // saturated one; unknown reports still fail open.
-        let mut cohort_shed = None;
         open.retain(|&i| {
             let decode: Vec<Arc<dyn Worker>> = pairs.partners[i]
                 .iter()
                 .filter(|d| partner_open(d, leg_runtime))
                 .cloned()
                 .collect();
-            match guard.check(&decode, model_id) {
-                Ok(()) => true,
-                Err(shed) => {
-                    cohort_shed = Some(shed);
-                    false
-                }
-            }
+            !guard.check_cohort(&decode, model_id)
         });
         if open.is_empty() {
             // Preserve a veto from the actual compatible cohorts. Rechecking
             // the entire decode pool could include an incompatible idle worker.
-            let verdict = cohort_shed.map_or(
-                PlacementFailure::Unavailable,
-                PlacementFailure::AllOverloaded,
-            );
+            let verdict = PlacementFailure::AllOverloaded(guard.shed(model_id));
             return Err(fail(WorkerLeg::Decode, verdict));
         }
     }
@@ -666,6 +656,72 @@ mod tests {
                 PlacementFailure::AllOverloaded(_)
             ));
         }
+    }
+
+    #[test]
+    fn estimated_wait_multiple_blocked_cohorts_record_one_shed() {
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+        use std::time::Instant;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let registry = pd_registry(&[
+                ("grpc://p:a", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://p:b", WorkerType::Prefill, Some("MooncakeConnector")),
+                ("grpc://d:a", WorkerType::Decode, Some("NixlConnector")),
+                ("grpc://d:b", WorkerType::Decode, Some("MooncakeConnector")),
+            ]);
+            registry.estimated_wait().configure(EstimatedWaitConfig {
+                max_estimated_wait_secs: Some(1.0),
+                ..Default::default()
+            });
+            for worker in registry.get_all() {
+                let stamp = registry.estimated_wait().poll_started(&worker);
+                registry.estimated_wait().publish(
+                    &worker,
+                    Some(&WorkerLoadResponse {
+                        loads: vec![SchedulerLoadSnapshot {
+                            num_waiting_uncached_tokens: 200,
+                            gen_throughput: 100.0,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    stamp,
+                    Instant::now(),
+                );
+            }
+            assert!(pair_from(&registry, &cohort_policies()).is_err());
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("smg_estimated_wait_rejections_total{model=\"m\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("smg_worker_overload_shed_total{stage=\"selection\"} 1"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn estimated_wait_successful_cohort_fallback_does_not_record_shed() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            estimated_wait_uses_another_pd_cohort_when_one_decode_is_saturated();
+        });
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_estimated_wait_rejections_total"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_worker_overload_shed_total"),
+            "{rendered}"
+        );
     }
 
     #[test]

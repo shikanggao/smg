@@ -199,6 +199,23 @@ struct Entry {
 }
 
 impl Entry {
+    fn new(worker: &Arc<dyn Worker>) -> Self {
+        Self {
+            source: Arc::downgrade(worker),
+            generation: Arc::new(()),
+            total_dispatched: 0,
+            last_published: None,
+            sample: None,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.generation = Arc::new(());
+        self.total_dispatched = 0;
+        self.last_published = None;
+        self.sample = None;
+    }
+
     fn refresh(&mut self, worker: &Arc<dyn Worker>, max_age_secs: f64) {
         if let Some(sample) = &mut self.sample {
             let seconds = sample
@@ -249,13 +266,31 @@ impl EstimatedWaitAdmission {
 
     /// Called under the registry's per-worker mutation lock, before publication.
     pub(crate) fn worker_added(&self, worker: &Arc<dyn Worker>) {
+        // Only registration can install a different incarnation for a URL.
+        if self
+            .entries
+            .lock()
+            .insert(worker.url().to_owned(), Entry::new(worker))
+            .is_some()
+        {
+            metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned())
+                .set(0.0);
+        }
         if worker.metadata().overload.max_estimated_wait_secs.is_some() {
             self.worker_overrides.fetch_add(1, Ordering::Release);
         }
     }
 
     pub(crate) fn worker_removed(&self, worker: &Arc<dyn Worker>) {
-        self.evict(worker);
+        let mut entries = self.entries.lock();
+        if entries
+            .get(worker.url())
+            .is_some_and(|entry| entry.source.ptr_eq(&Arc::downgrade(worker)))
+        {
+            entries.remove(worker.url());
+            metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned())
+                .set(0.0);
+        }
         if worker.metadata().overload.max_estimated_wait_secs.is_some() {
             self.worker_overrides.fetch_sub(1, Ordering::Release);
         }
@@ -264,26 +299,14 @@ impl EstimatedWaitAdmission {
     fn entry<'a>(
         entries: &'a mut HashMap<String, Entry>,
         worker: &Arc<dyn Worker>,
-    ) -> &'a mut Entry {
+    ) -> Option<&'a mut Entry> {
         let entry = entries
             .entry(worker.url().to_owned())
-            .or_insert_with(|| Entry {
-                source: Arc::downgrade(worker),
-                generation: Arc::new(()),
-                total_dispatched: 0,
-                last_published: None,
-                sample: None,
-            });
-        if !entry.source.ptr_eq(&Arc::downgrade(worker)) {
-            *entry = Entry {
-                source: Arc::downgrade(worker),
-                generation: Arc::new(()),
-                total_dispatched: 0,
-                last_published: None,
-                sample: None,
-            };
-        }
+            .or_insert_with(|| Entry::new(worker));
         entry
+            .source
+            .ptr_eq(&Arc::downgrade(worker))
+            .then_some(entry)
     }
 
     pub(crate) fn poll_started(&self, worker: &Arc<dyn Worker>) -> Option<PollWatermark> {
@@ -291,7 +314,7 @@ impl EstimatedWaitAdmission {
             return None;
         }
         let mut entries = self.entries.lock();
-        let entry = Self::entry(&mut entries, worker);
+        let entry = Self::entry(&mut entries, worker)?;
         Some(PollWatermark {
             generation: Arc::clone(&entry.generation),
             dispatched: entry.total_dispatched,
@@ -345,7 +368,9 @@ impl EstimatedWaitAdmission {
             .get(worker.url())
             .is_some_and(|entry| entry.source.ptr_eq(&Arc::downgrade(worker)))
         {
-            entries.remove(worker.url());
+            if let Some(entry) = entries.get_mut(worker.url()) {
+                entry.invalidate();
+            }
             metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned())
                 .set(0.0);
         }
@@ -353,10 +378,10 @@ impl EstimatedWaitAdmission {
 
     pub(crate) fn clear(&self) {
         let mut entries = self.entries.lock();
-        for url in entries.keys() {
+        for (url, entry) in entries.iter_mut() {
+            entry.invalidate();
             metrics::gauge!("smg_estimated_wait_data_usable", "worker" => url.clone()).set(0.0);
         }
-        entries.clear();
     }
 
     /// Keep admission, selection and final credit atomic. Disabled fleets take
@@ -388,13 +413,28 @@ impl AdmissionGuard<'_> {
         candidates: &[Arc<dyn Worker>],
         model: &str,
     ) -> Result<(), Response> {
+        if self.check_cohort(candidates, model) {
+            return Err(self.shed(model));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn shed(&self, model: &str) -> Response {
+        metrics::counter!("smg_estimated_wait_rejections_total", "model" => model.to_owned())
+            .increment(1);
+        overload::shed_estimated_wait(model)
+    }
+
+    /// Probe a cohort without recording an enforced rejection or building a response.
+    /// Shadow mode still counts would-reject pool checks and permits selection.
+    pub(crate) fn check_cohort(&self, candidates: &[Arc<dyn Worker>], model: &str) -> bool {
         let mut eligible = false;
         for worker in candidates.iter().filter(|w| w.is_available()) {
             eligible = true;
             // One permissive worker is sufficient. In particular, an unprotected
             // worker or unknown report must not allow its peers to prove saturation.
             if self.config.threshold(worker).is_none() {
-                return Ok(());
+                return false;
             }
             let entry = self
                 .entries
@@ -417,25 +457,23 @@ impl AdmissionGuard<'_> {
             };
             match verdict {
                 Ok(true) => {}
-                Ok(false) => return Ok(()),
+                Ok(false) => return false,
                 Err(reason) => {
                     metrics::counter!("smg_estimated_wait_unknown_total", "model" => model.to_owned(), "reason" => reason).increment(1);
                     metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned()).set(0.0);
-                    return Ok(());
+                    return false;
                 }
             }
         }
         if !eligible {
-            return Ok(());
+            return false;
         }
         if self.config.estimated_wait_shadow {
             metrics::counter!("smg_estimated_wait_shadow_rejections_total", "model" => model.to_owned())
                 .increment(1);
-            return Ok(());
+            return false;
         }
-        metrics::counter!("smg_estimated_wait_rejections_total", "model" => model.to_owned())
-            .increment(1);
-        Err(overload::shed_estimated_wait(model))
+        true
     }
 
     pub(crate) fn credit(&mut self, worker: &Arc<dyn Worker>, tokens: Option<&[u32]>) {
@@ -446,7 +484,9 @@ impl AdmissionGuard<'_> {
             || u64::from(self.config.estimated_wait_mean_prefill_tokens),
             |t| t.len() as u64,
         );
-        let entry = EstimatedWaitAdmission::entry(&mut self.entries, worker);
+        let Some(entry) = EstimatedWaitAdmission::entry(&mut self.entries, worker) else {
+            return;
+        };
         entry.total_dispatched = entry.total_dispatched.saturating_add(count);
         entry.refresh(worker, self.config.estimated_wait_max_snapshot_age_secs);
     }
@@ -515,6 +555,67 @@ mod tests {
             stamp,
             Instant::now(),
         );
+    }
+
+    #[test]
+    fn estimated_wait_late_old_poll_preserves_replacement_sample() {
+        let registry = WorkerRegistry::new();
+        let admission = registry.estimated_wait();
+        admission.configure(config());
+        let old = worker("http://a:1");
+        let id = registry.register(old.clone()).unwrap();
+        publish(admission, &old, 0);
+        let replacement = worker(old.url());
+        assert!(registry.replace(&id, replacement.clone()));
+        for reset in [false, true] {
+            if reset {
+                admission.clear();
+                assert!(admission.poll_started(&old).is_none());
+            }
+            publish(admission, &replacement, 200);
+            assert!(admission.poll_started(&old).is_none());
+            admission.begin().unwrap().credit(&old, Some(&[0; 100]));
+            assert!(admission
+                .begin()
+                .unwrap()
+                .check(std::slice::from_ref(&replacement), "m")
+                .is_err());
+            let entries = admission.entries.lock();
+            assert_eq!(entries[replacement.url()].total_dispatched, 0);
+        }
+    }
+
+    #[test]
+    fn estimated_wait_missing_http_tokens_uses_configured_proxy() {
+        let config = EstimatedWaitConfig {
+            estimated_wait_queue_tokens_per_request: 100,
+            ..config()
+        };
+        let report = crate::worker::monitor::WorkerMonitor::decode_native_loads(
+            serde_json::json!({"loads":[{"num_waiting_reqs":10,"token_usage":0.0,"gen_throughput":100.0}]}),
+        ).unwrap();
+        assert_eq!(config.score(&report, 0), Some((10.0, true, false)));
+        let no_proxy = EstimatedWaitConfig {
+            estimated_wait_queue_tokens_per_request: 0,
+            ..config.clone()
+        };
+        assert!(no_proxy.score(&report, 0).is_none());
+        for availability in [None, Some(true), Some(false)] {
+            let mut value = serde_json::json!({"loads":[{
+                "num_waiting_reqs":10,"token_usage":0.0,"gen_throughput":100.0,
+                "num_waiting_uncached_tokens":0
+            }]});
+            if let Some(available) = availability {
+                value["loads"][0]["num_waiting_uncached_tokens_available"] = available.into();
+            }
+            let report = crate::worker::monitor::WorkerMonitor::decode_native_loads(value).unwrap();
+            let expected = if availability == Some(false) {
+                (10.0, true, false)
+            } else {
+                (0.0, false, false)
+            };
+            assert_eq!(config.score(&report, 0), Some(expected));
+        }
     }
 
     #[test]
@@ -915,6 +1016,7 @@ mod tests {
             .is_err());
         let late = admission.poll_started(&old);
         let replacement = worker(old.url());
+        admission.worker_added(&replacement);
         publish(&admission, &replacement, 200);
         admission.publish(
             &old,

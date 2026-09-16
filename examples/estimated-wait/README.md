@@ -64,7 +64,8 @@ zero, aggregate throughput across ranks, and average rank KV usage. The numeric
 queue-token field retains wire compatibility; an explicit
 `num_waiting_uncached_tokens_available: false` marks it unavailable. An omitted
 availability flag keeps the legacy interpretation that the numeric field is
-usable. Unavailable tokens are converted from waiting requests only with an explicit proxy;
+usable when the numeric field is present. Native HTTP reports that omit the numeric
+field are marked unavailable before schema defaults are applied. Unavailable tokens are converted from waiting requests only with an explicit proxy;
 partial rank reports use that proxy only for ranks lacking token data. vLLM's
 Prometheus path requires waiting-request and KV gauges, uses maximum KV usage
 across samples, and uses the configured throughput fallback. Both vLLM KV metric
