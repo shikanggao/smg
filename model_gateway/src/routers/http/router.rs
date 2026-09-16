@@ -2367,13 +2367,16 @@ mod tests {
         let router = create_test_regular_router();
         router
             .worker_registry
-            .estimated_wait
+            .estimated_wait()
             .configure(EstimatedWaitConfig {
                 max_estimated_wait_secs: Some(1.0),
                 ..Default::default()
             });
         for worker in router.worker_registry.get_all() {
-            let stamp = router.worker_registry.estimated_wait.poll_started(&worker);
+            let stamp = router
+                .worker_registry
+                .estimated_wait()
+                .poll_started(&worker);
             let load = WorkerLoadResponse {
                 loads: vec![SchedulerLoadSnapshot {
                     num_waiting_uncached_tokens: 2000,
@@ -2382,7 +2385,7 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            router.worker_registry.estimated_wait.publish(
+            router.worker_registry.estimated_wait().publish(
                 &worker,
                 Some(&load),
                 stamp,

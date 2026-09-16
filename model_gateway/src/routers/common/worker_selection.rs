@@ -128,7 +128,7 @@ impl<'a> WorkerSelector<'a> {
         &self,
         req: &SelectWorkerRequest<'_>,
     ) -> Result<Option<Arc<dyn Worker>>, Response> {
-        let mut admission = self.registry.estimated_wait.begin();
+        let mut admission = self.registry.estimated_wait().begin();
         let candidates = self.candidate_pool(req, true);
         if let Some(guard) = &admission {
             guard.check(&candidates, req.model_id)?;

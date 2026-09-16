@@ -663,7 +663,7 @@ impl WorkerSelectionStage {
             return Ok(None);
         }
 
-        let mut admission = self.worker_registry.estimated_wait.begin();
+        let mut admission = self.worker_registry.estimated_wait().begin();
         if let Some(guard) = &admission {
             guard.check(&available_prefill, model_id)?;
             guard.check(&available_decode, model_id)?;
@@ -1206,7 +1206,7 @@ mod tests {
 
         use crate::worker::estimated_wait::EstimatedWaitConfig;
         let registry = Arc::new(WorkerRegistry::new());
-        registry.estimated_wait.configure(EstimatedWaitConfig {
+        registry.estimated_wait().configure(EstimatedWaitConfig {
             max_estimated_wait_secs: Some(1.0),
             ..Default::default()
         });
@@ -1218,7 +1218,7 @@ mod tests {
                 .build(),
         );
         registry.register(worker.clone()).unwrap();
-        let stamp = registry.estimated_wait.poll_started(&worker);
+        let stamp = registry.estimated_wait().poll_started(&worker);
         let load = WorkerLoadResponse {
             loads: vec![SchedulerLoadSnapshot {
                 num_waiting_uncached_tokens: 0,
@@ -1228,7 +1228,7 @@ mod tests {
             ..Default::default()
         };
         registry
-            .estimated_wait
+            .estimated_wait()
             .publish(&worker, Some(&load), stamp, std::time::Instant::now());
         let stage = WorkerSelectionStage::new(
             registry,

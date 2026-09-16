@@ -663,7 +663,7 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
             let registry = WorkerRegistry::new();
-            registry.estimated_wait.configure(EstimatedWaitConfig {
+            registry.estimated_wait().configure(EstimatedWaitConfig {
                 estimated_wait_shadow: true,
                 ..config()
             });
@@ -671,24 +671,24 @@ mod tests {
             let b = worker("http://b:1");
             let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
             let pool = [a.clone(), b.clone()];
-            publish(&registry.estimated_wait, &a, 200);
+            publish(registry.estimated_wait(), &a, 200);
             // Missing, below-budget, stale and empty pools are not would-rejects.
             assert!(registry
-                .estimated_wait
+                .estimated_wait()
                 .begin()
                 .unwrap()
                 .check(&pool, "m")
                 .is_ok());
-            publish(&registry.estimated_wait, &b, 199);
+            publish(registry.estimated_wait(), &b, 199);
             assert!(registry
-                .estimated_wait
+                .estimated_wait()
                 .begin()
                 .unwrap()
                 .check(&pool, "m")
                 .is_ok());
-            publish(&registry.estimated_wait, &b, 200);
+            publish(registry.estimated_wait(), &b, 200);
             registry
-                .estimated_wait
+                .estimated_wait()
                 .entries
                 .lock()
                 .get_mut(b.url())
@@ -698,13 +698,13 @@ mod tests {
                 .unwrap()
                 .started = Instant::now() - Duration::from_secs(31);
             assert!(registry
-                .estimated_wait
+                .estimated_wait()
                 .begin()
                 .unwrap()
                 .check(&pool, "m")
                 .is_ok());
             assert!(registry
-                .estimated_wait
+                .estimated_wait()
                 .begin()
                 .unwrap()
                 .check(&[], "m")
@@ -714,7 +714,7 @@ mod tests {
                 .contains("smg_estimated_wait_shadow_rejections_total"));
 
             // All workers at budget still reach policy selection and reserve credit.
-            publish(&registry.estimated_wait, &b, 200);
+            publish(registry.estimated_wait(), &b, 200);
             for _ in 0..4 {
                 assert!(placement::select_from(
                     &registry,
@@ -726,7 +726,7 @@ mod tests {
                 .unwrap()
                 .is_some());
             }
-            let entries = registry.estimated_wait.entries.lock();
+            let entries = registry.estimated_wait().entries.lock();
             assert_eq!(
                 entries.values().map(|e| e.total_dispatched).sum::<u64>(),
                 400
@@ -763,11 +763,11 @@ mod tests {
         use openai_protocol::worker::OverloadUpdate;
 
         let registry = WorkerRegistry::new();
-        registry.estimated_wait.configure(EstimatedWaitConfig {
+        registry.estimated_wait().configure(EstimatedWaitConfig {
             estimated_wait_shadow: true,
             ..Default::default()
         });
-        assert!(registry.estimated_wait.begin().is_none());
+        assert!(registry.estimated_wait().begin().is_none());
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://override:1")
                 .status(WorkerStatus::Ready)
@@ -778,16 +778,16 @@ mod tests {
                 .build(),
         );
         registry.register(worker.clone()).unwrap();
-        assert!(registry.estimated_wait.needs_load(&worker));
-        publish(&registry.estimated_wait, &worker, 200);
+        assert!(registry.estimated_wait().needs_load(&worker));
+        publish(registry.estimated_wait(), &worker, 200);
         assert!(registry
-            .estimated_wait
+            .estimated_wait()
             .begin()
             .unwrap()
             .check(std::slice::from_ref(&worker), "m")
             .is_ok());
         assert!(registry
-            .estimated_wait
+            .estimated_wait()
             .entries
             .lock()
             .get(worker.url())
@@ -802,9 +802,9 @@ mod tests {
     #[test]
     fn concurrent_placements_credit_once_and_recover_on_fresh_poll() {
         let registry = Arc::new(WorkerRegistry::new());
-        registry.estimated_wait.configure(config());
+        registry.estimated_wait().configure(config());
         let worker = worker("http://a:1");
-        publish(&registry.estimated_wait, &worker, 0);
+        publish(registry.estimated_wait(), &worker, 0);
         let barrier = Arc::new(Barrier::new(16));
         let policies = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
         let tasks: Vec<_> = (0..16)
@@ -832,7 +832,7 @@ mod tests {
             .filter(|ok| *ok)
             .count();
         assert_eq!(admitted, 2);
-        publish(&registry.estimated_wait, &worker, 0);
+        publish(registry.estimated_wait(), &worker, 0);
         assert!(placement::select_from(
             &registry,
             &policies,
@@ -931,12 +931,12 @@ mod tests {
     #[test]
     fn pd_sheds_the_saturated_leg_without_crediting_the_other_leg() {
         let registry = WorkerRegistry::new();
-        registry.estimated_wait.configure(config());
+        registry.estimated_wait().configure(config());
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let prefill = worker("http://prefill:1");
         let decode = worker("http://decode:1");
-        publish(&registry.estimated_wait, &prefill, 0);
-        publish(&registry.estimated_wait, &decode, 200);
+        publish(registry.estimated_wait(), &prefill, 0);
+        publish(registry.estimated_wait(), &decode, 200);
         let failure = placement::select_pair(
             &registry,
             &policies,
@@ -957,7 +957,7 @@ mod tests {
             }
             _ => panic!("expected an admission shed"),
         }
-        let guard = registry.estimated_wait.begin().unwrap();
+        let guard = registry.estimated_wait().begin().unwrap();
         assert_eq!(
             guard.entries.get(prefill.url()).unwrap().total_dispatched,
             0
@@ -970,9 +970,9 @@ mod tests {
 
         let registry = WorkerRegistry::new();
         registry
-            .estimated_wait
+            .estimated_wait()
             .configure(EstimatedWaitConfig::default());
-        assert!(registry.estimated_wait.begin().is_none());
+        assert!(registry.estimated_wait().begin().is_none());
         let make_worker = |budget| -> Arc<dyn Worker> {
             Arc::new(
                 BasicWorkerBuilder::new("http://override:1")
@@ -986,10 +986,10 @@ mod tests {
         };
         let worker = make_worker(2.0);
         let id = registry.register(worker.clone()).unwrap();
-        assert!(registry.estimated_wait.needs_load(&worker));
-        publish(&registry.estimated_wait, &worker, 200);
+        assert!(registry.estimated_wait().needs_load(&worker));
+        publish(registry.estimated_wait(), &worker, 200);
         assert!(registry
-            .estimated_wait
+            .estimated_wait()
             .begin()
             .unwrap()
             .check(std::slice::from_ref(&worker), "m")
@@ -998,36 +998,36 @@ mod tests {
             !worker.is_overloaded(),
             "estimated admission must not alter the static veto"
         );
-        registry.estimated_wait.clear();
+        registry.estimated_wait().clear();
         assert!(
-            registry.estimated_wait.enabled(),
+            registry.estimated_wait().enabled(),
             "monitor reset must retain worker configuration"
         );
         assert!(registry
-            .estimated_wait
+            .estimated_wait()
             .begin()
             .unwrap()
             .check(std::slice::from_ref(&worker), "m")
             .is_ok());
-        publish(&registry.estimated_wait, &worker, 200);
-        let late = registry.estimated_wait.poll_started(&worker);
+        publish(registry.estimated_wait(), &worker, 200);
+        let late = registry.estimated_wait().poll_started(&worker);
         let replacement = make_worker(4.0);
         assert!(registry.replace(&id, replacement.clone()));
-        publish(&registry.estimated_wait, &replacement, 200);
-        registry.estimated_wait.publish(
+        publish(registry.estimated_wait(), &replacement, 200);
+        registry.estimated_wait().publish(
             &worker,
             Some(&load(Some(1000), 0, 100.0, 0.0)),
             late,
             Instant::now(),
         );
         assert!(registry
-            .estimated_wait
+            .estimated_wait()
             .begin()
             .unwrap()
             .check(std::slice::from_ref(&replacement), "m")
             .is_ok());
         registry.remove(&id).unwrap();
-        assert!(registry.estimated_wait.begin().is_none());
+        assert!(registry.estimated_wait().begin().is_none());
     }
 
     #[test]
@@ -1035,7 +1035,7 @@ mod tests {
         use openai_protocol::worker::OverloadUpdate;
 
         let registry = WorkerRegistry::new();
-        registry.estimated_wait.configure(config());
+        registry.estimated_wait().configure(config());
         let protected: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://override:2")
                 .status(WorkerStatus::Ready)
@@ -1046,16 +1046,16 @@ mod tests {
                 .build(),
         );
         registry.register(protected.clone()).unwrap();
-        publish(&registry.estimated_wait, &protected, 300);
+        publish(registry.estimated_wait(), &protected, 300);
         assert!(registry
-            .estimated_wait
+            .estimated_wait()
             .begin()
             .unwrap()
             .check(std::slice::from_ref(&protected), "m")
             .is_ok());
-        publish(&registry.estimated_wait, &protected, 400);
+        publish(registry.estimated_wait(), &protected, 400);
         assert!(registry
-            .estimated_wait
+            .estimated_wait()
             .begin()
             .unwrap()
             .check(std::slice::from_ref(&protected), "m")
@@ -1063,11 +1063,11 @@ mod tests {
 
         let standalone = WorkerRegistry::new();
         standalone.register(protected.clone()).unwrap();
-        publish(&standalone.estimated_wait, &protected, 400);
+        publish(standalone.estimated_wait(), &protected, 400);
         let unprotected = worker("http://unprotected:1");
-        assert!(!standalone.estimated_wait.needs_load(&unprotected));
+        assert!(!standalone.estimated_wait().needs_load(&unprotected));
         assert!(standalone
-            .estimated_wait
+            .estimated_wait()
             .begin()
             .unwrap()
             .check(&[protected, unprotected], "m")

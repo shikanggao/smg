@@ -256,7 +256,7 @@ type ModelAliasIndex = Arc<DashMap<String, Arc<str>>>;
 /// Worker registry with model-based indexing
 #[derive(Debug)]
 pub struct WorkerRegistry {
-    pub(crate) estimated_wait: super::estimated_wait::EstimatedWaitAdmission,
+    estimated_wait: super::estimated_wait::EstimatedWaitAdmission,
     /// All workers indexed by ID
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
 
@@ -357,6 +357,11 @@ pub struct WorkerRegistry {
 }
 
 impl WorkerRegistry {
+    /// Shared estimated-wait admission state for the router and load monitor.
+    pub(crate) fn estimated_wait(&self) -> &super::estimated_wait::EstimatedWaitAdmission {
+        &self.estimated_wait
+    }
+
     // ───────────────────────────────────────────────────────────────────
     // 1. Construction & subscription
     // ───────────────────────────────────────────────────────────────────

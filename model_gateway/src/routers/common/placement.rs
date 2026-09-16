@@ -159,7 +159,7 @@ pub(crate) fn select_from(
     candidates: &[Arc<dyn Worker>],
     inputs: PlacementInputs<'_>,
 ) -> Result<Option<Arc<dyn Worker>>, Response> {
-    let mut admission = registry.estimated_wait.begin();
+    let mut admission = registry.estimated_wait().begin();
     if let Some(guard) = &admission {
         guard.check(candidates, model_id)?;
     }
@@ -365,7 +365,7 @@ pub(crate) fn select_pair(
     }
     // Independent prefill/decode policies so stateful ones (round robin) do
     // not share a counter; each leg tags the sticky key with its own prefix.
-    let mut admission = registry.estimated_wait.begin();
+    let mut admission = registry.estimated_wait().begin();
     if let Some(guard) = &admission {
         // Exclude a prefill only when every compatible decode has a fresh,
         // confirmed estimated-wait veto. This lets the prefill policy choose
@@ -593,7 +593,7 @@ mod tests {
                 ("grpc://d:a", WorkerType::Decode, Some("NixlConnector")),
                 ("grpc://d:b", WorkerType::Decode, Some("MooncakeConnector")),
             ]);
-            registry.estimated_wait.configure(EstimatedWaitConfig {
+            registry.estimated_wait().configure(EstimatedWaitConfig {
                 max_estimated_wait_secs: Some(1.0),
                 estimated_wait_shadow: shadow,
                 estimated_wait_mean_prefill_tokens: 100,
@@ -602,8 +602,8 @@ mod tests {
             let policies = cohort_policies();
             let pairs = pairs_of(&registry, &policies);
             let publish = |worker: &Arc<dyn Worker>, queued| {
-                let stamp = registry.estimated_wait.poll_started(worker);
-                registry.estimated_wait.publish(
+                let stamp = registry.estimated_wait().poll_started(worker);
+                registry.estimated_wait().publish(
                     worker,
                     Some(&WorkerLoadResponse {
                         loads: vec![SchedulerLoadSnapshot {
@@ -681,7 +681,7 @@ mod tests {
             ("grpc://d:a", WorkerType::Decode, Some("NixlConnector")),
             ("grpc://d:b", WorkerType::Decode, Some("MooncakeConnector")),
         ]);
-        registry.estimated_wait.configure(EstimatedWaitConfig {
+        registry.estimated_wait().configure(EstimatedWaitConfig {
             max_estimated_wait_secs: Some(1.0),
             estimated_wait_mean_prefill_tokens: 100,
             ..Default::default()
@@ -690,8 +690,8 @@ mod tests {
         let pairs = pairs_of(&registry, &policies);
         for worker in pairs.prefill_pool.iter().chain(pairs.decode_pool.iter()) {
             let queued = if worker.url() == "grpc://d:a" { 100 } else { 0 };
-            let stamp = registry.estimated_wait.poll_started(worker);
-            registry.estimated_wait.publish(
+            let stamp = registry.estimated_wait().poll_started(worker);
+            registry.estimated_wait().publish(
                 worker,
                 Some(&WorkerLoadResponse {
                     loads: vec![SchedulerLoadSnapshot {

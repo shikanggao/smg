@@ -496,7 +496,7 @@ impl WorkerMonitor {
         // per live URL: workers removed during the lag window would
         // otherwise leak entries, and the cost is one re-probe per
         // worker on a path that only runs on lag recovery.
-        self.worker_registry.estimated_wait.clear();
+        self.worker_registry.estimated_wait().clear();
         self.load_state.clear();
         self.worker_load_manager.clear();
         self.native_loads_memo.clear();
@@ -619,7 +619,7 @@ impl WorkerMonitor {
         self.worker_registry.set_worker_overloaded(worker, false);
         self.worker_load_manager.remove_worker(url);
         self.native_loads_memo.remove(url);
-        self.worker_registry.estimated_wait.evict(worker);
+        self.worker_registry.estimated_wait().evict(worker);
         self.load_state.enqueue_eviction(Arc::clone(worker));
     }
 
@@ -1092,7 +1092,7 @@ async fn group_monitor_loop(
                 && !overload_needs_load
                 && !workers
                     .iter()
-                    .any(|w| monitor.worker_registry.estimated_wait.needs_load(w))
+                    .any(|w| monitor.worker_registry.estimated_wait().needs_load(w))
             {
                 debug!("Load monitoring disabled and nothing needs the data, skipping load fetch for group {group_key}");
                 drop(monitor);
@@ -1109,7 +1109,7 @@ async fn group_monitor_loop(
                 let registry = Arc::clone(&monitor.worker_registry);
                 async move {
                     let started = std::time::Instant::now();
-                    let watermark = registry.estimated_wait.poll_started(&worker);
+                    let watermark = registry.estimated_wait().poll_started(&worker);
                     let response = match connection_mode {
                         ConnectionMode::Http => {
                             WorkerMonitor::fetch_http_load(&worker, Some(&native_loads_memo)).await
@@ -1147,7 +1147,7 @@ async fn group_monitor_loop(
             // Admission aggregates ranks here and latches a compact verdict;
             // request handling only updates credit and checks freshness.
             if monitor.worker_registry.is_current_ready(&worker) {
-                monitor.worker_registry.estimated_wait.publish(
+                monitor.worker_registry.estimated_wait().publish(
                     &worker,
                     response.as_ref(),
                     watermark,
@@ -2039,7 +2039,7 @@ mod native_loads_tests {
         monitor.start_event_loop();
         wait_until("estimated-wait ingestion to shed", || {
             registry
-                .estimated_wait
+                .estimated_wait()
                 .begin()
                 .unwrap()
                 .check(std::slice::from_ref(&worker), "a")
