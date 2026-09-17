@@ -414,12 +414,12 @@ impl AdmissionGuard<'_> {
         model: &str,
     ) -> Result<(), Response> {
         if self.check_cohort(candidates, model) {
-            return Err(self.shed(model));
+            return Err(Self::shed(model));
         }
         Ok(())
     }
 
-    pub(crate) fn shed(&self, model: &str) -> Response {
+    pub(crate) fn shed(model: &str) -> Response {
         metrics::counter!("smg_estimated_wait_rejections_total", "model" => model.to_owned())
             .increment(1);
         overload::shed_estimated_wait(model)
@@ -510,7 +510,9 @@ mod tests {
             },
             error,
         },
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerRegistry, WorkerType},
+        worker::{
+            monitor::WorkerMonitor, BasicWorkerBuilder, ConnectionMode, WorkerRegistry, WorkerType,
+        },
     };
 
     fn config() -> EstimatedWaitConfig {
@@ -591,7 +593,7 @@ mod tests {
             estimated_wait_queue_tokens_per_request: 100,
             ..config()
         };
-        let report = crate::worker::monitor::WorkerMonitor::decode_native_loads(
+        let report = WorkerMonitor::decode_native_loads(
             serde_json::json!({"loads":[{"num_waiting_reqs":10,"token_usage":0.0,"gen_throughput":100.0}]}),
         ).unwrap();
         assert_eq!(config.score(&report, 0), Some((10.0, true, false)));
@@ -608,7 +610,7 @@ mod tests {
             if let Some(available) = availability {
                 value["loads"][0]["num_waiting_uncached_tokens_available"] = available.into();
             }
-            let report = crate::worker::monitor::WorkerMonitor::decode_native_loads(value).unwrap();
+            let report = WorkerMonitor::decode_native_loads(value).unwrap();
             let expected = if availability == Some(false) {
                 (10.0, true, false)
             } else {

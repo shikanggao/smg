@@ -382,7 +382,9 @@ pub(crate) fn select_pair(
         if open.is_empty() {
             // Preserve a veto from the actual compatible cohorts. Rechecking
             // the entire decode pool could include an incompatible idle worker.
-            let verdict = PlacementFailure::AllOverloaded(guard.shed(model_id));
+            let verdict = PlacementFailure::AllOverloaded(
+                crate::worker::estimated_wait::AdmissionGuard::shed(model_id),
+            );
             return Err(fail(WorkerLeg::Decode, verdict));
         }
     }
@@ -660,9 +662,11 @@ mod tests {
 
     #[test]
     fn estimated_wait_multiple_blocked_cohorts_record_one_shed() {
-        use crate::worker::estimated_wait::EstimatedWaitConfig;
-        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
         use std::time::Instant;
+
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
 
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
