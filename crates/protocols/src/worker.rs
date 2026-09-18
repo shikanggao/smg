@@ -1075,7 +1075,7 @@ impl HttpPoolConfig {
 }
 
 /// Per-worker absolute overload threshold overrides.
-/// All fields optional — `None` means "use gateway default". Either field set
+/// All fields optional — `None` means "use gateway default". Any field set
 /// enables overload protection for this worker even when the gateway leaves
 /// it off. Mirrors `HealthCheckUpdate` pattern for PATCH-style config.
 #[serde_with::skip_serializing_none]
@@ -1087,12 +1087,17 @@ pub struct OverloadUpdate {
     /// Mean KV-cache token usage across DP ranks at or above which this worker
     /// is considered overloaded. Must be in `(0.0, 1.0]`.
     pub token_usage: Option<f64>,
+    /// Estimated-wait budget in seconds. Must be finite and > 0.
+    /// Enables calibrated admission for this worker without a gateway budget.
+    pub max_estimated_wait_secs: Option<f64>,
 }
 
 impl OverloadUpdate {
     /// Returns `true` if all fields are `None` (no overrides specified).
     pub fn is_empty(&self) -> bool {
-        self.waiting_requests.is_none() && self.token_usage.is_none()
+        self.waiting_requests.is_none()
+            && self.token_usage.is_none()
+            && self.max_estimated_wait_secs.is_none()
     }
 }
 
@@ -1296,9 +1301,15 @@ pub struct SchedulerLoadSnapshot {
     pub dp_rank: i32,
     pub num_running_reqs: i32,
     pub num_waiting_reqs: i32,
-    /// Queued token-work: waiting-queue tokens not yet served from cache. 0 when
-    /// the backend does not report it — callers degrade gracefully.
+    /// Queued uncached token-work. Kept required for wire compatibility with
+    /// existing generated clients; use the companion flag to distinguish an
+    /// unavailable signal from an exact empty queue.
     pub num_waiting_uncached_tokens: i32,
+    /// Whether `num_waiting_uncached_tokens` is reported by the backend.
+    /// Missing keeps the legacy interpretation that the required numeric field
+    /// is usable; backends that cannot report it set this to `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_waiting_uncached_tokens_available: Option<bool>,
     pub num_total_reqs: i32,
     pub num_used_tokens: i32,
     pub max_total_num_tokens: i32,
@@ -1436,7 +1447,7 @@ impl WorkerLoadResponse {
     pub fn total_waiting_uncached_tokens(&self) -> i64 {
         self.loads
             .iter()
-            .map(|l| l.num_waiting_uncached_tokens as i64)
+            .map(|l| i64::from(l.num_waiting_uncached_tokens))
             .sum()
     }
 
@@ -1748,7 +1759,20 @@ mod overload_update_tests {
     }
 
     #[test]
-    fn is_empty_tracks_both_fields() {
+    fn estimated_wait_override_round_trips_without_static_thresholds() {
+        let spec: WorkerSpec = serde_json::from_value(json!({
+            "url": "http://w:1",
+            "overload": {"max_estimated_wait_secs": 2.5}
+        }))
+        .unwrap();
+        assert!(!spec.overload.is_empty());
+        assert_eq!(spec.overload.max_estimated_wait_secs, Some(2.5));
+        let out = serde_json::to_value(&spec).unwrap();
+        assert_eq!(out["overload"], json!({"max_estimated_wait_secs": 2.5}));
+    }
+
+    #[test]
+    fn is_empty_tracks_all_fields() {
         let mut update = OverloadUpdate::default();
         assert!(update.is_empty());
         update.waiting_requests = Some(1);
@@ -1756,6 +1780,7 @@ mod overload_update_tests {
         update = OverloadUpdate {
             waiting_requests: None,
             token_usage: Some(1.0),
+            max_estimated_wait_secs: None,
         };
         assert!(!update.is_empty());
     }

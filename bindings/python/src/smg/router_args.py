@@ -257,6 +257,13 @@ class RouterArgs:
     enable_rl: bool = False  # Mount the RL control plane under /v1/rl
     rl_control_timeout_secs: int = 600  # Timeout for one proxied engine control call
     rl_fanout_concurrency: int = 32  # Max concurrent engine calls in one fan-out
+    max_estimated_wait_secs: float | None = None
+    estimated_wait_kv_pressure_weight: float = 0.15
+    estimated_wait_mean_prefill_tokens: int = 1024
+    estimated_wait_default_throughput: float = 2000.0
+    estimated_wait_queue_tokens_per_request: int = 0
+    estimated_wait_max_snapshot_age_secs: float = 30.0
+    estimated_wait_shadow: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -599,6 +606,49 @@ class RouterArgs:
                 " de-ranks the hottest backend within cache-aware affinity; this"
                 " flag removes the worker from routing entirely."
             ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-shadow",
+            action="store_true",
+            default=RouterArgs.estimated_wait_shadow,
+            help="Record would-reject decisions without enforcing estimated-wait budgets; "
+            "requires a gateway or worker wait budget; static protection is unchanged",
+        )
+        routing_group.add_argument(
+            f"--{prefix}max-estimated-wait-secs",
+            type=float,
+            default=RouterArgs.max_estimated_wait_secs,
+            help="Estimated wait budget in seconds; unset disables admission",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-kv-pressure-weight",
+            type=float,
+            default=RouterArgs.estimated_wait_kv_pressure_weight,
+            help="KV pressure weight in seconds",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-mean-prefill-tokens",
+            type=int,
+            default=RouterArgs.estimated_wait_mean_prefill_tokens,
+            help="Dispatch tokens when input tokens are unavailable",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-default-throughput",
+            type=float,
+            default=RouterArgs.estimated_wait_default_throughput,
+            help="Calibrated fallback throughput in tokens/s",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-queue-tokens-per-request",
+            type=int,
+            default=RouterArgs.estimated_wait_queue_tokens_per_request,
+            help="Queued tokens per waiting request; zero disables proxy",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-max-snapshot-age-secs",
+            type=float,
+            default=RouterArgs.estimated_wait_max_snapshot_age_secs,
+            help="Maximum snapshot age in seconds; older data fails open",
         )
         routing_group.add_argument(
             f"--{prefix}worker-overload-protection",
