@@ -386,6 +386,14 @@ pub(crate) fn init_metrics() {
         "Engine-reported generation throughput (tokens/s) by worker, model, dp_rank"
     );
     describe_gauge!(
+        "smg_engine_prefill_throughput",
+        "Engine-derived prompt throughput (tokens/s) by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_avg_request_prefill_kv_computed_tokens",
+        "Engine-derived mean uncached prefill tokens per request by worker, model, dp_rank"
+    );
+    describe_gauge!(
         "smg_engine_cache_hit_rate",
         "Engine-reported prefix cache hit rate (0.0-1.0) by worker, model, dp_rank"
     );
@@ -1562,6 +1570,20 @@ impl Metrics {
             )
             .set(load.gen_throughput);
             gauge!(
+                "smg_engine_prefill_throughput",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(load.prefill_throughput.unwrap_or(-1.0));
+            gauge!(
+                "smg_engine_avg_request_prefill_kv_computed_tokens",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(load.avg_request_prefill_kv_computed_tokens.unwrap_or(-1.0));
+            gauge!(
                 "smg_engine_cache_hit_rate",
                 "worker" => Arc::clone(&worker),
                 "model" => Arc::clone(&model),
@@ -1652,6 +1674,8 @@ impl Metrics {
                 "smg_engine_waiting_requests",
                 "smg_engine_token_usage",
                 "smg_engine_gen_throughput",
+                "smg_engine_prefill_throughput",
+                "smg_engine_avg_request_prefill_kv_computed_tokens",
                 "smg_engine_cache_hit_rate",
             ] {
                 gauge!(
@@ -1734,7 +1758,9 @@ mod tests {
                 num_running_reqs: 7,
                 num_waiting_reqs: 3,
                 token_usage: 0.5,
+                prefill_throughput: Some(84.0),
                 gen_throughput: 42.0,
+                avg_request_prefill_kv_computed_tokens: Some(1024.0),
                 cache_hit_rate: 0.25,
                 ..Default::default()
             }],
@@ -1750,6 +1776,18 @@ mod tests {
         assert_metric(&rendered, "smg_engine_running_requests", &CORE_LABELS, "7");
         assert_metric(&rendered, "smg_engine_waiting_requests", &CORE_LABELS, "3");
         assert_metric(&rendered, "smg_engine_gen_throughput", &CORE_LABELS, "42");
+        assert_metric(
+            &rendered,
+            "smg_engine_prefill_throughput",
+            &CORE_LABELS,
+            "84",
+        );
+        assert_metric(
+            &rendered,
+            "smg_engine_avg_request_prefill_kv_computed_tokens",
+            &CORE_LABELS,
+            "1024",
+        );
         // PD gauges absent when no disagg section was reported.
         assert!(
             !rendered.contains("smg_engine_pd_"),

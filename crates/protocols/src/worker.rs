@@ -1315,7 +1315,16 @@ pub struct SchedulerLoadSnapshot {
     pub max_total_num_tokens: i32,
     /// Token usage ratio (0.0–1.0).
     pub token_usage: f64,
+    /// Recent aggregate prefill throughput in tokens/s when the backend can
+    /// derive it. `None` keeps older producers and counter cold starts on the
+    /// existing generation-throughput/configured fallback path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_throughput: Option<f64>,
     pub gen_throughput: f64,
+    /// Recent mean uncached prefill tokens per completed request. Gauge-only
+    /// backends use this to turn waiting-request counts into queued token-work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_request_prefill_kv_computed_tokens: Option<f64>,
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,
@@ -1459,6 +1468,13 @@ impl WorkerLoadResponse {
     /// Total generation throughput (tokens/s) summed across all DP ranks.
     pub fn total_gen_throughput(&self) -> f64 {
         self.loads.iter().map(|l| l.gen_throughput).sum()
+    }
+
+    /// Total prefill throughput when every rank that reports load supplies it.
+    pub fn total_prefill_throughput(&self) -> Option<f64> {
+        self.loads
+            .iter()
+            .try_fold(0.0, |sum, load| load.prefill_throughput.map(|v| sum + v))
     }
 
     /// Whether these ranks are one engine's DP ranks rather than a

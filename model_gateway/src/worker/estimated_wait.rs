@@ -128,25 +128,30 @@ impl EstimatedWaitConfig {
         for rank in &load.loads {
             queued += match rank.num_waiting_uncached_tokens_available {
                 Some(false) => {
-                    if self.estimated_wait_queue_tokens_per_request == 0 {
+                    let tokens_per_request = rank
+                        .avg_request_prefill_kv_computed_tokens
+                        .filter(|value| value.is_finite() && *value > 0.0)
+                        .unwrap_or_else(|| f64::from(self.estimated_wait_queue_tokens_per_request));
+                    if tokens_per_request == 0.0 {
                         return None;
                     }
                     proxy = true;
-                    f64::from(rank.num_waiting_reqs)
-                        * f64::from(self.estimated_wait_queue_tokens_per_request)
+                    f64::from(rank.num_waiting_reqs) * tokens_per_request
                 }
                 _ => f64::from(rank.num_waiting_uncached_tokens),
             };
         }
-        let live = load.total_gen_throughput();
-        let fallback = !live.is_finite()
-            || live <= 0.0
-            || load.loads.iter().any(|rank| rank.gen_throughput < 0.0);
-        let throughput = if fallback {
-            self.estimated_wait_default_throughput
-        } else {
-            live
-        };
+        let prefill = load
+            .total_prefill_throughput()
+            .filter(|value| value.is_finite() && *value > 0.0);
+        let generation = load.total_gen_throughput();
+        let generation = (generation.is_finite()
+            && generation > 0.0
+            && load.loads.iter().all(|rank| rank.gen_throughput >= 0.0))
+        .then_some(generation);
+        let live = prefill.or(generation);
+        let fallback = live.is_none();
+        let throughput = live.unwrap_or(self.estimated_wait_default_throughput);
         let estimate = ExpectedWait::new(
             queued,
             throughput,
@@ -618,6 +623,19 @@ mod tests {
             };
             assert_eq!(config.score(&report, 0), Some(expected));
         }
+    }
+
+    #[test]
+    fn vllm_dynamic_prefill_metrics_override_static_fallbacks() {
+        let config = EstimatedWaitConfig {
+            estimated_wait_queue_tokens_per_request: 100,
+            estimated_wait_default_throughput: 10.0,
+            ..config()
+        };
+        let mut report = load(None, 2, 50.0, 0.0);
+        report.loads[0].prefill_throughput = Some(200.0);
+        report.loads[0].avg_request_prefill_kv_computed_tokens = Some(1000.0);
+        assert_eq!(config.score(&report, 0), Some((10.0, true, false)));
     }
 
     #[test]
