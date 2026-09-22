@@ -1315,9 +1315,9 @@ pub struct SchedulerLoadSnapshot {
     pub max_total_num_tokens: i32,
     /// Token usage ratio (0.0–1.0).
     pub token_usage: f64,
-    /// Recent aggregate prefill throughput in tokens/s when the backend can
-    /// derive it. `None` keeps older producers and counter cold starts on the
-    /// existing generation-throughput/configured fallback path.
+    /// Recent aggregate uncached-prefill throughput in tokens/s when the
+    /// backend can derive it. `None` keeps older producers and counter cold
+    /// starts on the existing generation-throughput/configured fallback path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_throughput: Option<f64>,
     pub gen_throughput: f64,

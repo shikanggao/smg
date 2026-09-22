@@ -387,7 +387,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_engine_prefill_throughput",
-        "Engine-derived prompt throughput (tokens/s) by worker, model, dp_rank"
+        "Engine-derived uncached-prefill throughput (tokens/s) by worker, model, dp_rank"
     );
     describe_gauge!(
         "smg_engine_avg_request_prefill_kv_computed_tokens",

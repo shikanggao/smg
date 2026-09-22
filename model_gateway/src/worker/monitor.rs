@@ -254,11 +254,18 @@ fn derive_vllm_metrics(
         .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0);
 
-    let prefill_throughput = previous
-        .and_then(|history| {
+    let prefill_throughput = previous.and_then(|history| {
+        let uncached = counter_rate(
+            current.prefill_kv_sum,
+            history.sample.prefill_kv_sum,
+            elapsed,
+        )
+        .filter(|rate| rate.is_finite() && *rate > 0.0);
+        uncached.or_else(|| {
             counter_rate(current.prompt_tokens, history.sample.prompt_tokens, elapsed)
+                .filter(|rate| rate.is_finite() && *rate >= 0.0)
         })
-        .filter(|rate| rate.is_finite() && *rate >= 0.0);
+    });
     let gen_throughput = previous
         .and_then(|history| {
             counter_rate(
@@ -1912,7 +1919,7 @@ sglang:utilization{model="llama"} 0.9
             vllm_counter_sample(&second, observed + Duration::from_secs(10)),
             Some(history),
         );
-        assert_eq!(derived.prefill_throughput, Some(400.0));
+        assert_eq!(derived.prefill_throughput, Some(2048.0));
         assert_eq!(derived.gen_throughput, 100.0);
         assert_eq!(derived.avg_request_prefill_kv_computed_tokens, Some(2048.0));
         assert!((derived.cache_hit_rate - 0.8).abs() < f64::EPSILON);
