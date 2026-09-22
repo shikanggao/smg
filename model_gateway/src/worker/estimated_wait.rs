@@ -150,8 +150,15 @@ impl EstimatedWaitConfig {
             && load.loads.iter().all(|rank| rank.gen_throughput >= 0.0))
         .then_some(generation);
         let live = prefill.or(generation);
-        let fallback = live.is_none();
-        let throughput = live.unwrap_or(self.estimated_wait_default_throughput);
+        // Counter rates measure observed demand, not capacity. A sparse request
+        // can therefore publish an arbitrarily low positive rate and make the
+        // next dispatch look much slower than the engine really is. Treat the
+        // calibrated default as a capacity floor; live rates still take over
+        // once sustained load proves a higher drain rate.
+        let (throughput, fallback) = match live {
+            Some(value) if value >= self.estimated_wait_default_throughput => (value, false),
+            _ => (self.estimated_wait_default_throughput, true),
+        };
         let estimate = ExpectedWait::new(
             queued,
             throughput,
@@ -639,6 +646,19 @@ mod tests {
     }
 
     #[test]
+    fn sparse_vllm_rate_cannot_collapse_calibrated_capacity() {
+        let config = EstimatedWaitConfig {
+            estimated_wait_default_throughput: 2000.0,
+            ..config()
+        };
+        let mut report = load(None, 0, 2.5, 0.0);
+        report.loads[0].prefill_throughput = Some(10.0);
+        report.loads[0].avg_request_prefill_kv_computed_tokens = Some(20.0);
+
+        assert_eq!(config.score(&report, 1024), Some((0.512, true, true)));
+    }
+
+    #[test]
     fn formula_uses_exact_tokens_live_throughput_and_mean_rank_kv() {
         let config = EstimatedWaitConfig {
             estimated_wait_kv_pressure_weight: 0.5,
@@ -902,7 +922,7 @@ mod tests {
         );
         registry.register(worker.clone()).unwrap();
         assert!(registry.estimated_wait().needs_load(&worker));
-        publish(registry.estimated_wait(), &worker, 200);
+        publish(registry.estimated_wait(), &worker, 4000);
         assert!(registry
             .estimated_wait()
             .begin()
@@ -1075,7 +1095,7 @@ mod tests {
         let worker = make_worker(2.0);
         let id = registry.register(worker.clone()).unwrap();
         assert!(registry.estimated_wait().needs_load(&worker));
-        publish(registry.estimated_wait(), &worker, 200);
+        publish(registry.estimated_wait(), &worker, 4000);
         assert!(registry
             .estimated_wait()
             .begin()
