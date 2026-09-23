@@ -18,6 +18,9 @@ pub const DEFAULT_MAX_KV_PENALTY_SECS: f64 = 5.0;
 pub(crate) struct ExpectedWait {
     queued_tokens: f64,
     throughput: f64,
+    base_overhead: f64,
+    queue_work_correction: f64,
+    dispatch_blocking_factor: f64,
     kv_wait: f64,
 }
 
@@ -27,12 +30,44 @@ impl ExpectedWait {
         Self {
             queued_tokens,
             throughput,
+            base_overhead: 0.0,
+            queue_work_correction: 1.0,
+            dispatch_blocking_factor: 1.0,
             kv_wait: weight * k / (1.0 - k),
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the calibrated equation is clearer when each named coefficient stays explicit"
+    )]
+    pub(crate) fn calibrated(
+        queued_tokens: f64,
+        throughput: f64,
+        usage: f64,
+        base_overhead: f64,
+        queue_work_correction: f64,
+        dispatch_blocking_factor: f64,
+        kv_pressure_threshold: f64,
+        kv_pressure_weight: f64,
+    ) -> Self {
+        let k = usage.clamp(0.0, 0.999);
+        Self {
+            queued_tokens,
+            throughput,
+            base_overhead,
+            queue_work_correction,
+            dispatch_blocking_factor,
+            kv_wait: kv_pressure_weight * (k - kv_pressure_threshold).max(0.0) / (1.0 - k),
+        }
+    }
+
     pub(crate) fn seconds(self, dispatched_tokens: u64) -> f64 {
-        self.seconds_with_dispatch_factor(dispatched_tokens, 1.0)
+        self.base_overhead
+            + self.queue_work_correction
+                * (self.queued_tokens + self.dispatch_blocking_factor * dispatched_tokens as f64)
+                / self.throughput
+            + self.kv_wait
     }
 
     /// Limit the KV-pressure contribution without changing queue accounting.
@@ -40,14 +75,16 @@ impl ExpectedWait {
         self.kv_wait = self.kv_wait.min(max_secs);
         self
     }
+}
 
-    /// Discount prompt work already dispatched into a continuously batched engine.
-    pub(crate) fn seconds_with_dispatch_factor(
-        self,
-        dispatched_tokens: u64,
-        dispatch_blocking_factor: f64,
-    ) -> f64 {
-        (self.queued_tokens + dispatched_tokens as f64 * dispatch_blocking_factor) / self.throughput
-            + self.kv_wait
+#[cfg(test)]
+mod tests {
+    use super::ExpectedWait;
+
+    #[test]
+    fn calibrated_wait_applies_base_queue_and_dispatch_terms_with_kv_disabled() {
+        let wait = ExpectedWait::calibrated(8_000.0, 5_000.0, 0.99, 0.05, 0.7, 0.4, 0.8, 0.0);
+
+        assert!((wait.seconds(2_000) - 1.282).abs() < 1e-9);
     }
 }

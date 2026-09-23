@@ -11,8 +11,10 @@ static overload guard:
 ```
 dispatch_work = dispatch_blocking_factor * since_poll_dispatch_tokens
 kv_penalty = min(max_kv_penalty_secs,
-                 kv_weight * token_usage / (1 - token_usage))
-wait_seconds = (queued_uncached_tokens + dispatch_work) / throughput
+                 kv_weight * max(0, token_usage - kv_threshold) / (1 - token_usage))
+wait_seconds = base_overhead
+             + queue_work_correction
+               * (queued_uncached_tokens + dispatch_work) / prefill_capacity
              + kv_penalty
 ```
 
@@ -37,11 +39,15 @@ builder's `estimated_wait(EstimatedWaitConfig)` method.
 | `--max-estimated-wait-secs` | unset | Gateway wait budget; disabled unless a worker sets its own |
 | `--estimated-wait-shadow` | false | Record would-reject decisions and continue routing |
 | `--estimated-wait-queue-tokens-per-request` | 0 | Explicit waiting-request proxy; 0 disables it |
-| `--estimated-wait-default-throughput` | 2000 | Fallback aggregate generation tokens/s |
+| `--estimated-wait-fallback-prefill-throughput` | 2000 | Cold-start prefill capacity until a qualified value is learned; `--estimated-wait-min-prefill-throughput` and `--estimated-wait-default-throughput` remain aliases |
+| `--estimated-wait-prompt-size-prior-samples` | 32 | Effective sample count assigned to the configured prompt-size prior |
 | `--estimated-wait-mean-prefill-tokens` | 1024 | Dispatch credit when tokenized input is unavailable |
-| `--estimated-wait-kv-pressure-weight` | 0.15 | KV pressure weight in seconds; 0 disables the penalty |
+| `--estimated-wait-kv-pressure-weight` | 0 | KV pressure weight in seconds; disabled until a controlled KV sweep justifies it |
+| `--estimated-wait-kv-pressure-threshold` | 0 | KV usage below this ratio adds no pressure penalty |
+| `--estimated-wait-base-overhead-secs` | 0 | Fixed wait overhead |
+| `--estimated-wait-queue-work-correction` | 1 | Correction applied to queued token work |
+| `--estimated-wait-dispatch-blocking-factor` | 0.05 | Fraction of newly dispatched work that blocks an arrival; range 0–1 |
 | `--estimated-wait-max-snapshot-age-secs` | 30 | Age after which a sample is unusable |
-| `--estimated-wait-dispatch-blocking-factor` | 0.05 | Fraction of since-poll dispatched tokens treated as blocking work; range 0–1 |
 | `--estimated-wait-max-kv-penalty-secs` | 5 | Maximum seconds contributed by the KV-pressure term |
 
 Defaults are calibration starting points, not measured model capacity. Positive
@@ -75,9 +81,20 @@ availability flag keeps the legacy interpretation that the numeric field is
 usable when the numeric field is present. Native HTTP reports that omit the numeric
 field are marked unavailable before schema defaults are applied. Unavailable tokens are converted from waiting requests only with an explicit proxy;
 partial rank reports use that proxy only for ranks lacking token data. vLLM's
-Prometheus path requires waiting-request and KV gauges, uses maximum KV usage
-across samples, and uses the configured throughput fallback. Both vLLM KV metric
-names are supported. SGLang Prometheus fallback also requires a queue proxy.
+Prometheus path requires waiting-request and KV gauges and uses maximum KV usage
+across samples. Histogram deltas provide a rolling P50 uncached prompt size,
+which is blended with the configured prior. Prefill capacity is learned as P25
+over a bounded window only while requests are waiting; at least eight qualified
+intervals are required. Cold start and sparse traffic use the configured fallback
+prefill throughput. Both vLLM KV metric names are supported. SGLang Prometheus
+fallback and native load endpoints retain their existing behavior.
+
+The calibrated formula is
+`base + alpha * (queued + rho * dispatched) / capacity + weight * max(0, kv - threshold) / (1 - kv)`.
+The generic defaults are `base=0`, `alpha=1`, `rho=0.05`, `weight=0`, and
+`threshold=0`. Admission therefore discounts newly dispatched work and leaves
+the KV term off until controlled measurements justify enabling it. Least-load
+routing keeps its legacy full-dispatch and KV arithmetic unchanged.
 
 The load monitor runs even with `--disable-load-monitoring` when this guard is
 enabled, including when only a worker override enables it. No network queries
@@ -128,6 +145,8 @@ The threshold gauge now uses a worker label to reflect per-worker overrides:
 | `smg_estimated_wait_data_usable` | worker; 1 usable, 0 unknown/stale |
 | `smg_estimated_wait_queue_proxy` | worker; 1 proxy used |
 | `smg_estimated_wait_throughput_fallback` | worker; 1 fallback used |
+| `smg_estimated_wait_blended_prompt_tokens` | worker; prior-blended vLLM P50 or compatibility proxy |
+| `smg_estimated_wait_effective_prefill_capacity` | worker; learned or configured effective capacity |
 | `smg_estimated_wait_unknown_total` | model, reason: missing/stale/unusable |
 | `smg_estimated_wait_rejections_total` | model; enforced pool rejections |
 | `smg_estimated_wait_shadow_rejections_total` | model; would-reject pool checks in shadow mode |
@@ -192,9 +211,11 @@ between profiles without rerunning this procedure.
    at or faster than load polling cadence; retain per-request queue delay, TTFT,
    TPOT, errors, and timestamps. A simulator can validate control flow but cannot
    provide model/accelerator calibration.
-4. Fit conservative fallback throughput, waiting-request token proxy, mean
-   dispatch tokens, and KV weight against measured delay. Report the upper-tail
-   underprediction `max(0, observed_queue_wait - estimated_wait)` for each shape.
+4. After the rolling P50 and saturated-capacity windows are warm, fit only the
+   base overhead (`b`), queue-work correction (`alpha`), and dispatch-blocking
+   factor (`rho`) against request-level wait evidence. Keep the KV weight at
+   zero for this first calibration. Report the upper-tail underprediction
+   `max(0, observed_queue_wait - estimated_wait)` for each shape.
 5. Derive `W_max <= max(0, TTFT_SLO - no_queue_TTFT - polling_margin -
    underprediction_margin - operational_margin)`. A zero remaining budget means
    the profile has no feasible positive threshold. Do not derive it from the

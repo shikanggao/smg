@@ -590,6 +590,10 @@ mod tests {
                 max_estimated_wait_secs: Some(1.0),
                 estimated_wait_shadow: shadow,
                 estimated_wait_mean_prefill_tokens: 100,
+                estimated_wait_fallback_prefill_throughput: 100.0,
+                // This test exercises full dispatch-credit accounting; the
+                // production default intentionally discounts it.
+                estimated_wait_dispatch_blocking_factor: 1.0,
                 ..Default::default()
             });
             let policies = cohort_policies();
@@ -679,6 +683,7 @@ mod tests {
             ]);
             registry.estimated_wait().configure(EstimatedWaitConfig {
                 max_estimated_wait_secs: Some(1.0),
+                estimated_wait_fallback_prefill_throughput: 100.0,
                 ..Default::default()
             });
             for worker in registry.get_all() {
@@ -745,6 +750,7 @@ mod tests {
         registry.estimated_wait().configure(EstimatedWaitConfig {
             max_estimated_wait_secs: Some(1.0),
             estimated_wait_mean_prefill_tokens: 100,
+            estimated_wait_fallback_prefill_throughput: 100.0,
             ..Default::default()
         });
         let policies = cohort_policies();

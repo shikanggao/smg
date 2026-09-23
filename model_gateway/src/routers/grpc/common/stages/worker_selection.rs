@@ -1208,6 +1208,9 @@ mod tests {
         let registry = Arc::new(WorkerRegistry::new());
         registry.estimated_wait().configure(EstimatedWaitConfig {
             max_estimated_wait_secs: Some(1.0),
+            estimated_wait_fallback_prefill_throughput: 100.0,
+            // Make one 100-token dispatch reach the one-second threshold.
+            estimated_wait_dispatch_blocking_factor: 1.0,
             ..Default::default()
         });
         let worker: Arc<dyn Worker> = Arc::new(
