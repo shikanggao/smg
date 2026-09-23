@@ -34,8 +34,17 @@ use crate::{
 pub struct EstimatedWaitConfig {
     pub max_estimated_wait_secs: Option<f64>,
     pub estimated_wait_kv_pressure_weight: f64,
+    pub estimated_wait_kv_pressure_threshold: f64,
+    pub estimated_wait_base_overhead_secs: f64,
+    pub estimated_wait_queue_work_correction: f64,
+    pub estimated_wait_dispatch_blocking_factor: f64,
     pub estimated_wait_mean_prefill_tokens: u32,
-    pub estimated_wait_default_throughput: f64,
+    #[serde(
+        alias = "estimated_wait_default_throughput",
+        alias = "estimated_wait_min_prefill_throughput"
+    )]
+    pub estimated_wait_fallback_prefill_throughput: f64,
+    pub estimated_wait_prompt_size_prior_samples: u32,
     /// Zero disables the waiting-request compatibility proxy.
     pub estimated_wait_queue_tokens_per_request: u32,
     pub estimated_wait_max_snapshot_age_secs: f64,
@@ -48,8 +57,13 @@ impl Default for EstimatedWaitConfig {
         Self {
             max_estimated_wait_secs: None,
             estimated_wait_kv_pressure_weight: DEFAULT_KV_PRESSURE_WEIGHT,
+            estimated_wait_kv_pressure_threshold: 0.0,
+            estimated_wait_base_overhead_secs: 0.0,
+            estimated_wait_queue_work_correction: 1.0,
+            estimated_wait_dispatch_blocking_factor: 1.0,
             estimated_wait_mean_prefill_tokens: DEFAULT_MEAN_PREFILL_TOKENS,
-            estimated_wait_default_throughput: DEFAULT_THROUGHPUT,
+            estimated_wait_fallback_prefill_throughput: DEFAULT_THROUGHPUT,
+            estimated_wait_prompt_size_prior_samples: 32,
             estimated_wait_queue_tokens_per_request: 0,
             estimated_wait_max_snapshot_age_secs: 30.0,
             estimated_wait_shadow: false,
@@ -71,8 +85,28 @@ impl EstimatedWaitConfig {
                 true,
             ),
             (
-                "estimated_wait_default_throughput",
-                self.estimated_wait_default_throughput,
+                "estimated_wait_kv_pressure_threshold",
+                self.estimated_wait_kv_pressure_threshold,
+                true,
+            ),
+            (
+                "estimated_wait_base_overhead_secs",
+                self.estimated_wait_base_overhead_secs,
+                true,
+            ),
+            (
+                "estimated_wait_queue_work_correction",
+                self.estimated_wait_queue_work_correction,
+                true,
+            ),
+            (
+                "estimated_wait_dispatch_blocking_factor",
+                self.estimated_wait_dispatch_blocking_factor,
+                true,
+            ),
+            (
+                "estimated_wait_fallback_prefill_throughput",
+                self.estimated_wait_fallback_prefill_throughput,
                 false,
             ),
             (
@@ -99,6 +133,13 @@ impl EstimatedWaitConfig {
                 });
             }
         }
+        if self.estimated_wait_kv_pressure_threshold > 1.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "estimated_wait_kv_pressure_threshold".to_owned(),
+                value: self.estimated_wait_kv_pressure_threshold.to_string(),
+                reason: "Must be finite and between 0 and 1".to_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -124,17 +165,52 @@ impl EstimatedWaitConfig {
             return None;
         }
         let mut proxy = false;
+        let mut blended_prompt_size = None;
         let mut queued = 0.0;
         for rank in &load.loads {
             queued += match rank.num_waiting_uncached_tokens_available {
                 Some(false) => {
-                    let tokens_per_request = rank
-                        .avg_request_prefill_kv_computed_tokens
+                    let observed = rank
+                        .median_request_prefill_kv_computed_tokens
                         .filter(|value| value.is_finite() && *value > 0.0)
-                        .unwrap_or_else(|| f64::from(self.estimated_wait_queue_tokens_per_request));
+                        .zip(rank.prefill_size_sample_count.filter(|count| *count > 0));
+                    let configured_prior = if self.estimated_wait_queue_tokens_per_request > 0 {
+                        f64::from(self.estimated_wait_queue_tokens_per_request)
+                    } else {
+                        f64::from(self.estimated_wait_mean_prefill_tokens)
+                    };
+                    let calibrated_vllm = rank.prefill_capacity_learning_active.is_some();
+                    let tokens_per_request = observed
+                        .map(|(median, count)| {
+                            let observed_weight = count as f64;
+                            let prior_weight =
+                                f64::from(self.estimated_wait_prompt_size_prior_samples);
+                            if prior_weight + observed_weight > 0.0 {
+                                (configured_prior * prior_weight + median * observed_weight)
+                                    / (prior_weight + observed_weight)
+                            } else {
+                                configured_prior
+                            }
+                        })
+                        .or_else(|| {
+                            if calibrated_vllm {
+                                None
+                            } else {
+                                rank.avg_request_prefill_kv_computed_tokens
+                                    .filter(|value| value.is_finite() && *value > 0.0)
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            if calibrated_vllm {
+                                configured_prior
+                            } else {
+                                f64::from(self.estimated_wait_queue_tokens_per_request)
+                            }
+                        });
                     if tokens_per_request == 0.0 {
                         return None;
                     }
+                    blended_prompt_size = Some(tokens_per_request);
                     proxy = true;
                     f64::from(rank.num_waiting_reqs) * tokens_per_request
                 }
@@ -150,25 +226,42 @@ impl EstimatedWaitConfig {
             && load.loads.iter().all(|rank| rank.gen_throughput >= 0.0))
         .then_some(generation);
         let live = prefill.or(generation);
-        // Counter rates measure observed demand, not capacity. A sparse request
-        // can therefore publish an arbitrarily low positive rate and make the
-        // next dispatch look much slower than the engine really is. Treat the
-        // calibrated default as a capacity floor; live rates still take over
-        // once sustained load proves a higher drain rate.
-        let (throughput, fallback) = match live {
-            Some(value) if value >= self.estimated_wait_default_throughput => (value, false),
-            _ => (self.estimated_wait_default_throughput, true),
+        let capacity_learning_backend = load
+            .loads
+            .iter()
+            .any(|rank| rank.prefill_capacity_learning_active.is_some());
+        let learned = load.loads.iter().try_fold(0.0, |sum, rank| {
+            rank.learned_prefill_capacity.map(|value| sum + value)
+        });
+        // vLLM counter rates are observed demand, not capacity. Only saturated
+        // intervals train its capacity estimate; cold start and sparse traffic
+        // stay on the configured fallback. Native load endpoints retain their
+        // existing live-throughput behavior.
+        let candidate = if capacity_learning_backend {
+            learned
+        } else {
+            live
         };
-        let estimate = ExpectedWait::new(
+        let (throughput, fallback) = match candidate {
+            Some(value) if value.is_finite() && value > 0.0 => (value, false),
+            _ => (self.estimated_wait_fallback_prefill_throughput, true),
+        };
+        let estimate = ExpectedWait::calibrated(
             queued,
             throughput,
             load.effective_token_usage(),
+            self.estimated_wait_base_overhead_secs,
+            self.estimated_wait_queue_work_correction,
+            self.estimated_wait_dispatch_blocking_factor,
+            self.estimated_wait_kv_pressure_threshold,
             self.estimated_wait_kv_pressure_weight,
         );
         estimate.seconds(0).is_finite().then_some(PreparedWait {
             estimate,
             proxy,
             fallback,
+            blended_prompt_size,
+            effective_prefill_capacity: throughput,
         })
     }
 
@@ -187,6 +280,8 @@ struct PreparedWait {
     estimate: ExpectedWait,
     proxy: bool,
     fallback: bool,
+    blended_prompt_size: Option<f64>,
+    effective_prefill_capacity: f64,
 }
 
 #[derive(Debug)]
@@ -370,6 +465,10 @@ impl EstimatedWaitAdmission {
             metrics::gauge!("smg_estimated_wait_queue_proxy", "worker" => worker.url().to_owned())
                 .set(u8::from(sample.prepared.proxy));
             metrics::gauge!("smg_estimated_wait_throughput_fallback", "worker" => worker.url().to_owned()).set(u8::from(sample.prepared.fallback));
+            metrics::gauge!("smg_estimated_wait_blended_prompt_tokens", "worker" => worker.url().to_owned())
+                .set(sample.prepared.blended_prompt_size.unwrap_or(-1.0));
+            metrics::gauge!("smg_estimated_wait_effective_prefill_capacity", "worker" => worker.url().to_owned())
+                .set(sample.prepared.effective_prefill_capacity);
         }
         entry.refresh(worker, config.estimated_wait_max_snapshot_age_secs);
     }
@@ -532,7 +631,7 @@ mod tests {
             max_estimated_wait_secs: Some(2.0),
             estimated_wait_kv_pressure_weight: 0.0,
             estimated_wait_mean_prefill_tokens: 100,
-            estimated_wait_default_throughput: 100.0,
+            estimated_wait_fallback_prefill_throughput: 100.0,
             ..Default::default()
         }
     }
@@ -636,7 +735,7 @@ mod tests {
     fn vllm_dynamic_prefill_metrics_override_static_fallbacks() {
         let config = EstimatedWaitConfig {
             estimated_wait_queue_tokens_per_request: 100,
-            estimated_wait_default_throughput: 10.0,
+            estimated_wait_fallback_prefill_throughput: 10.0,
             ..config()
         };
         let mut report = load(None, 2, 50.0, 0.0);
@@ -648,14 +747,75 @@ mod tests {
     #[test]
     fn sparse_vllm_rate_cannot_collapse_calibrated_capacity() {
         let config = EstimatedWaitConfig {
-            estimated_wait_default_throughput: 2000.0,
+            estimated_wait_fallback_prefill_throughput: 2000.0,
             ..config()
         };
         let mut report = load(None, 0, 2.5, 0.0);
         report.loads[0].prefill_throughput = Some(10.0);
         report.loads[0].avg_request_prefill_kv_computed_tokens = Some(20.0);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
 
         assert_eq!(config.score(&report, 1024), Some((0.512, true, true)));
+    }
+
+    #[test]
+    fn cold_vllm_histogram_uses_configured_prompt_prior() {
+        let mut report = load(None, 1, 100.0, 0.0);
+        report.loads[0].avg_request_prefill_kv_computed_tokens = Some(20.0);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+
+        assert_eq!(config().score(&report, 0), Some((1.0, true, true)));
+    }
+
+    #[test]
+    fn tiny_vllm_observation_is_blended_with_prompt_prior() {
+        let mut report = load(None, 1, 100.0, 0.0);
+        report.loads[0].median_request_prefill_kv_computed_tokens = Some(20.0);
+        report.loads[0].prefill_size_sample_count = Some(1);
+        let score = config().score(&report, 0).unwrap().0;
+        let expected_tokens = (100.0 * 32.0 + 20.0) / 33.0;
+        assert!((score - expected_tokens / 100.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn representative_vllm_observations_converge_toward_median() {
+        let mut report = load(None, 1, 100.0, 0.0);
+        report.loads[0].median_request_prefill_kv_computed_tokens = Some(80.0);
+        report.loads[0].prefill_size_sample_count = Some(320);
+        let score = config().score(&report, 0).unwrap().0;
+        let expected_tokens = (100.0 * 32.0 + 80.0 * 320.0) / 352.0;
+        assert!((score - expected_tokens / 100.0).abs() < 1e-10);
+        assert!((expected_tokens - 80.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn calibrated_coefficients_match_formula_and_defaults_match_legacy() {
+        let state = load(Some(300), 0, 100.0, 0.5);
+        let legacy = config().score(&state, 100).unwrap().0;
+        assert!((legacy - 4.0).abs() < f64::EPSILON);
+
+        let calibrated = EstimatedWaitConfig {
+            estimated_wait_base_overhead_secs: 0.25,
+            estimated_wait_queue_work_correction: 0.5,
+            estimated_wait_dispatch_blocking_factor: 0.25,
+            estimated_wait_kv_pressure_threshold: 0.4,
+            estimated_wait_kv_pressure_weight: 2.0,
+            ..config()
+        };
+        // 0.25 + 0.5 * (300 + 0.25 * 100) / 100 + 2 * (0.5 - 0.4) / 0.5
+        assert!((calibrated.score(&state, 100).unwrap().0 - 2.275).abs() < 1e-10);
+    }
+
+    #[test]
+    fn qualified_learned_capacity_replaces_fallback_even_when_lower() {
+        let mut report = load(None, 0, 10.0, 0.0);
+        report.loads[0].avg_request_prefill_kv_computed_tokens = Some(100.0);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        assert_eq!(config().score(&report, 100), Some((1.0, true, true)));
+
+        report.loads[0].learned_prefill_capacity = Some(40.0);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        assert_eq!(config().score(&report, 100), Some((2.5, true, false)));
     }
 
     #[test]
@@ -732,7 +892,7 @@ mod tests {
             .validate()
             .is_err());
             assert!(EstimatedWaitConfig {
-                estimated_wait_default_throughput: bad,
+                estimated_wait_fallback_prefill_throughput: bad,
                 ..config()
             }
             .validate()
@@ -764,6 +924,16 @@ mod tests {
             serde_json::from_str(r#"{"estimated_wait_shadow":true}"#).unwrap();
         assert!(shadow.estimated_wait_shadow);
         assert!(shadow.max_estimated_wait_secs.is_none());
+        let renamed: EstimatedWaitConfig =
+            serde_json::from_str(r#"{"estimated_wait_fallback_prefill_throughput":321.0}"#)
+                .unwrap();
+        assert_eq!(renamed.estimated_wait_fallback_prefill_throughput, 321.0);
+        let interim: EstimatedWaitConfig =
+            serde_json::from_str(r#"{"estimated_wait_min_prefill_throughput":222.0}"#).unwrap();
+        assert_eq!(interim.estimated_wait_fallback_prefill_throughput, 222.0);
+        let legacy: EstimatedWaitConfig =
+            serde_json::from_str(r#"{"estimated_wait_default_throughput":123.0}"#).unwrap();
+        assert_eq!(legacy.estimated_wait_fallback_prefill_throughput, 123.0);
     }
 
     #[test]

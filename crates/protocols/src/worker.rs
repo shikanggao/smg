@@ -1325,6 +1325,23 @@ pub struct SchedulerLoadSnapshot {
     /// backends use this to turn waiting-request counts into queued token-work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avg_request_prefill_kv_computed_tokens: Option<f64>,
+    /// Rolling median uncached prefill tokens per completed request, derived
+    /// from backend histogram deltas when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_request_prefill_kv_computed_tokens: Option<f64>,
+    /// Number of completed requests represented by the rolling prefill-size
+    /// histogram. Used to blend the observed median with a configured prior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_size_sample_count: Option<u64>,
+    /// Conservative prefill capacity learned from saturated intervals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_prefill_capacity: Option<f64>,
+    /// Number of saturated intervals in the capacity-learning window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_capacity_sample_count: Option<u32>,
+    /// Whether the current interval qualified for capacity learning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_capacity_learning_active: Option<bool>,
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,
