@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
+use smg::worker::estimated_wait::EstimatedWaitConfig;
 
 // Jemalloc for all Rust-side allocations in the extension. Prefixed symbols
 // leave CPython's allocators untouched; disable_initial_exec_tls is required
@@ -534,6 +535,21 @@ struct Router {
     enable_rl: bool,
     rl_control_timeout_secs: u64,
     rl_fanout_concurrency: usize,
+    max_estimated_wait_secs: Option<f64>,
+    estimated_wait_kv_pressure_weight: f64,
+    estimated_wait_mean_prefill_tokens: u32,
+    estimated_wait_default_throughput: f64,
+    estimated_wait_queue_tokens_per_request: u32,
+    estimated_wait_max_snapshot_age_secs: f64,
+    estimated_wait_shadow: bool,
+    estimated_wait_dispatch_blocking_factor: f64,
+    estimated_wait_max_kv_penalty_secs: f64,
+    estimated_wait_min_prefill_throughput: Option<f64>,
+    estimated_wait_prompt_size_prior_samples: u32,
+    estimated_wait_base_overhead_secs: f64,
+    estimated_wait_queue_work_correction: f64,
+    estimated_wait_kv_pressure_threshold: f64,
+    estimated_wait_fallback_prefill_throughput: Option<f64>,
 }
 
 impl Router {
@@ -851,6 +867,27 @@ impl Router {
             .job_queue_concurrency(self.job_queue_concurrency)
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
             .worker_overload_token_usage(self.worker_overload_token_usage)
+            .estimated_wait(EstimatedWaitConfig {
+                max_estimated_wait_secs: self.max_estimated_wait_secs,
+                estimated_wait_shadow: self.estimated_wait_shadow,
+                estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
+                estimated_wait_kv_pressure_threshold: self.estimated_wait_kv_pressure_threshold,
+                estimated_wait_base_overhead_secs: self.estimated_wait_base_overhead_secs,
+                estimated_wait_queue_work_correction: self.estimated_wait_queue_work_correction,
+                estimated_wait_dispatch_blocking_factor: self
+                    .estimated_wait_dispatch_blocking_factor,
+                estimated_wait_mean_prefill_tokens: self.estimated_wait_mean_prefill_tokens,
+                estimated_wait_fallback_prefill_throughput: self
+                    .estimated_wait_fallback_prefill_throughput
+                    .or(self.estimated_wait_min_prefill_throughput)
+                    .unwrap_or(self.estimated_wait_default_throughput),
+                estimated_wait_prompt_size_prior_samples: self
+                    .estimated_wait_prompt_size_prior_samples,
+                estimated_wait_queue_tokens_per_request: self
+                    .estimated_wait_queue_tokens_per_request,
+                estimated_wait_max_snapshot_age_secs: self.estimated_wait_max_snapshot_age_secs,
+                estimated_wait_max_kv_penalty_secs: self.estimated_wait_max_kv_penalty_secs,
+            })
             .worker_overload_protection(self.worker_overload_protection)
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
@@ -1117,6 +1154,21 @@ impl Router {
         enable_rl = false,
         rl_control_timeout_secs = 600,
         rl_fanout_concurrency = 32,
+        max_estimated_wait_secs = None,
+        estimated_wait_kv_pressure_weight = 0.0,
+        estimated_wait_mean_prefill_tokens = 1024,
+        estimated_wait_default_throughput = 2000.0,
+        estimated_wait_queue_tokens_per_request = 0,
+        estimated_wait_max_snapshot_age_secs = 30.0,
+        estimated_wait_shadow = false,
+        estimated_wait_dispatch_blocking_factor = 0.05,
+        estimated_wait_max_kv_penalty_secs = 5.0,
+        estimated_wait_min_prefill_throughput = None,
+        estimated_wait_prompt_size_prior_samples = 32,
+        estimated_wait_base_overhead_secs = 0.0,
+        estimated_wait_queue_work_correction = 1.0,
+        estimated_wait_kv_pressure_threshold = 0.0,
+        estimated_wait_fallback_prefill_throughput = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1276,6 +1328,21 @@ impl Router {
         enable_rl: bool,
         rl_control_timeout_secs: u64,
         rl_fanout_concurrency: usize,
+        max_estimated_wait_secs: Option<f64>,
+        estimated_wait_kv_pressure_weight: f64,
+        estimated_wait_mean_prefill_tokens: u32,
+        estimated_wait_default_throughput: f64,
+        estimated_wait_queue_tokens_per_request: u32,
+        estimated_wait_max_snapshot_age_secs: f64,
+        estimated_wait_shadow: bool,
+        estimated_wait_dispatch_blocking_factor: f64,
+        estimated_wait_max_kv_penalty_secs: f64,
+        estimated_wait_min_prefill_throughput: Option<f64>,
+        estimated_wait_prompt_size_prior_samples: u32,
+        estimated_wait_base_overhead_secs: f64,
+        estimated_wait_queue_work_correction: f64,
+        estimated_wait_kv_pressure_threshold: f64,
+        estimated_wait_fallback_prefill_throughput: Option<f64>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1447,6 +1514,21 @@ impl Router {
             enable_rl,
             rl_control_timeout_secs,
             rl_fanout_concurrency,
+            max_estimated_wait_secs,
+            estimated_wait_kv_pressure_weight,
+            estimated_wait_mean_prefill_tokens,
+            estimated_wait_default_throughput,
+            estimated_wait_queue_tokens_per_request,
+            estimated_wait_max_snapshot_age_secs,
+            estimated_wait_shadow,
+            estimated_wait_dispatch_blocking_factor,
+            estimated_wait_max_kv_penalty_secs,
+            estimated_wait_min_prefill_throughput,
+            estimated_wait_prompt_size_prior_samples,
+            estimated_wait_base_overhead_secs,
+            estimated_wait_queue_work_correction,
+            estimated_wait_kv_pressure_threshold,
+            estimated_wait_fallback_prefill_throughput,
         })
     }
 

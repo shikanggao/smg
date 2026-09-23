@@ -138,8 +138,9 @@ impl PipelineStage for WorkerSelectionStage {
                     cache_namespace,
                     None,
                 ) {
-                    Some(w) => WorkerSelection::Single { worker: w },
-                    None => {
+                    Err(shed) => return Err(shed),
+                    Ok(Some(w)) => WorkerSelection::Single { worker: w },
+                    Ok(None) => {
                         return Err(self.selection_failure(model_id, &[WorkerType::Regular], None))
                     }
                 }
@@ -187,7 +188,8 @@ impl PipelineStage for WorkerSelectionStage {
                     cache_namespace,
                     &encode_item_hashes,
                 ) {
-                    Some((encode_assignments, prefill, decode, runtime_type)) => {
+                    Err(shed) => return Err(shed),
+                    Ok(Some((encode_assignments, prefill, decode, runtime_type))) => {
                         WorkerSelection::Disaggregated {
                             encode_assignments: if encode_assignments.is_empty() {
                                 None
@@ -199,7 +201,7 @@ impl PipelineStage for WorkerSelectionStage {
                             runtime_type,
                         }
                     }
-                    None => {
+                    Ok(None) => {
                         // Encode is a demanded leg only when the request
                         // carries encode items; an idle-but-vetoed encode pool
                         // must not shed a text-only request.
@@ -276,8 +278,9 @@ impl WorkerSelectionStage {
                     cache_namespace,
                     wire,
                 ) {
-                    Some(w) => WorkerSelection::Single { worker: w },
-                    None => {
+                    Err(shed) => return Err(shed),
+                    Ok(Some(w)) => WorkerSelection::Single { worker: w },
+                    Ok(None) => {
                         return Err(self.selection_failure(model_id, &[WorkerType::Regular], wire))
                     }
                 }
@@ -476,7 +479,7 @@ impl WorkerSelectionStage {
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Result<Option<Arc<dyn Worker>>, Response> {
         // The gRPC router serves both gRPC and direct-ZMQ workers, so the pool
         // accepts either transport (not HTTP). A retry pins the retained wire.
         placement::select_single(
@@ -570,7 +573,7 @@ impl WorkerSelectionStage {
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
         encode_item_hashes: &[Vec<u8>],
-    ) -> Option<EncodePrefillDecodeWorkerSelection> {
+    ) -> Result<Option<EncodePrefillDecodeWorkerSelection>, Response> {
         // All three legs derive from ONE membership snapshot (see
         // select_pd_pair). The pools are strictly gRPC — encode dispatch is
         // a gRPC encoder RPC the direct-ZMQ worker has no path for, and the
@@ -585,15 +588,15 @@ impl WorkerSelectionStage {
         let needs_encode = !encode_item_hashes.is_empty();
         if needs_encode && all_encode.is_empty() {
             warn!("No available encode workers");
-            return None;
+            return Ok(None);
         }
         if all_prefill.is_empty() {
             warn!("No available prefill workers");
-            return None;
+            return Ok(None);
         }
         if all_decode.is_empty() {
             warn!("No available decode workers");
-            return None;
+            return Ok(None);
         }
 
         // Disaggregated legs must share a runtime. Pick a runtime that has at
@@ -617,7 +620,7 @@ impl WorkerSelectionStage {
             })
         else {
             warn!("No available encode/prefill/decode worker set with a shared runtime");
-            return None;
+            return Ok(None);
         };
 
         let mixed = all_prefill
@@ -657,71 +660,83 @@ impl WorkerSelectionStage {
                 "No available encode/prefill/decode worker set for runtime {:?}",
                 target_runtime
             );
-            return None;
+            return Ok(None);
         }
 
-        // Select encode, prefill, and decode via their per-role policies. Encode
-        // defaults to consistent hashing over each item's content hash; prefill
-        // and decode fall back to the main policy when unset.
-        let encode_policy = self.policy_registry.get_encode_policy();
-        let prefill_policy = self.policy_registry.get_prefill_policy();
-        let decode_policy = self.policy_registry.get_decode_policy();
+        let mut admission = self.worker_registry.estimated_wait().begin();
+        if let Some(guard) = &admission {
+            guard.check(&available_prefill, model_id)?;
+            guard.check(&available_decode, model_id)?;
+        }
+        let selected = (|| {
+            // Select encode, prefill, and decode via their per-role policies. Encode
+            // defaults to consistent hashing over each item's content hash; prefill
+            // and decode fall back to the main policy when unset.
+            let encode_policy = self.policy_registry.get_encode_policy();
+            let prefill_policy = self.policy_registry.get_prefill_policy();
+            let decode_policy = self.policy_registry.get_decode_policy();
 
-        // Get cached hash ring for consistent hashing (O(log n) lookup)
-        let hash_ring = self.worker_registry.get_hash_ring(model_id);
+            // Get cached hash ring for consistent hashing (O(log n) lookup)
+            let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        let mut info = SelectWorkerInfo {
-            request_text: text,
-            tokens,
-            headers,
-            routing_key: self.policy_registry.resolve_routing_key(headers),
-            rid_key,
-            cache_namespace,
-            hash_ring: hash_ring.clone(),
-            leg: WorkerLeg::Prefill,
-        };
-        let prefill_idx =
-            self.policy_registry
-                .select_worker(&prefill_policy, &available_prefill, &info)?;
-        info.leg = WorkerLeg::Decode;
-        let decode_idx =
-            self.policy_registry
-                .select_worker(&decode_policy, &available_decode, &info)?;
+            let mut info = SelectWorkerInfo {
+                request_text: text,
+                tokens,
+                headers,
+                routing_key: self.policy_registry.resolve_routing_key(headers),
+                rid_key,
+                cache_namespace,
+                hash_ring: hash_ring.clone(),
+                leg: WorkerLeg::Prefill,
+            };
+            let prefill_idx =
+                self.policy_registry
+                    .select_worker(&prefill_policy, &available_prefill, &info)?;
+            info.leg = WorkerLeg::Decode;
+            let decode_idx =
+                self.policy_registry
+                    .select_worker(&decode_policy, &available_decode, &info)?;
 
-        let encode_assignments = assign_encode_workers(
-            &available_encode,
-            encode_item_hashes,
-            model_id,
-            encode_policy.as_ref(),
-            hash_ring.clone(),
-        )?;
+            let encode_assignments = assign_encode_workers(
+                &available_encode,
+                encode_item_hashes,
+                model_id,
+                encode_policy.as_ref(),
+                hash_ring.clone(),
+            )?;
 
-        // Record worker selection metrics for prefill and decode, each tagged
-        // with the policy that picked it. Encode item assignment metrics are
-        // recorded in assign_encode_workers.
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_PREFILL,
-            available_prefill[prefill_idx]
-                .connection_mode()
-                .as_metric_label(),
-            model_id,
-            prefill_policy.name(),
-        );
-        Metrics::record_worker_selection(
-            metrics_labels::WORKER_DECODE,
-            available_decode[decode_idx]
-                .connection_mode()
-                .as_metric_label(),
-            model_id,
-            decode_policy.name(),
-        );
+            // Record worker selection metrics for prefill and decode, each tagged
+            // with the policy that picked it. Encode item assignment metrics are
+            // recorded in assign_encode_workers.
+            Metrics::record_worker_selection(
+                metrics_labels::WORKER_PREFILL,
+                available_prefill[prefill_idx]
+                    .connection_mode()
+                    .as_metric_label(),
+                model_id,
+                prefill_policy.name(),
+            );
+            Metrics::record_worker_selection(
+                metrics_labels::WORKER_DECODE,
+                available_decode[decode_idx]
+                    .connection_mode()
+                    .as_metric_label(),
+                model_id,
+                decode_policy.name(),
+            );
 
-        Some((
-            encode_assignments,
-            available_prefill[prefill_idx].clone(),
-            available_decode[decode_idx].clone(),
-            target_runtime,
-        ))
+            Some((
+                encode_assignments,
+                available_prefill[prefill_idx].clone(),
+                available_decode[decode_idx].clone(),
+                target_runtime,
+            ))
+        })();
+        if let (Some(guard), Some((_, prefill, decode, _))) = (&mut admission, &selected) {
+            guard.credit(prefill, tokens);
+            guard.credit(decode, tokens);
+        }
+        Ok(selected)
     }
 }
 
@@ -1156,6 +1171,7 @@ mod tests {
         poison.insert("x-smg-routing-key", "req-unique-1".parse().unwrap());
         let first = stage
             .select_single_worker(model_id, None, None, Some(&poison), rid_key, None, None)
+            .unwrap()
             .unwrap();
         for (i, rid) in ["conv7_t2", "conv7_t2_r1", "conv7_t3"].iter().enumerate() {
             let mut rotated = HeaderMap::new();
@@ -1173,6 +1189,7 @@ mod tests {
                     None,
                     None,
                 )
+                .unwrap()
                 .unwrap();
             assert_eq!(again.url(), first.url(), "follow-up must pin by rid key");
         }
@@ -1182,6 +1199,61 @@ mod tests {
     /// distinct overload 503 the HTTP router uses. Its usual empty-pool answer
     /// is a 404, which would both misreport pressure as model absence and skip
     /// the retry path (404 is not retryable).
+
+    #[test]
+    fn estimated_wait_grpc_selection_propagates_503_and_credits_tokenized_input() {
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.estimated_wait().configure(EstimatedWaitConfig {
+            max_estimated_wait_secs: Some(1.0),
+            estimated_wait_fallback_prefill_throughput: 100.0,
+            // Make one 100-token dispatch reach the one-second threshold.
+            estimated_wait_dispatch_blocking_factor: 1.0,
+            ..Default::default()
+        });
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:8400")
+                .model(ModelCard::new("m"))
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        registry.register(worker.clone()).unwrap();
+        let stamp = registry.estimated_wait().poll_started(&worker);
+        let load = WorkerLoadResponse {
+            loads: vec![SchedulerLoadSnapshot {
+                num_waiting_uncached_tokens: 0,
+                gen_throughput: 100.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        registry
+            .estimated_wait()
+            .publish(&worker, Some(&load), stamp, std::time::Instant::now());
+        let stage = WorkerSelectionStage::new(
+            registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+        );
+        assert!(stage
+            .select_single_worker("m", None, Some(&[0; 100]), None, None, None, None)
+            .unwrap()
+            .is_some());
+        let shed = stage
+            .select_single_worker("m", None, None, None, None, None, None)
+            .unwrap_err();
+        assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            shed.headers().get(error::HEADER_X_SMG_ERROR_CODE).unwrap(),
+            "worker_overload_protection_shed"
+        );
+        assert!(shed.headers().contains_key(http::header::RETRY_AFTER));
+        assert!(!is_retryable_response(&shed));
+    }
+
     #[test]
     fn grpc_all_overloaded_sheds_503_instead_of_404() {
         use crate::routers::error::extract_error_code_from_response;
@@ -1210,12 +1282,14 @@ mod tests {
 
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, None)
+            .unwrap()
             .is_some());
 
         worker_registry.set_worker_overloaded(&workers[0], true);
         assert!(
             stage
                 .select_single_worker(model_id, None, None, None, None, None, None)
+                .unwrap()
                 .is_some(),
             "one eligible worker left still serves"
         );
@@ -1224,6 +1298,7 @@ mod tests {
         assert!(
             stage
                 .select_single_worker(model_id, None, None, None, None, None, None)
+                .unwrap()
                 .is_none(),
             "the veto empties the candidate pool"
         );
@@ -1240,6 +1315,7 @@ mod tests {
         worker_registry.set_worker_overloaded(&workers[0], false);
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, None)
+            .unwrap()
             .is_some());
         assert_eq!(
             stage
@@ -1277,6 +1353,7 @@ mod tests {
         worker.set_status(WorkerStatus::NotReady);
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, None)
+            .unwrap()
             .is_none());
 
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None);

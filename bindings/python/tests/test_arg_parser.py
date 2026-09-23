@@ -659,6 +659,64 @@ class TestParseRouterArgs:
         assert defaults.worker_overload_protection is False
         assert defaults.disable_load_monitoring is False
 
+    def test_estimated_wait_flags_and_prefixed_aliases(self):
+        for prefix in ("", "router-"):
+            parser = argparse.ArgumentParser()
+            RouterArgs.add_cli_args(parser, use_router_prefix=bool(prefix))
+            namespace = parser.parse_args(
+                [
+                    f"--{prefix}estimated-wait-shadow",
+                    f"--{prefix}max-estimated-wait-secs",
+                    "12",
+                    f"--{prefix}estimated-wait-queue-tokens-per-request",
+                    "2048",
+                    f"--{prefix}estimated-wait-default-throughput",
+                    "500",
+                    f"--{prefix}estimated-wait-fallback-prefill-throughput",
+                    "450",
+                    f"--{prefix}estimated-wait-prompt-size-prior-samples",
+                    "24",
+                    f"--{prefix}estimated-wait-base-overhead-secs",
+                    "0.1",
+                    f"--{prefix}estimated-wait-queue-work-correction",
+                    "0.7",
+                    f"--{prefix}estimated-wait-kv-pressure-threshold",
+                    "0.8",
+                    f"--{prefix}estimated-wait-kv-pressure-weight",
+                    "0.4",
+                    f"--{prefix}estimated-wait-mean-prefill-tokens",
+                    "800",
+                    f"--{prefix}estimated-wait-max-snapshot-age-secs",
+                    "8",
+                    f"--{prefix}estimated-wait-dispatch-blocking-factor",
+                    "0.2",
+                    f"--{prefix}estimated-wait-max-kv-penalty-secs",
+                    "3",
+                ]
+            )
+            args = RouterArgs.from_cli_args(namespace, use_router_prefix=bool(prefix))
+            assert args.max_estimated_wait_secs == 12.0
+            assert args.estimated_wait_shadow is True
+            assert args.estimated_wait_queue_tokens_per_request == 2048
+            assert args.estimated_wait_default_throughput == 500.0
+            assert args.estimated_wait_fallback_prefill_throughput == 450.0
+            assert args.estimated_wait_prompt_size_prior_samples == 24
+            assert args.estimated_wait_base_overhead_secs == 0.1
+            assert args.estimated_wait_queue_work_correction == 0.7
+            assert args.estimated_wait_kv_pressure_threshold == 0.8
+            assert args.estimated_wait_kv_pressure_weight == 0.4
+            assert args.estimated_wait_mean_prefill_tokens == 800
+            assert args.estimated_wait_max_snapshot_age_secs == 8.0
+            assert args.estimated_wait_dispatch_blocking_factor == 0.2
+            assert args.estimated_wait_max_kv_penalty_secs == 3.0
+        assert RouterArgs().max_estimated_wait_secs is None
+        assert RouterArgs().estimated_wait_shadow is False
+        assert RouterArgs().estimated_wait_queue_tokens_per_request == 0
+        assert RouterArgs().estimated_wait_dispatch_blocking_factor == 0.05
+        assert RouterArgs().estimated_wait_max_kv_penalty_secs == 5.0
+        assert RouterArgs().estimated_wait_kv_pressure_weight == 0.0
+        assert RouterArgs().estimated_wait_prompt_size_prior_samples == 32
+
     def test_prefixed_overload_protection_and_monitoring_flags(self):
         """The --router-prefixed aliases reach the same fields."""
         parser = argparse.ArgumentParser()
@@ -1468,6 +1526,21 @@ class TestRouterArgsFieldOrder:
         "enable_rl",
         "rl_control_timeout_secs",
         "rl_fanout_concurrency",
+        "max_estimated_wait_secs",
+        "estimated_wait_kv_pressure_weight",
+        "estimated_wait_mean_prefill_tokens",
+        "estimated_wait_default_throughput",
+        "estimated_wait_queue_tokens_per_request",
+        "estimated_wait_max_snapshot_age_secs",
+        "estimated_wait_shadow",
+        "estimated_wait_dispatch_blocking_factor",
+        "estimated_wait_max_kv_penalty_secs",
+        "estimated_wait_min_prefill_throughput",
+        "estimated_wait_prompt_size_prior_samples",
+        "estimated_wait_base_overhead_secs",
+        "estimated_wait_queue_work_correction",
+        "estimated_wait_kv_pressure_threshold",
+        "estimated_wait_fallback_prefill_throughput",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1506,6 +1579,12 @@ class TestRouterArgsFieldOrder:
             "enable_rl",
             "rl_control_timeout_secs",
             "rl_fanout_concurrency",
+            "estimated_wait_min_prefill_throughput",
+            "estimated_wait_prompt_size_prior_samples",
+            "estimated_wait_base_overhead_secs",
+            "estimated_wait_queue_work_correction",
+            "estimated_wait_kv_pressure_threshold",
+            "estimated_wait_fallback_prefill_throughput",
         ):
             assert names.index(appended) > marker, (
                 f"{appended} must be appended after worker_startup_delay to "
