@@ -25,7 +25,9 @@
     "estimated_wait_default_throughput": null,
     "estimated_wait_mean_prefill_tokens": null,
     "estimated_wait_kv_pressure_weight": null,
-    "estimated_wait_max_snapshot_age_secs": null
+    "estimated_wait_max_snapshot_age_secs": null,
+    "estimated_wait_dispatch_blocking_factor": null,
+    "estimated_wait_max_kv_penalty_secs": null
   },
   "evidence": {
     "raw_observations": null,

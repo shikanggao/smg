@@ -542,6 +542,8 @@ struct Router {
     estimated_wait_queue_tokens_per_request: u32,
     estimated_wait_max_snapshot_age_secs: f64,
     estimated_wait_shadow: bool,
+    estimated_wait_dispatch_blocking_factor: f64,
+    estimated_wait_max_kv_penalty_secs: f64,
 }
 
 impl Router {
@@ -868,6 +870,9 @@ impl Router {
                 estimated_wait_queue_tokens_per_request: self
                     .estimated_wait_queue_tokens_per_request,
                 estimated_wait_max_snapshot_age_secs: self.estimated_wait_max_snapshot_age_secs,
+                estimated_wait_dispatch_blocking_factor: self
+                    .estimated_wait_dispatch_blocking_factor,
+                estimated_wait_max_kv_penalty_secs: self.estimated_wait_max_kv_penalty_secs,
             })
             .worker_overload_protection(self.worker_overload_protection)
             .disable_load_monitoring(self.disable_load_monitoring)
@@ -1142,6 +1147,8 @@ impl Router {
         estimated_wait_queue_tokens_per_request = 0,
         estimated_wait_max_snapshot_age_secs = 30.0,
         estimated_wait_shadow = false,
+        estimated_wait_dispatch_blocking_factor = 0.05,
+        estimated_wait_max_kv_penalty_secs = 5.0,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1308,6 +1315,8 @@ impl Router {
         estimated_wait_queue_tokens_per_request: u32,
         estimated_wait_max_snapshot_age_secs: f64,
         estimated_wait_shadow: bool,
+        estimated_wait_dispatch_blocking_factor: f64,
+        estimated_wait_max_kv_penalty_secs: f64,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1486,6 +1495,8 @@ impl Router {
             estimated_wait_queue_tokens_per_request,
             estimated_wait_max_snapshot_age_secs,
             estimated_wait_shadow,
+            estimated_wait_dispatch_blocking_factor,
+            estimated_wait_max_kv_penalty_secs,
         })
     }
 

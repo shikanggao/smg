@@ -327,6 +327,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 30.0, help_heading = "Routing Policy")]
     estimated_wait_max_snapshot_age_secs: f64,
 
+    /// Fraction of newly dispatched prompt tokens that still block admission.
+    #[arg(long, default_value_t = 0.05, help_heading = "Routing Policy")]
+    estimated_wait_dispatch_blocking_factor: f64,
+
+    /// Maximum KV-pressure contribution to estimated wait, in seconds.
+    #[arg(long, default_value_t = 5.0, help_heading = "Routing Policy")]
+    estimated_wait_max_kv_penalty_secs: f64,
+
     /// Queued-request count at or above which a worker is considered
     /// overloaded and excluded from routing until the signal recovers; when
     /// every worker is overloaded, requests are shed immediately rather than
@@ -1895,6 +1903,9 @@ impl CliArgs {
                 estimated_wait_queue_tokens_per_request: self
                     .estimated_wait_queue_tokens_per_request,
                 estimated_wait_max_snapshot_age_secs: self.estimated_wait_max_snapshot_age_secs,
+                estimated_wait_dispatch_blocking_factor: self
+                    .estimated_wait_dispatch_blocking_factor,
+                estimated_wait_max_kv_penalty_secs: self.estimated_wait_max_kv_penalty_secs,
             })
             .worker_overload_protection(self.worker_overload_protection)
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
@@ -2623,6 +2634,10 @@ mod tests {
             "800",
             "--estimated-wait-max-snapshot-age-secs",
             "8",
+            "--estimated-wait-dispatch-blocking-factor",
+            "0.2",
+            "--estimated-wait-max-kv-penalty-secs",
+            "3",
         ]);
         let config = cli.to_router_config(vec![], vec![]).unwrap();
         let server = cli.to_server_config(config).unwrap();
@@ -2635,6 +2650,19 @@ mod tests {
         assert_eq!(config.estimated_wait_kv_pressure_weight, 0.4);
         assert_eq!(config.estimated_wait_mean_prefill_tokens, 800);
         assert_eq!(config.estimated_wait_max_snapshot_age_secs, 8.0);
+        assert_eq!(config.estimated_wait_dispatch_blocking_factor, 0.2);
+        assert_eq!(config.estimated_wait_max_kv_penalty_secs, 3.0);
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            defaults
+                .estimated_wait
+                .estimated_wait_dispatch_blocking_factor,
+            0.05
+        );
+        assert_eq!(
+            defaults.estimated_wait.estimated_wait_max_kv_penalty_secs,
+            5.0
+        );
     }
 
     #[test]

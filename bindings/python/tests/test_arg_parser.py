@@ -678,6 +678,10 @@ class TestParseRouterArgs:
                     "800",
                     f"--{prefix}estimated-wait-max-snapshot-age-secs",
                     "8",
+                    f"--{prefix}estimated-wait-dispatch-blocking-factor",
+                    "0.2",
+                    f"--{prefix}estimated-wait-max-kv-penalty-secs",
+                    "3",
                 ]
             )
             args = RouterArgs.from_cli_args(namespace, use_router_prefix=bool(prefix))
@@ -688,9 +692,13 @@ class TestParseRouterArgs:
             assert args.estimated_wait_kv_pressure_weight == 0.4
             assert args.estimated_wait_mean_prefill_tokens == 800
             assert args.estimated_wait_max_snapshot_age_secs == 8.0
+            assert args.estimated_wait_dispatch_blocking_factor == 0.2
+            assert args.estimated_wait_max_kv_penalty_secs == 3.0
         assert RouterArgs().max_estimated_wait_secs is None
         assert RouterArgs().estimated_wait_shadow is False
         assert RouterArgs().estimated_wait_queue_tokens_per_request == 0
+        assert RouterArgs().estimated_wait_dispatch_blocking_factor == 0.05
+        assert RouterArgs().estimated_wait_max_kv_penalty_secs == 5.0
 
     def test_prefixed_overload_protection_and_monitoring_flags(self):
         """The --router-prefixed aliases reach the same fields."""
@@ -1508,6 +1516,8 @@ class TestRouterArgsFieldOrder:
         "estimated_wait_queue_tokens_per_request",
         "estimated_wait_max_snapshot_age_secs",
         "estimated_wait_shadow",
+        "estimated_wait_dispatch_blocking_factor",
+        "estimated_wait_max_kv_penalty_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

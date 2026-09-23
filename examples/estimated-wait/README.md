@@ -9,8 +9,11 @@ For each healthy, circuit-breaker-eligible worker that passes the independent
 static overload guard:
 
 ```
-wait_seconds = (queued_uncached_tokens + since_poll_dispatch_tokens) / throughput
-             + kv_weight * token_usage / (1 - token_usage)
+dispatch_work = dispatch_blocking_factor * since_poll_dispatch_tokens
+kv_penalty = min(max_kv_penalty_secs,
+                 kv_weight * token_usage / (1 - token_usage))
+wait_seconds = (queued_uncached_tokens + dispatch_work) / throughput
+             + kv_penalty
 ```
 
 Each worker's score is compared inclusively to its effective budget. When every
@@ -38,10 +41,15 @@ builder's `estimated_wait(EstimatedWaitConfig)` method.
 | `--estimated-wait-mean-prefill-tokens` | 1024 | Dispatch credit when tokenized input is unavailable |
 | `--estimated-wait-kv-pressure-weight` | 0.15 | KV pressure weight in seconds; 0 disables the penalty |
 | `--estimated-wait-max-snapshot-age-secs` | 30 | Age after which a sample is unusable |
+| `--estimated-wait-dispatch-blocking-factor` | 0.05 | Fraction of since-poll dispatched tokens treated as blocking work; range 0–1 |
+| `--estimated-wait-max-kv-penalty-secs` | 5 | Maximum seconds contributed by the KV-pressure term |
 
 Defaults are calibration starting points, not measured model capacity. Positive
 budgets, throughput, dispatch estimates, and maximum age are required. Floating
-point values must be finite. The KV weight may be zero.
+point values must be finite. The KV weight and dispatch factor may be zero.
+The dispatch factor cannot exceed 1. The KV cap prevents near-full cache
+utilization from making the rational penalty unbounded; it does not replace
+memory-safety or static overload protection.
 
 A worker can override the gateway budget using the existing overload block:
 
@@ -74,7 +82,9 @@ names are supported. SGLang Prometheus fallback also requires a queue proxy.
 The load monitor runs even with `--disable-load-monitoring` when this guard is
 enabled, including when only a worker override enables it. No network queries
 occur on admission. Rank aggregation, validity checks and queue/KV arithmetic
-run during load ingestion using the same arithmetic as least-load routing.
+run during load ingestion. Estimated-wait admission discounts newly dispatched
+work and caps its KV term; least-load routing keeps its existing full-dispatch,
+uncapped index calculation.
 Admission retains a compact prepared estimate, not another copy of the backend
 report. Ingestion and dispatch-credit updates latch the verdict; pool checks
 read the verdict and its age, stopping at the first permissive eligible worker.

@@ -264,6 +264,9 @@ class RouterArgs:
     estimated_wait_queue_tokens_per_request: int = 0
     estimated_wait_max_snapshot_age_secs: float = 30.0
     estimated_wait_shadow: bool = False
+    # Appended for compatibility with positional RouterArgs construction.
+    estimated_wait_dispatch_blocking_factor: float = 0.05
+    estimated_wait_max_kv_penalty_secs: float = 5.0
 
     @staticmethod
     def add_cli_args(
@@ -649,6 +652,18 @@ class RouterArgs:
             type=float,
             default=RouterArgs.estimated_wait_max_snapshot_age_secs,
             help="Maximum snapshot age in seconds; older data fails open",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-dispatch-blocking-factor",
+            type=float,
+            default=RouterArgs.estimated_wait_dispatch_blocking_factor,
+            help="Fraction of newly dispatched prompt tokens that still block admission",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-max-kv-penalty-secs",
+            type=float,
+            default=RouterArgs.estimated_wait_max_kv_penalty_secs,
+            help="Maximum KV-pressure contribution to estimated wait in seconds",
         )
         routing_group.add_argument(
             f"--{prefix}worker-overload-protection",

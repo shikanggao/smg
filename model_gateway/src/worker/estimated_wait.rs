@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     expected_wait::{
-        ExpectedWait, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
+        ExpectedWait, DEFAULT_DISPATCH_BLOCKING_FACTOR, DEFAULT_KV_PRESSURE_WEIGHT,
+        DEFAULT_MAX_KV_PENALTY_SECS, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
     },
     Worker,
 };
@@ -39,6 +40,10 @@ pub struct EstimatedWaitConfig {
     /// Zero disables the waiting-request compatibility proxy.
     pub estimated_wait_queue_tokens_per_request: u32,
     pub estimated_wait_max_snapshot_age_secs: f64,
+    /// Fraction of prompt work dispatched since the snapshot that still blocks admission.
+    pub estimated_wait_dispatch_blocking_factor: f64,
+    /// Maximum KV-pressure contribution to the estimate, in seconds.
+    pub estimated_wait_max_kv_penalty_secs: f64,
     /// Record would-reject decisions without enforcing estimated-wait budgets.
     pub estimated_wait_shadow: bool,
 }
@@ -52,6 +57,8 @@ impl Default for EstimatedWaitConfig {
             estimated_wait_default_throughput: DEFAULT_THROUGHPUT,
             estimated_wait_queue_tokens_per_request: 0,
             estimated_wait_max_snapshot_age_secs: 30.0,
+            estimated_wait_dispatch_blocking_factor: DEFAULT_DISPATCH_BLOCKING_FACTOR,
+            estimated_wait_max_kv_penalty_secs: DEFAULT_MAX_KV_PENALTY_SECS,
             estimated_wait_shadow: false,
         }
     }
@@ -85,6 +92,11 @@ impl EstimatedWaitConfig {
                 self.estimated_wait_max_snapshot_age_secs,
                 false,
             ),
+            (
+                "estimated_wait_max_kv_penalty_secs",
+                self.estimated_wait_max_kv_penalty_secs,
+                false,
+            ),
         ] {
             if !value.is_finite() || value < 0.0 || (!allow_zero && value == 0.0) {
                 return Err(ConfigError::InvalidValue {
@@ -98,6 +110,15 @@ impl EstimatedWaitConfig {
                     .to_owned(),
                 });
             }
+        }
+        if !self.estimated_wait_dispatch_blocking_factor.is_finite()
+            || !(0.0..=1.0).contains(&self.estimated_wait_dispatch_blocking_factor)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "estimated_wait_dispatch_blocking_factor".to_owned(),
+                value: self.estimated_wait_dispatch_blocking_factor.to_string(),
+                reason: "Must be finite and in [0, 1]".to_owned(),
+            });
         }
         Ok(())
     }
@@ -164,9 +185,11 @@ impl EstimatedWaitConfig {
             throughput,
             load.effective_token_usage(),
             self.estimated_wait_kv_pressure_weight,
-        );
+        )
+        .with_kv_wait_cap(self.estimated_wait_max_kv_penalty_secs);
         estimate.seconds(0).is_finite().then_some(PreparedWait {
             estimate,
+            dispatch_blocking_factor: self.estimated_wait_dispatch_blocking_factor,
             proxy,
             fallback,
         })
@@ -175,7 +198,7 @@ impl EstimatedWaitConfig {
     #[cfg(test)]
     fn score(&self, load: &WorkerLoadResponse, dispatched: u64) -> Option<(f64, bool, bool)> {
         let prepared = self.prepare(load)?;
-        let seconds = prepared.estimate.seconds(dispatched);
+        let seconds = prepared.seconds(dispatched);
         seconds
             .is_finite()
             .then_some((seconds, prepared.proxy, prepared.fallback))
@@ -185,8 +208,16 @@ impl EstimatedWaitConfig {
 #[derive(Clone, Copy, Debug)]
 struct PreparedWait {
     estimate: ExpectedWait,
+    dispatch_blocking_factor: f64,
     proxy: bool,
     fallback: bool,
+}
+
+impl PreparedWait {
+    fn seconds(self, dispatched_tokens: u64) -> f64 {
+        self.estimate
+            .seconds_with_dispatch_factor(dispatched_tokens, self.dispatch_blocking_factor)
+    }
 }
 
 #[derive(Debug)]
@@ -232,7 +263,6 @@ impl Entry {
         if let Some(sample) = &mut self.sample {
             let seconds = sample
                 .prepared
-                .estimate
                 .seconds(self.total_dispatched.saturating_sub(sample.watermark));
             sample.overloaded = seconds.is_finite().then_some(seconds >= sample.threshold);
             metrics::gauge!("smg_estimated_wait_seconds", "worker" => worker.url().to_owned())
@@ -533,6 +563,10 @@ mod tests {
             estimated_wait_kv_pressure_weight: 0.0,
             estimated_wait_mean_prefill_tokens: 100,
             estimated_wait_default_throughput: 100.0,
+            // Preserve the original arithmetic in tests that exercise other
+            // dimensions; the correction has dedicated coverage below.
+            estimated_wait_dispatch_blocking_factor: 1.0,
+            estimated_wait_max_kv_penalty_secs: 1000.0,
             ..Default::default()
         }
     }
@@ -675,6 +709,24 @@ mod tests {
     }
 
     #[test]
+    fn admission_discounts_dispatched_work_and_caps_kv_penalty() {
+        let config = EstimatedWaitConfig {
+            estimated_wait_dispatch_blocking_factor: 0.05,
+            estimated_wait_max_kv_penalty_secs: 5.0,
+            estimated_wait_kv_pressure_weight: 0.15,
+            ..config()
+        };
+
+        // 1,000 dispatched tokens at 100 tokens/s contribute 0.5s after the
+        // correction, while saturated KV is bounded at 5s instead of 149.85s.
+        let score = config
+            .score(&load(Some(0), 0, 100.0, 1.0), 1_000)
+            .unwrap()
+            .0;
+        assert!((score - 5.5).abs() < 1e-8);
+    }
+
+    #[test]
     fn exact_zero_is_preserved_and_proxy_is_explicit_per_rank() {
         let mut config = config();
         assert_eq!(
@@ -724,6 +776,14 @@ mod tests {
         let admission = EstimatedWaitAdmission::default();
         admission.configure(EstimatedWaitConfig::default());
         assert!(admission.begin().is_none());
+        assert_eq!(
+            EstimatedWaitConfig::default().estimated_wait_dispatch_blocking_factor,
+            0.05
+        );
+        assert_eq!(
+            EstimatedWaitConfig::default().estimated_wait_max_kv_penalty_secs,
+            5.0
+        );
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert!(EstimatedWaitConfig {
                 max_estimated_wait_secs: Some(bad),
@@ -739,6 +799,20 @@ mod tests {
             .is_err());
             assert!(EstimatedWaitConfig {
                 estimated_wait_max_snapshot_age_secs: bad,
+                ..config()
+            }
+            .validate()
+            .is_err());
+            assert!(EstimatedWaitConfig {
+                estimated_wait_max_kv_penalty_secs: bad,
+                ..config()
+            }
+            .validate()
+            .is_err());
+        }
+        for bad in [-1.0, 1.01, f64::NAN, f64::INFINITY] {
+            assert!(EstimatedWaitConfig {
+                estimated_wait_dispatch_blocking_factor: bad,
                 ..config()
             }
             .validate()
