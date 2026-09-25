@@ -12,7 +12,7 @@ use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 pub use crate::worker::expected_wait::{
     DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
 };
-use crate::worker::{expected_wait::ExpectedWait, load_state::LoadSnapshot, Worker};
+use crate::worker::{expected_wait::PreparedExpectedWait, load_state::LoadSnapshot, Worker};
 
 /// Since-poll dispatch tally for one worker.
 #[derive(Clone, Copy, Debug, Default)]
@@ -220,7 +220,7 @@ impl LeastLoadPolicy {
                 } else {
                     self.default_throughput
                 };
-                ExpectedWait::new(
+                PreparedExpectedWait::new(
                     queued_tokens,
                     throughput,
                     load.effective_token_usage(),

@@ -10,15 +10,18 @@ pub const DEFAULT_MEAN_PREFILL_TOKENS: u32 = 1024;
 /// Fallback aggregate throughput, in tokens per second.
 pub const DEFAULT_THROUGHPUT: f64 = 2000.0;
 
-/// Prepared expected-wait score for one worker load snapshot.
+/// Expected-wait inputs prepared from one worker-load snapshot.
+///
+/// The snapshot fields stay fixed until the next load poll; callers can update
+/// the estimate between polls with the tokens dispatched since that snapshot.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ExpectedWait {
+pub(crate) struct PreparedExpectedWait {
     queued_tokens: f64,
     throughput: f64,
     kv_wait: f64,
 }
 
-impl ExpectedWait {
+impl PreparedExpectedWait {
     pub(crate) fn new(queued_tokens: f64, throughput: f64, usage: f64, weight: f64) -> Self {
         let k = usage.clamp(0.0, 0.999);
         Self {
@@ -35,20 +38,20 @@ impl ExpectedWait {
 
 #[cfg(test)]
 mod tests {
-    use super::ExpectedWait;
+    use super::PreparedExpectedWait;
 
     #[test]
     fn combines_queued_dispatched_and_kv_wait() {
-        let wait = ExpectedWait::new(800.0, 500.0, 0.5, 0.2);
+        let wait = PreparedExpectedWait::new(800.0, 500.0, 0.5, 0.2);
 
         assert!((wait.seconds(200) - 2.2).abs() < f64::EPSILON);
     }
 
     #[test]
     fn clamps_kv_usage_to_formula_bounds() {
-        let below_zero = ExpectedWait::new(0.0, 100.0, -1.0, 0.2).seconds(0);
-        let at_upper_bound = ExpectedWait::new(0.0, 100.0, 0.999, 0.2).seconds(0);
-        let above_one = ExpectedWait::new(0.0, 100.0, 2.0, 0.2).seconds(0);
+        let below_zero = PreparedExpectedWait::new(0.0, 100.0, -1.0, 0.2).seconds(0);
+        let at_upper_bound = PreparedExpectedWait::new(0.0, 100.0, 0.999, 0.2).seconds(0);
+        let above_one = PreparedExpectedWait::new(0.0, 100.0, 2.0, 0.2).seconds(0);
 
         assert_eq!(below_zero, 0.0);
         assert!(at_upper_bound.is_finite());
