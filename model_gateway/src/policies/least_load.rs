@@ -14,6 +14,12 @@ pub use crate::worker::expected_wait::{
 };
 use crate::worker::{expected_wait::ExpectedWait, load_state::LoadSnapshot, Worker};
 
+/// Prior strength for blending a newly observed prompt-size median with the
+/// operator's configured mean. This prevents a handful of requests from
+/// immediately replacing the stable fallback. A later configuration PR can
+/// expose this tuning knob without coupling it to metric collection.
+const PROMPT_SIZE_PRIOR_SAMPLES: f64 = 32.0;
+
 /// Since-poll dispatch tally for one worker.
 #[derive(Clone, Copy, Debug, Default)]
 struct SincePollDispatch {
@@ -51,9 +57,9 @@ struct SincePollDispatch {
 ///   `waiting_reqs · p̄`, keeping the queue visible in time units rather than
 ///   scoring a backlogged worker as idle. Only a backend reporting neither
 ///   scores `queued_tokens = 0`;
-/// - zero/absent throughput (backend reports no generation rate): falls back to
-///   the configured `default_throughput`, so the work term stays in seconds and
-///   the KV barrier stays relevant;
+/// - zero/absent throughput: prefer learned saturated prefill capacity, then
+///   live prefill rate, then generation rate, and finally the configured
+///   `default_throughput`, so the work term stays in seconds;
 /// - a worker with no fresh snapshot while peers report: its live in-flight is
 ///   converted to a drain-time estimate (`load · p̄ / fleet_nominal_throughput`)
 ///   so it is comparable to reporting workers, not scored on a raw count;
@@ -99,7 +105,7 @@ pub struct LeastLoadPolicy {
     /// request's token count is unknown at routing time.
     mean_prefill_tokens: u32,
     /// Fallback throughput (tokens/s) for the `/throughput` term when a backend
-    /// reports no live `gen_throughput`.
+    /// reports no learned prefill capacity or live prompt/generation rate.
     default_throughput: f64,
     /// Per-worker waiting-queue cap; `0` disables the veto.
     max_waiting_requests: u32,
@@ -214,12 +220,7 @@ impl LeastLoadPolicy {
             Some(load) => {
                 let inflight_tokens = inflight.get(url).copied().unwrap_or_default().tokens;
                 let queued_tokens = self.queued_tokens(load);
-                let live_throughput = load.total_gen_throughput();
-                let throughput = if live_throughput > 0.0 {
-                    live_throughput
-                } else {
-                    self.default_throughput
-                };
+                let throughput = Self::live_throughput(load).unwrap_or(self.default_throughput);
                 ExpectedWait::new(
                     queued_tokens,
                     throughput,
@@ -260,19 +261,69 @@ impl LeastLoadPolicy {
 
     /// Waiting-queue token-work for a worker.
     ///
-    /// Prefers the backend's own `num_waiting_uncached_tokens`. Backends that
-    /// report a queue depth but no token count for it — anything scored from
-    /// Prometheus gauges, which have no waiting-token equivalent — would
-    /// otherwise be read as having an empty queue, and the policy would go
-    /// blind to the very imbalance it exists to correct. Estimate their queue
-    /// from the same mean prefill the in-flight term uses, so a queued request
-    /// and a just-dispatched one weigh the same.
+    /// Uses an explicitly available `num_waiting_uncached_tokens`, including an
+    /// exact zero. Gauge-only backends estimate queue work from request count.
+    /// Their rolling median is blended with the configured mean until enough
+    /// samples arrive; if no median exists, a recent mean or the configured
+    /// fallback is used.
     fn queued_tokens(&self, load: &WorkerLoadResponse) -> f64 {
-        let reported = load.total_waiting_uncached_tokens();
-        if reported > 0 {
-            return reported as f64;
-        }
-        load.total_waiting_reqs().max(0) as f64 * self.mean_prefill_tokens as f64
+        load.loads
+            .iter()
+            .map(|rank| {
+                let estimate = || {
+                    let prior = self.mean_prefill_tokens as f64;
+                    let tokens_per_request = match (
+                        rank.median_request_prefill_kv_computed_tokens
+                            .filter(|value| value.is_finite() && *value > 0.0),
+                        rank.prefill_size_sample_count,
+                    ) {
+                        (Some(median), Some(count)) if count > 0 => {
+                            let observed = count as f64;
+                            (median * observed + prior * PROMPT_SIZE_PRIOR_SAMPLES)
+                                / (observed + PROMPT_SIZE_PRIOR_SAMPLES)
+                        }
+                        _ => rank
+                            .avg_request_prefill_kv_computed_tokens
+                            .filter(|value| value.is_finite() && *value > 0.0)
+                            .unwrap_or(prior),
+                    };
+                    rank.num_waiting_reqs.max(0) as f64 * tokens_per_request
+                };
+                match rank.num_waiting_uncached_tokens_available {
+                    Some(true) => rank.num_waiting_uncached_tokens.max(0) as f64,
+                    Some(false) => estimate(),
+                    // Before the availability flag existed, a positive value
+                    // was exact and zero on a non-empty queue triggered the
+                    // request-count estimate. Preserve that wire behavior.
+                    None if rank.num_waiting_uncached_tokens > 0 => {
+                        rank.num_waiting_uncached_tokens as f64
+                    }
+                    None => estimate(),
+                }
+            })
+            .sum()
+    }
+
+    /// Best available rate for draining queued prompt work. A learned value is
+    /// only published after enough saturated intervals, so it is preferred to
+    /// the instantaneous rate once present.
+    fn live_throughput(load: &WorkerLoadResponse) -> Option<f64> {
+        load.total_learned_prefill_capacity()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .or_else(|| {
+                load.total_prefill_throughput()
+                    .filter(|value| value.is_finite() && *value > 0.0)
+            })
+            .or_else(|| {
+                let generation = load.total_gen_throughput();
+                (generation.is_finite()
+                    && generation > 0.0
+                    && load
+                        .loads
+                        .iter()
+                        .all(|rank| rank.gen_throughput.is_finite() && rank.gen_throughput >= 0.0))
+                .then_some(generation)
+            })
     }
 
     /// Token-work the request being routed adds to the chosen worker's
@@ -355,8 +406,7 @@ impl LeastLoadPolicy {
         let (tp_sum, tp_count) = candidates
             .iter()
             .filter_map(|&i| Self::fresh_load(loads, complete_snapshot, workers[i].url()))
-            .map(|l| l.total_gen_throughput())
-            .filter(|t| *t > 0.0)
+            .filter_map(Self::live_throughput)
             .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
         let nominal_throughput = if tp_count > 0 {
             tp_sum / tp_count as f64
@@ -589,7 +639,43 @@ mod tests {
     ) -> WorkerLoadResponse {
         let mut load = make_load(0, token_usage, gen_throughput);
         load.loads[0].num_waiting_reqs = num_waiting_reqs;
+        load.loads[0].num_waiting_uncached_tokens_available = Some(false);
         load
+    }
+
+    #[test]
+    fn exact_empty_queue_is_not_replaced_by_request_count() {
+        let policy = LeastLoadPolicy::with_params(0.0, 100, 10.0, 0);
+        let mut load = make_load(0, 0.0, 10.0);
+        load.loads[0].num_waiting_reqs = 7;
+        load.loads[0].num_waiting_uncached_tokens_available = Some(true);
+        assert_eq!(policy.queued_tokens(&load), 0.0);
+
+        load.loads[0].num_waiting_uncached_tokens_available = Some(false);
+        assert_eq!(policy.queued_tokens(&load), 700.0);
+
+        load.loads[0].num_waiting_uncached_tokens_available = None;
+        assert_eq!(policy.queued_tokens(&load), 700.0);
+    }
+
+    #[test]
+    fn observed_median_is_blended_with_configured_prior() {
+        let policy = LeastLoadPolicy::with_params(0.0, 100, 10.0, 0);
+        let mut load = make_load_reqs_only(2, 0.0, 10.0);
+        load.loads[0].median_request_prefill_kv_computed_tokens = Some(1000.0);
+        load.loads[0].prefill_size_sample_count = Some(32);
+        assert_eq!(policy.queued_tokens(&load), 1100.0);
+    }
+
+    #[test]
+    fn learned_capacity_precedes_live_prefill_and_generation_rates() {
+        let mut load = make_load(0, 0.0, 25.0);
+        load.loads[0].prefill_throughput = Some(50.0);
+        load.loads[0].learned_prefill_capacity = Some(100.0);
+        assert_eq!(LeastLoadPolicy::live_throughput(&load), Some(100.0));
+
+        load.loads[0].learned_prefill_capacity = None;
+        assert_eq!(LeastLoadPolicy::live_throughput(&load), Some(50.0));
     }
 
     fn mk(url: &str) -> Arc<dyn Worker> {

@@ -711,6 +711,7 @@ impl From<tokenspeed_proto::SchedulerLoad> for openai_protocol::worker::Schedule
             num_running_reqs: load.num_running_reqs,
             num_waiting_reqs: load.num_waiting_reqs,
             num_waiting_uncached_tokens: load.num_waiting_uncached_tokens,
+            num_waiting_uncached_tokens_available: Some(true),
             num_total_reqs: load.num_total_reqs,
             num_used_tokens: load.num_used_tokens,
             max_total_num_tokens: load.max_total_num_tokens,

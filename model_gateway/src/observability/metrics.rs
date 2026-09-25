@@ -386,6 +386,34 @@ pub(crate) fn init_metrics() {
         "Engine-reported generation throughput (tokens/s) by worker, model, dp_rank"
     );
     describe_gauge!(
+        "smg_engine_prefill_throughput",
+        "Engine-derived uncached-prefill throughput (tokens/s) by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_avg_request_prefill_kv_computed_tokens",
+        "Engine-derived mean uncached prefill tokens per request by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_median_request_prefill_kv_computed_tokens",
+        "Rolling median uncached prefill tokens per request by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_prefill_size_sample_count",
+        "Requests represented by the rolling prefill-size histogram by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_learned_prefill_capacity",
+        "Conservative saturated prefill capacity by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_prefill_capacity_sample_count",
+        "Saturated intervals in the capacity-learning window by worker, model, dp_rank"
+    );
+    describe_gauge!(
+        "smg_engine_prefill_capacity_learning_active",
+        "Whether the interval trained prefill capacity by worker, model, dp_rank"
+    );
+    describe_gauge!(
         "smg_engine_cache_hit_rate",
         "Engine-reported prefix cache hit rate (0.0-1.0) by worker, model, dp_rank"
     );
@@ -1562,6 +1590,71 @@ impl Metrics {
             )
             .set(load.gen_throughput);
             gauge!(
+                "smg_engine_prefill_throughput",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(load.prefill_throughput.unwrap_or(-1.0));
+            gauge!(
+                "smg_engine_avg_request_prefill_kv_computed_tokens",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(load.avg_request_prefill_kv_computed_tokens.unwrap_or(-1.0));
+            gauge!(
+                "smg_engine_median_request_prefill_kv_computed_tokens",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(
+                load.median_request_prefill_kv_computed_tokens
+                    .unwrap_or(-1.0),
+            );
+            gauge!(
+                "smg_engine_prefill_size_sample_count",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(
+                load.prefill_size_sample_count
+                    .map(|value| value as f64)
+                    .unwrap_or(-1.0),
+            );
+            gauge!(
+                "smg_engine_learned_prefill_capacity",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(load.learned_prefill_capacity.unwrap_or(-1.0));
+            gauge!(
+                "smg_engine_prefill_capacity_sample_count",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(
+                load.prefill_capacity_sample_count
+                    .map(f64::from)
+                    .unwrap_or(-1.0),
+            );
+            gauge!(
+                "smg_engine_prefill_capacity_learning_active",
+                "worker" => Arc::clone(&worker),
+                "model" => Arc::clone(&model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(
+                load.prefill_capacity_learning_active
+                    .map(u8::from)
+                    .map(f64::from)
+                    .unwrap_or(-1.0),
+            );
+            gauge!(
                 "smg_engine_cache_hit_rate",
                 "worker" => Arc::clone(&worker),
                 "model" => Arc::clone(&model),
@@ -1652,6 +1745,13 @@ impl Metrics {
                 "smg_engine_waiting_requests",
                 "smg_engine_token_usage",
                 "smg_engine_gen_throughput",
+                "smg_engine_prefill_throughput",
+                "smg_engine_avg_request_prefill_kv_computed_tokens",
+                "smg_engine_median_request_prefill_kv_computed_tokens",
+                "smg_engine_prefill_size_sample_count",
+                "smg_engine_learned_prefill_capacity",
+                "smg_engine_prefill_capacity_sample_count",
+                "smg_engine_prefill_capacity_learning_active",
                 "smg_engine_cache_hit_rate",
             ] {
                 gauge!(
@@ -1734,7 +1834,14 @@ mod tests {
                 num_running_reqs: 7,
                 num_waiting_reqs: 3,
                 token_usage: 0.5,
+                prefill_throughput: Some(84.0),
                 gen_throughput: 42.0,
+                avg_request_prefill_kv_computed_tokens: Some(512.0),
+                median_request_prefill_kv_computed_tokens: Some(256.0),
+                prefill_size_sample_count: Some(40),
+                learned_prefill_capacity: Some(80.0),
+                prefill_capacity_sample_count: Some(12),
+                prefill_capacity_learning_active: Some(true),
                 cache_hit_rate: 0.25,
                 ..Default::default()
             }],
@@ -1750,6 +1857,48 @@ mod tests {
         assert_metric(&rendered, "smg_engine_running_requests", &CORE_LABELS, "7");
         assert_metric(&rendered, "smg_engine_waiting_requests", &CORE_LABELS, "3");
         assert_metric(&rendered, "smg_engine_gen_throughput", &CORE_LABELS, "42");
+        assert_metric(
+            &rendered,
+            "smg_engine_prefill_throughput",
+            &CORE_LABELS,
+            "84",
+        );
+        assert_metric(
+            &rendered,
+            "smg_engine_avg_request_prefill_kv_computed_tokens",
+            &CORE_LABELS,
+            "512",
+        );
+        assert_metric(
+            &rendered,
+            "smg_engine_median_request_prefill_kv_computed_tokens",
+            &CORE_LABELS,
+            "256",
+        );
+        assert_metric(
+            &rendered,
+            "smg_engine_prefill_size_sample_count",
+            &CORE_LABELS,
+            "40",
+        );
+        assert_metric(
+            &rendered,
+            "smg_engine_learned_prefill_capacity",
+            &CORE_LABELS,
+            "80",
+        );
+        assert_metric(
+            &rendered,
+            "smg_engine_prefill_capacity_sample_count",
+            &CORE_LABELS,
+            "12",
+        );
+        assert_metric(
+            &rendered,
+            "smg_engine_prefill_capacity_learning_active",
+            &CORE_LABELS,
+            "1",
+        );
         // PD gauges absent when no disagg section was reported.
         assert!(
             !rendered.contains("smg_engine_pd_"),

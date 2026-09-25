@@ -1296,15 +1296,44 @@ pub struct SchedulerLoadSnapshot {
     pub dp_rank: i32,
     pub num_running_reqs: i32,
     pub num_waiting_reqs: i32,
-    /// Queued token-work: waiting-queue tokens not yet served from cache. 0 when
-    /// the backend does not report it — callers degrade gracefully.
+    /// Queued uncached token-work. Kept required for wire compatibility with
+    /// existing generated clients; use the companion flag to distinguish an
+    /// unavailable signal from an exact empty queue.
     pub num_waiting_uncached_tokens: i32,
+    /// Whether `num_waiting_uncached_tokens` is reported by the backend.
+    /// Missing keeps the legacy heuristic: a positive numeric value is exact,
+    /// while zero with a non-empty queue is estimated. Backends that cannot
+    /// report token-work set this to `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_waiting_uncached_tokens_available: Option<bool>,
     pub num_total_reqs: i32,
     pub num_used_tokens: i32,
     pub max_total_num_tokens: i32,
     /// Token usage ratio (0.0–1.0).
     pub token_usage: f64,
+    /// Recent aggregate uncached-prefill throughput in tokens/s when the
+    /// backend can derive it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_throughput: Option<f64>,
     pub gen_throughput: f64,
+    /// Recent mean uncached prefill tokens per completed request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_request_prefill_kv_computed_tokens: Option<f64>,
+    /// Rolling median uncached prefill tokens per completed request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_request_prefill_kv_computed_tokens: Option<f64>,
+    /// Requests represented by the rolling prefill-size histogram.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_size_sample_count: Option<u64>,
+    /// Conservative prefill capacity learned from saturated intervals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_prefill_capacity: Option<f64>,
+    /// Saturated intervals represented by `learned_prefill_capacity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_capacity_sample_count: Option<u32>,
+    /// Whether the current interval qualified for capacity learning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_capacity_learning_active: Option<bool>,
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,
@@ -1450,6 +1479,20 @@ impl WorkerLoadResponse {
         self.loads.iter().map(|l| l.gen_throughput).sum()
     }
 
+    /// Total prefill throughput when every reported rank supplies it.
+    pub fn total_prefill_throughput(&self) -> Option<f64> {
+        self.loads
+            .iter()
+            .try_fold(0.0, |sum, load| load.prefill_throughput.map(|v| sum + v))
+    }
+
+    /// Total learned prefill capacity when every reported rank supplies it.
+    pub fn total_learned_prefill_capacity(&self) -> Option<f64> {
+        self.loads.iter().try_fold(0.0, |sum, load| {
+            load.learned_prefill_capacity.map(|v| sum + v)
+        })
+    }
+
     /// Whether these ranks are one engine's DP ranks rather than a
     /// gateway's fleet rollup, where every entry names its own `worker`.
     ///
@@ -1467,6 +1510,49 @@ impl WorkerLoadResponse {
             map.insert(snapshot.dp_rank as isize, snapshot.num_used_tokens as isize);
         }
         map
+    }
+}
+
+#[cfg(test)]
+mod load_signal_compat_tests {
+    use serde_json::json;
+
+    use super::SchedulerLoadSnapshot;
+
+    #[test]
+    fn legacy_snapshot_keeps_queued_token_signal_usable() {
+        let snapshot: SchedulerLoadSnapshot = serde_json::from_value(json!({
+            "num_waiting_uncached_tokens": 0
+        }))
+        .unwrap();
+
+        assert_eq!(snapshot.num_waiting_uncached_tokens_available, None);
+        assert!(serde_json::to_value(snapshot)
+            .unwrap()
+            .get("num_waiting_uncached_tokens_available")
+            .is_none());
+    }
+
+    #[test]
+    fn unavailable_queue_tokens_and_vllm_metrics_round_trip() {
+        let value = json!({
+            "num_waiting_uncached_tokens": 0,
+            "num_waiting_uncached_tokens_available": false,
+            "prefill_throughput": 2048.0,
+            "median_request_prefill_kv_computed_tokens": 512.0,
+            "prefill_size_sample_count": 64,
+            "learned_prefill_capacity": 4096.0,
+            "prefill_capacity_sample_count": 8,
+            "prefill_capacity_learning_active": true
+        });
+        let snapshot: SchedulerLoadSnapshot = serde_json::from_value(value.clone()).unwrap();
+
+        assert_eq!(snapshot.num_waiting_uncached_tokens_available, Some(false));
+        assert_eq!(snapshot.learned_prefill_capacity, Some(4096.0));
+        let output = serde_json::to_value(snapshot).unwrap();
+        for key in value.as_object().unwrap().keys() {
+            assert_eq!(output.get(key), value.get(key), "field {key}");
+        }
     }
 }
 
