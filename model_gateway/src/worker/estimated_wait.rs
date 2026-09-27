@@ -342,6 +342,21 @@ impl PreparedWait {
     }
 }
 
+fn invalidate_diagnostic_metrics(worker_url: &str) {
+    let worker = worker_url.to_owned();
+    metrics::gauge!("smg_estimated_wait_seconds", "worker" => worker.clone()).set(-1.0);
+    metrics::gauge!("smg_estimated_wait_threshold_seconds", "worker" => worker.clone()).set(-1.0);
+    metrics::gauge!("smg_estimated_wait_queue_proxy", "worker" => worker.clone()).set(-1.0);
+    metrics::gauge!("smg_estimated_wait_throughput_fallback", "worker" => worker.clone()).set(-1.0);
+    metrics::gauge!("smg_estimated_wait_snapshot_age_seconds", "worker" => worker.clone())
+        .set(-1.0);
+    metrics::gauge!("smg_estimated_wait_blended_prompt_tokens", "worker" => worker.clone())
+        .set(-1.0);
+    metrics::gauge!("smg_estimated_wait_effective_prefill_capacity", "worker" => worker.clone())
+        .set(-1.0);
+    metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker).set(0.0);
+}
+
 #[derive(Debug)]
 struct Sample {
     prepared: PreparedWait,
@@ -437,8 +452,7 @@ impl EstimatedWaitAdmission {
             .insert(worker.url().to_owned(), Entry::new(worker))
             .is_some()
         {
-            metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned())
-                .set(0.0);
+            invalidate_diagnostic_metrics(worker.url());
         }
         if worker.metadata().overload.max_estimated_wait_secs.is_some() {
             self.worker_overrides.fetch_add(1, Ordering::Release);
@@ -452,8 +466,7 @@ impl EstimatedWaitAdmission {
             .is_some_and(|entry| entry.source.ptr_eq(&Arc::downgrade(worker)))
         {
             entries.remove(worker.url());
-            metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned())
-                .set(0.0);
+            invalidate_diagnostic_metrics(worker.url());
         }
         if worker.metadata().overload.max_estimated_wait_secs.is_some() {
             self.worker_overrides.fetch_sub(1, Ordering::Release);
@@ -539,8 +552,7 @@ impl EstimatedWaitAdmission {
             if let Some(entry) = entries.get_mut(worker.url()) {
                 entry.invalidate();
             }
-            metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned())
-                .set(0.0);
+            invalidate_diagnostic_metrics(worker.url());
         }
     }
 
@@ -548,7 +560,7 @@ impl EstimatedWaitAdmission {
         let mut entries = self.entries.lock();
         for (url, entry) in entries.iter_mut() {
             entry.invalidate();
-            metrics::gauge!("smg_estimated_wait_data_usable", "worker" => url.clone()).set(0.0);
+            invalidate_diagnostic_metrics(url);
         }
     }
 
@@ -1363,6 +1375,64 @@ mod tests {
             .unwrap()
             .check(&[replacement], "m")
             .is_err());
+    }
+
+    #[test]
+    fn retired_worker_diagnostics_are_invalidated_without_clearing_replacement() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let admission = EstimatedWaitAdmission::default();
+            admission.configure(config());
+            let old = worker("http://a:1");
+            admission.worker_added(&old);
+            publish(&admission, &old, 200);
+
+            let replacement = worker(old.url());
+            admission.worker_added(&replacement);
+            publish(&admission, &replacement, 100);
+            admission.worker_removed(&old);
+
+            let rendered = handle.render();
+            assert!(
+                rendered.contains("smg_estimated_wait_seconds{worker=\"http://a:1\"} 1"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("smg_estimated_wait_data_usable{worker=\"http://a:1\"} 1"),
+                "{rendered}"
+            );
+
+            let assert_invalidated = |rendered: &str| {
+                for metric in [
+                    "smg_estimated_wait_seconds",
+                    "smg_estimated_wait_threshold_seconds",
+                    "smg_estimated_wait_queue_proxy",
+                    "smg_estimated_wait_throughput_fallback",
+                    "smg_estimated_wait_snapshot_age_seconds",
+                    "smg_estimated_wait_blended_prompt_tokens",
+                    "smg_estimated_wait_effective_prefill_capacity",
+                ] {
+                    assert!(
+                        rendered.contains(&format!("{metric}{{worker=\"http://a:1\"}} -1")),
+                        "{rendered}"
+                    );
+                }
+                assert!(
+                    rendered.contains("smg_estimated_wait_data_usable{worker=\"http://a:1\"} 0"),
+                    "{rendered}"
+                );
+            };
+
+            admission.evict(&replacement);
+            assert_invalidated(&handle.render());
+            publish(&admission, &replacement, 100);
+            admission.clear();
+            assert_invalidated(&handle.render());
+            publish(&admission, &replacement, 100);
+            admission.worker_removed(&replacement);
+            assert_invalidated(&handle.render());
+        });
     }
 
     #[test]
