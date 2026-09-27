@@ -250,6 +250,10 @@ impl EstimatedWaitConfig {
             .loads
             .iter()
             .any(|rank| rank.prefill_capacity_learning_active.is_some());
+        let capacity_learning_active = load
+            .loads
+            .iter()
+            .any(|rank| rank.prefill_capacity_learning_active == Some(true));
         let learned = load.loads.iter().try_fold(0.0, |sum, rank| {
             rank.learned_prefill_capacity.map(|value| sum + value)
         });
@@ -272,7 +276,20 @@ impl EstimatedWaitConfig {
                 {
                     (value, false)
                 }
-                _ => (self.estimated_wait_fallback_prefill_throughput, true),
+                _ => match live {
+                    // Before the conservative rolling estimate is ready,
+                    // bridge with the observed prefill rate only while vLLM
+                    // has both backlog and positive prefill work. Idle and
+                    // sparse demand therefore remain on the configured floor.
+                    Some(value)
+                        if capacity_learning_active
+                            && value.is_finite()
+                            && value >= self.estimated_wait_fallback_prefill_throughput =>
+                    {
+                        (value, false)
+                    }
+                    _ => (self.estimated_wait_fallback_prefill_throughput, true),
+                },
             }
         } else {
             match live {
@@ -863,6 +880,21 @@ mod tests {
 
         report.loads[0].learned_prefill_capacity = Some(200.0);
         assert_eq!(config().score(&report, 100), Some((0.5, true, false)));
+    }
+
+    #[test]
+    fn saturated_live_prefill_rate_bridges_until_capacity_is_learned() {
+        let mut report = load(None, 2, 10.0, 0.0);
+        report.loads[0].avg_request_prefill_kv_computed_tokens = Some(100.0);
+        report.loads[0].prefill_throughput = Some(200.0);
+        report.loads[0].prefill_capacity_learning_active = Some(true);
+
+        assert_eq!(config().score(&report, 0), Some((1.0, true, false)));
+
+        // The same live rate is observed demand, not capacity, when there is
+        // no qualified backlog in the interval.
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        assert_eq!(config().score(&report, 0), Some((2.0, true, true)));
     }
 
     #[test]
