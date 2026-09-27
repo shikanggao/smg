@@ -1242,6 +1242,10 @@ impl WorkerMonitor {
     async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
+        Self::decode_sglang_metrics(&body).map(Self::single_rank)
+    }
+
+    fn decode_sglang_metrics(body: &str) -> Option<SchedulerLoadSnapshot> {
         let m = PromScrape::parse(&body);
 
         // Require the KV-usage gauge — the load signal routing acts on.
@@ -1256,16 +1260,19 @@ impl WorkerMonitor {
         if !m.has(&waiting_name) || !waiting.is_finite() || waiting < 0.0 {
             return None;
         }
-        Some(Self::single_rank(SchedulerLoadSnapshot {
+        Some(SchedulerLoadSnapshot {
             num_running_reqs: m.sum(&format!("{prefix}num_running_reqs")) as i32,
             num_waiting_reqs: m.sum(&format!("{prefix}num_queue_reqs")) as i32,
             num_waiting_uncached_tokens_available: Some(false),
             token_usage: m.mean(&format!("{prefix}token_usage")),
-            gen_throughput: m.sum(&format!("{prefix}gen_throughput")),
+            // SGLang's generation gauge reports current demand, not engine
+            // capacity. A small positive idle sample must not replace the
+            // configured estimated-wait capacity fallback.
+            gen_throughput: -1.0,
             cache_hit_rate: m.mean(&format!("{prefix}cache_hit_rate")),
             utilization: m.mean(&format!("{prefix}utilization")),
             ..Default::default()
-        }))
+        })
     }
 
     /// Shared authenticated GET builder with the standard timeout.
@@ -2076,6 +2083,7 @@ vllm:generation_tokens_total{model_name="llama"} 123456.0
 sglang:num_running_reqs{model="llama"} 2.0
 sglang:num_queue_reqs{model="llama"} 4.0
 sglang:token_usage{model="llama"} 0.42
+sglang:gen_throughput{model="llama"} 0.088
 sglang:utilization{model="llama"} 0.9
 "#;
 
@@ -2360,10 +2368,12 @@ sglang:utilization{model="llama"} 0.9
 
     #[test]
     fn sglang_metrics_map_onto_token_usage_snapshot() {
-        let m = PromScrape::parse(SGLANG_METRICS);
-        assert_eq!(m.mean("sglang:token_usage"), 0.42);
-        assert_eq!(m.sum("sglang:num_running_reqs"), 2.0);
-        assert_eq!(m.sum("sglang:num_queue_reqs"), 4.0);
+        let snapshot = WorkerMonitor::decode_sglang_metrics(SGLANG_METRICS).unwrap();
+        assert_eq!(snapshot.token_usage, 0.42);
+        assert_eq!(snapshot.num_running_reqs, 2);
+        assert_eq!(snapshot.num_waiting_reqs, 4);
+        // A demand-starved generation rate is not a prefill capacity signal.
+        assert_eq!(snapshot.gen_throughput, -1.0);
     }
 
     #[test]
@@ -2371,15 +2381,13 @@ sglang:utilization{model="llama"} 0.9
         // SGLang v0.5.4+ renamed the metric prefix `sglang:` -> `sglang_`.
         let v054 = "sglang_token_usage{model=\"llama\"} 0.5\n\
                     sglang_num_running_reqs{model=\"llama\"} 7\n\
-                    sglang_num_queue_reqs{model=\"llama\"} 1\n";
-        let m = PromScrape::parse(v054);
-        assert!(!m.has("sglang:token_usage"));
-        let prefix = ["sglang:", "sglang_"]
-            .into_iter()
-            .find(|p| m.has(&format!("{p}token_usage")));
-        assert_eq!(prefix, Some("sglang_"));
-        assert_eq!(m.mean("sglang_token_usage"), 0.5);
-        assert_eq!(m.sum("sglang_num_running_reqs"), 7.0);
+                    sglang_num_queue_reqs{model=\"llama\"} 1\n\
+                    sglang_gen_throughput{model=\"llama\"} 0.125\n";
+        let snapshot = WorkerMonitor::decode_sglang_metrics(v054).unwrap();
+        assert_eq!(snapshot.token_usage, 0.5);
+        assert_eq!(snapshot.num_running_reqs, 7);
+        assert_eq!(snapshot.num_waiting_reqs, 1);
+        assert_eq!(snapshot.gen_throughput, -1.0);
     }
 
     #[test]
