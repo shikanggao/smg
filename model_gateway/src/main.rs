@@ -331,7 +331,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     estimated_wait_mean_prefill_tokens: u32,
 
-    /// Cold-start prefill capacity in tokens/s until a qualified value is learned.
+    /// Minimum prefill capacity in tokens/s, also used during cold start.
     #[arg(
         long,
         aliases = [

@@ -257,14 +257,28 @@ impl EstimatedWaitConfig {
         // intervals train its capacity estimate; cold start and sparse traffic
         // stay on the configured fallback. Native load endpoints retain their
         // existing live-throughput behavior.
-        let candidate = if capacity_learning_backend {
-            learned
+        let (throughput, fallback) = if capacity_learning_backend {
+            // A waiting gauge can overlap a demand-starved scrape interval
+            // while vLLM is ramping a batch or draining decode work. Such an
+            // interval is useful evidence that the worker is busy, but its
+            // near-zero token delta is not a credible prefill-capacity
+            // estimate. Keep the configured cold-start value as a capacity
+            // floor so a transient low learned quantile cannot inflate wait
+            // by orders of magnitude.
+            match learned {
+                Some(value)
+                    if value.is_finite()
+                        && value >= self.estimated_wait_fallback_prefill_throughput =>
+                {
+                    (value, false)
+                }
+                _ => (self.estimated_wait_fallback_prefill_throughput, true),
+            }
         } else {
-            live
-        };
-        let (throughput, fallback) = match candidate {
-            Some(value) if value.is_finite() && value > 0.0 => (value, false),
-            _ => (self.estimated_wait_fallback_prefill_throughput, true),
+            match live {
+                Some(value) if value.is_finite() && value > 0.0 => (value, false),
+                _ => (self.estimated_wait_fallback_prefill_throughput, true),
+            }
         };
         let estimate = ExpectedWait::calibrated(
             queued,
@@ -837,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn qualified_learned_capacity_replaces_fallback_even_when_lower() {
+    fn demand_starved_learned_capacity_does_not_replace_configured_floor() {
         let mut report = load(None, 0, 10.0, 0.0);
         report.loads[0].avg_request_prefill_kv_computed_tokens = Some(100.0);
         report.loads[0].prefill_capacity_learning_active = Some(false);
@@ -845,7 +859,10 @@ mod tests {
 
         report.loads[0].learned_prefill_capacity = Some(40.0);
         report.loads[0].prefill_capacity_sample_count = Some(8);
-        assert_eq!(config().score(&report, 100), Some((2.5, true, false)));
+        assert_eq!(config().score(&report, 100), Some((1.0, true, true)));
+
+        report.loads[0].learned_prefill_capacity = Some(200.0);
+        assert_eq!(config().score(&report, 100), Some((0.5, true, false)));
     }
 
     #[test]
