@@ -257,6 +257,12 @@ impl EstimatedWaitConfig {
         let learned = load.loads.iter().try_fold(0.0, |sum, rank| {
             rank.learned_prefill_capacity.map(|value| sum + value)
         });
+        // vLLM publishes learned capacity only after the monitor has collected
+        // enough saturated intervals. Keep producing estimates before then so
+        // operators can observe calibration, but do not let those cold-start
+        // estimates drive hard admission decisions.
+        let capacity_ready = !capacity_learning_backend
+            || learned.is_some_and(|value| value.is_finite() && value > 0.0);
         // vLLM counter rates are observed demand, not capacity. Only saturated
         // intervals train its capacity estimate; cold start and sparse traffic
         // stay on the configured fallback. Native load endpoints retain their
@@ -312,6 +318,7 @@ impl EstimatedWaitConfig {
             estimate,
             proxy,
             fallback,
+            capacity_ready,
             blended_prompt_size,
             effective_prefill_capacity: throughput,
         })
@@ -332,6 +339,7 @@ struct PreparedWait {
     estimate: ExpectedWait,
     proxy: bool,
     fallback: bool,
+    capacity_ready: bool,
     blended_prompt_size: Option<f64>,
     effective_prefill_capacity: f64,
 }
@@ -354,6 +362,7 @@ fn invalidate_diagnostic_metrics(worker_url: &str) {
         .set(-1.0);
     metrics::gauge!("smg_estimated_wait_effective_prefill_capacity", "worker" => worker.clone())
         .set(-1.0);
+    metrics::gauge!("smg_estimated_wait_capacity_ready", "worker" => worker.clone()).set(-1.0);
     metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker).set(0.0);
 }
 
@@ -405,6 +414,8 @@ impl Entry {
             metrics::gauge!("smg_estimated_wait_seconds", "worker" => worker.url().to_owned())
                 .set(seconds);
             metrics::gauge!("smg_estimated_wait_snapshot_age_seconds", "worker" => worker.url().to_owned()).set(sample.started.elapsed().as_secs_f64());
+            metrics::gauge!("smg_estimated_wait_capacity_ready", "worker" => worker.url().to_owned())
+                .set(u8::from(sample.prepared.capacity_ready));
         }
         metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned()).set(
             u8::from(self.sample.as_ref().is_some_and(|s| {
@@ -628,6 +639,7 @@ impl AdmissionGuard<'_> {
                 {
                     Err("stale")
                 }
+                Some(sample) if !sample.prepared.capacity_ready => Err("capacity_unready"),
                 Some(sample) => sample.overloaded.ok_or("unusable"),
                 None => Err(if entry.is_some_and(|e| e.last_published.is_some()) {
                     "unusable"
@@ -640,7 +652,9 @@ impl AdmissionGuard<'_> {
                 Ok(false) => return false,
                 Err(reason) => {
                     metrics::counter!("smg_estimated_wait_unknown_total", "model" => model.to_owned(), "reason" => reason).increment(1);
-                    metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned()).set(0.0);
+                    if reason != "capacity_unready" {
+                        metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned()).set(0.0);
+                    }
                     return false;
                 }
             }
@@ -734,13 +748,16 @@ mod tests {
     }
 
     fn publish(admission: &EstimatedWaitAdmission, worker: &Arc<dyn Worker>, tokens: i32) {
+        publish_load(admission, worker, &load(Some(tokens), 0, 100.0, 0.0));
+    }
+
+    fn publish_load(
+        admission: &EstimatedWaitAdmission,
+        worker: &Arc<dyn Worker>,
+        report: &WorkerLoadResponse,
+    ) {
         let stamp = admission.poll_started(worker);
-        admission.publish(
-            worker,
-            Some(&load(Some(tokens), 0, 100.0, 0.0)),
-            stamp,
-            Instant::now(),
-        );
+        admission.publish(worker, Some(report), stamp, Instant::now());
     }
 
     #[test]
@@ -1106,6 +1123,86 @@ mod tests {
     }
 
     #[test]
+    fn vllm_admission_waits_for_learned_capacity_without_hiding_estimate() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let admission = EstimatedWaitAdmission::default();
+            admission.configure(config());
+            let worker = worker("http://vllm:1");
+
+            let mut report = load(Some(200), 0, 100.0, 0.0);
+            report.loads[0].prefill_capacity_learning_active = Some(false);
+            publish_load(&admission, &worker, &report);
+
+            // The cold estimate is still published and usable for calibration,
+            // but it cannot reject until the conservative capacity is learned.
+            assert_eq!(config().score(&report, 0), Some((2.0, false, true)));
+            assert!(admission
+                .begin()
+                .unwrap()
+                .check(std::slice::from_ref(&worker), "m")
+                .is_ok());
+            let cold = handle.render();
+            assert!(
+                cold.contains("smg_estimated_wait_capacity_ready{worker=\"http://vllm:1\"} 0"),
+                "{cold}"
+            );
+            assert!(
+                cold.contains("smg_estimated_wait_data_usable{worker=\"http://vllm:1\"} 1"),
+                "{cold}"
+            );
+            assert!(
+                cold.contains(
+                    "smg_estimated_wait_unknown_total{model=\"m\",reason=\"capacity_unready\"} 1"
+                ),
+                "{cold}"
+            );
+
+            report.loads[0].learned_prefill_capacity = Some(100.0);
+            report.loads[0].prefill_capacity_sample_count = Some(8);
+            publish_load(&admission, &worker, &report);
+            assert_eq!(config().score(&report, 0), Some((2.0, false, false)));
+            assert!(admission
+                .begin()
+                .unwrap()
+                .check(std::slice::from_ref(&worker), "m")
+                .is_err());
+            let ready = handle.render();
+            assert!(
+                ready.contains("smg_estimated_wait_capacity_ready{worker=\"http://vllm:1\"} 1"),
+                "{ready}"
+            );
+        });
+    }
+
+    #[test]
+    fn shadow_does_not_count_uncalibrated_vllm_estimate_as_would_reject() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let admission = EstimatedWaitAdmission::default();
+            admission.configure(EstimatedWaitConfig {
+                estimated_wait_shadow: true,
+                ..config()
+            });
+            let worker = worker("http://vllm:1");
+            let mut report = load(Some(200), 0, 100.0, 0.0);
+            report.loads[0].prefill_capacity_learning_active = Some(false);
+            publish_load(&admission, &worker, &report);
+
+            assert!(admission
+                .begin()
+                .unwrap()
+                .check(std::slice::from_ref(&worker), "m")
+                .is_ok());
+            assert!(!handle
+                .render()
+                .contains("smg_estimated_wait_shadow_rejections_total"));
+        });
+    }
+
+    #[test]
     fn shadow_counts_only_would_reject_decisions_and_keeps_credit() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -1412,6 +1509,7 @@ mod tests {
                     "smg_estimated_wait_snapshot_age_seconds",
                     "smg_estimated_wait_blended_prompt_tokens",
                     "smg_estimated_wait_effective_prefill_capacity",
+                    "smg_estimated_wait_capacity_ready",
                 ] {
                     assert!(
                         rendered.contains(&format!("{metric}{{worker=\"http://a:1\"}} -1")),
