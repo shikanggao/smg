@@ -266,12 +266,10 @@ class RouterArgs:
     estimated_wait_shadow: bool = False
     # Appended for compatibility with positional RouterArgs construction.
     estimated_wait_dispatch_blocking_factor: float = 0.05
-    estimated_wait_max_kv_penalty_secs: float = 5.0
     estimated_wait_min_prefill_throughput: float | None = None
     estimated_wait_prompt_size_prior_samples: int = 32
     estimated_wait_base_overhead_secs: float = 0.0
     estimated_wait_queue_work_correction: float = 1.0
-    estimated_wait_kv_pressure_threshold: float = 0.0
     estimated_wait_fallback_prefill_throughput: float | None = None
 
     @staticmethod
@@ -678,12 +676,6 @@ class RouterArgs:
             help="Multiplier applied to queued and dispatch-blocking work",
         )
         routing_group.add_argument(
-            f"--{prefix}estimated-wait-kv-pressure-threshold",
-            type=float,
-            default=RouterArgs.estimated_wait_kv_pressure_threshold,
-            help="KV usage below which the KV penalty is zero",
-        )
-        routing_group.add_argument(
             f"--{prefix}estimated-wait-queue-tokens-per-request",
             type=int,
             default=RouterArgs.estimated_wait_queue_tokens_per_request,
@@ -700,12 +692,6 @@ class RouterArgs:
             type=float,
             default=RouterArgs.estimated_wait_dispatch_blocking_factor,
             help="Fraction of newly dispatched prompt tokens that still block admission",
-        )
-        routing_group.add_argument(
-            f"--{prefix}estimated-wait-max-kv-penalty-secs",
-            type=float,
-            default=RouterArgs.estimated_wait_max_kv_penalty_secs,
-            help="Maximum KV-pressure contribution to estimated wait in seconds",
         )
         routing_group.add_argument(
             f"--{prefix}worker-overload-protection",

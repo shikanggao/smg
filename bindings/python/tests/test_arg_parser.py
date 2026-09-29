@@ -680,8 +680,6 @@ class TestParseRouterArgs:
                     "0.1",
                     f"--{prefix}estimated-wait-queue-work-correction",
                     "0.7",
-                    f"--{prefix}estimated-wait-kv-pressure-threshold",
-                    "0.8",
                     f"--{prefix}estimated-wait-kv-pressure-weight",
                     "0.4",
                     f"--{prefix}estimated-wait-mean-prefill-tokens",
@@ -690,8 +688,6 @@ class TestParseRouterArgs:
                     "8",
                     f"--{prefix}estimated-wait-dispatch-blocking-factor",
                     "0.2",
-                    f"--{prefix}estimated-wait-max-kv-penalty-secs",
-                    "3",
                 ]
             )
             args = RouterArgs.from_cli_args(namespace, use_router_prefix=bool(prefix))
@@ -703,17 +699,14 @@ class TestParseRouterArgs:
             assert args.estimated_wait_prompt_size_prior_samples == 24
             assert args.estimated_wait_base_overhead_secs == 0.1
             assert args.estimated_wait_queue_work_correction == 0.7
-            assert args.estimated_wait_kv_pressure_threshold == 0.8
             assert args.estimated_wait_kv_pressure_weight == 0.4
             assert args.estimated_wait_mean_prefill_tokens == 800
             assert args.estimated_wait_max_snapshot_age_secs == 8.0
             assert args.estimated_wait_dispatch_blocking_factor == 0.2
-            assert args.estimated_wait_max_kv_penalty_secs == 3.0
         assert RouterArgs().max_estimated_wait_secs is None
         assert RouterArgs().estimated_wait_shadow is False
         assert RouterArgs().estimated_wait_queue_tokens_per_request == 0
         assert RouterArgs().estimated_wait_dispatch_blocking_factor == 0.05
-        assert RouterArgs().estimated_wait_max_kv_penalty_secs == 5.0
         assert RouterArgs().estimated_wait_kv_pressure_weight == 0.0
         assert RouterArgs().estimated_wait_prompt_size_prior_samples == 32
 
@@ -1534,12 +1527,10 @@ class TestRouterArgsFieldOrder:
         "estimated_wait_max_snapshot_age_secs",
         "estimated_wait_shadow",
         "estimated_wait_dispatch_blocking_factor",
-        "estimated_wait_max_kv_penalty_secs",
         "estimated_wait_min_prefill_throughput",
         "estimated_wait_prompt_size_prior_samples",
         "estimated_wait_base_overhead_secs",
         "estimated_wait_queue_work_correction",
-        "estimated_wait_kv_pressure_threshold",
         "estimated_wait_fallback_prefill_throughput",
     ]
 
@@ -1583,7 +1574,6 @@ class TestRouterArgsFieldOrder:
             "estimated_wait_prompt_size_prior_samples",
             "estimated_wait_base_overhead_secs",
             "estimated_wait_queue_work_correction",
-            "estimated_wait_kv_pressure_threshold",
             "estimated_wait_fallback_prefill_throughput",
         ):
             assert names.index(appended) > marker, (

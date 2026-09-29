@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     expected_wait::{
-        ExpectedWait, DEFAULT_DISPATCH_BLOCKING_FACTOR, DEFAULT_MAX_KV_PENALTY_SECS,
-        DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
+        ExpectedWait, DEFAULT_DISPATCH_BLOCKING_FACTOR, DEFAULT_MEAN_PREFILL_TOKENS,
+        DEFAULT_THROUGHPUT,
     },
     Worker,
 };
@@ -35,7 +35,6 @@ use crate::{
 pub struct EstimatedWaitConfig {
     pub max_estimated_wait_secs: Option<f64>,
     pub estimated_wait_kv_pressure_weight: f64,
-    pub estimated_wait_kv_pressure_threshold: f64,
     pub estimated_wait_base_overhead_secs: f64,
     pub estimated_wait_queue_work_correction: f64,
     pub estimated_wait_dispatch_blocking_factor: f64,
@@ -49,8 +48,6 @@ pub struct EstimatedWaitConfig {
     /// Zero disables the waiting-request compatibility proxy.
     pub estimated_wait_queue_tokens_per_request: u32,
     pub estimated_wait_max_snapshot_age_secs: f64,
-    /// Maximum KV-pressure contribution to the estimate, in seconds.
-    pub estimated_wait_max_kv_penalty_secs: f64,
     /// Record would-reject decisions without enforcing estimated-wait budgets.
     pub estimated_wait_shadow: bool,
 }
@@ -62,7 +59,6 @@ impl Default for EstimatedWaitConfig {
             // Keep the admission KV term off until a controlled KV sweep shows
             // that it independently explains request-level wait residuals.
             estimated_wait_kv_pressure_weight: 0.0,
-            estimated_wait_kv_pressure_threshold: 0.0,
             estimated_wait_base_overhead_secs: 0.0,
             estimated_wait_queue_work_correction: 1.0,
             estimated_wait_dispatch_blocking_factor: DEFAULT_DISPATCH_BLOCKING_FACTOR,
@@ -71,7 +67,6 @@ impl Default for EstimatedWaitConfig {
             estimated_wait_prompt_size_prior_samples: 32,
             estimated_wait_queue_tokens_per_request: 0,
             estimated_wait_max_snapshot_age_secs: 30.0,
-            estimated_wait_max_kv_penalty_secs: DEFAULT_MAX_KV_PENALTY_SECS,
             estimated_wait_shadow: false,
         }
     }
@@ -88,11 +83,6 @@ impl EstimatedWaitConfig {
             (
                 "estimated_wait_kv_pressure_weight",
                 self.estimated_wait_kv_pressure_weight,
-                true,
-            ),
-            (
-                "estimated_wait_kv_pressure_threshold",
-                self.estimated_wait_kv_pressure_threshold,
                 true,
             ),
             (
@@ -125,11 +115,6 @@ impl EstimatedWaitConfig {
                 self.estimated_wait_max_snapshot_age_secs,
                 false,
             ),
-            (
-                "estimated_wait_max_kv_penalty_secs",
-                self.estimated_wait_max_kv_penalty_secs,
-                false,
-            ),
         ] {
             if !value.is_finite() || value < 0.0 || (!allow_zero && value == 0.0) {
                 return Err(ConfigError::InvalidValue {
@@ -151,13 +136,6 @@ impl EstimatedWaitConfig {
                 field: "estimated_wait_dispatch_blocking_factor".to_owned(),
                 value: self.estimated_wait_dispatch_blocking_factor.to_string(),
                 reason: "Must be finite and in [0, 1]".to_owned(),
-            });
-        }
-        if self.estimated_wait_kv_pressure_threshold > 1.0 {
-            return Err(ConfigError::InvalidValue {
-                field: "estimated_wait_kv_pressure_threshold".to_owned(),
-                value: self.estimated_wait_kv_pressure_threshold.to_string(),
-                reason: "Must be finite and between 0 and 1".to_owned(),
             });
         }
         Ok(())
@@ -310,10 +288,8 @@ impl EstimatedWaitConfig {
             self.estimated_wait_base_overhead_secs,
             self.estimated_wait_queue_work_correction,
             self.estimated_wait_dispatch_blocking_factor,
-            self.estimated_wait_kv_pressure_threshold,
             self.estimated_wait_kv_pressure_weight,
-        )
-        .with_kv_wait_cap(self.estimated_wait_max_kv_penalty_secs);
+        );
         estimate.seconds(0).is_finite().then_some(PreparedWait {
             estimate,
             proxy,
@@ -718,7 +694,6 @@ mod tests {
             // Preserve the original arithmetic in tests that exercise other
             // dimensions; the correction has dedicated coverage below.
             estimated_wait_dispatch_blocking_factor: 1.0,
-            estimated_wait_max_kv_penalty_secs: 1000.0,
             ..Default::default()
         }
     }
@@ -888,12 +863,11 @@ mod tests {
             estimated_wait_base_overhead_secs: 0.25,
             estimated_wait_queue_work_correction: 0.5,
             estimated_wait_dispatch_blocking_factor: 0.25,
-            estimated_wait_kv_pressure_threshold: 0.4,
             estimated_wait_kv_pressure_weight: 2.0,
             ..config()
         };
-        // 0.25 + 0.5 * (300 + 0.25 * 100) / 100 + 2 * (0.5 - 0.4) / 0.5
-        assert!((calibrated.score(&state, 100).unwrap().0 - 2.275).abs() < 1e-10);
+        // 0.25 + 0.5 * (300 + 0.25 * 100) / 100 + 2 * 0.5 / 0.5
+        assert!((calibrated.score(&state, 100).unwrap().0 - 3.875).abs() < 1e-10);
     }
 
     #[test]
@@ -943,21 +917,20 @@ mod tests {
     }
 
     #[test]
-    fn admission_discounts_dispatched_work_and_caps_kv_penalty() {
+    fn admission_discounts_dispatched_work_and_applies_kv_penalty() {
         let config = EstimatedWaitConfig {
             estimated_wait_dispatch_blocking_factor: 0.05,
-            estimated_wait_max_kv_penalty_secs: 5.0,
             estimated_wait_kv_pressure_weight: 0.15,
             ..config()
         };
 
         // 1,000 dispatched tokens at 100 tokens/s contribute 0.5s after the
-        // correction, while saturated KV is bounded at 5s instead of 149.85s.
+        // correction; k is clamped to 0.999, so KV contributes 149.85s.
         let score = config
             .score(&load(Some(0), 0, 100.0, 1.0), 1_000)
             .unwrap()
             .0;
-        assert!((score - 5.5).abs() < 1e-8);
+        assert!((score - 150.35).abs() < 1e-8);
     }
 
     #[test]
@@ -1015,10 +988,6 @@ mod tests {
             0.05
         );
         assert_eq!(
-            EstimatedWaitConfig::default().estimated_wait_max_kv_penalty_secs,
-            5.0
-        );
-        assert_eq!(
             EstimatedWaitConfig::default().estimated_wait_kv_pressure_weight,
             0.0
         );
@@ -1037,12 +1006,6 @@ mod tests {
             .is_err());
             assert!(EstimatedWaitConfig {
                 estimated_wait_max_snapshot_age_secs: bad,
-                ..config()
-            }
-            .validate()
-            .is_err());
-            assert!(EstimatedWaitConfig {
-                estimated_wait_max_kv_penalty_secs: bad,
                 ..config()
             }
             .validate()

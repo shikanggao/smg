@@ -26,12 +26,10 @@
     "estimated_wait_prompt_size_prior_samples": null,
     "estimated_wait_mean_prefill_tokens": null,
     "estimated_wait_kv_pressure_weight": null,
-    "estimated_wait_kv_pressure_threshold": null,
     "estimated_wait_base_overhead_secs": null,
     "estimated_wait_queue_work_correction": null,
     "estimated_wait_dispatch_blocking_factor": null,
-    "estimated_wait_max_snapshot_age_secs": null,
-    "estimated_wait_max_kv_penalty_secs": null
+    "estimated_wait_max_snapshot_age_secs": null
   },
   "evidence": {
     "raw_observations": null,

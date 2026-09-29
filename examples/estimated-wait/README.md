@@ -10,8 +10,7 @@ static overload guard:
 
 ```
 dispatch_work = dispatch_blocking_factor * since_poll_dispatch_tokens
-kv_penalty = min(max_kv_penalty_secs,
-                 kv_weight * max(0, token_usage - kv_threshold) / (1 - token_usage))
+kv_penalty = kv_weight * token_usage / (1 - token_usage)
 wait_seconds = base_overhead
              + queue_work_correction
                * (queued_uncached_tokens + dispatch_work) / prefill_capacity
@@ -43,19 +42,16 @@ builder's `estimated_wait(EstimatedWaitConfig)` method.
 | `--estimated-wait-prompt-size-prior-samples` | 32 | Effective sample count assigned to the configured prompt-size prior |
 | `--estimated-wait-mean-prefill-tokens` | 1024 | Dispatch credit when tokenized input is unavailable |
 | `--estimated-wait-kv-pressure-weight` | 0 | KV pressure weight in seconds; disabled until a controlled KV sweep justifies it |
-| `--estimated-wait-kv-pressure-threshold` | 0 | KV usage below this ratio adds no pressure penalty |
 | `--estimated-wait-base-overhead-secs` | 0 | Fixed wait overhead |
 | `--estimated-wait-queue-work-correction` | 1 | Correction applied to queued token work |
 | `--estimated-wait-dispatch-blocking-factor` | 0.05 | Fraction of newly dispatched work that blocks an arrival; range 0–1 |
 | `--estimated-wait-max-snapshot-age-secs` | 30 | Age after which a sample is unusable |
-| `--estimated-wait-max-kv-penalty-secs` | 5 | Maximum seconds contributed by the KV-pressure term |
 
 Defaults are calibration starting points, not measured model capacity. Positive
 budgets, throughput, dispatch estimates, and maximum age are required. Floating
 point values must be finite. The KV weight and dispatch factor may be zero.
-The dispatch factor cannot exceed 1. The KV cap prevents near-full cache
-utilization from making the rational penalty unbounded; it does not replace
-memory-safety or static overload protection.
+The dispatch factor cannot exceed 1. Static overload protection remains the
+separate memory-safety guard near full KV-cache utilization.
 
 A worker can override the gateway budget using the existing overload block:
 
@@ -90,9 +86,9 @@ prefill throughput. Both vLLM KV metric names are supported. SGLang Prometheus
 fallback and native load endpoints retain their existing behavior.
 
 The calibrated formula is
-`base + alpha * (queued + rho * dispatched) / capacity + weight * max(0, kv - threshold) / (1 - kv)`.
-The generic defaults are `base=0`, `alpha=1`, `rho=0.05`, `weight=0`, and
-`threshold=0`. Admission therefore discounts newly dispatched work and leaves
+`base + alpha * (queued + rho * dispatched) / capacity + weight * kv / (1 - kv)`.
+The generic defaults are `base=0`, `alpha=1`, `rho=0.05`, and `weight=0`.
+Admission therefore discounts newly dispatched work and leaves
 the KV term off until controlled measurements justify enabling it. Least-load
 routing keeps its legacy full-dispatch and KV arithmetic unchanged.
 
