@@ -22,15 +22,15 @@ use crate::{
     routers::{common::retry::mark_non_retryable, error},
     worker::{
         overload::{
-            BRANCH_ALL_OVERLOADED_SHED, BRANCH_OVERLOADED_AT_DISPATCH, BRANCH_PD_ADMISSION_SHED,
-            STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION,
+            BRANCH_ALL_OVERLOADED_SHED, BRANCH_ESTIMATED_WAIT_SHED, BRANCH_OVERLOADED_AT_DISPATCH,
+            BRANCH_PD_ADMISSION_SHED, STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION,
         },
         Worker,
     },
 };
 
-/// Retry-After seconds advertised on every shed: the load-monitor poll
-/// interval, since the veto provably cannot clear faster. Process-wide because
+/// Retry-After seconds advertised on every shed, aligned with the load-monitor
+/// poll interval when fresh evidence normally arrives. Process-wide because
 /// the shed helpers are free functions called from every router; the value is
 /// a client hint, not a correctness input. Default matches the config default.
 static SHED_RETRY_AFTER_SECS: AtomicU64 = AtomicU64::new(10);
@@ -39,6 +39,7 @@ static SHED_RETRY_AFTER_SECS: AtomicU64 = AtomicU64::new(10);
 ///
 /// This deliberately covers both an all-overloaded candidate pool and the
 /// selection-to-dispatch re-check, where another worker may still be eligible.
+/// Estimated-wait and PD admission sheds use the same contract.
 pub(crate) const WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE: &str =
     "worker_overload_protection_shed";
 
@@ -70,6 +71,18 @@ pub fn shed_if_all_overloaded(candidates: &[Arc<dyn Worker>], model_id: &str) ->
         "none",
         format!("All workers for model '{model_id}' are overloaded"),
     ))
+}
+
+/// Reject a pool whose eligible workers all meet or exceed its estimated-wait budget.
+/// Share the overload response contract while preserving a distinct decision
+/// branch and message for the calibrated admission guard.
+pub(crate) fn shed_estimated_wait(model_id: &str) -> Response {
+    shed(
+        BRANCH_ESTIMATED_WAIT_SHED,
+        STAGE_SELECTION,
+        "none",
+        format!("All eligible workers for model '{model_id}' are at or above their estimated wait budgets"),
+    )
 }
 
 /// Dispatch-time re-check: one atomic read on the already-chosen worker,
@@ -235,6 +248,38 @@ mod tests {
             );
             assert!(!is_retryable_response(response));
         }
+    }
+
+    #[tokio::test]
+    async fn estimated_wait_uses_the_shared_overload_response_contract() {
+        let response = shed_estimated_wait("m");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "worker_overload_protection_shed"
+        );
+        assert!(response
+            .headers()
+            .get(RETRY_AFTER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .is_ok_and(|secs| secs >= 1));
+        assert!(is_retryable_status(response.status()));
+        assert!(!is_retryable_response(&response));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "worker_overload_protection_shed");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("estimated wait budgets"));
     }
 
     /// An empty pool is a 404/unavailable question for the caller, not a shed.

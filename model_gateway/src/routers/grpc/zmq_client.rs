@@ -676,6 +676,9 @@ impl ZmqEngineClient {
                     dp_rank: i32::try_from(dp_rank).unwrap_or(i32::MAX),
                     num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
                     num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
+                    // vLLM's ZMQ scheduler stats report queue depth, but not
+                    // the queued token work required by estimated-wait.
+                    num_waiting_uncached_tokens_available: Some(false),
                     token_usage: load.kv_cache_usage,
                     ..Default::default()
                 })
@@ -1626,6 +1629,7 @@ mod tests {
         protocol::vllm::{
             logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
             output::{EngineCoreOutputs, RequestBatchOutputs},
+            stats::SchedulerStats,
         },
         EngineId,
     };
@@ -1822,6 +1826,81 @@ mod tests {
         let client = connected_client(dir.path(), "resolved", resolved.clone()).await;
         client.adopt_tokenizer_eos(Some(&tokenizer));
         assert_eq!(client.effective_eos(), &resolved);
+    }
+
+    #[tokio::test]
+    async fn vllm_zmq_load_marks_queued_tokens_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::Vllm,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = client.expect("adapter connect");
+        let engine = engine.expect("mock engine");
+        let (mut input, mut output) = engine.split();
+
+        let mut stream = client
+            .generate(ProtoGenerateRequest::Vllm(Box::new(
+                vllm::GenerateRequest {
+                    request_id: "load".to_string(),
+                    input: Some(vllm::generate_request::Input::Tokenized(
+                        vllm::TokenizedInput {
+                            input_ids: vec![1],
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )))
+            .await
+            .expect("generate");
+        input.recv().await.expect("request reaches engine");
+        output
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                engine_index: 0,
+                outputs: vec![EngineCoreOutput {
+                    request_id: "load".to_string(),
+                    new_token_ids: vec![2],
+                    ..Default::default()
+                }],
+                scheduler_stats: Some(Box::new(SchedulerStats {
+                    num_running_reqs: 3,
+                    num_waiting_reqs: 5,
+                    kv_cache_usage: 0.25,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))
+            .await
+            .expect("load output");
+        stream
+            .next()
+            .await
+            .expect("load chunk")
+            .expect("load chunk succeeds");
+
+        let response = client.get_loads();
+        let load = response.loads.first().expect("load snapshot");
+        assert_eq!(load.num_running_reqs, 3);
+        assert_eq!(load.num_waiting_reqs, 5);
+        assert_eq!(load.num_waiting_uncached_tokens, 0);
+        assert_eq!(load.num_waiting_uncached_tokens_available, Some(false));
+        assert_eq!(load.token_usage, 0.25);
     }
 
     #[test]

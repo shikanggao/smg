@@ -48,10 +48,10 @@
 //!    channel and merge in the fresh loads.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt::Debug,
     sync::{Arc, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dashmap::DashMap;
@@ -78,16 +78,45 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Minimal Prometheus text-format scraper: metric name -> sample values
 /// (one per label-set). Only the flat `name{labels} value` / `name value`
-/// gauge lines that the engine load fetchers look up are collected;
-/// `#` comment lines and unparsable values are skipped, and histogram or
-/// summary buckets are simply never queried by name.
+/// gauge lines that the engine load fetchers look up are collected. The one
+/// vLLM histogram used for wait calibration also retains its `le` bounds;
+/// `#` comment lines and unparsable values are skipped.
 struct PromScrape {
     samples: HashMap<String, Vec<f64>>,
+    histogram_buckets: HashMap<String, Vec<(f64, f64)>>,
+    local_compute_tokens: Option<f64>,
+}
+
+fn local_compute_source(head: &str) -> bool {
+    const LABEL: &str = "source=\"local_compute\"";
+    head.match_indices(LABEL).any(|(index, _)| {
+        matches!(
+            head[..index].trim_end().chars().next_back(),
+            Some('{') | Some(',')
+        ) && matches!(
+            head[index + LABEL.len()..].trim_start().chars().next(),
+            Some(',') | Some('}')
+        )
+    })
+}
+
+fn histogram_bound(head: &str) -> Option<f64> {
+    head.match_indices("le=\"").find_map(|(index, _)| {
+        matches!(
+            head[..index].trim_end().chars().next_back(),
+            Some('{') | Some(',')
+        )
+        .then(|| &head[index + 4..])
+        .and_then(|tail| tail.split_once('"'))
+        .and_then(|(bound, _)| bound.parse::<f64>().ok())
+    })
 }
 
 impl PromScrape {
     fn parse(text: &str) -> Self {
         let mut samples: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut histogram_buckets: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
+        let mut local_compute_tokens = None;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -109,13 +138,41 @@ impl PromScrape {
             let Some(value) = tail.split_whitespace().next() else {
                 continue;
             };
+            let name = head.split('{').next().unwrap_or(head).trim();
+            if name == "vllm:prompt_tokens_by_source_total" && local_compute_source(head) {
+                // Retain invalid presence: it must not silently select cached
+                // prompt totals or completion-time counters as capacity.
+                let computed = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .unwrap_or(f64::NAN);
+                local_compute_tokens = Some(local_compute_tokens.unwrap_or(0.0) + computed);
+            }
             let Ok(value) = value.parse::<f64>() else {
                 continue;
             };
-            let name = head.split('{').next().unwrap_or(head).trim();
             samples.entry(name.to_string()).or_default().push(value);
+            if name == "vllm:request_prefill_kv_computed_tokens_bucket" {
+                let bound = histogram_bound(head);
+                if let Some(bound) = bound {
+                    let buckets = histogram_buckets.entry(name.to_string()).or_default();
+                    if let Some((_, total)) = buckets.iter_mut().find(|(seen, _)| *seen == bound) {
+                        *total += value;
+                    } else {
+                        buckets.push((bound, value));
+                    }
+                }
+            }
         }
-        Self { samples }
+        for buckets in histogram_buckets.values_mut() {
+            buckets.sort_by(|(a, _), (b, _)| a.total_cmp(b));
+        }
+        Self {
+            samples,
+            histogram_buckets,
+            local_compute_tokens,
+        }
     }
 
     /// Sum across all label-set samples for `name` (0.0 if absent). Right for
@@ -136,10 +193,402 @@ impl PromScrape {
         }
     }
 
+    fn max(&self, name: &str) -> f64 {
+        self.samples
+            .get(name)
+            .map(|v| {
+                v.iter().copied().fold(0.0_f64, |a, b| {
+                    if a.is_finite() && b.is_finite() {
+                        a.max(b)
+                    } else {
+                        f64::NAN
+                    }
+                })
+            })
+            .unwrap_or(0.0)
+    }
+
     /// True when at least one sample exists for `name`.
     fn has(&self, name: &str) -> bool {
         self.samples.get(name).is_some_and(|v| !v.is_empty())
     }
+
+    fn first_sum(&self, names: &[&str]) -> Option<f64> {
+        names
+            .iter()
+            .find(|name| self.has(name))
+            .map(|name| self.sum(name))
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    }
+
+    fn histogram(&self, name: &str) -> Option<Vec<(f64, f64)>> {
+        self.histogram_buckets.get(name).cloned()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct VllmCounterSample {
+    observed: Option<Instant>,
+    local_compute_tokens: Option<f64>,
+    prompt_tokens: Option<f64>,
+    generation_tokens: Option<f64>,
+    prefill_kv_sum: Option<f64>,
+    prefill_kv_count: Option<f64>,
+    prefix_cache_hits: Option<f64>,
+    prefix_cache_queries: Option<f64>,
+    prefill_kv_buckets: Option<Vec<(f64, f64)>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VllmPrefillCounter {
+    LocalCompute,
+    CompletedUncached,
+    Prompt,
+}
+
+impl VllmCounterSample {
+    fn prefill_counter(&self) -> (VllmPrefillCounter, Option<f64>) {
+        if self.local_compute_tokens.is_some() {
+            (VllmPrefillCounter::LocalCompute, self.local_compute_tokens)
+        } else if self.prefill_kv_sum.is_some() {
+            (VllmPrefillCounter::CompletedUncached, self.prefill_kv_sum)
+        } else {
+            (VllmPrefillCounter::Prompt, self.prompt_tokens)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct VllmMetricsHistory {
+    sample: VllmCounterSample,
+    avg_request_prefill_kv_computed_tokens: Option<f64>,
+    cache_hit_rate: Option<f64>,
+    prefill_histogram_deltas: VecDeque<Vec<(f64, f64)>>,
+    saturated_prefill_rates: VecDeque<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct VllmDerivedMetrics {
+    prefill_throughput: Option<f64>,
+    gen_throughput: f64,
+    avg_request_prefill_kv_computed_tokens: Option<f64>,
+    median_request_prefill_kv_computed_tokens: Option<f64>,
+    prefill_size_sample_count: Option<u64>,
+    learned_prefill_capacity: Option<f64>,
+    prefill_capacity_sample_count: Option<u32>,
+    prefill_capacity_learning_active: Option<bool>,
+    cache_hit_rate: f64,
+}
+
+const VLLM_PREFILL_HISTOGRAM_WINDOW_INTERVALS: usize = 64;
+const VLLM_CAPACITY_WINDOW_INTERVALS: usize = 32;
+const VLLM_CAPACITY_MIN_SAMPLES: usize = 8;
+
+fn counter_rate(current: Option<f64>, previous: Option<f64>, elapsed: f64) -> Option<f64> {
+    let (current, previous) = (current?, previous?);
+    (elapsed > 0.0 && current >= previous).then_some((current - previous) / elapsed)
+}
+
+fn counter_delta_mean(
+    current_numerator: Option<f64>,
+    previous_numerator: Option<f64>,
+    current_denominator: Option<f64>,
+    previous_denominator: Option<f64>,
+) -> Option<f64> {
+    let numerator = current_numerator? - previous_numerator?;
+    let denominator = current_denominator? - previous_denominator?;
+    (numerator >= 0.0 && denominator > 0.0).then_some(numerator / denominator)
+}
+
+fn counter_delta_ratio(
+    current_numerator: Option<f64>,
+    previous_numerator: Option<f64>,
+    current_denominator: Option<f64>,
+    previous_denominator: Option<f64>,
+) -> Option<f64> {
+    counter_delta_mean(
+        current_numerator,
+        previous_numerator,
+        current_denominator,
+        previous_denominator,
+    )
+    .map(|ratio| ratio.clamp(0.0, 1.0))
+}
+
+fn counter_reset(current: Option<f64>, previous: Option<f64>) -> bool {
+    matches!((current, previous), (Some(current), Some(previous)) if current < previous)
+}
+
+enum HistogramDelta {
+    Valid(Vec<(f64, f64)>),
+    Reset,
+    Unavailable,
+}
+
+fn histogram_delta(
+    current: Option<&[(f64, f64)]>,
+    previous: Option<&[(f64, f64)]>,
+) -> HistogramDelta {
+    let (Some(current), Some(previous)) = (current, previous) else {
+        return HistogramDelta::Unavailable;
+    };
+    if current.len() != previous.len() || current.is_empty() {
+        return HistogramDelta::Unavailable;
+    }
+    let mut delta = Vec::with_capacity(current.len());
+    let mut last = 0.0;
+    for ((bound, value), (previous_bound, previous_value)) in current.iter().zip(previous.iter()) {
+        if bound != previous_bound
+            || !value.is_finite()
+            || !previous_value.is_finite()
+            || *value < 0.0
+            || *previous_value < 0.0
+        {
+            return HistogramDelta::Unavailable;
+        }
+        if value < previous_value {
+            return HistogramDelta::Reset;
+        }
+        let count = value - previous_value;
+        if count < last {
+            return HistogramDelta::Unavailable;
+        }
+        last = count;
+        delta.push((*bound, count));
+    }
+    HistogramDelta::Valid(delta)
+}
+
+fn rolling_histogram_quantile(
+    windows: &VecDeque<Vec<(f64, f64)>>,
+    quantile: f64,
+) -> Option<(f64, u64)> {
+    let first = windows.front()?;
+    if first.is_empty() {
+        return None;
+    }
+    let mut cumulative = vec![0.0; first.len()];
+    for window in windows {
+        if window.len() != first.len()
+            || window
+                .iter()
+                .zip(first)
+                .any(|((bound, _), (first_bound, _))| bound != first_bound)
+        {
+            return None;
+        }
+        for (total, (_, count)) in cumulative.iter_mut().zip(window) {
+            *total += count;
+        }
+    }
+    let sample_count = cumulative.last().copied()?;
+    if !sample_count.is_finite() || sample_count <= 0.0 {
+        return None;
+    }
+    let target = sample_count * quantile.clamp(0.0, 1.0);
+    let value = first
+        .iter()
+        .zip(cumulative)
+        .find_map(|((bound, _), count)| (count >= target && bound.is_finite()).then_some(*bound))?;
+    Some((value, sample_count.round().max(0.0) as u64))
+}
+
+fn conservative_capacity(samples: &VecDeque<f64>) -> Option<f64> {
+    if samples.len() < VLLM_CAPACITY_MIN_SAMPLES {
+        return None;
+    }
+    let mut sorted: Vec<_> = samples.iter().copied().collect();
+    sorted.sort_by(f64::total_cmp);
+    let index = (sorted.len() - 1) / 4;
+    sorted.get(index).copied()
+}
+
+fn vllm_counter_sample(metrics: &PromScrape, observed: Instant) -> VllmCounterSample {
+    VllmCounterSample {
+        observed: Some(observed),
+        local_compute_tokens: metrics.local_compute_tokens,
+        prompt_tokens: metrics.first_sum(&["vllm:prompt_tokens_total", "vllm:prompt_tokens"]),
+        generation_tokens: metrics
+            .first_sum(&["vllm:generation_tokens_total", "vllm:generation_tokens"]),
+        prefill_kv_sum: metrics.first_sum(&["vllm:request_prefill_kv_computed_tokens_sum"]),
+        prefill_kv_count: metrics.first_sum(&["vllm:request_prefill_kv_computed_tokens_count"]),
+        prefix_cache_hits: metrics.first_sum(&[
+            "vllm:prefix_cache_hits_total",
+            "vllm:prefix_cache_hits",
+            "vllm:gpu_prefix_cache_hits_total",
+        ]),
+        prefix_cache_queries: metrics.first_sum(&[
+            "vllm:prefix_cache_queries_total",
+            "vllm:prefix_cache_queries",
+            "vllm:gpu_prefix_cache_queries_total",
+        ]),
+        prefill_kv_buckets: metrics.histogram("vllm:request_prefill_kv_computed_tokens_bucket"),
+    }
+}
+
+fn derive_vllm_metrics(
+    metrics: &PromScrape,
+    current: VllmCounterSample,
+    previous: Option<VllmMetricsHistory>,
+) -> (VllmDerivedMetrics, VllmMetricsHistory) {
+    let elapsed = previous
+        .as_ref()
+        .and_then(|history| history.sample.observed)
+        .and_then(|observed| current.observed.map(|now| now.duration_since(observed)))
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0);
+
+    let (prefill_source, prefill_counter) = current.prefill_counter();
+    let capacity_counter_changed = previous.as_ref().is_some_and(|history| {
+        let (previous_source, previous_counter) = history.sample.prefill_counter();
+        prefill_source != previous_source || counter_reset(prefill_counter, previous_counter)
+    }) || prefill_counter
+        .is_some_and(|value| !value.is_finite() || value < 0.0);
+    let prefill_counter_reset = previous.as_ref().is_some_and(|history| {
+        counter_reset(current.prefill_kv_sum, history.sample.prefill_kv_sum)
+            || counter_reset(current.prefill_kv_count, history.sample.prefill_kv_count)
+            || counter_reset(current.prompt_tokens, history.sample.prompt_tokens)
+    });
+    let prefill_throughput = previous.as_ref().and_then(|history| {
+        if capacity_counter_changed {
+            return None;
+        }
+        // vLLM's source="local_compute" counter is published with prefill
+        // outputs, before decode completes. The request histogram remains a
+        // prompt-size signal and a compatibility rate for older versions.
+        // Zero local compute must not fall back to cache-inclusive totals.
+        counter_rate(prefill_counter, history.sample.prefill_counter().1, elapsed)
+            .filter(|rate| rate.is_finite() && *rate > 0.0)
+    });
+    let gen_throughput = previous
+        .as_ref()
+        .and_then(|history| {
+            counter_rate(
+                current.generation_tokens,
+                history.sample.generation_tokens,
+                elapsed,
+            )
+        })
+        .filter(|rate| rate.is_finite() && *rate >= 0.0)
+        .unwrap_or(0.0);
+
+    let recent_prefill = previous.as_ref().and_then(|history| {
+        counter_delta_mean(
+            current.prefill_kv_sum,
+            history.sample.prefill_kv_sum,
+            current.prefill_kv_count,
+            history.sample.prefill_kv_count,
+        )
+    });
+    let cumulative_prefill = match (current.prefill_kv_sum, current.prefill_kv_count) {
+        (Some(sum), Some(count)) if count > 0.0 => Some(sum / count),
+        _ => None,
+    };
+    let avg_request_prefill_kv_computed_tokens = recent_prefill
+        .or_else(|| {
+            previous
+                .as_ref()
+                .and_then(|history| history.avg_request_prefill_kv_computed_tokens)
+        })
+        .or(cumulative_prefill)
+        .filter(|value| value.is_finite() && *value > 0.0);
+
+    let direct_cache_hit_rate = [
+        "vllm:gpu_prefix_cache_hit_rate",
+        "vllm:prefix_cache_hit_rate",
+    ]
+    .into_iter()
+    .find(|name| metrics.has(name))
+    .map(|name| metrics.mean(name))
+    .filter(|rate| rate.is_finite())
+    .map(|rate| rate.clamp(0.0, 1.0));
+    let recent_cache_hit_rate = previous.as_ref().and_then(|history| {
+        counter_delta_ratio(
+            current.prefix_cache_hits,
+            history.sample.prefix_cache_hits,
+            current.prefix_cache_queries,
+            history.sample.prefix_cache_queries,
+        )
+    });
+    let cumulative_cache_hit_rate = match (current.prefix_cache_hits, current.prefix_cache_queries)
+    {
+        (Some(hits), Some(queries)) if queries > 0.0 => Some((hits / queries).clamp(0.0, 1.0)),
+        _ => None,
+    };
+    let cache_hit_rate = direct_cache_hit_rate
+        .or(recent_cache_hit_rate)
+        .or_else(|| previous.as_ref().and_then(|history| history.cache_hit_rate))
+        .or(cumulative_cache_hit_rate);
+
+    let mut prefill_histogram_deltas = previous
+        .as_ref()
+        .map(|history| history.prefill_histogram_deltas.clone())
+        .unwrap_or_default();
+    let histogram = previous.as_ref().map(|history| {
+        histogram_delta(
+            current.prefill_kv_buckets.as_deref(),
+            history.sample.prefill_kv_buckets.as_deref(),
+        )
+    });
+    match histogram {
+        Some(HistogramDelta::Valid(delta)) => {
+            if delta.last().is_some_and(|(_, count)| *count > 0.0) {
+                prefill_histogram_deltas.push_back(delta);
+                while prefill_histogram_deltas.len() > VLLM_PREFILL_HISTOGRAM_WINDOW_INTERVALS {
+                    prefill_histogram_deltas.pop_front();
+                }
+            }
+        }
+        Some(HistogramDelta::Reset) => prefill_histogram_deltas.clear(),
+        Some(HistogramDelta::Unavailable) | None => {}
+    }
+    if prefill_counter_reset {
+        prefill_histogram_deltas.clear();
+    }
+    let (median_request_prefill_kv_computed_tokens, prefill_size_sample_count) =
+        rolling_histogram_quantile(&prefill_histogram_deltas, 0.5)
+            .map(|(median, count)| (Some(median), Some(count)))
+            .unwrap_or((None, None));
+
+    let mut saturated_prefill_rates = previous
+        .as_ref()
+        .map(|history| history.saturated_prefill_rates.clone())
+        .unwrap_or_default();
+    if prefill_counter_reset || capacity_counter_changed {
+        saturated_prefill_rates.clear();
+    }
+    let waiting = metrics.sum("vllm:num_requests_waiting");
+    let prefill_capacity_learning_active = waiting > 0.0 && prefill_throughput.is_some();
+    if waiting > 0.0 {
+        if let Some(rate) = prefill_throughput {
+            saturated_prefill_rates.push_back(rate);
+            while saturated_prefill_rates.len() > VLLM_CAPACITY_WINDOW_INTERVALS {
+                saturated_prefill_rates.pop_front();
+            }
+        }
+    }
+    let learned_prefill_capacity = conservative_capacity(&saturated_prefill_rates);
+    let prefill_capacity_sample_count = u32::try_from(saturated_prefill_rates.len()).ok();
+
+    let derived = VllmDerivedMetrics {
+        prefill_throughput,
+        gen_throughput,
+        avg_request_prefill_kv_computed_tokens,
+        median_request_prefill_kv_computed_tokens,
+        prefill_size_sample_count,
+        learned_prefill_capacity,
+        prefill_capacity_sample_count,
+        prefill_capacity_learning_active: Some(prefill_capacity_learning_active),
+        cache_hit_rate: cache_hit_rate.unwrap_or(0.0),
+    };
+    let history = VllmMetricsHistory {
+        sample: current,
+        avg_request_prefill_kv_computed_tokens,
+        cache_hit_rate,
+        prefill_histogram_deltas,
+        saturated_prefill_rates,
+    };
+    (derived, history)
 }
 
 /// DP rank load cache used by load-aware routing policies.
@@ -334,6 +783,10 @@ pub struct WorkerMonitor {
     /// in-place image upgrade that adds or removes an endpoint is
     /// re-discovered.
     native_loads_memo: Arc<DashMap<String, NativeLoadsMemo>>,
+    /// Previous vLLM counter samples by worker URL. `/metrics` exposes token
+    /// counters rather than live throughput gauges, so two polls are required
+    /// to derive rates without involving an external Prometheus server.
+    vllm_metrics_history: Arc<DashMap<String, VllmMetricsHistory>>,
     group_handles: Mutex<HashMap<WorkerGroupKey, GroupState>>,
     event_task: Mutex<Option<JoinHandle<()>>>,
     eviction_flush_task: Mutex<Option<JoinHandle<()>>>,
@@ -376,6 +829,7 @@ impl WorkerMonitor {
             conditional_polling,
             load_state,
             native_loads_memo: Arc::new(DashMap::new()),
+            vllm_metrics_history: Arc::new(DashMap::new()),
             group_handles: Mutex::new(HashMap::new()),
             event_task: Mutex::new(None),
             eviction_flush_task: Mutex::new(None),
@@ -481,9 +935,11 @@ impl WorkerMonitor {
         // per live URL: workers removed during the lag window would
         // otherwise leak entries, and the cost is one re-probe per
         // worker on a path that only runs on lag recovery.
+        self.worker_registry.estimated_wait().clear();
         self.load_state.clear();
         self.worker_load_manager.clear();
         self.native_loads_memo.clear();
+        self.vllm_metrics_history.clear();
         // The feed that would clear the vetoes is being torn down: fail open,
         // but say so — a wiped gauge is otherwise indistinguishable from a
         // genuine recovery. With no thresholds anywhere no flag was ever
@@ -603,6 +1059,8 @@ impl WorkerMonitor {
         self.worker_registry.set_worker_overloaded(worker, false);
         self.worker_load_manager.remove_worker(url);
         self.native_loads_memo.remove(url);
+        self.vllm_metrics_history.remove(url);
+        self.worker_registry.estimated_wait().evict(worker);
         self.load_state.enqueue_eviction(Arc::clone(worker));
     }
 
@@ -662,9 +1120,18 @@ impl WorkerMonitor {
     ///
     /// `native_loads_memo` is the shared probe memo, or `None` for callers
     /// with no monitor to borrow it from (they simply always discover).
+    #[cfg(test)]
     pub(crate) async fn fetch_http_load(
         worker: &Arc<dyn Worker>,
         native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
+    ) -> Option<WorkerLoadResponse> {
+        Self::fetch_http_load_with_vllm_history(worker, native_loads_memo, None).await
+    }
+
+    async fn fetch_http_load_with_vllm_history(
+        worker: &Arc<dyn Worker>,
+        native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
+        vllm_metrics_history: Option<&DashMap<String, VllmMetricsHistory>>,
     ) -> Option<WorkerLoadResponse> {
         // Only workers already `Ready` are polled, so a definitive "no such
         // endpoint" cannot be a warm-up artifact and is safe to memoize.
@@ -697,7 +1164,7 @@ impl WorkerMonitor {
         }
 
         match worker.metadata().spec.runtime_type {
-            RuntimeType::Vllm => Self::fetch_http_load_vllm(worker).await,
+            RuntimeType::Vllm => Self::fetch_http_load_vllm(worker, vllm_metrics_history).await,
             RuntimeType::Sglang => Self::fetch_http_load_sglang(worker).await,
             // Custom engines expose no gauge schema we can parse; the native
             // routes above were their only path.
@@ -731,21 +1198,49 @@ impl WorkerMonitor {
             return NativeLoads::Inconclusive;
         }
 
-        match resp.json::<WorkerLoadResponse>().await {
-            Ok(response) if !response.loads.is_empty() => NativeLoads::Available(response),
+        match resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(Self::decode_native_loads)
+        {
+            Some(response) if !response.loads.is_empty() => NativeLoads::Available(response),
             // Our schema, no ranks reported yet — keep probing.
-            Ok(_) => NativeLoads::Inconclusive,
+            Some(_) => NativeLoads::Inconclusive,
             // A 200 that is not a load response means something else is
             // mounted here; that is as definitive as a 404.
-            Err(_) => NativeLoads::Absent,
+            None => NativeLoads::Absent,
         }
+    }
+
+    /// Preserve missing queue-token signals before the wire schema fills defaults.
+    pub(crate) fn decode_native_loads(mut value: serde_json::Value) -> Option<WorkerLoadResponse> {
+        if let Some(loads) = value
+            .get_mut("loads")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for load in loads {
+                if let Some(rank) = load.as_object_mut() {
+                    if !rank.contains_key("num_waiting_uncached_tokens") {
+                        rank.insert(
+                            "num_waiting_uncached_tokens_available".to_owned(),
+                            false.into(),
+                        );
+                    }
+                }
+            }
+        }
+        serde_json::from_value(value).ok()
     }
 
     /// vLLM HTTP: derive load from the Prometheus `/metrics` endpoint.
     /// The KV-cache usage ratio (0.0–1.0) maps onto `token_usage`; it is
     /// exposed as `vllm:gpu_cache_usage_perc` in vLLM v0 and renamed to
     /// `vllm:kv_cache_usage_perc` in vLLM v1, so accept either.
-    async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
+    async fn fetch_http_load_vllm(
+        worker: &Arc<dyn Worker>,
+        history: Option<&DashMap<String, VllmMetricsHistory>>,
+    ) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
@@ -757,11 +1252,32 @@ impl WorkerMonitor {
             .into_iter()
             .find(|name| m.has(name))?;
 
+        let waiting = m.sum("vllm:num_requests_waiting");
+        if !m.has("vllm:num_requests_waiting") || !waiting.is_finite() || waiting < 0.0 {
+            return None;
+        }
+        let current = vllm_counter_sample(&m, Instant::now());
+        let previous =
+            history.and_then(|store| store.get(worker.url()).map(|sample| sample.value().clone()));
+        let (derived, next) = derive_vllm_metrics(&m, current, previous);
+        if let Some(store) = history {
+            store.insert(worker.url().to_string(), next);
+        }
         Some(Self::single_rank(SchedulerLoadSnapshot {
             num_running_reqs: m.sum("vllm:num_requests_running") as i32,
             num_waiting_reqs: m.sum("vllm:num_requests_waiting") as i32,
-            token_usage: m.mean(kv_usage),
-            cache_hit_rate: m.mean("vllm:gpu_prefix_cache_hit_rate"),
+            num_waiting_uncached_tokens_available: Some(false),
+            token_usage: m.max(kv_usage),
+            prefill_throughput: derived.prefill_throughput,
+            gen_throughput: derived.gen_throughput,
+            avg_request_prefill_kv_computed_tokens: derived.avg_request_prefill_kv_computed_tokens,
+            median_request_prefill_kv_computed_tokens: derived
+                .median_request_prefill_kv_computed_tokens,
+            prefill_size_sample_count: derived.prefill_size_sample_count,
+            learned_prefill_capacity: derived.learned_prefill_capacity,
+            prefill_capacity_sample_count: derived.prefill_capacity_sample_count,
+            prefill_capacity_learning_active: derived.prefill_capacity_learning_active,
+            cache_hit_rate: derived.cache_hit_rate,
             ..Default::default()
         }))
     }
@@ -774,6 +1290,10 @@ impl WorkerMonitor {
     async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
+        Self::decode_sglang_metrics(&body).map(Self::single_rank)
+    }
+
+    fn decode_sglang_metrics(body: &str) -> Option<SchedulerLoadSnapshot> {
         let m = PromScrape::parse(&body);
 
         // Require the KV-usage gauge — the load signal routing acts on.
@@ -783,15 +1303,24 @@ impl WorkerMonitor {
             .into_iter()
             .find(|p| m.has(&format!("{p}token_usage")))?;
 
-        Some(Self::single_rank(SchedulerLoadSnapshot {
+        let waiting_name = format!("{prefix}num_queue_reqs");
+        let waiting = m.sum(&waiting_name);
+        if !m.has(&waiting_name) || !waiting.is_finite() || waiting < 0.0 {
+            return None;
+        }
+        Some(SchedulerLoadSnapshot {
             num_running_reqs: m.sum(&format!("{prefix}num_running_reqs")) as i32,
             num_waiting_reqs: m.sum(&format!("{prefix}num_queue_reqs")) as i32,
+            num_waiting_uncached_tokens_available: Some(false),
             token_usage: m.mean(&format!("{prefix}token_usage")),
-            gen_throughput: m.mean(&format!("{prefix}gen_throughput")),
+            // SGLang's generation gauge reports current demand, not engine
+            // capacity. A small positive idle sample must not replace the
+            // configured estimated-wait capacity fallback.
+            gen_throughput: -1.0,
             cache_hit_rate: m.mean(&format!("{prefix}cache_hit_rate")),
             utilization: m.mean(&format!("{prefix}utilization")),
             ..Default::default()
-        }))
+        })
     }
 
     /// Shared authenticated GET builder with the standard timeout.
@@ -1059,7 +1588,13 @@ async fn group_monitor_loop(
             let routing_needs_load = !load_aware_policies.is_empty()
                 || monitor.policy_registry.get_dp_rank_policy().is_some();
             let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
-            if !routing_needs_load && !monitor.engine_metrics && !overload_needs_load {
+            if !routing_needs_load
+                && !monitor.engine_metrics
+                && !overload_needs_load
+                && !workers
+                    .iter()
+                    .any(|w| monitor.worker_registry.estimated_wait().needs_load(w))
+            {
                 debug!("Load monitoring disabled and nothing needs the data, skipping load fetch for group {group_key}");
                 drop(monitor);
                 continue;
@@ -1070,18 +1605,27 @@ async fn group_monitor_loop(
             .iter()
             .map(|worker| {
                 let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
+                let vllm_metrics_history = Arc::clone(&monitor.vllm_metrics_history);
                 let worker = Arc::clone(worker);
                 let connection_mode = group_key.connection_mode;
+                let registry = Arc::clone(&monitor.worker_registry);
                 async move {
+                    let started = Instant::now();
+                    let watermark = registry.estimated_wait().poll_started(&worker);
                     let response = match connection_mode {
                         ConnectionMode::Http => {
-                            WorkerMonitor::fetch_http_load(&worker, Some(&native_loads_memo)).await
+                            WorkerMonitor::fetch_http_load_with_vllm_history(
+                                &worker,
+                                Some(&native_loads_memo),
+                                Some(&vllm_metrics_history),
+                            )
+                            .await
                         }
                         ConnectionMode::Grpc | ConnectionMode::Zmq => {
                             WorkerMonitor::fetch_backend_load(&worker).await
                         }
                     };
-                    (worker, response)
+                    (worker, response, watermark, started)
                 }
             })
             .collect();
@@ -1091,7 +1635,7 @@ async fn group_monitor_loop(
         let mut group_loads: HashMap<String, WorkerLoadResponse> = HashMap::new();
         let mut group_dp_loads: HashMap<String, HashMap<isize, isize>> = HashMap::new();
         let mut dp_evict: Vec<String> = Vec::new();
-        for (worker, response) in results {
+        for (worker, response, watermark, started) in results {
             let url = worker.url().to_string();
             // The overload predicate runs exactly here, once per report, never
             // on a request path, against the worker's effective thresholds
@@ -1105,6 +1649,17 @@ async fn group_monitor_loop(
                 monitor
                     .worker_registry
                     .set_worker_overloaded(&worker, verdict);
+            }
+            // Both guards consume this same report and the same lifecycle fence.
+            // Admission aggregates ranks here and latches a compact verdict;
+            // request handling only updates credit and checks freshness.
+            if monitor.worker_registry.is_current_ready(&worker) {
+                monitor.worker_registry.estimated_wait().publish(
+                    &worker,
+                    response.as_ref(),
+                    watermark,
+                    started,
+                );
             }
             if let Some(load) = response {
                 // Only feed the DP-rank cache from responses that carry real
@@ -1188,6 +1743,21 @@ async fn group_monitor_loop(
         // Drop the temporary strong reference so we do not keep the
         // monitor alive across the next `interval_timer.tick().await`.
         drop(monitor);
+    }
+}
+
+#[cfg(test)]
+mod estimated_wait_metrics_tests {
+    use super::PromScrape;
+
+    #[test]
+    fn maximum_kv_sample_preserves_saturation_and_invalid_data() {
+        let scrape = PromScrape::parse(
+            "vllm:kv_cache_usage_perc{rank=\"0\"} 0.99\nvllm:kv_cache_usage_perc{rank=\"1\"} 0.1",
+        );
+        assert_eq!(scrape.max("vllm:kv_cache_usage_perc"), 0.99);
+        let scrape = PromScrape::parse("kv 0.5\nkv NaN");
+        assert!(scrape.max("kv").is_nan());
     }
 }
 
@@ -1431,6 +2001,18 @@ mod worker_monitor_tests {
     }
 
     #[tokio::test]
+    async fn stop_all_groups_clears_vllm_learning_history() {
+        let (_registry, monitor) = build_monitor();
+        monitor
+            .vllm_metrics_history
+            .insert("http://w1:8080".to_string(), VllmMetricsHistory::default());
+
+        monitor.stop_all_groups();
+
+        assert!(monitor.vllm_metrics_history.is_empty());
+    }
+
+    #[tokio::test]
     async fn stop_all_groups_clears_dp_cache() {
         // Regression test for the bug where a `RecvError::Lagged`
         // rebuild would leave stale DP cache entries because
@@ -1549,6 +2131,7 @@ vllm:generation_tokens_total{model_name="llama"} 123456.0
 sglang:num_running_reqs{model="llama"} 2.0
 sglang:num_queue_reqs{model="llama"} 4.0
 sglang:token_usage{model="llama"} 0.42
+sglang:gen_throughput{model="llama"} 0.088
 sglang:utilization{model="llama"} 0.9
 "#;
 
@@ -1562,6 +2145,17 @@ sglang:utilization{model="llama"} 0.9
         assert!(!m.has("vllm:does_not_exist"));
         assert_eq!(m.sum("vllm:does_not_exist"), 0.0);
         assert_eq!(m.mean("vllm:does_not_exist"), 0.0);
+    }
+
+    #[test]
+    fn histogram_parser_requires_the_exact_le_label() {
+        let scrape = PromScrape::parse(
+            "vllm:request_prefill_kv_computed_tokens_bucket{fake_le=\"1\",le=\"32\"} 4\n",
+        );
+        assert_eq!(
+            scrape.histogram("vllm:request_prefill_kv_computed_tokens_bucket"),
+            Some(vec![(32.0, 4.0)])
+        );
     }
 
     #[test]
@@ -1590,11 +2184,362 @@ sglang:utilization{model="llama"} 0.9
     }
 
     #[test]
+    fn vllm_counter_deltas_derive_work_rates_and_recent_means() {
+        let first = PromScrape::parse(
+            "vllm:prompt_tokens_total 1000\n\
+             vllm:generation_tokens_total 500\n\
+             vllm:request_prefill_kv_computed_tokens_sum 10240\n\
+             vllm:request_prefill_kv_computed_tokens_count 10\n\
+             vllm:prefix_cache_hits_total 100\n\
+             vllm:prefix_cache_queries_total 200\n",
+        );
+        let second = PromScrape::parse(
+            "vllm:prompt_tokens_total 5000\n\
+             vllm:generation_tokens_total 1500\n\
+             vllm:request_prefill_kv_computed_tokens_sum 30720\n\
+             vllm:request_prefill_kv_computed_tokens_count 20\n\
+             vllm:prefix_cache_hits_total 180\n\
+             vllm:prefix_cache_queries_total 300\n",
+        );
+        let observed = Instant::now();
+        let (cold, history) =
+            derive_vllm_metrics(&first, vllm_counter_sample(&first, observed), None);
+        assert_eq!(cold.prefill_throughput, None);
+        assert_eq!(cold.gen_throughput, 0.0);
+        assert_eq!(cold.avg_request_prefill_kv_computed_tokens, Some(1024.0));
+        assert_eq!(cold.cache_hit_rate, 0.5);
+
+        let (derived, _) = derive_vllm_metrics(
+            &second,
+            vllm_counter_sample(&second, observed + Duration::from_secs(10)),
+            Some(history),
+        );
+        assert_eq!(derived.prefill_throughput, Some(2048.0));
+        assert_eq!(derived.gen_throughput, 100.0);
+        assert_eq!(derived.avg_request_prefill_kv_computed_tokens, Some(2048.0));
+        assert!((derived.cache_hit_rate - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn zero_uncached_delta_does_not_fall_back_to_prompt_rate_or_train_capacity() {
+        let first = PromScrape::parse(
+            "vllm:num_requests_waiting 1\n\
+             vllm:prompt_tokens_total 100\n\
+             vllm:request_prefill_kv_computed_tokens_sum 50\n",
+        );
+        let second = PromScrape::parse(
+            "vllm:num_requests_waiting 1\n\
+             vllm:prompt_tokens_total 1100\n\
+             vllm:request_prefill_kv_computed_tokens_sum 50\n",
+        );
+        let observed = Instant::now();
+        let (_, history) = derive_vllm_metrics(&first, vllm_counter_sample(&first, observed), None);
+        let (derived, _) = derive_vllm_metrics(
+            &second,
+            vllm_counter_sample(&second, observed + Duration::from_secs(1)),
+            Some(history),
+        );
+
+        assert_eq!(derived.prefill_throughput, None);
+        assert_eq!(derived.prefill_capacity_learning_active, Some(false));
+        assert_eq!(derived.prefill_capacity_sample_count, Some(0));
+        assert_eq!(derived.learned_prefill_capacity, None);
+    }
+
+    #[test]
+    fn local_compute_parser_selects_exact_source_and_sums_engines() {
+        let scrape = PromScrape::parse(
+            "vllm:prompt_tokens_by_source_total{engine=\"0\",source=\"local_compute\"} 100\n\
+             vllm:prompt_tokens_by_source_total{source=\"local_compute\",engine=\"1\"} 200 1234\n\
+             vllm:prompt_tokens_by_source_total{source=\"local_cache_hit\"} 10000\n\
+             vllm:prompt_tokens_by_source_total{source=\"external_kv_transfer\"} 10000\n\
+             vllm:prompt_tokens_by_source_total{fake_source=\"local_compute\"} 10000\n\
+             vllm:prompt_tokens_by_source_total{source=\"local_compute_extra\"} 10000\n",
+        );
+        assert_eq!(scrape.local_compute_tokens, Some(300.0));
+        for invalid in ["NaN", "-1", "Inf", "invalid"] {
+            let scrape = PromScrape::parse(&format!(
+                "vllm:prompt_tokens_by_source_total{{source=\"local_compute\"}} {invalid}\n"
+            ));
+            assert!(scrape.local_compute_tokens.unwrap().is_nan());
+        }
+    }
+
+    fn vllm_compute_scrape(computed: f64, completed: f64) -> PromScrape {
+        PromScrape::parse(&format!(
+            "vllm:num_requests_waiting 1\n\
+             vllm:prompt_tokens_by_source_total{{source=\"local_compute\"}} {computed}\n\
+             vllm:prompt_tokens_by_source_total{{source=\"local_cache_hit\"}} 100000\n\
+             vllm:request_prefill_kv_computed_tokens_sum {completed}\n\
+             vllm:prompt_tokens_total 100000\n"
+        ))
+    }
+
+    #[test]
+    fn local_compute_trains_capacity_before_requests_finish() {
+        let observed = Instant::now();
+        let first = vllm_compute_scrape(0.0, 0.0);
+        let (_, mut history) =
+            derive_vllm_metrics(&first, vllm_counter_sample(&first, observed), None);
+        for second in 1..=8 {
+            let scrape = vllm_compute_scrape(second as f64 * 1000.0, 0.0);
+            let (derived, next) = derive_vllm_metrics(
+                &scrape,
+                vllm_counter_sample(&scrape, observed + Duration::from_secs(second)),
+                Some(history),
+            );
+            assert_eq!(derived.prefill_throughput, Some(1000.0));
+            assert_eq!(derived.prefill_capacity_sample_count, Some(second as u32));
+            assert_eq!(
+                derived.learned_prefill_capacity,
+                (second == 8).then_some(1000.0)
+            );
+            history = next;
+        }
+        // Decode finishes later in a burst. This is not new prefill work.
+        let completed = vllm_compute_scrape(8000.0, 8000.0);
+        let (derived, _) = derive_vllm_metrics(
+            &completed,
+            vllm_counter_sample(&completed, observed + Duration::from_secs(9)),
+            Some(history),
+        );
+        assert_eq!(derived.prefill_throughput, None);
+        assert_eq!(derived.prefill_capacity_sample_count, Some(8));
+        assert_eq!(derived.learned_prefill_capacity, Some(1000.0));
+    }
+
+    #[test]
+    fn zero_local_compute_does_not_use_completion_or_cached_prompt_tokens() {
+        let observed = Instant::now();
+        let first = vllm_compute_scrape(1000.0, 0.0);
+        let (_, history) = derive_vllm_metrics(&first, vllm_counter_sample(&first, observed), None);
+        let second = vllm_compute_scrape(1000.0, 100000.0);
+        let (derived, _) = derive_vllm_metrics(
+            &second,
+            vllm_counter_sample(&second, observed + Duration::from_secs(1)),
+            Some(history),
+        );
+        assert_eq!(derived.prefill_throughput, None);
+        assert_eq!(derived.prefill_capacity_sample_count, Some(0));
+        assert_eq!(derived.learned_prefill_capacity, None);
+    }
+
+    #[test]
+    fn local_compute_reset_invalid_data_and_source_changes_clear_capacity() {
+        let observed = Instant::now();
+        let baseline = vllm_compute_scrape(10000.0, 10000.0);
+        let (_, mut history) =
+            derive_vllm_metrics(&baseline, vllm_counter_sample(&baseline, observed), None);
+        history.saturated_prefill_rates = VecDeque::from(vec![1000.0; 8]);
+        for scrape in [
+            vllm_compute_scrape(1.0, 10000.0),
+            vllm_compute_scrape(f64::NAN, 10000.0),
+            PromScrape::parse(
+                "vllm:num_requests_waiting 1\n\
+                 vllm:request_prefill_kv_computed_tokens_sum 20000\n",
+            ),
+        ] {
+            let (derived, _) = derive_vllm_metrics(
+                &scrape,
+                vllm_counter_sample(&scrape, observed + Duration::from_secs(1)),
+                Some(history.clone()),
+            );
+            assert_eq!(derived.prefill_throughput, None);
+            assert_eq!(derived.prefill_capacity_sample_count, Some(0));
+            assert_eq!(derived.learned_prefill_capacity, None);
+        }
+        let legacy = PromScrape::parse(
+            "vllm:num_requests_waiting 1\n\
+             vllm:request_prefill_kv_computed_tokens_sum 10000\n",
+        );
+        let (_, mut legacy_history) =
+            derive_vllm_metrics(&legacy, vllm_counter_sample(&legacy, observed), None);
+        legacy_history.saturated_prefill_rates = VecDeque::from(vec![1000.0; 8]);
+        let (derived, _) = derive_vllm_metrics(
+            &baseline,
+            vllm_counter_sample(&baseline, observed + Duration::from_secs(1)),
+            Some(legacy_history),
+        );
+        assert_eq!(derived.prefill_throughput, None);
+        assert_eq!(derived.learned_prefill_capacity, None);
+    }
+
+    #[test]
+    fn vllm_counter_reset_does_not_publish_negative_rates() {
+        let before =
+            PromScrape::parse("vllm:prompt_tokens_total 1000\nvllm:generation_tokens_total 500\n");
+        let after =
+            PromScrape::parse("vllm:prompt_tokens_total 10\nvllm:generation_tokens_total 5\n");
+        let observed = Instant::now();
+        let (_, history) =
+            derive_vllm_metrics(&before, vllm_counter_sample(&before, observed), None);
+        let (derived, _) = derive_vllm_metrics(
+            &after,
+            vllm_counter_sample(&after, observed + Duration::from_secs(10)),
+            Some(history),
+        );
+        assert_eq!(derived.prefill_throughput, None);
+        assert_eq!(derived.gen_throughput, 0.0);
+    }
+
+    fn vllm_histogram_scrape(sum: f64, count: u64, waiting: u64, buckets: &[u64]) -> PromScrape {
+        PromScrape::parse(&format!(
+            "vllm:num_requests_waiting {waiting}\n\
+             vllm:request_prefill_kv_computed_tokens_sum {sum}\n\
+             vllm:request_prefill_kv_computed_tokens_count {count}\n\
+             vllm:request_prefill_kv_computed_tokens_bucket{{le=\"32\"}} {}\n\
+             vllm:request_prefill_kv_computed_tokens_bucket{{le=\"1024\"}} {}\n\
+             vllm:request_prefill_kv_computed_tokens_bucket{{le=\"+Inf\"}} {}\n",
+            buckets[0], buckets[1], buckets[2]
+        ))
+    }
+
+    #[test]
+    fn vllm_histogram_delta_derives_rolling_median() {
+        let observed = Instant::now();
+        let first = vllm_histogram_scrape(0.0, 0, 0, &[0, 0, 0]);
+        let (_, history) = derive_vllm_metrics(&first, vllm_counter_sample(&first, observed), None);
+        let tiny = vllm_histogram_scrape(20.0, 1, 0, &[1, 1, 1]);
+        let (tiny_metrics, history) = derive_vllm_metrics(
+            &tiny,
+            vllm_counter_sample(&tiny, observed + Duration::from_secs(1)),
+            Some(history),
+        );
+        assert_eq!(
+            tiny_metrics.median_request_prefill_kv_computed_tokens,
+            Some(32.0)
+        );
+        assert_eq!(tiny_metrics.prefill_size_sample_count, Some(1));
+
+        let representative = vllm_histogram_scrape(10_260.0, 11, 0, &[1, 11, 11]);
+        let (representative_metrics, _) = derive_vllm_metrics(
+            &representative,
+            vllm_counter_sample(&representative, observed + Duration::from_secs(2)),
+            Some(history),
+        );
+        assert_eq!(
+            representative_metrics.median_request_prefill_kv_computed_tokens,
+            Some(1024.0)
+        );
+        assert_eq!(representative_metrics.prefill_size_sample_count, Some(11));
+    }
+
+    #[test]
+    fn vllm_cold_histogram_establishes_baseline_without_lifetime_samples() {
+        let scrape = vllm_histogram_scrape(20.0, 1, 0, &[1, 1, 1]);
+        let (metrics, _) =
+            derive_vllm_metrics(&scrape, vllm_counter_sample(&scrape, Instant::now()), None);
+        assert_eq!(metrics.median_request_prefill_kv_computed_tokens, None);
+        assert_eq!(metrics.prefill_size_sample_count, None);
+    }
+
+    #[test]
+    fn malformed_missing_and_reset_histograms_are_safe() {
+        assert!(matches!(
+            histogram_delta(
+                Some(&[(32.0, 2.0), (1024.0, 1.0)]),
+                Some(&[(32.0, 0.0), (1024.0, 0.0)])
+            ),
+            HistogramDelta::Unavailable
+        ));
+        let observed = Instant::now();
+        let first = vllm_histogram_scrape(0.0, 0, 0, &[0, 0, 0]);
+        let (_, history) = derive_vllm_metrics(&first, vllm_counter_sample(&first, observed), None);
+        let populated = vllm_histogram_scrape(100.0, 1, 0, &[0, 1, 1]);
+        let (_, history) = derive_vllm_metrics(
+            &populated,
+            vllm_counter_sample(&populated, observed + Duration::from_secs(1)),
+            Some(history),
+        );
+
+        let missing = PromScrape::parse(
+            "vllm:num_requests_waiting 0\n\
+             vllm:request_prefill_kv_computed_tokens_sum 100\n\
+             vllm:request_prefill_kv_computed_tokens_count 1\n",
+        );
+        let (missing_metrics, history) = derive_vllm_metrics(
+            &missing,
+            vllm_counter_sample(&missing, observed + Duration::from_secs(2)),
+            Some(history),
+        );
+        assert_eq!(
+            missing_metrics.median_request_prefill_kv_computed_tokens,
+            Some(1024.0)
+        );
+
+        let reset = vllm_histogram_scrape(0.0, 0, 0, &[0, 0, 0]);
+        let (reset_metrics, _) = derive_vllm_metrics(
+            &reset,
+            vllm_counter_sample(&reset, observed + Duration::from_secs(3)),
+            Some(history),
+        );
+        assert_eq!(
+            reset_metrics.median_request_prefill_kv_computed_tokens,
+            None
+        );
+        assert_eq!(reset_metrics.prefill_size_sample_count, None);
+    }
+
+    #[test]
+    fn vllm_capacity_learns_only_from_saturated_intervals_and_uses_p25() {
+        let observed = Instant::now();
+        let first = vllm_histogram_scrape(0.0, 0, 0, &[0, 0, 0]);
+        let (_, mut history) =
+            derive_vllm_metrics(&first, vllm_counter_sample(&first, observed), None);
+        let mut sum = 0.0;
+
+        for second in 1..=4 {
+            sum += 50.0;
+            let idle = vllm_histogram_scrape(sum, second, 0, &[0, second, second]);
+            let (metrics, next) = derive_vllm_metrics(
+                &idle,
+                vllm_counter_sample(&idle, observed + Duration::from_secs(second)),
+                Some(history),
+            );
+            assert_eq!(metrics.prefill_capacity_sample_count, Some(0));
+            assert_eq!(metrics.learned_prefill_capacity, None);
+            history = next;
+        }
+
+        for (index, rate) in [800.0, 200.0, 700.0, 100.0, 600.0, 300.0, 500.0, 400.0]
+            .into_iter()
+            .enumerate()
+        {
+            sum += rate;
+            let second = index as u64 + 5;
+            let saturated = vllm_histogram_scrape(sum, second, 1, &[0, second, second]);
+            let (metrics, next) = derive_vllm_metrics(
+                &saturated,
+                vllm_counter_sample(&saturated, observed + Duration::from_secs(second)),
+                Some(history),
+            );
+            if index < VLLM_CAPACITY_MIN_SAMPLES - 1 {
+                assert_eq!(metrics.learned_prefill_capacity, None);
+            } else {
+                assert_eq!(metrics.learned_prefill_capacity, Some(200.0));
+            }
+            history = next;
+        }
+
+        let idle = vllm_histogram_scrape(sum, 12, 0, &[0, 12, 12]);
+        let (metrics, _) = derive_vllm_metrics(
+            &idle,
+            vllm_counter_sample(&idle, observed + Duration::from_secs(13)),
+            Some(history),
+        );
+        assert_eq!(metrics.learned_prefill_capacity, Some(200.0));
+        assert_eq!(metrics.prefill_capacity_sample_count, Some(8));
+        assert_eq!(metrics.prefill_capacity_learning_active, Some(false));
+    }
+
+    #[test]
     fn sglang_metrics_map_onto_token_usage_snapshot() {
-        let m = PromScrape::parse(SGLANG_METRICS);
-        assert_eq!(m.mean("sglang:token_usage"), 0.42);
-        assert_eq!(m.sum("sglang:num_running_reqs"), 2.0);
-        assert_eq!(m.sum("sglang:num_queue_reqs"), 4.0);
+        let snapshot = WorkerMonitor::decode_sglang_metrics(SGLANG_METRICS).unwrap();
+        assert_eq!(snapshot.token_usage, 0.42);
+        assert_eq!(snapshot.num_running_reqs, 2);
+        assert_eq!(snapshot.num_waiting_reqs, 4);
+        // A demand-starved generation rate is not a prefill capacity signal.
+        assert_eq!(snapshot.gen_throughput, -1.0);
     }
 
     #[test]
@@ -1602,15 +2547,13 @@ sglang:utilization{model="llama"} 0.9
         // SGLang v0.5.4+ renamed the metric prefix `sglang:` -> `sglang_`.
         let v054 = "sglang_token_usage{model=\"llama\"} 0.5\n\
                     sglang_num_running_reqs{model=\"llama\"} 7\n\
-                    sglang_num_queue_reqs{model=\"llama\"} 1\n";
-        let m = PromScrape::parse(v054);
-        assert!(!m.has("sglang:token_usage"));
-        let prefix = ["sglang:", "sglang_"]
-            .into_iter()
-            .find(|p| m.has(&format!("{p}token_usage")));
-        assert_eq!(prefix, Some("sglang_"));
-        assert_eq!(m.mean("sglang_token_usage"), 0.5);
-        assert_eq!(m.sum("sglang_num_running_reqs"), 7.0);
+                    sglang_num_queue_reqs{model=\"llama\"} 1\n\
+                    sglang_gen_throughput{model=\"llama\"} 0.125\n";
+        let snapshot = WorkerMonitor::decode_sglang_metrics(v054).unwrap();
+        assert_eq!(snapshot.token_usage, 0.5);
+        assert_eq!(snapshot.num_running_reqs, 7);
+        assert_eq!(snapshot.num_waiting_reqs, 1);
+        assert_eq!(snapshot.gen_throughput, -1.0);
     }
 
     #[test]
@@ -1909,6 +2852,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(4),
                 token_usage: None,
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -1934,6 +2878,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(5),
                 token_usage: None,
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -1959,6 +2904,33 @@ mod native_loads_tests {
     /// `--disable-load-monitoring`: without it the feature would silently
     /// never engage under a load-blind policy.
     #[tokio::test]
+    async fn estimated_wait_override_alone_polls_and_sheds_with_monitoring_disabled() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
+        let worker = vllm_worker_with_overload(
+            &stub.url,
+            OverloadUpdate {
+                max_estimated_wait_secs: Some(0.01),
+                ..Default::default()
+            },
+        );
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker.clone()).unwrap();
+        monitor.start_event_loop();
+        wait_until("estimated-wait ingestion to shed", || {
+            registry
+                .estimated_wait()
+                .begin()
+                .unwrap()
+                .check(std::slice::from_ref(&worker), "a")
+                .is_err()
+        })
+        .await;
+        assert!(stub.probes.load(Ordering::SeqCst) > 0);
+        assert!(!worker.is_overloaded());
+    }
+
+    #[tokio::test]
     async fn overload_thresholds_alone_start_load_polling() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
         let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
@@ -1967,6 +2939,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: None,
                 token_usage: Some(0.2),
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2024,6 +2997,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(1),
                 token_usage: None,
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2049,6 +3023,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(1),
                 token_usage: None,
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
