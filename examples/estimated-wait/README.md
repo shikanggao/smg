@@ -10,11 +10,9 @@ static overload guard:
 
 ```
 dispatch_work = dispatch_blocking_factor * since_poll_dispatch_tokens
-kv_penalty = kv_weight * token_usage / (1 - token_usage)
 wait_seconds = base_overhead
              + queue_work_correction
                * (queued_uncached_tokens + dispatch_work) / prefill_capacity
-             + kv_penalty
 ```
 
 Each worker's score is compared inclusively to its effective budget. When every
@@ -41,7 +39,7 @@ builder's `estimated_wait(EstimatedWaitConfig)` method.
 | `--estimated-wait-fallback-prefill-throughput` | 2000 | Cold-start prefill capacity until a qualified value is learned; `--estimated-wait-min-prefill-throughput` and `--estimated-wait-default-throughput` remain aliases |
 | `--estimated-wait-prompt-size-prior-samples` | 32 | Effective sample count assigned to the configured prompt-size prior |
 | `--estimated-wait-mean-prefill-tokens` | 1024 | Dispatch credit when tokenized input is unavailable |
-| `--estimated-wait-kv-pressure-weight` | 0 | KV pressure weight in seconds; disabled until a controlled KV sweep justifies it |
+| `--estimated-wait-kv-pressure-weight` | 0 | Deprecated compatibility option; only zero is accepted because the KV term was removed |
 | `--estimated-wait-base-overhead-secs` | 0 | Fixed wait overhead |
 | `--estimated-wait-queue-work-correction` | 1 | Correction applied to queued token work |
 | `--estimated-wait-dispatch-blocking-factor` | 0.05 | Fraction of newly dispatched work that blocks an arrival; range 0–1 |
@@ -49,7 +47,7 @@ builder's `estimated_wait(EstimatedWaitConfig)` method.
 
 Defaults are calibration starting points, not measured model capacity. Positive
 budgets, throughput, dispatch estimates, and maximum age are required. Floating
-point values must be finite. The KV weight and dispatch factor may be zero.
+point values must be finite. The dispatch factor may be zero.
 The dispatch factor cannot exceed 1. Static overload protection remains the
 separate memory-safety guard near full KV-cache utilization.
 
@@ -93,18 +91,17 @@ prefill throughput. Both vLLM KV metric names are supported. SGLang Prometheus
 fallback and native load endpoints retain their existing behavior.
 
 The calibrated formula is
-`base + alpha * (queued + rho * dispatched) / capacity + weight * kv / (1 - kv)`.
-The generic defaults are `base=0`, `alpha=1`, `rho=0.05`, and `weight=0`.
-Admission therefore discounts newly dispatched work and leaves
-the KV term off until controlled measurements justify enabling it. Least-load
-routing keeps its legacy full-dispatch and KV arithmetic unchanged.
+`base + alpha * (queued + rho * dispatched) / capacity`.
+The generic defaults are `base=0`, `alpha=1`, and `rho=0.05`.
+Admission discounts newly dispatched work and does not read KV usage in its
+wait calculation. The retired KV-weight option accepts only zero for old
+configuration and Python positional-argument compatibility. Least-load
+routing keeps its existing full-dispatch and KV arithmetic.
 
 The load monitor runs even with `--disable-load-monitoring` when this guard is
 enabled, including when only a worker override enables it. No network queries
-occur on admission. Rank aggregation, validity checks and queue/KV arithmetic
-run during load ingestion. Estimated-wait admission discounts newly dispatched
-work and caps its KV term; least-load routing keeps its existing full-dispatch,
-uncapped index calculation.
+occur on admission. Rank aggregation, validity checks and token-work arithmetic
+run during load ingestion. Least-load routing retains its independent KV index.
 Admission retains a compact prepared estimate, not another copy of the backend
 report. Ingestion and dispatch-credit updates latch the verdict; pool checks
 read the verdict and its age, stopping at the first permissive eligible worker.
@@ -216,8 +213,8 @@ between profiles without rerunning this procedure.
    provide model/accelerator calibration.
 4. After the rolling P50 and saturated-capacity windows are warm, fit only the
    base overhead (`b`), queue-work correction (`alpha`), and dispatch-blocking
-   factor (`rho`) against request-level wait evidence. Keep the KV weight at
-   zero for this first calibration. Report the upper-tail underprediction
+   factor (`rho`) against request-level wait evidence. The wait formula has no
+   KV-pressure term. Report the upper-tail underprediction
    `max(0, observed_queue_wait - estimated_wait)` for each shape.
 5. Derive `W_max <= max(0, TTFT_SLO - no_queue_TTFT - polling_margin -
    underprediction_margin - operational_margin)`. A zero remaining budget means

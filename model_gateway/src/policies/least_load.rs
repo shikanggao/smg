@@ -215,13 +215,11 @@ impl LeastLoadPolicy {
                 let inflight_tokens = inflight.get(url).copied().unwrap_or_default().tokens;
                 let queued_tokens = self.queued_tokens(load);
                 let throughput = Self::live_throughput(load).unwrap_or(self.default_throughput);
-                ExpectedWait::new(
-                    queued_tokens,
-                    throughput,
-                    load.effective_token_usage(),
-                    self.kv_pressure_weight,
-                )
-                .seconds(inflight_tokens)
+                // Least-load's legacy KV index is independent of admission.
+                let k = load.effective_token_usage().clamp(0.0, 0.999);
+                ExpectedWait::calibrated(queued_tokens, throughput, 0.0, 1.0, 1.0)
+                    .seconds(inflight_tokens)
+                    + self.kv_pressure_weight * k / (1.0 - k)
             }
             // No fresh snapshot, but peers report: score it as the best-known
             // reporting peer plus its own live in-flight (count × mean prefill)

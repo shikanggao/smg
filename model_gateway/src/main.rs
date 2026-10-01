@@ -307,7 +307,7 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     estimated_wait_shadow: bool,
 
-    /// KV pressure weight in seconds.
+    /// Deprecated compatibility option; only zero is accepted. Admission has no KV term.
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     estimated_wait_kv_pressure_weight: f64,
 
@@ -2655,7 +2655,7 @@ mod tests {
             "--estimated-wait-queue-work-correction",
             "0.7",
             "--estimated-wait-kv-pressure-weight",
-            "0.4",
+            "0",
             "--estimated-wait-mean-prefill-tokens",
             "800",
             "--estimated-wait-max-snapshot-age-secs",
@@ -2674,7 +2674,7 @@ mod tests {
         assert_eq!(config.estimated_wait_prompt_size_prior_samples, 24);
         assert_eq!(config.estimated_wait_base_overhead_secs, 0.1);
         assert_eq!(config.estimated_wait_queue_work_correction, 0.7);
-        assert_eq!(config.estimated_wait_kv_pressure_weight, 0.4);
+        assert_eq!(config.estimated_wait_kv_pressure_weight, 0.0);
         assert_eq!(config.estimated_wait_mean_prefill_tokens, 800);
         assert_eq!(config.estimated_wait_max_snapshot_age_secs, 8.0);
         assert_eq!(config.estimated_wait_dispatch_blocking_factor, 0.2);

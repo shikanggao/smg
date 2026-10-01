@@ -34,6 +34,8 @@ use crate::{
 #[serde(default)]
 pub struct EstimatedWaitConfig {
     pub max_estimated_wait_secs: Option<f64>,
+    /// Deprecated compatibility field; the admission formula has no KV term.
+    /// Only zero is accepted so old disabled-KV configurations still load.
     pub estimated_wait_kv_pressure_weight: f64,
     pub estimated_wait_base_overhead_secs: f64,
     pub estimated_wait_queue_work_correction: f64,
@@ -56,8 +58,6 @@ impl Default for EstimatedWaitConfig {
     fn default() -> Self {
         Self {
             max_estimated_wait_secs: None,
-            // Keep the admission KV term off until a controlled KV sweep shows
-            // that it independently explains request-level wait residuals.
             estimated_wait_kv_pressure_weight: 0.0,
             estimated_wait_base_overhead_secs: 0.0,
             estimated_wait_queue_work_correction: 1.0,
@@ -74,16 +74,19 @@ impl Default for EstimatedWaitConfig {
 
 impl EstimatedWaitConfig {
     pub fn validate(&self) -> ConfigResult<()> {
+        if self.estimated_wait_kv_pressure_weight != 0.0 {
+            return Err(ConfigError::InvalidValue {
+                field: "estimated_wait_kv_pressure_weight".to_string(),
+                value: self.estimated_wait_kv_pressure_weight.to_string(),
+                reason: "KV pressure was removed from estimated-wait admission; use zero"
+                    .to_string(),
+            });
+        }
         for (field, value, allow_zero) in [
             (
                 "max_estimated_wait_secs",
                 self.max_estimated_wait_secs.unwrap_or(1.0),
                 false,
-            ),
-            (
-                "estimated_wait_kv_pressure_weight",
-                self.estimated_wait_kv_pressure_weight,
-                true,
             ),
             (
                 "estimated_wait_base_overhead_secs",
@@ -154,11 +157,10 @@ impl EstimatedWaitConfig {
     fn prepare(&self, load: &WorkerLoadResponse) -> Option<PreparedWait> {
         if load.loads.is_empty()
             || (load.dp_rank_count > 0 && load.dp_rank_count as usize != load.loads.len())
-            || load.loads.iter().any(|rank| {
-                rank.num_waiting_reqs < 0
-                    || rank.num_waiting_uncached_tokens < 0
-                    || !rank.token_usage.is_finite()
-            })
+            || load
+                .loads
+                .iter()
+                .any(|rank| rank.num_waiting_reqs < 0 || rank.num_waiting_uncached_tokens < 0)
         {
             return None;
         }
@@ -284,11 +286,9 @@ impl EstimatedWaitConfig {
         let estimate = ExpectedWait::calibrated(
             queued,
             throughput,
-            load.effective_token_usage(),
             self.estimated_wait_base_overhead_secs,
             self.estimated_wait_queue_work_correction,
             self.estimated_wait_dispatch_blocking_factor,
-            self.estimated_wait_kv_pressure_weight,
         );
         estimate.seconds(0).is_finite().then_some(PreparedWait {
             estimate,
@@ -863,11 +863,10 @@ mod tests {
             estimated_wait_base_overhead_secs: 0.25,
             estimated_wait_queue_work_correction: 0.5,
             estimated_wait_dispatch_blocking_factor: 0.25,
-            estimated_wait_kv_pressure_weight: 2.0,
             ..config()
         };
-        // 0.25 + 0.5 * (300 + 0.25 * 100) / 100 + 2 * 0.5 / 0.5
-        assert!((calibrated.score(&state, 100).unwrap().0 - 3.875).abs() < 1e-10);
+        // 0.25 + 0.5 * (300 + 0.25 * 100) / 100
+        assert!((calibrated.score(&state, 100).unwrap().0 - 1.875).abs() < 1e-10);
     }
 
     #[test]
@@ -901,11 +900,8 @@ mod tests {
     }
 
     #[test]
-    fn formula_uses_exact_tokens_live_throughput_and_mean_rank_kv() {
-        let config = EstimatedWaitConfig {
-            estimated_wait_kv_pressure_weight: 0.5,
-            ..config()
-        };
+    fn formula_uses_exact_tokens_and_live_throughput_without_rank_kv() {
+        let config = config();
         let mut state = load(Some(100), 80, 50.0, 0.25);
         state.loads.push(SchedulerLoadSnapshot {
             num_waiting_uncached_tokens: 200,
@@ -913,24 +909,23 @@ mod tests {
             token_usage: 0.75,
             ..Default::default()
         });
-        assert_eq!(config.score(&state, 100), Some((4.5, false, false)));
+        assert_eq!(config.score(&state, 100), Some((4.0, false, false)));
     }
 
     #[test]
-    fn admission_discounts_dispatched_work_and_applies_kv_penalty() {
+    fn admission_discounts_dispatched_work_independently_of_kv_usage() {
         let config = EstimatedWaitConfig {
             estimated_wait_dispatch_blocking_factor: 0.05,
-            estimated_wait_kv_pressure_weight: 0.15,
             ..config()
         };
 
-        // 1,000 dispatched tokens at 100 tokens/s contribute 0.5s after the
-        // correction; k is clamped to 0.999, so KV contributes 149.85s.
-        let score = config
-            .score(&load(Some(0), 0, 100.0, 1.0), 1_000)
-            .unwrap()
-            .0;
-        assert!((score - 150.35).abs() < 1e-8);
+        // The formula never reads KV, even when that diagnostic is invalid.
+        for usage in [0.0, 0.5, 0.999, 1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                config.score(&load(Some(0), 0, 100.0, usage), 1_000),
+                Some((0.5, false, false))
+            );
+        }
     }
 
     #[test]
@@ -967,15 +962,10 @@ mod tests {
         assert!(config().score(&partial, 0).is_none());
         assert!(config().score(&load(Some(-1), 0, 100.0, 0.0), 0).is_none());
         assert!(config().score(&load(None, -1, 100.0, 0.0), 0).is_none());
-        assert!(config()
-            .score(&load(Some(0), 0, 100.0, f64::NAN), 0)
-            .is_none());
-        let config = EstimatedWaitConfig {
-            estimated_wait_kv_pressure_weight: 0.5,
-            ..config()
-        };
-        let score = config.score(&load(Some(0), 0, 100.0, 1.0), 0).unwrap().0;
-        assert!((score - 499.5).abs() < 1e-8);
+        assert_eq!(
+            config().score(&load(Some(0), 0, 100.0, f64::NAN), 0),
+            Some((0.0, false, false))
+        );
     }
 
     #[test]
@@ -1025,12 +1015,14 @@ mod tests {
         }
         .validate()
         .is_err());
-        assert!(EstimatedWaitConfig {
-            estimated_wait_kv_pressure_weight: -1.0,
-            ..config()
+        for weight in [-1.0, 0.15, f64::NAN, f64::INFINITY] {
+            assert!(EstimatedWaitConfig {
+                estimated_wait_kv_pressure_weight: weight,
+                ..config()
+            }
+            .validate()
+            .is_err());
         }
-        .validate()
-        .is_err());
         assert!(config().validate().is_ok());
         let decoded: EstimatedWaitConfig = serde_json::from_str("{}").unwrap();
         assert!(decoded.max_estimated_wait_secs.is_none());

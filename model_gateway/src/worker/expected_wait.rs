@@ -1,7 +1,7 @@
-//! Expected-wait arithmetic shared by routing and admission.
+//! Token-work expected-wait arithmetic used by admission and routing.
 //!
 //! Callers own signal validity and missing-data policy. Preparing a sample
-//! resolves the KV term once; dispatch updates only add token work.
+//! contains only token work and calibrated overhead; dispatch updates add work.
 
 /// Default KV-pressure time penalty, in seconds.
 pub const DEFAULT_KV_PRESSURE_WEIGHT: f64 = 0.15;
@@ -19,43 +19,22 @@ pub(crate) struct ExpectedWait {
     base_overhead: f64,
     queue_work_correction: f64,
     dispatch_blocking_factor: f64,
-    kv_wait: f64,
 }
 
 impl ExpectedWait {
-    pub(crate) fn new(queued_tokens: f64, throughput: f64, usage: f64, weight: f64) -> Self {
-        let k = usage.clamp(0.0, 0.999);
-        Self {
-            queued_tokens,
-            throughput,
-            base_overhead: 0.0,
-            queue_work_correction: 1.0,
-            dispatch_blocking_factor: 1.0,
-            kv_wait: weight * k / (1.0 - k),
-        }
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the calibrated equation is clearer when each named coefficient stays explicit"
-    )]
     pub(crate) fn calibrated(
         queued_tokens: f64,
         throughput: f64,
-        usage: f64,
         base_overhead: f64,
         queue_work_correction: f64,
         dispatch_blocking_factor: f64,
-        kv_pressure_weight: f64,
     ) -> Self {
-        let k = usage.clamp(0.0, 0.999);
         Self {
             queued_tokens,
             throughput,
             base_overhead,
             queue_work_correction,
             dispatch_blocking_factor,
-            kv_wait: kv_pressure_weight * k / (1.0 - k),
         }
     }
 
@@ -64,7 +43,6 @@ impl ExpectedWait {
             + self.queue_work_correction
                 * (self.queued_tokens + self.dispatch_blocking_factor * dispatched_tokens as f64)
                 / self.throughput
-            + self.kv_wait
     }
 }
 
@@ -73,8 +51,8 @@ mod tests {
     use super::ExpectedWait;
 
     #[test]
-    fn calibrated_wait_applies_base_queue_and_dispatch_terms_with_kv_disabled() {
-        let wait = ExpectedWait::calibrated(8_000.0, 5_000.0, 0.99, 0.05, 0.7, 0.4, 0.0);
+    fn calibrated_wait_applies_only_base_queue_and_dispatch_terms() {
+        let wait = ExpectedWait::calibrated(8_000.0, 5_000.0, 0.05, 0.7, 0.4);
 
         assert!((wait.seconds(2_000) - 1.282).abs() < 1e-9);
     }

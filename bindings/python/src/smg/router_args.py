@@ -631,7 +631,7 @@ class RouterArgs:
             f"--{prefix}estimated-wait-kv-pressure-weight",
             type=float,
             default=RouterArgs.estimated_wait_kv_pressure_weight,
-            help="KV pressure weight in seconds",
+            help="Deprecated compatibility option; only zero is accepted. Admission has no KV term",
         )
         routing_group.add_argument(
             f"--{prefix}estimated-wait-mean-prefill-tokens",

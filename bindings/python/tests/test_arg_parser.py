@@ -681,7 +681,7 @@ class TestParseRouterArgs:
                     f"--{prefix}estimated-wait-queue-work-correction",
                     "0.7",
                     f"--{prefix}estimated-wait-kv-pressure-weight",
-                    "0.4",
+                    "0",
                     f"--{prefix}estimated-wait-mean-prefill-tokens",
                     "800",
                     f"--{prefix}estimated-wait-max-snapshot-age-secs",
@@ -699,7 +699,7 @@ class TestParseRouterArgs:
             assert args.estimated_wait_prompt_size_prior_samples == 24
             assert args.estimated_wait_base_overhead_secs == 0.1
             assert args.estimated_wait_queue_work_correction == 0.7
-            assert args.estimated_wait_kv_pressure_weight == 0.4
+            assert args.estimated_wait_kv_pressure_weight == 0.0
             assert args.estimated_wait_mean_prefill_tokens == 800
             assert args.estimated_wait_max_snapshot_age_secs == 8.0
             assert args.estimated_wait_dispatch_blocking_factor == 0.2

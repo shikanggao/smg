@@ -25,7 +25,6 @@
     "estimated_wait_fallback_prefill_throughput": null,
     "estimated_wait_prompt_size_prior_samples": null,
     "estimated_wait_mean_prefill_tokens": null,
-    "estimated_wait_kv_pressure_weight": null,
     "estimated_wait_base_overhead_secs": null,
     "estimated_wait_queue_work_correction": null,
     "estimated_wait_dispatch_blocking_factor": null,
