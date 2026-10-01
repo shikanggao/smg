@@ -84,6 +84,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 struct PromScrape {
     samples: HashMap<String, Vec<f64>>,
     histogram_buckets: HashMap<String, Vec<(f64, f64)>>,
+    local_compute_tokens: Option<f64>,
+}
+
+fn local_compute_source(head: &str) -> bool {
+    const LABEL: &str = "source=\"local_compute\"";
+    head.match_indices(LABEL).any(|(index, _)| {
+        matches!(
+            head[..index].trim_end().chars().next_back(),
+            Some('{') | Some(',')
+        ) && matches!(
+            head[index + LABEL.len()..].trim_start().chars().next(),
+            Some(',') | Some('}')
+        )
+    })
 }
 
 fn histogram_bound(head: &str) -> Option<f64> {
@@ -102,6 +116,7 @@ impl PromScrape {
     fn parse(text: &str) -> Self {
         let mut samples: HashMap<String, Vec<f64>> = HashMap::new();
         let mut histogram_buckets: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
+        let mut local_compute_tokens = None;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -123,10 +138,20 @@ impl PromScrape {
             let Some(value) = tail.split_whitespace().next() else {
                 continue;
             };
+            let name = head.split('{').next().unwrap_or(head).trim();
+            if name == "vllm:prompt_tokens_by_source_total" && local_compute_source(head) {
+                // Retain invalid presence: it must not silently select cached
+                // prompt totals or completion-time counters as capacity.
+                let computed = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .unwrap_or(f64::NAN);
+                local_compute_tokens = Some(local_compute_tokens.unwrap_or(0.0) + computed);
+            }
             let Ok(value) = value.parse::<f64>() else {
                 continue;
             };
-            let name = head.split('{').next().unwrap_or(head).trim();
             samples.entry(name.to_string()).or_default().push(value);
             if name == "vllm:request_prefill_kv_computed_tokens_bucket" {
                 let bound = histogram_bound(head);
@@ -146,6 +171,7 @@ impl PromScrape {
         Self {
             samples,
             histogram_buckets,
+            local_compute_tokens,
         }
     }
 
@@ -203,6 +229,7 @@ impl PromScrape {
 #[derive(Clone, Debug, Default)]
 struct VllmCounterSample {
     observed: Option<Instant>,
+    local_compute_tokens: Option<f64>,
     prompt_tokens: Option<f64>,
     generation_tokens: Option<f64>,
     prefill_kv_sum: Option<f64>,
@@ -210,6 +237,25 @@ struct VllmCounterSample {
     prefix_cache_hits: Option<f64>,
     prefix_cache_queries: Option<f64>,
     prefill_kv_buckets: Option<Vec<(f64, f64)>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VllmPrefillCounter {
+    LocalCompute,
+    CompletedUncached,
+    Prompt,
+}
+
+impl VllmCounterSample {
+    fn prefill_counter(&self) -> (VllmPrefillCounter, Option<f64>) {
+        if self.local_compute_tokens.is_some() {
+            (VllmPrefillCounter::LocalCompute, self.local_compute_tokens)
+        } else if self.prefill_kv_sum.is_some() {
+            (VllmPrefillCounter::CompletedUncached, self.prefill_kv_sum)
+        } else {
+            (VllmPrefillCounter::Prompt, self.prompt_tokens)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -360,6 +406,7 @@ fn conservative_capacity(samples: &VecDeque<f64>) -> Option<f64> {
 fn vllm_counter_sample(metrics: &PromScrape, observed: Instant) -> VllmCounterSample {
     VllmCounterSample {
         observed: Some(observed),
+        local_compute_tokens: metrics.local_compute_tokens,
         prompt_tokens: metrics.first_sum(&["vllm:prompt_tokens_total", "vllm:prompt_tokens"]),
         generation_tokens: metrics
             .first_sum(&["vllm:generation_tokens_total", "vllm:generation_tokens"]),
@@ -391,26 +438,27 @@ fn derive_vllm_metrics(
         .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0);
 
+    let (prefill_source, prefill_counter) = current.prefill_counter();
+    let capacity_counter_changed = previous.as_ref().is_some_and(|history| {
+        let (previous_source, previous_counter) = history.sample.prefill_counter();
+        prefill_source != previous_source || counter_reset(prefill_counter, previous_counter)
+    }) || prefill_counter
+        .is_some_and(|value| !value.is_finite() || value < 0.0);
     let prefill_counter_reset = previous.as_ref().is_some_and(|history| {
         counter_reset(current.prefill_kv_sum, history.sample.prefill_kv_sum)
             || counter_reset(current.prefill_kv_count, history.sample.prefill_kv_count)
             || counter_reset(current.prompt_tokens, history.sample.prompt_tokens)
     });
     let prefill_throughput = previous.as_ref().and_then(|history| {
-        match (current.prefill_kv_sum, history.sample.prefill_kv_sum) {
-            // Once the uncached-prefill counter is available it is
-            // authoritative. A valid zero delta can mean all prompts hit the
-            // prefix cache; falling back to raw prompt tokens here would
-            // overstate uncached capacity.
-            (Some(_), Some(_)) => counter_rate(
-                current.prefill_kv_sum,
-                history.sample.prefill_kv_sum,
-                elapsed,
-            )
-            .filter(|rate| rate.is_finite() && *rate > 0.0),
-            _ => counter_rate(current.prompt_tokens, history.sample.prompt_tokens, elapsed)
-                .filter(|rate| rate.is_finite() && *rate > 0.0),
+        if capacity_counter_changed {
+            return None;
         }
+        // vLLM's source="local_compute" counter is published with prefill
+        // outputs, before decode completes. The request histogram remains a
+        // prompt-size signal and a compatibility rate for older versions.
+        // Zero local compute must not fall back to cache-inclusive totals.
+        counter_rate(prefill_counter, history.sample.prefill_counter().1, elapsed)
+            .filter(|rate| rate.is_finite() && *rate > 0.0)
     });
     let gen_throughput = previous
         .as_ref()
@@ -506,7 +554,7 @@ fn derive_vllm_metrics(
         .as_ref()
         .map(|history| history.saturated_prefill_rates.clone())
         .unwrap_or_default();
-    if prefill_counter_reset {
+    if prefill_counter_reset || capacity_counter_changed {
         saturated_prefill_rates.clear();
     }
     let waiting = metrics.sum("vllm:num_requests_waiting");
@@ -2195,6 +2243,124 @@ sglang:utilization{model="llama"} 0.9
         assert_eq!(derived.prefill_throughput, None);
         assert_eq!(derived.prefill_capacity_learning_active, Some(false));
         assert_eq!(derived.prefill_capacity_sample_count, Some(0));
+        assert_eq!(derived.learned_prefill_capacity, None);
+    }
+
+    #[test]
+    fn local_compute_parser_selects_exact_source_and_sums_engines() {
+        let scrape = PromScrape::parse(
+            "vllm:prompt_tokens_by_source_total{engine=\"0\",source=\"local_compute\"} 100\n\
+             vllm:prompt_tokens_by_source_total{source=\"local_compute\",engine=\"1\"} 200 1234\n\
+             vllm:prompt_tokens_by_source_total{source=\"local_cache_hit\"} 10000\n\
+             vllm:prompt_tokens_by_source_total{source=\"external_kv_transfer\"} 10000\n\
+             vllm:prompt_tokens_by_source_total{fake_source=\"local_compute\"} 10000\n\
+             vllm:prompt_tokens_by_source_total{source=\"local_compute_extra\"} 10000\n",
+        );
+        assert_eq!(scrape.local_compute_tokens, Some(300.0));
+        for invalid in ["NaN", "-1", "Inf", "invalid"] {
+            let scrape = PromScrape::parse(&format!(
+                "vllm:prompt_tokens_by_source_total{{source=\"local_compute\"}} {invalid}\n"
+            ));
+            assert!(scrape.local_compute_tokens.unwrap().is_nan());
+        }
+    }
+
+    fn vllm_compute_scrape(computed: f64, completed: f64) -> PromScrape {
+        PromScrape::parse(&format!(
+            "vllm:num_requests_waiting 1\n\
+             vllm:prompt_tokens_by_source_total{{source=\"local_compute\"}} {computed}\n\
+             vllm:prompt_tokens_by_source_total{{source=\"local_cache_hit\"}} 100000\n\
+             vllm:request_prefill_kv_computed_tokens_sum {completed}\n\
+             vllm:prompt_tokens_total 100000\n"
+        ))
+    }
+
+    #[test]
+    fn local_compute_trains_capacity_before_requests_finish() {
+        let observed = Instant::now();
+        let first = vllm_compute_scrape(0.0, 0.0);
+        let (_, mut history) =
+            derive_vllm_metrics(&first, vllm_counter_sample(&first, observed), None);
+        for second in 1..=8 {
+            let scrape = vllm_compute_scrape(second as f64 * 1000.0, 0.0);
+            let (derived, next) = derive_vllm_metrics(
+                &scrape,
+                vllm_counter_sample(&scrape, observed + Duration::from_secs(second)),
+                Some(history),
+            );
+            assert_eq!(derived.prefill_throughput, Some(1000.0));
+            assert_eq!(derived.prefill_capacity_sample_count, Some(second as u32));
+            assert_eq!(
+                derived.learned_prefill_capacity,
+                (second == 8).then_some(1000.0)
+            );
+            history = next;
+        }
+        // Decode finishes later in a burst. This is not new prefill work.
+        let completed = vllm_compute_scrape(8000.0, 8000.0);
+        let (derived, _) = derive_vllm_metrics(
+            &completed,
+            vllm_counter_sample(&completed, observed + Duration::from_secs(9)),
+            Some(history),
+        );
+        assert_eq!(derived.prefill_throughput, None);
+        assert_eq!(derived.prefill_capacity_sample_count, Some(8));
+        assert_eq!(derived.learned_prefill_capacity, Some(1000.0));
+    }
+
+    #[test]
+    fn zero_local_compute_does_not_use_completion_or_cached_prompt_tokens() {
+        let observed = Instant::now();
+        let first = vllm_compute_scrape(1000.0, 0.0);
+        let (_, history) = derive_vllm_metrics(&first, vllm_counter_sample(&first, observed), None);
+        let second = vllm_compute_scrape(1000.0, 100000.0);
+        let (derived, _) = derive_vllm_metrics(
+            &second,
+            vllm_counter_sample(&second, observed + Duration::from_secs(1)),
+            Some(history),
+        );
+        assert_eq!(derived.prefill_throughput, None);
+        assert_eq!(derived.prefill_capacity_sample_count, Some(0));
+        assert_eq!(derived.learned_prefill_capacity, None);
+    }
+
+    #[test]
+    fn local_compute_reset_invalid_data_and_source_changes_clear_capacity() {
+        let observed = Instant::now();
+        let baseline = vllm_compute_scrape(10000.0, 10000.0);
+        let (_, mut history) =
+            derive_vllm_metrics(&baseline, vllm_counter_sample(&baseline, observed), None);
+        history.saturated_prefill_rates = VecDeque::from(vec![1000.0; 8]);
+        for scrape in [
+            vllm_compute_scrape(1.0, 10000.0),
+            vllm_compute_scrape(f64::NAN, 10000.0),
+            PromScrape::parse(
+                "vllm:num_requests_waiting 1\n\
+                 vllm:request_prefill_kv_computed_tokens_sum 20000\n",
+            ),
+        ] {
+            let (derived, _) = derive_vllm_metrics(
+                &scrape,
+                vllm_counter_sample(&scrape, observed + Duration::from_secs(1)),
+                Some(history.clone()),
+            );
+            assert_eq!(derived.prefill_throughput, None);
+            assert_eq!(derived.prefill_capacity_sample_count, Some(0));
+            assert_eq!(derived.learned_prefill_capacity, None);
+        }
+        let legacy = PromScrape::parse(
+            "vllm:num_requests_waiting 1\n\
+             vllm:request_prefill_kv_computed_tokens_sum 10000\n",
+        );
+        let (_, mut legacy_history) =
+            derive_vllm_metrics(&legacy, vllm_counter_sample(&legacy, observed), None);
+        legacy_history.saturated_prefill_rates = VecDeque::from(vec![1000.0; 8]);
+        let (derived, _) = derive_vllm_metrics(
+            &baseline,
+            vllm_counter_sample(&baseline, observed + Duration::from_secs(1)),
+            Some(legacy_history),
+        );
+        assert_eq!(derived.prefill_throughput, None);
         assert_eq!(derived.learned_prefill_capacity, None);
     }
 

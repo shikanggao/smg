@@ -79,7 +79,14 @@ field are marked unavailable before schema defaults are applied. Unavailable tok
 partial rank reports use that proxy only for ranks lacking token data. vLLM's
 Prometheus path requires waiting-request and KV gauges and uses maximum KV usage
 across samples. Histogram deltas provide a rolling P50 uncached prompt size,
-which is blended with the configured prior. Prefill capacity is learned as P25
+which is blended with the configured prior. Prefill rates prefer
+`vllm:prompt_tokens_by_source_total{source="local_compute"}`, published with
+prefill outputs before decode completes. Cached and transferred token series
+are excluded. The request-completion uncached-token counter remains a fallback
+for older engines, followed by the legacy prompt-token counter. A zero or
+invalid preferred counter never falls back to another rate; counter resets or
+source changes clear learned capacity and establish a new baseline.
+Prefill capacity is learned as P25
 over a bounded window only while requests are waiting; at least eight qualified
 intervals are required. Cold start and sparse traffic use the configured fallback
 prefill throughput. Both vLLM KV metric names are supported. SGLang Prometheus
