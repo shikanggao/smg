@@ -45,6 +45,7 @@ pub struct EstimatedWaitConfig {
         alias = "estimated_wait_default_throughput",
         alias = "estimated_wait_min_prefill_throughput"
     )]
+    /// Aggregate generation-rate floor; the field name is retained for compatibility.
     pub estimated_wait_fallback_prefill_throughput: f64,
     pub estimated_wait_prompt_size_prior_samples: u32,
     /// Zero disables the waiting-request compatibility proxy.
@@ -217,23 +218,15 @@ impl EstimatedWaitConfig {
                 _ => f64::from(rank.num_waiting_uncached_tokens),
             };
         }
-        let prefill = load
-            .total_prefill_throughput()
-            .filter(|value| value.is_finite() && *value > 0.0);
         let generation = load.total_gen_throughput();
         let generation = (generation.is_finite()
             && generation > 0.0
             && load.loads.iter().all(|rank| rank.gen_throughput >= 0.0))
         .then_some(generation);
-        let live = prefill.or(generation);
         let capacity_learning_backend = load
             .loads
             .iter()
             .any(|rank| rank.prefill_capacity_learning_active.is_some());
-        let capacity_learning_active = load
-            .loads
-            .iter()
-            .any(|rank| rank.prefill_capacity_learning_active == Some(true));
         let learned = load.loads.iter().try_fold(0.0, |sum, rank| {
             rank.learned_prefill_capacity.map(|value| sum + value)
         });
@@ -243,45 +236,15 @@ impl EstimatedWaitConfig {
         // estimates drive hard admission decisions.
         let capacity_ready = !capacity_learning_backend
             || learned.is_some_and(|value| value.is_finite() && value > 0.0);
-        // vLLM counter rates are observed demand, not capacity. Only saturated
-        // intervals train its capacity estimate; cold start and sparse traffic
-        // stay on the configured fallback. Native load endpoints retain their
-        // existing live-throughput behavior.
-        let (throughput, fallback) = if capacity_learning_backend {
-            // A waiting gauge can overlap a demand-starved scrape interval
-            // while vLLM is ramping a batch or draining decode work. Such an
-            // interval is useful evidence that the worker is busy, but its
-            // near-zero token delta is not a credible prefill-capacity
-            // estimate. Keep the configured cold-start value as a capacity
-            // floor so a transient low learned quantile cannot inflate wait
-            // by orders of magnitude.
-            match learned {
-                Some(value)
-                    if value.is_finite()
-                        && value >= self.estimated_wait_fallback_prefill_throughput =>
-                {
-                    (value, false)
-                }
-                _ => match live {
-                    // Before the conservative rolling estimate is ready,
-                    // bridge with the observed prefill rate only while vLLM
-                    // has both backlog and positive prefill work. Idle and
-                    // sparse demand therefore remain on the configured floor.
-                    Some(value)
-                        if capacity_learning_active
-                            && value.is_finite()
-                            && value >= self.estimated_wait_fallback_prefill_throughput =>
-                    {
-                        (value, false)
-                    }
-                    _ => (self.estimated_wait_fallback_prefill_throughput, true),
-                },
+        // Generation throughput is an observed drain-rate proxy. Keep the
+        // configured fallback (2,000 tokens/s by default) as its floor so
+        // sparse demand cannot inflate the estimated wait. Prefill rates and
+        // learned prefill capacity remain diagnostics and readiness inputs.
+        let (throughput, fallback) = match generation {
+            Some(value) if value >= self.estimated_wait_fallback_prefill_throughput => {
+                (value, false)
             }
-        } else {
-            match live {
-                Some(value) if value.is_finite() && value > 0.0 => (value, false),
-                _ => (self.estimated_wait_fallback_prefill_throughput, true),
-            }
+            _ => (self.estimated_wait_fallback_prefill_throughput, true),
         };
         let estimate = ExpectedWait::calibrated(
             queued,
@@ -797,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn vllm_dynamic_prefill_metrics_override_static_fallbacks() {
+    fn generation_rate_is_used_instead_of_prefill_rate() {
         let config = EstimatedWaitConfig {
             estimated_wait_queue_tokens_per_request: 100,
             estimated_wait_fallback_prefill_throughput: 10.0,
@@ -806,7 +769,47 @@ mod tests {
         let mut report = load(None, 2, 50.0, 0.0);
         report.loads[0].prefill_throughput = Some(200.0);
         report.loads[0].avg_request_prefill_kv_computed_tokens = Some(1000.0);
-        assert_eq!(config.score(&report, 0), Some((10.0, true, false)));
+        assert_eq!(config.score(&report, 0), Some((40.0, true, false)));
+    }
+
+    #[test]
+    fn generation_throughput_is_floored_for_native_and_vllm_loads() {
+        let config = EstimatedWaitConfig {
+            estimated_wait_fallback_prefill_throughput: 2000.0,
+            ..config()
+        };
+        for vllm in [false, true] {
+            for (generation, expected, fallback) in [
+                (0.088, 2.0, true),
+                (1999.0, 2.0, true),
+                (2000.0, 2.0, false),
+                (4000.0, 1.0, false),
+            ] {
+                let mut report = load(Some(4000), 0, generation, 0.0);
+                report.loads[0].prefill_throughput = Some(20_000.0);
+                if vllm {
+                    report.loads[0].prefill_capacity_learning_active = Some(false);
+                    report.loads[0].learned_prefill_capacity = Some(10_000.0);
+                }
+                assert_eq!(config.score(&report, 0), Some((expected, false, fallback)));
+            }
+        }
+    }
+
+    #[test]
+    fn generation_floor_applies_to_aggregate_not_each_rank() {
+        let config = EstimatedWaitConfig {
+            estimated_wait_fallback_prefill_throughput: 2000.0,
+            ..config()
+        };
+        let mut report = load(Some(4000), 0, 1500.0, 0.0);
+        report.loads.push(SchedulerLoadSnapshot {
+            gen_throughput: 2500.0,
+            ..Default::default()
+        });
+        assert_eq!(config.score(&report, 0), Some((1.0, false, false)));
+        report.loads[1].gen_throughput = -1.0;
+        assert_eq!(config.score(&report, 0), Some((2.0, false, true)));
     }
 
     #[test]
@@ -829,7 +832,7 @@ mod tests {
         report.loads[0].avg_request_prefill_kv_computed_tokens = Some(20.0);
         report.loads[0].prefill_capacity_learning_active = Some(false);
 
-        assert_eq!(config().score(&report, 0), Some((1.0, true, true)));
+        assert_eq!(config().score(&report, 0), Some((1.0, true, false)));
     }
 
     #[test]
@@ -870,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn demand_starved_learned_capacity_does_not_replace_configured_floor() {
+    fn learned_prefill_capacity_does_not_replace_generation_floor() {
         let mut report = load(None, 0, 10.0, 0.0);
         report.loads[0].avg_request_prefill_kv_computed_tokens = Some(100.0);
         report.loads[0].prefill_capacity_learning_active = Some(false);
@@ -881,20 +884,19 @@ mod tests {
         assert_eq!(config().score(&report, 100), Some((1.0, true, true)));
 
         report.loads[0].learned_prefill_capacity = Some(200.0);
-        assert_eq!(config().score(&report, 100), Some((0.5, true, false)));
+        assert_eq!(config().score(&report, 100), Some((1.0, true, true)));
     }
 
     #[test]
-    fn saturated_live_prefill_rate_bridges_until_capacity_is_learned() {
+    fn generation_floor_does_not_depend_on_prefill_learning_activity() {
         let mut report = load(None, 2, 10.0, 0.0);
         report.loads[0].avg_request_prefill_kv_computed_tokens = Some(100.0);
         report.loads[0].prefill_throughput = Some(200.0);
         report.loads[0].prefill_capacity_learning_active = Some(true);
 
-        assert_eq!(config().score(&report, 0), Some((1.0, true, false)));
+        assert_eq!(config().score(&report, 0), Some((2.0, true, true)));
 
-        // The same live rate is observed demand, not capacity, when there is
-        // no qualified backlog in the interval.
+        // Prefill learning activity does not select the throughput source.
         report.loads[0].prefill_capacity_learning_active = Some(false);
         assert_eq!(config().score(&report, 0), Some((2.0, true, true)));
     }
@@ -1092,7 +1094,7 @@ mod tests {
 
             // The cold estimate is still published and usable for calibration,
             // but it cannot reject until the conservative capacity is learned.
-            assert_eq!(config().score(&report, 0), Some((2.0, false, true)));
+            assert_eq!(config().score(&report, 0), Some((2.0, false, false)));
             assert!(admission
                 .begin()
                 .unwrap()

@@ -7,7 +7,7 @@
 pub const DEFAULT_KV_PRESSURE_WEIGHT: f64 = 0.15;
 /// Token estimate for a request without a known token count.
 pub const DEFAULT_MEAN_PREFILL_TOKENS: u32 = 1024;
-/// Fallback aggregate generation throughput, in tokens per second.
+/// Default aggregate generation throughput floor, in tokens per second.
 pub const DEFAULT_THROUGHPUT: f64 = 2000.0;
 /// Fraction of already-dispatched prompt work that blocks a new request.
 pub const DEFAULT_DISPATCH_BLOCKING_FACTOR: f64 = 0.05;

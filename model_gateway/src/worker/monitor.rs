@@ -1313,10 +1313,11 @@ impl WorkerMonitor {
             num_waiting_reqs: m.sum(&format!("{prefix}num_queue_reqs")) as i32,
             num_waiting_uncached_tokens_available: Some(false),
             token_usage: m.mean(&format!("{prefix}token_usage")),
-            // SGLang's generation gauge reports current demand, not engine
-            // capacity. A small positive idle sample must not replace the
-            // configured estimated-wait capacity fallback.
-            gen_throughput: -1.0,
+            // Preserve the reported generation rate; estimated-wait admission
+            // applies its configured floor to demand-starved samples.
+            gen_throughput: m
+                .first_sum(&[&format!("{prefix}gen_throughput")])
+                .unwrap_or(-1.0),
             cache_hit_rate: m.mean(&format!("{prefix}cache_hit_rate")),
             utilization: m.mean(&format!("{prefix}utilization")),
             ..Default::default()
@@ -2538,8 +2539,7 @@ sglang:utilization{model="llama"} 0.9
         assert_eq!(snapshot.token_usage, 0.42);
         assert_eq!(snapshot.num_running_reqs, 2);
         assert_eq!(snapshot.num_waiting_reqs, 4);
-        // A demand-starved generation rate is not a prefill capacity signal.
-        assert_eq!(snapshot.gen_throughput, -1.0);
+        assert_eq!(snapshot.gen_throughput, 0.088);
     }
 
     #[test]
@@ -2553,7 +2553,28 @@ sglang:utilization{model="llama"} 0.9
         assert_eq!(snapshot.token_usage, 0.5);
         assert_eq!(snapshot.num_running_reqs, 7);
         assert_eq!(snapshot.num_waiting_reqs, 1);
-        assert_eq!(snapshot.gen_throughput, -1.0);
+        assert_eq!(snapshot.gen_throughput, 0.125);
+    }
+
+    #[test]
+    fn sglang_generation_rates_are_aggregated_and_missing_rates_stay_unavailable() {
+        let body = "sglang_token_usage 0.5\nsglang_num_queue_reqs 1\n";
+        assert_eq!(
+            WorkerMonitor::decode_sglang_metrics(body)
+                .unwrap()
+                .gen_throughput,
+            -1.0
+        );
+        let body = format!(
+            "{body}sglang_gen_throughput{{dp_rank=\"0\"}} 1500\n\
+             sglang_gen_throughput{{dp_rank=\"1\"}} 2500\n"
+        );
+        assert_eq!(
+            WorkerMonitor::decode_sglang_metrics(&body)
+                .unwrap()
+                .gen_throughput,
+            4000.0
+        );
     }
 
     #[test]
