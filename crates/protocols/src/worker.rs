@@ -1329,8 +1329,8 @@ pub struct SchedulerLoadSnapshot {
     /// from backend histogram deltas when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub median_request_prefill_kv_computed_tokens: Option<f64>,
-    /// Number of completed requests represented by the rolling prefill-size
-    /// histogram. Used to blend the observed median with a configured prior.
+    /// Number of completed requests represented by the rolling uncached
+    /// prefill-size observations. Used to blend observed work with a prior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_size_sample_count: Option<u64>,
     /// Conservative prefill capacity learned from saturated intervals.
@@ -1342,6 +1342,10 @@ pub struct SchedulerLoadSnapshot {
     /// Whether the current interval qualified for capacity learning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_capacity_learning_active: Option<bool>,
+    /// Rolling low-load engine TTFT, learned only while the queue is empty
+    /// and at most one request is running. Added once to the backlog estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_load_ttft_seconds: Option<f64>,
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,

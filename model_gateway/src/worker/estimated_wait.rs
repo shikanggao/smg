@@ -45,7 +45,7 @@ pub struct EstimatedWaitConfig {
         alias = "estimated_wait_default_throughput",
         alias = "estimated_wait_min_prefill_throughput"
     )]
-    /// Aggregate generation-rate floor; the field name is retained for compatibility.
+    /// Aggregate prefill-capacity floor/fallback; the field name is retained for compatibility.
     pub estimated_wait_fallback_prefill_throughput: f64,
     pub estimated_wait_prompt_size_prior_samples: u32,
     /// Zero disables the waiting-request compatibility proxy.
@@ -172,15 +172,16 @@ impl EstimatedWaitConfig {
             queued += match rank.num_waiting_uncached_tokens_available {
                 Some(false) => {
                     let observed = rank
-                        .median_request_prefill_kv_computed_tokens
-                        .filter(|value| value.is_finite() && *value > 0.0)
+                        .avg_request_prefill_kv_computed_tokens
+                        .or(rank.median_request_prefill_kv_computed_tokens)
+                        .filter(|value| value.is_finite() && *value >= 0.0)
                         .zip(rank.prefill_size_sample_count.filter(|count| *count > 0));
                     let configured_prior = if self.estimated_wait_queue_tokens_per_request > 0 {
                         f64::from(self.estimated_wait_queue_tokens_per_request)
                     } else {
                         f64::from(self.estimated_wait_mean_prefill_tokens)
                     };
-                    let calibrated_vllm = rank.prefill_capacity_learning_active.is_some();
+                    let calibrated_backend = rank.prefill_capacity_learning_active.is_some();
                     let tokens_per_request = observed
                         .map(|(median, count)| {
                             let observed_weight = count as f64;
@@ -194,7 +195,7 @@ impl EstimatedWaitConfig {
                             }
                         })
                         .or_else(|| {
-                            if calibrated_vllm {
+                            if calibrated_backend {
                                 None
                             } else {
                                 rank.avg_request_prefill_kv_computed_tokens
@@ -202,7 +203,7 @@ impl EstimatedWaitConfig {
                             }
                         })
                         .unwrap_or_else(|| {
-                            if calibrated_vllm {
+                            if calibrated_backend {
                                 configured_prior
                             } else {
                                 f64::from(self.estimated_wait_queue_tokens_per_request)
@@ -218,29 +219,40 @@ impl EstimatedWaitConfig {
                 _ => f64::from(rank.num_waiting_uncached_tokens),
             };
         }
-        let generation = load.total_gen_throughput();
-        let generation = (generation.is_finite()
-            && generation > 0.0
-            && load.loads.iter().all(|rank| rank.gen_throughput >= 0.0))
-        .then_some(generation);
         let capacity_learning_backend = load
             .loads
             .iter()
             .any(|rank| rank.prefill_capacity_learning_active.is_some());
         let learned = load.loads.iter().try_fold(0.0, |sum, rank| {
-            rank.learned_prefill_capacity.map(|value| sum + value)
+            rank.learned_prefill_capacity
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(|value| sum + value)
         });
-        // vLLM publishes learned capacity only after the monitor has collected
+        // Prometheus backends publish learned capacity after the monitor has collected
         // enough saturated intervals. Keep producing estimates before then so
         // operators can observe calibration, but do not let those cold-start
         // estimates drive hard admission decisions.
+        let baseline = load.loads.iter().try_fold(0.0_f64, |value, rank| {
+            rank.low_load_ttft_seconds
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                .map(|seconds| value.max(seconds))
+        });
         let capacity_ready = !capacity_learning_backend
-            || learned.is_some_and(|value| value.is_finite() && value > 0.0);
-        // Generation throughput is an observed drain-rate proxy. Keep the
-        // configured fallback (2,000 tokens/s by default) as its floor so
-        // sparse demand cannot inflate the estimated wait. Prefill rates and
-        // learned prefill capacity remain diagnostics and readiness inputs.
-        let (throughput, fallback) = match generation {
+            || (learned.is_some_and(|value| value.is_finite() && value > 0.0)
+                && baseline.is_some());
+        // Queue work is uncached prompt tokens, so its rate must measure the
+        // same work. Output generation throughput never selects this divisor.
+        let active_prefill = load.loads.iter().try_fold(0.0, |sum, rank| {
+            (rank.prefill_capacity_learning_active == Some(true))
+                .then_some(rank.prefill_throughput)
+                .flatten()
+                .filter(|rate| rate.is_finite() && *rate > 0.0)
+                .map(|rate| sum + rate)
+        });
+        let capacity = learned
+            .filter(|rate| rate.is_finite() && *rate > 0.0)
+            .or(active_prefill);
+        let (throughput, fallback) = match capacity {
             Some(value) if value >= self.estimated_wait_fallback_prefill_throughput => {
                 (value, false)
             }
@@ -249,7 +261,7 @@ impl EstimatedWaitConfig {
         let estimate = ExpectedWait::calibrated(
             queued,
             throughput,
-            self.estimated_wait_base_overhead_secs,
+            baseline.unwrap_or(0.0) + self.estimated_wait_base_overhead_secs,
             self.estimated_wait_queue_work_correction,
             self.estimated_wait_dispatch_blocking_factor,
         );
@@ -260,6 +272,7 @@ impl EstimatedWaitConfig {
             capacity_ready,
             blended_prompt_size,
             effective_prefill_capacity: throughput,
+            baseline,
         })
     }
 
@@ -281,6 +294,7 @@ struct PreparedWait {
     capacity_ready: bool,
     blended_prompt_size: Option<f64>,
     effective_prefill_capacity: f64,
+    baseline: Option<f64>,
 }
 
 impl PreparedWait {
@@ -302,6 +316,7 @@ fn invalidate_diagnostic_metrics(worker_url: &str) {
     metrics::gauge!("smg_estimated_wait_effective_prefill_capacity", "worker" => worker.clone())
         .set(-1.0);
     metrics::gauge!("smg_estimated_wait_capacity_ready", "worker" => worker.clone()).set(-1.0);
+    metrics::gauge!("smg_estimated_wait_baseline_seconds", "worker" => worker.clone()).set(-1.0);
     metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker).set(0.0);
 }
 
@@ -489,6 +504,8 @@ impl EstimatedWaitAdmission {
                 .set(sample.prepared.blended_prompt_size.unwrap_or(-1.0));
             metrics::gauge!("smg_estimated_wait_effective_prefill_capacity", "worker" => worker.url().to_owned())
                 .set(sample.prepared.effective_prefill_capacity);
+            metrics::gauge!("smg_estimated_wait_baseline_seconds", "worker" => worker.url().to_owned())
+                .set(sample.prepared.baseline.unwrap_or(-1.0));
         }
         entry.refresh(worker, config.estimated_wait_max_snapshot_age_secs);
     }
@@ -678,6 +695,8 @@ mod tests {
                 num_waiting_uncached_tokens_available: Some(tokens.is_some()),
                 num_waiting_reqs: waiting,
                 gen_throughput: throughput,
+                learned_prefill_capacity: Some(throughput),
+                low_load_ttft_seconds: Some(0.0),
                 token_usage: kv,
                 ..Default::default()
             }],
@@ -735,7 +754,7 @@ mod tests {
         let report = WorkerMonitor::decode_native_loads(
             serde_json::json!({"loads":[{"num_waiting_reqs":10,"token_usage":0.0,"gen_throughput":100.0}]}),
         ).unwrap();
-        assert_eq!(config.score(&report, 0), Some((10.0, true, false)));
+        assert_eq!(config.score(&report, 0), Some((10.0, true, true)));
         let no_proxy = EstimatedWaitConfig {
             estimated_wait_queue_tokens_per_request: 0,
             ..config.clone()
@@ -751,53 +770,53 @@ mod tests {
             }
             let report = WorkerMonitor::decode_native_loads(value).unwrap();
             let expected = if availability == Some(false) {
-                (10.0, true, false)
+                (10.0, true, true)
             } else {
-                (0.0, false, false)
+                (0.0, false, true)
             };
             assert_eq!(config.score(&report, 0), Some(expected));
         }
     }
 
     #[test]
-    fn generation_rate_is_used_instead_of_prefill_rate() {
+    fn qualified_prefill_rate_replaces_output_generation_rate() {
         let config = EstimatedWaitConfig {
             estimated_wait_queue_tokens_per_request: 100,
             estimated_wait_fallback_prefill_throughput: 10.0,
+            estimated_wait_prompt_size_prior_samples: 0,
             ..config()
         };
         let mut report = load(None, 2, 50.0, 0.0);
         report.loads[0].prefill_throughput = Some(200.0);
+        report.loads[0].learned_prefill_capacity = None;
+        report.loads[0].prefill_capacity_learning_active = Some(true);
         report.loads[0].avg_request_prefill_kv_computed_tokens = Some(1000.0);
-        assert_eq!(config.score(&report, 0), Some((40.0, true, false)));
+        report.loads[0].prefill_size_sample_count = Some(10);
+        assert_eq!(config.score(&report, 0), Some((10.0, true, false)));
     }
 
     #[test]
-    fn generation_throughput_is_floored_for_native_and_vllm_loads() {
+    fn generation_rate_does_not_override_learned_prefill_capacity() {
         let config = EstimatedWaitConfig {
             estimated_wait_fallback_prefill_throughput: 2000.0,
             ..config()
         };
         for vllm in [false, true] {
-            for (generation, expected, fallback) in [
-                (0.088, 2.0, true),
-                (1999.0, 2.0, true),
-                (2000.0, 2.0, false),
-                (4000.0, 1.0, false),
-            ] {
+            for generation in [0.088, 1999.0, 2000.0, 4000.0] {
                 let mut report = load(Some(4000), 0, generation, 0.0);
                 report.loads[0].prefill_throughput = Some(20_000.0);
+                report.loads[0].learned_prefill_capacity = Some(10_000.0);
                 if vllm {
                     report.loads[0].prefill_capacity_learning_active = Some(false);
                     report.loads[0].learned_prefill_capacity = Some(10_000.0);
                 }
-                assert_eq!(config.score(&report, 0), Some((expected, false, fallback)));
+                assert_eq!(config.score(&report, 0), Some((0.4, false, false)));
             }
         }
     }
 
     #[test]
-    fn generation_floor_applies_to_aggregate_not_each_rank() {
+    fn prefill_floor_applies_to_aggregate_not_each_rank() {
         let config = EstimatedWaitConfig {
             estimated_wait_fallback_prefill_throughput: 2000.0,
             ..config()
@@ -805,10 +824,11 @@ mod tests {
         let mut report = load(Some(4000), 0, 1500.0, 0.0);
         report.loads.push(SchedulerLoadSnapshot {
             gen_throughput: 2500.0,
+            learned_prefill_capacity: Some(2500.0),
             ..Default::default()
         });
         assert_eq!(config.score(&report, 0), Some((1.0, false, false)));
-        report.loads[1].gen_throughput = -1.0;
+        report.loads[1].learned_prefill_capacity = None;
         assert_eq!(config.score(&report, 0), Some((2.0, false, true)));
     }
 
@@ -873,7 +893,31 @@ mod tests {
     }
 
     #[test]
-    fn learned_prefill_capacity_does_not_replace_generation_floor() {
+    fn low_load_baseline_is_added_once_and_required_for_calibrated_admission() {
+        let mut report = load(Some(300), 0, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = Some(0.25);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        let prepared = config().prepare(&report).unwrap();
+        assert_eq!(prepared.seconds(100), 4.25);
+        assert!(prepared.capacity_ready);
+        report.loads[0].low_load_ttft_seconds = None;
+        let uncalibrated = config().prepare(&report).unwrap();
+        assert_eq!(uncalibrated.seconds(100), 4.0);
+        assert!(!uncalibrated.capacity_ready);
+    }
+
+    #[test]
+    fn uncached_prompt_mean_is_preferred_to_histogram_bucket_median() {
+        let mut report = load(None, 2, 100.0, 0.0);
+        report.loads[0].avg_request_prefill_kv_computed_tokens = Some(50.0);
+        report.loads[0].median_request_prefill_kv_computed_tokens = Some(200.0);
+        report.loads[0].prefill_size_sample_count = Some(32);
+        // The 100-token prior and 50-token observed mean have equal weight.
+        assert_eq!(config().score(&report, 0), Some((1.5, true, false)));
+    }
+
+    #[test]
+    fn learned_prefill_capacity_is_used_after_learning() {
         let mut report = load(None, 0, 10.0, 0.0);
         report.loads[0].avg_request_prefill_kv_computed_tokens = Some(100.0);
         report.loads[0].prefill_capacity_learning_active = Some(false);
@@ -884,19 +928,20 @@ mod tests {
         assert_eq!(config().score(&report, 100), Some((1.0, true, true)));
 
         report.loads[0].learned_prefill_capacity = Some(200.0);
-        assert_eq!(config().score(&report, 100), Some((1.0, true, true)));
+        assert_eq!(config().score(&report, 100), Some((0.5, true, false)));
     }
 
     #[test]
-    fn generation_floor_does_not_depend_on_prefill_learning_activity() {
+    fn unlearned_prefill_rate_requires_backlog_to_override_fallback() {
         let mut report = load(None, 2, 10.0, 0.0);
         report.loads[0].avg_request_prefill_kv_computed_tokens = Some(100.0);
         report.loads[0].prefill_throughput = Some(200.0);
         report.loads[0].prefill_capacity_learning_active = Some(true);
+        report.loads[0].learned_prefill_capacity = None;
 
-        assert_eq!(config().score(&report, 0), Some((2.0, true, true)));
+        assert_eq!(config().score(&report, 0), Some((1.0, true, false)));
 
-        // Prefill learning activity does not select the throughput source.
+        // Sparse demand does not train or replace a capacity estimate.
         report.loads[0].prefill_capacity_learning_active = Some(false);
         assert_eq!(config().score(&report, 0), Some((2.0, true, true)));
     }
@@ -908,6 +953,7 @@ mod tests {
         state.loads.push(SchedulerLoadSnapshot {
             num_waiting_uncached_tokens: 200,
             gen_throughput: 50.0,
+            learned_prefill_capacity: Some(50.0),
             token_usage: 0.75,
             ..Default::default()
         });
@@ -947,7 +993,7 @@ mod tests {
             gen_throughput: 50.0,
             ..Default::default()
         });
-        assert_eq!(config.score(&state, 0), Some((2.0, true, false)));
+        assert_eq!(config.score(&state, 0), Some((2.0, true, true)));
     }
 
     #[test]
@@ -1090,11 +1136,12 @@ mod tests {
 
             let mut report = load(Some(200), 0, 100.0, 0.0);
             report.loads[0].prefill_capacity_learning_active = Some(false);
+            report.loads[0].learned_prefill_capacity = None;
             publish_load(&admission, &worker, &report);
 
             // The cold estimate is still published and usable for calibration,
             // but it cannot reject until the conservative capacity is learned.
-            assert_eq!(config().score(&report, 0), Some((2.0, false, false)));
+            assert_eq!(config().score(&report, 0), Some((2.0, false, true)));
             assert!(admission
                 .begin()
                 .unwrap()
@@ -1146,6 +1193,7 @@ mod tests {
             let worker = worker("http://vllm:1");
             let mut report = load(Some(200), 0, 100.0, 0.0);
             report.loads[0].prefill_capacity_learning_active = Some(false);
+            report.loads[0].learned_prefill_capacity = None;
             publish_load(&admission, &worker, &report);
 
             assert!(admission

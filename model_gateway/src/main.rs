@@ -327,7 +327,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     estimated_wait_mean_prefill_tokens: u32,
 
-    /// Generation throughput floor in tokens/s, also used when the rate is unavailable.
+    /// Uncached-prefill capacity floor in tokens/s, also used before capacity is learned.
     #[arg(
         long,
         aliases = [

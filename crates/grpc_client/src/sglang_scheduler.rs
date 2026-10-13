@@ -801,6 +801,7 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             learned_prefill_capacity: None,
             prefill_capacity_sample_count: None,
             prefill_capacity_learning_active: None,
+            low_load_ttft_seconds: None,
             cache_hit_rate: load.cache_hit_rate,
             utilization: load.utilization,
             max_running_requests: load.max_running_requests,
