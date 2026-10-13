@@ -22,14 +22,18 @@ pub(crate) struct ExpectedWait {
 }
 
 impl ExpectedWait {
-    pub(crate) fn with_throughput(mut self, tokens_per_second: f64) -> Self {
-        self.throughput = tokens_per_second;
-        self
-    }
-
     pub(crate) fn token_work(self, dispatched_tokens: u64) -> f64 {
         self.queue_work_correction
             * (self.queued_tokens + self.dispatch_blocking_factor * dispatched_tokens as f64)
+    }
+
+    pub(crate) fn queued_work(self) -> f64 {
+        self.queued_tokens
+    }
+
+    pub(crate) fn with_queued_work(mut self, tokens: f64) -> Self {
+        self.queued_tokens = tokens;
+        self
     }
 
     pub(crate) fn with_base_overhead(mut self, seconds: f64) -> Self {
