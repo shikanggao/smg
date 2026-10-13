@@ -1346,6 +1346,12 @@ pub struct SchedulerLoadSnapshot {
     /// and at most one request is running. Added once to the backlog estimate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub low_load_ttft_seconds: Option<f64>,
+    /// Mean engine-reported queue time for requests reported since the last poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_queue_delay_seconds: Option<f64>,
+    /// Number of requests supporting the recent queue-delay mean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_queue_delay_sample_count: Option<u64>,
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,

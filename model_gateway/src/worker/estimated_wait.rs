@@ -237,9 +237,11 @@ impl EstimatedWaitConfig {
                 .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
                 .map(|seconds| value.max(seconds))
         });
+        // The extra-delay budget removes baseline from native queue arithmetic.
+        // Baseline is still required for total TTFT and observed-delay learning,
+        // but its absence must not disable a calibrated queue-capacity signal.
         let capacity_ready = !capacity_learning_backend
-            || (learned.is_some_and(|value| value.is_finite() && value > 0.0)
-                && baseline.is_some());
+            || learned.is_some_and(|value| value.is_finite() && value > 0.0);
         // Queue work is uncached prompt tokens, so its rate must measure the
         // same work. Output generation throughput never selects this divisor.
         let active_prefill = load.loads.iter().try_fold(0.0, |sum, rank| {
@@ -278,9 +280,7 @@ impl EstimatedWaitConfig {
                 .iter()
                 .map(|rank| f64::from(rank.num_running_reqs.max(0)))
                 .sum(),
-            queue_unit_tokens: blended_prompt_size
-                .unwrap_or(f64::from(self.estimated_wait_mean_prefill_tokens)),
-            active_prefill: 0.0,
+            pending_engine: 0.0,
             proxy,
             fallback,
             capacity_ready,
@@ -294,6 +294,17 @@ impl EstimatedWaitConfig {
                 .sum::<f64>()
                 .max(if queued > 0.0 { 1.0 } else { 0.0 }),
             observed_delay_floor: 0.0,
+            observed_delay_available: false,
+            native_queue_delay: load
+                .loads
+                .iter()
+                .filter_map(|rank| {
+                    rank.recent_queue_delay_sample_count
+                        .filter(|count| *count >= TTFT_MIN_SAMPLES as u64)?;
+                    rank.recent_queue_delay_seconds
+                        .filter(|delay| delay.is_finite() && *delay >= 0.0)
+                })
+                .max_by(f64::total_cmp),
             baseline,
             low_load: queued == 0.0
                 && load
@@ -329,8 +340,7 @@ struct PreparedWait {
     native_estimate: ExpectedWait,
     native_waiting: f64,
     native_running: f64,
-    queue_unit_tokens: f64,
-    active_prefill: f64,
+    pending_engine: f64,
     proxy: bool,
     fallback: bool,
     capacity_ready: bool,
@@ -339,6 +349,8 @@ struct PreparedWait {
     native_prefill_capacity: f64,
     backlog_size: f64,
     observed_delay_floor: f64,
+    observed_delay_available: bool,
+    native_queue_delay: Option<f64>,
     baseline: Option<f64>,
     low_load: bool,
     capacity_learned_ready: bool,
@@ -349,6 +361,11 @@ struct PreparedWait {
 impl PreparedWait {
     fn seconds(self, dispatched_tokens: u64) -> f64 {
         let baseline = self.baseline.unwrap_or(0.0);
+        if !self.capacity_learned_ready && self.observed_delay_available {
+            // Measured delay is useful before rate calibration. Do not let an
+            // untrusted default rate amplify that evidence into a huge TTFT.
+            return baseline + self.observed_delay_floor;
+        }
         baseline
             + (self.estimate.seconds(dispatched_tokens) - baseline).max(self.observed_delay_floor)
     }
@@ -362,7 +379,9 @@ fn invalidate_diagnostic_metrics(worker_url: &str) {
     let worker = worker_url.to_owned();
     metrics::gauge!("smg_estimated_wait_seconds", "worker" => worker.clone()).set(-1.0);
     metrics::gauge!("smg_estimated_wait_excess_seconds", "worker" => worker.clone()).set(-1.0);
-    metrics::gauge!("smg_estimated_wait_active_prefill_requests", "worker" => worker.clone())
+    metrics::gauge!("smg_estimated_wait_native_queue_delay_seconds", "worker" => worker.clone())
+        .set(-1.0);
+    metrics::gauge!("smg_estimated_wait_pending_engine_requests", "worker" => worker.clone())
         .set(-1.0);
     metrics::gauge!("smg_estimated_wait_pending_first_text_requests", "worker" => worker.clone())
         .set(-1.0);
@@ -431,6 +450,7 @@ struct TtftProbe {
     backlogged: bool,
     baseline: Option<f64>,
     observation_id: u64,
+    backlog_size: f64,
 }
 
 /// Observe standard OpenAI SSE without altering or delaying relayed bytes.
@@ -583,6 +603,8 @@ struct Entry {
     backlog_generation: u64,
     next_observation_id: u64,
     pending_first_text: HashSet<u64>,
+    backlog_peak_size: f64,
+    pipeline_idle: bool,
 }
 
 impl Entry {
@@ -600,6 +622,8 @@ impl Entry {
             backlog_generation: 0,
             next_observation_id: 0,
             pending_first_text: HashSet::new(),
+            backlog_peak_size: 0.0,
+            pipeline_idle: true,
         }
     }
 
@@ -613,6 +637,8 @@ impl Entry {
         self.busy_visibility.clear();
         self.observed_delays.clear();
         self.pending_first_text.clear();
+        self.backlog_peak_size = 0.0;
+        self.pipeline_idle = true;
         self.backlog_generation = self.backlog_generation.wrapping_add(1);
     }
 
@@ -625,8 +651,9 @@ impl Entry {
                 .prepared
                 .excess_seconds(self.total_dispatched.saturating_sub(sample.watermark));
             sample.overloaded = excess.is_finite().then_some(excess >= sample.threshold);
-            metrics::gauge!("smg_estimated_wait_active_prefill_requests", "worker" => worker.url().to_owned()).set(sample.prepared.active_prefill);
+            metrics::gauge!("smg_estimated_wait_pending_engine_requests", "worker" => worker.url().to_owned()).set(sample.prepared.pending_engine);
             metrics::gauge!("smg_estimated_wait_pending_first_text_requests", "worker" => worker.url().to_owned()).set(self.pending_first_text.len() as f64);
+            metrics::gauge!("smg_estimated_wait_native_queue_delay_seconds", "worker" => worker.url().to_owned()).set(sample.prepared.native_queue_delay.unwrap_or(-1.0));
             metrics::gauge!("smg_estimated_wait_seconds", "worker" => worker.url().to_owned())
                 .set(seconds);
             metrics::gauge!("smg_estimated_wait_excess_seconds", "worker" => worker.url().to_owned())
@@ -683,6 +710,7 @@ impl EstimatedWaitAdmission {
             backlogged: sample.prepared.has_backlog,
             baseline: ttft_median(&entry.low_load_ttfts),
             observation_id: entry.next_observation_id,
+            backlog_size: sample.prepared.backlog_size,
         };
         entry.pending_first_text.insert(probe.observation_id);
         Self::apply_observations(entry, self.config());
@@ -747,7 +775,7 @@ impl EstimatedWaitAdmission {
             // total extra delay as an independent floor instead of subtracting
             // that gap or fitting a throughput to a changing token-work proxy.
             if let Some(baseline) = probe.baseline {
-                let backlog = sample.prepared.backlog_size;
+                let backlog = sample.prepared.backlog_size.max(probe.backlog_size);
                 if backlog > 0.0 {
                     entry
                         .observed_delays
@@ -770,28 +798,25 @@ impl EstimatedWaitAdmission {
             return;
         };
         let prepared = &mut sample.prepared;
-        // Requests already producing text are decoding, not pending prefill.
-        // Bound local pending work by engine concurrency so post-engine stream
-        // formatting alone cannot fabricate GPU prefill backlog.
+        prepared.capacity_ready = prepared.capacity_learned_ready;
+        // Bound pre-text stream telemetry by engine concurrency. This is a
+        // diagnostic upper bound, not measured remaining prefill tokens.
         let pending = (entry.pending_first_text.len() as f64)
             .min(prepared.native_waiting + prepared.native_running);
-        prepared.active_prefill = (pending - prepared.native_waiting).max(0.0);
-        prepared.backlog_size = prepared
-            .native_waiting
-            .max(entry.pending_first_text.len() as f64)
-            .max(if prepared.native_estimate.token_work(0) > 0.0 {
-                1.0
-            } else {
-                0.0
-            });
-        prepared.estimate = prepared.estimate.with_queued_work(
-            prepared.native_estimate.queued_work()
-                + prepared.active_prefill * prepared.queue_unit_tokens,
-        );
-        prepared.has_backlog = prepared.native_estimate.token_work(0) > 0.0
-            || prepared.native_waiting > 0.0
-            || prepared.active_prefill > 0.0
-            || entry.pending_first_text.len() >= TTFT_MIN_SAMPLES;
+        prepared.pending_engine = (pending - prepared.native_waiting).max(0.0);
+        // A stream awaiting text may have partly completed prefill or may be
+        // formatting reasoning. Keep its count diagnostic; never treat every
+        // such stream as a full remaining prompt in the token-work numerator.
+        prepared.backlog_size =
+            prepared
+                .native_waiting
+                .max(if prepared.native_estimate.queued_work() > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                });
+        prepared.has_backlog =
+            prepared.native_estimate.queued_work() > 0.0 || prepared.native_waiting > 0.0;
         if let Some(baseline) = baseline {
             prepared.estimate = prepared
                 .estimate
@@ -811,6 +836,7 @@ impl EstimatedWaitAdmission {
             .then(|| observation_quantile(&adjusted, 0.75))
             .flatten();
         prepared.observed_delay_floor = floor.unwrap_or(0.0);
+        prepared.observed_delay_available = floor.is_some();
         prepared.visibility_delay = if prepared.has_backlog {
             busy_visibility
                 .zip(low_visibility)
@@ -821,8 +847,7 @@ impl EstimatedWaitAdmission {
         };
         // Observed over-budget delay can establish overload without guessing a
         // cold processing rate. A small observed delay cannot validate that rate.
-        prepared.capacity_ready |=
-            baseline.is_some() && floor.is_some_and(|delay| delay >= sample.threshold);
+        prepared.capacity_ready |= floor.is_some_and(|delay| delay >= sample.threshold);
     }
 
     pub(crate) fn configure(&self, config: EstimatedWaitConfig) {
@@ -928,11 +953,26 @@ impl EstimatedWaitAdmission {
         // preceding busy epoch cannot recalibrate a later workload after drain.
         if prepared.is_some_and(|prepared| prepared.low_load) && entry.pending_first_text.len() <= 1
         {
-            if entry.sample.as_ref().is_some_and(|s| !s.prepared.low_load) {
+            if !entry.pipeline_idle {
                 entry.backlog_generation = entry.backlog_generation.wrapping_add(1);
             }
+            entry.pipeline_idle = true;
+            entry.backlog_peak_size = 0.0;
             entry.observed_delays.clear();
             entry.busy_visibility.clear();
+        } else {
+            entry.pipeline_idle = false;
+        }
+        if let Some(prepared) = prepared {
+            entry.backlog_peak_size = entry.backlog_peak_size.max(prepared.backlog_size);
+            if let Some(delay) = prepared.native_queue_delay.filter(|_| prepared.has_backlog) {
+                entry
+                    .observed_delays
+                    .push_back((delay, entry.backlog_peak_size.max(1.0)));
+                while entry.observed_delays.len() > TTFT_WINDOW_SAMPLES {
+                    entry.observed_delays.pop_front();
+                }
+            }
         }
         entry.sample = prepared.zip(threshold).map(|(prepared, threshold)| Sample {
             prepared,
@@ -1054,15 +1094,18 @@ impl AdmissionGuard<'_> {
                 ready,
                 would_reject = ready && sample.overloaded == Some(true),
                 native_excess_seconds = native_excess,
-                native_ready = fresh && sample.prepared.capacity_learned_ready && sample.prepared.baseline.is_some(),
+                native_ready = fresh && sample.prepared.capacity_learned_ready,
+                legacy_baseline_gate_ready = fresh && sample.prepared.capacity_learned_ready && sample.prepared.baseline.is_some(),
                 token_work = sample.prepared.estimate.token_work(dispatched),
                 native_capacity = sample.prepared.native_prefill_capacity,
                 effective_capacity = sample.prepared.effective_prefill_capacity,
                 visibility_seconds = sample.prepared.visibility_delay,
                 observed_samples = entry.observed_delays.len(),
                 observed_delay_floor = sample.prepared.observed_delay_floor,
-                active_prefill = sample.prepared.active_prefill,
+                pending_engine = sample.prepared.pending_engine,
                 native_waiting = sample.prepared.native_waiting,
+                native_queue_delay = sample.prepared.native_queue_delay.unwrap_or(-1.0),
+                baseline_available = sample.prepared.baseline.is_some(),
             );
         }
     }
@@ -1405,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn low_load_baseline_is_added_once_and_required_for_calibrated_admission() {
+    fn low_load_baseline_is_added_once_but_not_required_for_native_extra_delay() {
         let mut report = load(Some(300), 0, 100.0, 0.0);
         report.loads[0].low_load_ttft_seconds = Some(0.25);
         report.loads[0].prefill_capacity_learning_active = Some(false);
@@ -1415,7 +1458,11 @@ mod tests {
         report.loads[0].low_load_ttft_seconds = None;
         let uncalibrated = config().prepare(&report).unwrap();
         assert_eq!(uncalibrated.seconds(100), 4.0);
-        assert!(!uncalibrated.capacity_ready);
+        assert!(uncalibrated.capacity_ready);
+        assert_eq!(
+            prepared.excess_seconds(100),
+            uncalibrated.excess_seconds(100)
+        );
     }
 
     #[test]
@@ -1463,6 +1510,9 @@ mod tests {
             admission.observe_ttft(probe, 10.25, 8.05);
         }
         let old = admission.ttft_probe(worker.url()).unwrap();
+        let late: Vec<_> = (0..TTFT_MIN_SAMPLES)
+            .map(|_| admission.ttft_probe(worker.url()).unwrap())
+            .collect();
         {
             let entries = admission.entries.lock();
             let sample = entries[worker.url()].sample.as_ref().unwrap();
@@ -1485,6 +1535,20 @@ mod tests {
         report.loads[0].num_waiting_reqs = 1;
         report.loads[0].num_waiting_uncached_tokens = 100;
         publish_load(&admission, &worker, &report);
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .sample
+                .as_ref()
+                .unwrap()
+                .prepared
+                .observed_delay_floor,
+            2.5
+        );
+        // Late responses must retain their larger dispatch-time queue as the
+        // reference; they cannot reinflate a now smaller queue's correction.
+        for probe in late {
+            admission.observe_ttft(probe, 10.25, 8.05);
+        }
         assert_eq!(
             admission.entries.lock()[worker.url()]
                 .sample
@@ -1517,7 +1581,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_first_text_covers_active_prefill_but_not_decode_or_post_engine_formatting() {
+    fn pending_first_text_telemetry_does_not_invent_remaining_prefill_work() {
         let admission = EstimatedWaitAdmission::default();
         admission.configure(EstimatedWaitConfig {
             estimated_wait_mean_prefill_tokens: 1024,
@@ -1539,8 +1603,8 @@ mod tests {
         {
             let entries = admission.entries.lock();
             let p = entries[worker.url()].sample.as_ref().unwrap().prepared;
-            assert_eq!(p.active_prefill, 8.0);
-            assert!(p.excess_seconds(0) > 5.0);
+            assert_eq!(p.pending_engine, 8.0);
+            assert_eq!(p.excess_seconds(0), 0.0);
         }
         for probe in probes {
             admission.observe_ttft(probe, 0.25, 0.0);
@@ -1548,7 +1612,7 @@ mod tests {
         {
             let entries = admission.entries.lock();
             let p = entries[worker.url()].sample.as_ref().unwrap().prepared;
-            assert_eq!(p.active_prefill, 0.0);
+            assert_eq!(p.pending_engine, 0.0);
             assert_eq!(p.excess_seconds(0), 0.0);
         }
         let probes: Vec<_> = (0..8)
@@ -1559,7 +1623,7 @@ mod tests {
         {
             let entries = admission.entries.lock();
             let p = entries[worker.url()].sample.as_ref().unwrap().prepared;
-            assert_eq!(p.active_prefill, 0.0);
+            assert_eq!(p.pending_engine, 0.0);
             assert_eq!(p.excess_seconds(0), 0.0);
         }
         for probe in probes {
@@ -1600,6 +1664,86 @@ mod tests {
         drop(observer);
         assert!(admission.entries.lock()[worker.url()]
             .pending_first_text
+            .is_empty());
+    }
+
+    #[test]
+    fn native_queue_delay_establishes_overload_without_baseline_or_capacity_guess() {
+        let admission = EstimatedWaitAdmission::default();
+        admission.configure(EstimatedWaitConfig {
+            max_estimated_wait_secs: Some(5.0),
+            ..config()
+        });
+        let worker = worker("http://native-queue-delay:1");
+        let mut report = load(Some(60_000), 6, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = None;
+        report.loads[0].learned_prefill_capacity = None;
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].recent_queue_delay_seconds = Some(0.1);
+        report.loads[0].recent_queue_delay_sample_count = Some(4);
+        for _ in 0..TTFT_MIN_SAMPLES {
+            publish_load(&admission, &worker, &report);
+        }
+        assert!(admission
+            .begin()
+            .unwrap()
+            .check(std::slice::from_ref(&worker), "m")
+            .is_ok());
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .sample
+                .as_ref()
+                .unwrap()
+                .prepared
+                .seconds(0),
+            0.1
+        );
+        report.loads[0].recent_queue_delay_seconds = Some(6.0);
+        for _ in 0..TTFT_WINDOW_SAMPLES {
+            publish_load(&admission, &worker, &report);
+        }
+        assert!(admission
+            .begin()
+            .unwrap()
+            .check(std::slice::from_ref(&worker), "m")
+            .is_err());
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .sample
+                .as_ref()
+                .unwrap()
+                .prepared
+                .seconds(0),
+            6.0
+        );
+        report.loads[0].num_waiting_reqs = 0;
+        report.loads[0].num_waiting_uncached_tokens = 0;
+        publish_load(&admission, &worker, &report);
+        assert!(admission
+            .begin()
+            .unwrap()
+            .check(std::slice::from_ref(&worker), "m")
+            .is_ok());
+    }
+
+    #[test]
+    fn delayed_streams_cannot_reenter_after_native_idle_precedes_pipeline_drain() {
+        let admission = EstimatedWaitAdmission::default();
+        admission.configure(config());
+        let worker = worker("http://delayed-drain:1");
+        publish_load(&admission, &worker, &load(Some(400), 4, 1_000.0, 0.0));
+        let mut probes: Vec<_> = (0..4)
+            .map(|_| admission.ttft_probe(worker.url()).unwrap())
+            .collect();
+        publish(&admission, &worker, 0);
+        while probes.len() > 1 {
+            admission.finish_ttft_probe(&probes.pop().unwrap());
+        }
+        publish(&admission, &worker, 0);
+        publish_load(&admission, &worker, &load(Some(400), 4, 1_000.0, 0.0));
+        admission.observe_ttft(probes.pop().unwrap(), 20.0, 0.0);
+        assert!(admission.entries.lock()[worker.url()]
+            .observed_delays
             .is_empty());
     }
 

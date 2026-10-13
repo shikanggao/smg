@@ -242,6 +242,8 @@ struct EngineCounterSample {
     ttft_sum: Option<f64>,
     ttft_count: Option<f64>,
     prefill_started_count: Option<f64>,
+    queue_delay_sum: Option<f64>,
+    queue_delay_count: Option<f64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -289,6 +291,8 @@ struct EngineDerivedMetrics {
     prefill_capacity_learning_active: Option<bool>,
     cache_hit_rate: f64,
     low_load_ttft_seconds: Option<f64>,
+    recent_queue_delay_seconds: Option<f64>,
+    recent_queue_delay_sample_count: Option<u64>,
 }
 
 const PREFILL_SIZE_WINDOW_INTERVALS: usize = 64;
@@ -442,6 +446,8 @@ fn vllm_counter_sample(metrics: &PromScrape, observed: Instant) -> EngineCounter
         ttft_sum: metrics.first_sum(&["vllm:time_to_first_token_seconds_sum"]),
         ttft_count: metrics.first_sum(&["vllm:time_to_first_token_seconds_count"]),
         prefill_started_count: None,
+        queue_delay_sum: metrics.first_sum(&["vllm:request_queue_time_seconds_sum"]),
+        queue_delay_count: metrics.first_sum(&["vllm:request_queue_time_seconds_count"]),
     }
 }
 
@@ -669,6 +675,20 @@ fn derive_engine_metrics(
             }
         });
 
+    let recent_queue_delay_seconds = previous.as_ref().and_then(|history| {
+        counter_delta_mean(
+            current.queue_delay_sum,
+            history.sample.queue_delay_sum,
+            current.queue_delay_count,
+            history.sample.queue_delay_count,
+        )
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    });
+    let recent_queue_delay_sample_count = recent_queue_delay_seconds.and_then(|_| {
+        let delta = current.queue_delay_count? - previous.as_ref()?.sample.queue_delay_count?;
+        (delta.is_finite() && delta > 0.0).then_some(delta.round() as u64)
+    });
+
     let derived = EngineDerivedMetrics {
         prefill_throughput,
         gen_throughput,
@@ -680,6 +700,8 @@ fn derive_engine_metrics(
         prefill_capacity_learning_active: Some(prefill_capacity_learning_active),
         cache_hit_rate: cache_hit_rate.unwrap_or(0.0),
         low_load_ttft_seconds,
+        recent_queue_delay_seconds,
+        recent_queue_delay_sample_count,
     };
     let history = EngineMetricsHistory {
         sample: current,
@@ -1383,6 +1405,8 @@ impl WorkerMonitor {
             prefill_capacity_learning_active: derived.prefill_capacity_learning_active,
             cache_hit_rate: derived.cache_hit_rate,
             low_load_ttft_seconds: derived.low_load_ttft_seconds,
+            recent_queue_delay_seconds: derived.recent_queue_delay_seconds,
+            recent_queue_delay_sample_count: derived.recent_queue_delay_sample_count,
             ..Default::default()
         }))
     }
@@ -1450,6 +1474,8 @@ impl WorkerMonitor {
             ttft_sum: m.first_sum(&[&format!("{prefix}time_to_first_token_seconds_sum")]),
             ttft_count: m.first_sum(&[&format!("{prefix}time_to_first_token_seconds_count")]),
             prefill_started_count: m.first_sum(&[&format!("{prefix}queue_time_seconds_count")]),
+            queue_delay_sum: m.first_sum(&[&format!("{prefix}queue_time_seconds_sum")]),
+            queue_delay_count: m.first_sum(&[&format!("{prefix}queue_time_seconds_count")]),
             ..Default::default()
         };
         let (derived, next) = derive_engine_metrics(&m, current, previous);
@@ -1474,6 +1500,8 @@ impl WorkerMonitor {
                 prefill_capacity_sample_count: derived.prefill_capacity_sample_count,
                 prefill_capacity_learning_active: derived.prefill_capacity_learning_active,
                 low_load_ttft_seconds: derived.low_load_ttft_seconds,
+                recent_queue_delay_seconds: derived.recent_queue_delay_seconds,
+                recent_queue_delay_sample_count: derived.recent_queue_delay_sample_count,
                 ..Default::default()
             },
             next,
@@ -2942,6 +2970,39 @@ sglang:utilization{model="llama"} 0.9
 
 #[cfg(test)]
 mod native_loads_tests {
+    #[test]
+    fn recent_queue_delay_uses_counter_deltas_and_rejects_resets_or_no_progress() {
+        use super::{derive_engine_metrics, EngineCounterSample, PromScrape};
+        let metrics = PromScrape::parse("");
+        let before = EngineCounterSample {
+            queue_delay_sum: Some(10.0),
+            queue_delay_count: Some(2.0),
+            ..Default::default()
+        };
+        let (_, history) = derive_engine_metrics(&metrics, before, None);
+        let current = EngineCounterSample {
+            queue_delay_sum: Some(30.0),
+            queue_delay_count: Some(6.0),
+            ..Default::default()
+        };
+        let (derived, history) = derive_engine_metrics(&metrics, current.clone(), Some(history));
+        assert_eq!(derived.recent_queue_delay_seconds, Some(5.0));
+        assert_eq!(derived.recent_queue_delay_sample_count, Some(4));
+        let (same, history) = derive_engine_metrics(&metrics, current, Some(history));
+        assert_eq!(same.recent_queue_delay_seconds, None);
+        let reset = EngineCounterSample {
+            queue_delay_sum: Some(0.0),
+            queue_delay_count: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_engine_metrics(&metrics, reset, Some(history))
+                .0
+                .recent_queue_delay_seconds,
+            None
+        );
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use openai_protocol::{

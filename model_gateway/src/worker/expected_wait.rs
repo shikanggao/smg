@@ -31,11 +31,6 @@ impl ExpectedWait {
         self.queued_tokens
     }
 
-    pub(crate) fn with_queued_work(mut self, tokens: f64) -> Self {
-        self.queued_tokens = tokens;
-        self
-    }
-
     pub(crate) fn with_base_overhead(mut self, seconds: f64) -> Self {
         self.base_overhead = seconds;
         self
