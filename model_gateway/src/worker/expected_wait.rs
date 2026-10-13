@@ -22,6 +22,10 @@ pub(crate) struct ExpectedWait {
 }
 
 impl ExpectedWait {
+    pub(crate) fn with_base_overhead(mut self, seconds: f64) -> Self {
+        self.base_overhead = seconds;
+        self
+    }
     pub(crate) fn calibrated(
         queued_tokens: f64,
         throughput: f64,

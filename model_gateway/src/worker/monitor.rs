@@ -241,11 +241,13 @@ struct EngineCounterSample {
     running: f64,
     ttft_sum: Option<f64>,
     ttft_count: Option<f64>,
+    prefill_started_count: Option<f64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PrefillCounter {
     LocalCompute,
+    StartedRequests,
     CompletedUncached,
     Prompt,
 }
@@ -254,6 +256,8 @@ impl EngineCounterSample {
     fn prefill_counter(&self) -> (PrefillCounter, Option<f64>) {
         if self.local_compute_tokens.is_some() {
             (PrefillCounter::LocalCompute, self.local_compute_tokens)
+        } else if self.prefill_started_count.is_some() {
+            (PrefillCounter::StartedRequests, self.prefill_started_count)
         } else if self.prefill_kv_sum.is_some() {
             (PrefillCounter::CompletedUncached, self.prefill_kv_sum)
         } else {
@@ -437,6 +441,7 @@ fn vllm_counter_sample(metrics: &PromScrape, observed: Instant) -> EngineCounter
         running: metrics.sum("vllm:num_requests_running"),
         ttft_sum: metrics.first_sum(&["vllm:time_to_first_token_seconds_sum"]),
         ttft_count: metrics.first_sum(&["vllm:time_to_first_token_seconds_count"]),
+        prefill_started_count: None,
     }
 }
 
@@ -471,8 +476,16 @@ fn derive_engine_metrics(
         // outputs, before decode completes. The request histogram remains a
         // prompt-size signal and a compatibility rate for older versions.
         // Zero local compute must not fall back to cache-inclusive totals.
-        counter_rate(prefill_counter, history.sample.prefill_counter().1, elapsed)
-            .filter(|rate| rate.is_finite() && *rate > 0.0)
+        let rate = counter_rate(prefill_counter, history.sample.prefill_counter().1, elapsed)?;
+        // Some engines publish prompt tokens only at generation completion.
+        // Their prefill-admission count is timely; convert that request rate
+        // to token work with the same observed mean used by the queue proxy.
+        let rate = if prefill_source == PrefillCounter::StartedRequests {
+            rate * history.avg_request_prefill_kv_computed_tokens?
+        } else {
+            rate
+        };
+        (rate.is_finite() && rate > 0.0).then_some(rate)
     });
     let gen_throughput = previous
         .as_ref()
@@ -600,7 +613,9 @@ fn derive_engine_metrics(
     if prefill_counter_reset || capacity_counter_changed {
         saturated_prefill_rates.clear();
     }
-    let waiting = current.waiting;
+    let waiting = current
+        .waiting
+        .max(previous.as_ref().map(|h| h.sample.waiting).unwrap_or(0.0));
     let prefill_capacity_learning_active = waiting > 0.0 && prefill_throughput.is_some();
     if waiting > 0.0 {
         if let Some(rate) = prefill_throughput {
@@ -1434,6 +1449,7 @@ impl WorkerMonitor {
             running: m.sum(&format!("{prefix}num_running_reqs")),
             ttft_sum: m.first_sum(&[&format!("{prefix}time_to_first_token_seconds_sum")]),
             ttft_count: m.first_sum(&[&format!("{prefix}time_to_first_token_seconds_count")]),
+            prefill_started_count: m.first_sum(&[&format!("{prefix}queue_time_seconds_count")]),
             ..Default::default()
         };
         let (derived, next) = derive_engine_metrics(&m, current, previous);
@@ -2433,6 +2449,32 @@ sglang:utilization{model="llama"} 0.9
                 assert_eq!(snapshot.low_load_ttft_seconds, None);
                 history = Some(next);
             }
+        }
+    }
+
+    #[test]
+    fn sglang_capacity_uses_prefill_starts_before_decode_completion() {
+        let now = Instant::now();
+        let mut history = None;
+        for second in 0..=8 {
+            let body = format!(
+                "sglang:token_usage 0.1\nsglang:num_queue_reqs 1\nsglang:num_running_reqs 10\nsglang:prompt_tokens_total 80000\nsglang:cached_tokens_total 20000\nsglang:num_requests_total 20\nsglang:queue_time_seconds_count {}\n",
+                20 + second * 2,
+            );
+            let (snapshot, next) = WorkerMonitor::decode_sglang_metrics_with_history(
+                &body,
+                now + Duration::from_secs(second),
+                history,
+            )
+            .unwrap();
+            if second > 0 {
+                assert_eq!(snapshot.prefill_throughput, Some(6000.0));
+            }
+            assert_eq!(
+                snapshot.learned_prefill_capacity,
+                (second >= 8).then_some(6000.0)
+            );
+            history = Some(next);
         }
     }
 

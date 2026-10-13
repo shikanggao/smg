@@ -4,7 +4,7 @@
 //! watermark before I/O so admissions during a poll survive its publication.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, OnceLock, Weak,
@@ -22,7 +22,7 @@ use super::{
         ExpectedWait, DEFAULT_DISPATCH_BLOCKING_FACTOR, DEFAULT_MEAN_PREFILL_TOKENS,
         DEFAULT_THROUGHPUT,
     },
-    Worker,
+    Worker, WorkerRegistry,
 };
 use crate::{
     config::{ConfigError, ConfigResult},
@@ -273,6 +273,20 @@ impl EstimatedWaitConfig {
             blended_prompt_size,
             effective_prefill_capacity: throughput,
             baseline,
+            low_load: queued == 0.0
+                && load
+                    .loads
+                    .iter()
+                    .all(|rank| rank.num_waiting_reqs == 0 && rank.num_running_reqs >= 0)
+                && load
+                    .loads
+                    .iter()
+                    .map(|rank| i64::from(rank.num_running_reqs))
+                    .sum::<i64>()
+                    <= 1,
+            capacity_learned_ready: !capacity_learning_backend
+                || learned.is_some_and(|value| value.is_finite() && value > 0.0),
+            visibility_delay: 0.0,
         })
     }
 
@@ -295,6 +309,9 @@ struct PreparedWait {
     blended_prompt_size: Option<f64>,
     effective_prefill_capacity: f64,
     baseline: Option<f64>,
+    low_load: bool,
+    capacity_learned_ready: bool,
+    visibility_delay: f64,
 }
 
 impl PreparedWait {
@@ -317,7 +334,141 @@ fn invalidate_diagnostic_metrics(worker_url: &str) {
         .set(-1.0);
     metrics::gauge!("smg_estimated_wait_capacity_ready", "worker" => worker.clone()).set(-1.0);
     metrics::gauge!("smg_estimated_wait_baseline_seconds", "worker" => worker.clone()).set(-1.0);
+    metrics::gauge!("smg_estimated_wait_visibility_delay_seconds", "worker" => worker.clone())
+        .set(-1.0);
+    metrics::gauge!("smg_estimated_wait_baseline_sample_count", "worker" => worker.clone())
+        .set(-1.0);
     metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker).set(0.0);
+}
+
+const TTFT_WINDOW_SAMPLES: usize = 32;
+const TTFT_MIN_SAMPLES: usize = 4;
+const MAX_TTFT_EVENT_BYTES: usize = 64 * 1024;
+
+fn push_ttft_sample(samples: &mut VecDeque<f64>, value: f64) {
+    samples.push_back(value);
+    while samples.len() > TTFT_WINDOW_SAMPLES {
+        samples.pop_front();
+    }
+}
+
+fn ttft_median(samples: &VecDeque<f64>) -> Option<f64> {
+    if samples.len() < TTFT_MIN_SAMPLES {
+        return None;
+    }
+    let mut values: Vec<_> = samples.iter().copied().collect();
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    })
+}
+
+struct TtftProbe {
+    worker_url: String,
+    generation: Arc<()>,
+    dispatched: u64,
+    low_load: bool,
+}
+
+/// Observe standard OpenAI SSE without altering or delaying relayed bytes.
+/// Empty role/metadata events are not the first visible reasoning/answer text.
+pub(crate) struct StreamTtftObserver {
+    registry: Weak<WorkerRegistry>,
+    probe: Option<TtftProbe>,
+    started: Instant,
+    first_event: Option<Instant>,
+    pending: Vec<u8>,
+    done: bool,
+}
+
+impl StreamTtftObserver {
+    pub(crate) fn cancel(&mut self) {
+        self.probe = None;
+        self.pending.clear();
+        self.done = true;
+    }
+    pub(crate) fn new(registry: &Arc<WorkerRegistry>, worker_url: &str, started: Instant) -> Self {
+        Self {
+            registry: Arc::downgrade(registry),
+            probe: registry.estimated_wait().ttft_probe(worker_url),
+            started,
+            first_event: None,
+            pending: Vec::new(),
+            done: false,
+        }
+    }
+
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        if self.probe.is_none() {
+            return;
+        }
+        if let Some((ttft, visibility)) = self.scan(bytes, Instant::now()) {
+            if let (Some(registry), Some(probe)) = (self.registry.upgrade(), self.probe.take()) {
+                registry
+                    .estimated_wait()
+                    .observe_ttft(probe, ttft, visibility);
+            }
+        }
+    }
+
+    fn scan(&mut self, bytes: &[u8], now: Instant) -> Option<(f64, f64)> {
+        if self.done {
+            return None;
+        }
+        if self.pending.len().saturating_add(bytes.len()) > MAX_TTFT_EVENT_BYTES {
+            self.done = true;
+            self.pending.clear();
+            return None;
+        }
+        self.pending.extend_from_slice(bytes);
+        while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<_> = self.pending.drain(..=end).collect();
+            let Some(data) = line.trim_ascii().strip_prefix(b"data:") else {
+                continue;
+            };
+            let data = data.trim_ascii();
+            if data == b"[DONE]" {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(data) else {
+                continue;
+            };
+            let first_event = *self.first_event.get_or_insert(now);
+            let has_text = value
+                .get("choices")
+                .and_then(|v| v.as_array())
+                .is_some_and(|choices| {
+                    choices.iter().any(|choice| {
+                        choice
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|v| !v.is_empty())
+                            || choice.get("delta").is_some_and(|delta| {
+                                ["content", "reasoning", "reasoning_content"]
+                                    .iter()
+                                    .any(|field| {
+                                        delta
+                                            .get(*field)
+                                            .and_then(|v| v.as_str())
+                                            .is_some_and(|v| !v.is_empty())
+                                    })
+                            })
+                    })
+                });
+            if has_text {
+                self.done = true;
+                self.pending.clear();
+                return Some((
+                    now.duration_since(self.started).as_secs_f64(),
+                    now.duration_since(first_event).as_secs_f64(),
+                ));
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -339,6 +490,9 @@ struct Entry {
     // Keep ordering even for failed polls, which must supersede older successes.
     last_published: Option<Instant>,
     sample: Option<Sample>,
+    low_load_ttfts: VecDeque<f64>,
+    low_load_visibility: VecDeque<f64>,
+    busy_visibility: VecDeque<f64>,
 }
 
 impl Entry {
@@ -349,6 +503,9 @@ impl Entry {
             total_dispatched: 0,
             last_published: None,
             sample: None,
+            low_load_ttfts: VecDeque::new(),
+            low_load_visibility: VecDeque::new(),
+            busy_visibility: VecDeque::new(),
         }
     }
 
@@ -357,6 +514,9 @@ impl Entry {
         self.total_dispatched = 0;
         self.last_published = None;
         self.sample = None;
+        self.low_load_ttfts.clear();
+        self.low_load_visibility.clear();
+        self.busy_visibility.clear();
     }
 
     fn refresh(&mut self, worker: &Arc<dyn Worker>, max_age_secs: f64) {
@@ -389,6 +549,60 @@ pub(crate) struct EstimatedWaitAdmission {
 }
 
 impl EstimatedWaitAdmission {
+    fn ttft_probe(&self, worker_url: &str) -> Option<TtftProbe> {
+        if !self.enabled() {
+            return None;
+        }
+        let entries = self.entries.lock();
+        let entry = entries.get(worker_url)?;
+        let worker = entry.source.upgrade()?;
+        let sample = entry.sample.as_ref()?;
+        Some(TtftProbe {
+            worker_url: worker_url.to_owned(),
+            generation: Arc::clone(&entry.generation),
+            dispatched: entry.total_dispatched,
+            low_load: sample.prepared.low_load && worker.load() == 1,
+        })
+    }
+
+    fn observe_ttft(&self, probe: TtftProbe, ttft: f64, visibility: f64) {
+        if !ttft.is_finite()
+            || !visibility.is_finite()
+            || ttft <= 0.0
+            || visibility < 0.0
+            || visibility > ttft
+        {
+            return;
+        }
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.get_mut(&probe.worker_url) else {
+            return;
+        };
+        if !Arc::ptr_eq(&entry.generation, &probe.generation) {
+            return;
+        }
+        let Some(worker) = entry.source.upgrade() else {
+            return;
+        };
+        let Some(sample) = entry.sample.as_ref() else {
+            return;
+        };
+        if sample.started.elapsed().as_secs_f64()
+            > self.config().estimated_wait_max_snapshot_age_secs
+        {
+            return;
+        }
+        if probe.low_load
+            && entry.total_dispatched == probe.dispatched
+            && worker.load() == 1
+            && sample.prepared.low_load
+        {
+            push_ttft_sample(&mut entry.low_load_ttfts, ttft);
+            push_ttft_sample(&mut entry.low_load_visibility, visibility);
+        } else if !probe.low_load || !sample.prepared.low_load {
+            push_ttft_sample(&mut entry.busy_visibility, visibility);
+        }
+    }
     pub(crate) fn configure(&self, config: EstimatedWaitConfig) {
         let _ = self.config.set(config);
     }
@@ -488,12 +702,33 @@ impl EstimatedWaitAdmission {
             return;
         }
         entry.last_published = Some(started);
-        entry.sample = prepared.zip(threshold).map(|(prepared, threshold)| Sample {
-            prepared,
-            started,
-            watermark: watermark.dispatched,
-            threshold,
-            overloaded: None,
+        entry.sample = prepared.zip(threshold).map(|(mut prepared, threshold)| {
+            if let Some(baseline) = ttft_median(&entry.low_load_ttfts) {
+                // Router observations measure the same first nonempty text
+                // target for reasoning and ordinary models. The baseline
+                // already contains the low-load stream visibility delay.
+                let visibility_delay = if prepared.low_load {
+                    0.0
+                } else {
+                    ttft_median(&entry.busy_visibility)
+                        .zip(ttft_median(&entry.low_load_visibility))
+                        .map(|(busy, low)| (busy - low).max(0.0))
+                        .unwrap_or(0.0)
+                };
+                prepared.estimate = prepared.estimate.with_base_overhead(
+                    baseline + config.estimated_wait_base_overhead_secs + visibility_delay,
+                );
+                prepared.baseline = Some(baseline);
+                prepared.visibility_delay = visibility_delay;
+                prepared.capacity_ready = prepared.capacity_learned_ready;
+            }
+            Sample {
+                prepared,
+                started,
+                watermark: watermark.dispatched,
+                threshold,
+                overloaded: None,
+            }
         });
         if let Some(sample) = &entry.sample {
             metrics::gauge!("smg_estimated_wait_threshold_seconds", "worker" => worker.url().to_owned()).set(sample.threshold);
@@ -506,6 +741,10 @@ impl EstimatedWaitAdmission {
                 .set(sample.prepared.effective_prefill_capacity);
             metrics::gauge!("smg_estimated_wait_baseline_seconds", "worker" => worker.url().to_owned())
                 .set(sample.prepared.baseline.unwrap_or(-1.0));
+            metrics::gauge!("smg_estimated_wait_visibility_delay_seconds", "worker" => worker.url().to_owned())
+                .set(sample.prepared.visibility_delay);
+            metrics::gauge!("smg_estimated_wait_baseline_sample_count", "worker" => worker.url().to_owned())
+                .set(entry.low_load_ttfts.len() as f64);
         }
         entry.refresh(worker, config.estimated_wait_max_snapshot_age_secs);
     }
@@ -904,6 +1143,121 @@ mod tests {
         let uncalibrated = config().prepare(&report).unwrap();
         assert_eq!(uncalibrated.seconds(100), 4.0);
         assert!(!uncalibrated.capacity_ready);
+    }
+
+    #[test]
+    fn sse_observer_handles_fragmented_reasoning_and_ignores_empty_role() {
+        let started = Instant::now();
+        let mut observer = StreamTtftObserver {
+            registry: Weak::new(),
+            probe: None,
+            started,
+            first_event: None,
+            pending: Vec::new(),
+            done: false,
+        };
+        assert_eq!(
+            observer.scan(
+                b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+                started + std::time::Duration::from_secs(1)
+            ),
+            None
+        );
+        assert_eq!(
+            observer.scan(
+                b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hel",
+                started + std::time::Duration::from_secs(2)
+            ),
+            None
+        );
+        assert_eq!(
+            observer.scan(b"lo\"}}]}\n\n", started + std::time::Duration::from_secs(3)),
+            Some((3.0, 2.0))
+        );
+        assert_eq!(
+            observer.scan(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"later\"}}]}\n\n",
+                started + std::time::Duration::from_secs(4)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sse_observer_does_not_train_after_backpressure_or_oversized_events() {
+        let started = Instant::now();
+        let mut observer = StreamTtftObserver {
+            registry: Weak::new(),
+            probe: None,
+            started,
+            first_event: None,
+            pending: Vec::new(),
+            done: false,
+        };
+        observer.cancel();
+        assert_eq!(
+            observer.scan(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"text\"}}]}\n",
+                started
+            ),
+            None
+        );
+        observer.done = false;
+        assert_eq!(
+            observer.scan(&vec![b'x'; MAX_TTFT_EVENT_BYTES + 1], started),
+            None
+        );
+        assert!(observer.done && observer.pending.is_empty());
+    }
+
+    #[test]
+    fn router_baseline_and_visibility_use_shared_rules_and_reset_with_worker() {
+        let admission = EstimatedWaitAdmission::default();
+        admission.configure(config());
+        let worker = worker("http://measured:1");
+        admission.worker_added(&worker);
+        worker.increment_load();
+        publish(&admission, &worker, 0);
+        for _ in 0..TTFT_MIN_SAMPLES {
+            let probe = admission.ttft_probe(worker.url()).unwrap();
+            admission.observe_ttft(probe, 0.25, 0.05);
+        }
+        publish(&admission, &worker, 100);
+        for _ in 0..TTFT_MIN_SAMPLES {
+            let probe = admission.ttft_probe(worker.url()).unwrap();
+            admission.observe_ttft(probe, 4.0, 3.0);
+        }
+        publish(&admission, &worker, 100);
+        let entries = admission.entries.lock();
+        let sample = entries[worker.url()].sample.as_ref().unwrap();
+        assert!((sample.prepared.seconds(0) - 4.2).abs() < 1e-9);
+        assert!((sample.prepared.visibility_delay - 2.95).abs() < 1e-9);
+        drop(entries);
+        let old = admission.ttft_probe(worker.url()).unwrap();
+        admission.evict(&worker);
+        publish(&admission, &worker, 0);
+        admission.observe_ttft(old, 99.0, 0.0);
+        assert!(admission.entries.lock()[worker.url()]
+            .low_load_ttfts
+            .is_empty());
+        worker.decrement_load();
+    }
+
+    #[test]
+    fn overlapping_dispatch_is_not_a_low_load_baseline() {
+        let admission = EstimatedWaitAdmission::default();
+        admission.configure(config());
+        let worker = worker("http://overlap:1");
+        admission.worker_added(&worker);
+        worker.increment_load();
+        publish(&admission, &worker, 0);
+        let probe = admission.ttft_probe(worker.url()).unwrap();
+        admission.begin().unwrap().credit(&worker, Some(&[1; 10]));
+        admission.observe_ttft(probe, 12.0, 0.0);
+        assert!(admission.entries.lock()[worker.url()]
+            .low_load_ttfts
+            .is_empty());
+        worker.decrement_load();
     }
 
     #[test]
