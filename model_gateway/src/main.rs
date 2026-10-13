@@ -298,7 +298,7 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     worker_overload_protection: bool,
 
-    /// Estimated wait budget in seconds; unset disables admission.
+    /// Extra-delay budget above the low-load first-text baseline; unset disables admission.
     #[arg(long, help_heading = "Routing Policy")]
     max_estimated_wait_secs: Option<f64>,
 

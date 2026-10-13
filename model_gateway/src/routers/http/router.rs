@@ -888,6 +888,13 @@ impl Router {
             worker.api_key(),
         );
 
+        let ttft_observer = is_stream.then(|| {
+            StreamTtftObserver::new(&self.worker_registry, worker.url(), start).with_request_id(
+                headers
+                    .and_then(|headers| headers.get("opc-request-id"))
+                    .and_then(|value| value.to_str().ok()),
+            )
+        });
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
@@ -963,8 +970,7 @@ impl Router {
             let stream_model_id = model_id.to_string();
             let stream_endpoint = endpoint;
             let stream_start = start;
-            let mut ttft_observer =
-                StreamTtftObserver::new(&self.worker_registry, worker.url(), start);
+            let mut ttft_observer = ttft_observer.expect("stream observer initialized before send");
             #[expect(
                 clippy::disallowed_methods,
                 reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
@@ -1175,6 +1181,13 @@ impl Router {
             api_key.as_ref(),
         );
 
+        let ttft_observer = is_stream.then(|| {
+            StreamTtftObserver::new(&self.worker_registry, worker.url(), started).with_request_id(
+                headers
+                    .and_then(|headers| headers.get("opc-request-id"))
+                    .and_then(|value| value.to_str().ok()),
+            )
+        });
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
@@ -1189,8 +1202,15 @@ impl Router {
             }
         };
 
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard, started)
-            .await
+        self.forward_worker_response(
+            res,
+            is_stream,
+            worker.url(),
+            load_guard,
+            started,
+            ttft_observer,
+        )
+        .await
     }
 
     /// Relay a worker response to the client. A streaming response flows
@@ -1203,6 +1223,7 @@ impl Router {
         worker_url: &str,
         load_guard: WorkerLoadGuard,
         started: Instant,
+        ttft_observer: Option<StreamTtftObserver>,
     ) -> Response {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1220,8 +1241,9 @@ impl Router {
             // Bounded channel applies backpressure: a slow client makes the
             // relay await on `send` instead of buffering the whole response.
             let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
-            let mut ttft_observer =
-                StreamTtftObserver::new(&self.worker_registry, worker_url, started);
+            let mut ttft_observer = ttft_observer.unwrap_or_else(|| {
+                StreamTtftObserver::new(&self.worker_registry, worker_url, started)
+            });
 
             // Spawn task to forward stream
             #[expect(
@@ -1391,7 +1413,7 @@ impl Router {
             .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
             .is_some_and(|ct| ct.starts_with("text/event-stream"));
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard, started)
+        self.forward_worker_response(res, is_stream, worker.url(), load_guard, started, None)
             .await
     }
 

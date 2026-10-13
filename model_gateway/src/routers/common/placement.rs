@@ -161,6 +161,13 @@ pub(crate) fn select_from(
 ) -> Result<Option<Arc<dyn Worker>>, Response> {
     let mut admission = registry.estimated_wait().begin();
     if let Some(guard) = &admission {
+        guard.record_forecast(
+            candidates,
+            inputs
+                .headers
+                .and_then(|headers| headers.get("opc-request-id"))
+                .and_then(|value| value.to_str().ok()),
+        );
         guard.check(candidates, model_id)?;
     }
     let policy = policies.get_policy_or_default(model_id);
