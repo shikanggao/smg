@@ -162,3 +162,68 @@ does not account exactly for prefill stages, heterogeneous remaining outputs,
 preemptions, future arrivals or scheduling. It is labelled experimental and must
 not be interpreted as a reliable deadline bound. The script deliberately reports
 regressions as well as improvements. No model-specific constants are assigned.
+
+## Live shadow calibration from first text
+
+`analyze_wait_calibration.py` and `plot_wait_calibration.py` reproduce the online
+shadow experiment. For each suite, retain `summary.json`, `requests.tsv`,
+`metrics.tsv` and `router-events.jsonl`. Keep the full router log history since
+startup: if a later suite inherits learning state, its trace must include the
+previous suite's feedback. The analyzer refuses to replace missing exact events
+with nearby metric samples.
+
+```sh
+for suite in train holdout cold hard; do
+  python scripts/analyze_wait_calibration.py "results/llama/$suite"
+done
+python scripts/plot_wait_calibration.py \
+  --input results/llama --title 'vLLM Llama 3.1 8B'
+```
+
+Enable serving diagnostics with `--estimated-wait-calibration-shadow` and
+`RUST_LOG=info,smg::estimated_wait::observation=debug`. The flag defaults off.
+Raw readiness and admission stay unchanged, including when raw hard admission is
+enabled. The experimental estimate is `B + g * E_raw`, scaling the entire extra
+delay (including F) while preserving B. It does not replace physical capacity C.
+This differs from the older pressure script's offline capacity-correction
+hypothesis described above.
+
+At worker selection, a snapshot saves B, E_raw, capacity-readiness state, epoch,
+observation sequence and g before dispatch credit. The first nonempty supported
+OpenAI-compatible SSE reasoning/content text contributes
+`max(actual_TTFT - saved_B, 0) / saved_E_raw`, weighted by saved E_raw. Each native
+capacity state uses its own rolling 32-observation weighted median, with g=1
+until four valid observations. Those shared policies apply to every engine/model.
+Only supported regular HTTP streaming responses supply learning feedback.
+
+The audit rebuilds each live history by worker, epoch, state and accepted
+observation sequence. It checks window weights, before/after scales, saved inputs,
+exact forecast arithmetic and that forecasts did not use later feedback. It
+separately audits the original pre-admission raw gate. Selected snapshots can
+slightly differ from that earlier gate during concurrent dispatch; accuracy
+compares raw/calibrated predictions from the same selected snapshot.
+
+Tables/scatterplots join those exact forecasts to each request's first-text TTFT
+on SMG's clock. Client TTFT is retained separately. Healthy/over-budget truth uses
+prompt-size/cache/output-limit matched serial baseline probes and the shared
+five-second extra-delay budget. Rejected requests have unknown counterfactual
+TTFT. They receive no invented healthy/over-budget label.
+
+Timeline curves are continuously sampled estimate gauges; actual dots are
+individual measured TTFTs placed at request start. The learning panel colors g
+by the saved native-capacity state. Other panels show queue/running/pending text,
+KV usage, B, F and C. These samples cannot recover sub-poll engine changes.
+Cold means a fresh router with an already warm engine. Holdout is new traffic
+with online learning still enabled, rather than a frozen fitted model. The
+`train` suite contains calibration inference requests, not model training.
+
+Accuracy axes are linear from zero to one second and logarithmic above one
+second; both use the same scale, so the diagonal still means perfect agreement.
+TTFT and scale timelines use the same compression above one. All outliers remain
+in the plots and error scores.
+
+A typical-error fit does not optimize admission classification. A tiny raw work
+estimate can teach a huge ratio before the queue becomes visible, then amplify
+an accurate later raw estimate. Sparse observations can also teach g near zero.
+Keep this diagnostic until transition, false-positive and false-negative checks
+pass. This flag provides no calibrated enforcement mode.
