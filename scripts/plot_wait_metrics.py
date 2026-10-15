@@ -49,7 +49,9 @@ def recalculate(forecast):
     schema it is equivalent to waiting>0 and at least four observed samples.
     Stale snapshots/direct-token queues need a richer trace, not this inference.
     """
-    if 'observed_delay_available' in forecast and 'capacity_learned_ready' in forecast:
+    if 'measured_delay_only' in forecast:
+        floor_only = forecast['measured_delay_only']
+    elif 'observed_delay_available' in forecast and 'capacity_learned_ready' in forecast:
         floor_only = not forecast['capacity_learned_ready'] and forecast['observed_delay_available']
     else:
         floor_only = (not forecast['native_ready'] and forecast['native_waiting'] > 0

@@ -48,12 +48,15 @@ This script replays the tested shared formula with alpha=1, b=0:
 
 `T = B + max(W / C, F)`, where `W = Q + 0.05 D`.
 
-Before capacity calibration, an available measured delay uses `T = B + F`.
+Before capacity calibration, when only a fallback rate exists and measured delay
+is available, the follow-up branch uses `T = B + F`.
 Otherwise the numerical estimate remains diagnostic until ready. Older traces
 do not explicitly log floor availability; for those fresh queue-proxy runs it is
 equivalent to native waiting > 0 and at least four observed samples. New traces
-log floor availability and learned-capacity readiness explicitly, so replay uses
-the recorded branch. The loader
+log floor availability and learned-capacity readiness explicitly; the measured
+rate follow-up also logs `measured_delay_only`, so replay uses that exact branch.
+Delay-only warm-up suppresses an unmeasured fallback rate, while an active native
+prefill measurement remains visible with its unready flag. The loader
 rejects stale (>30 s) snapshots, non-proxy queues, duplicate IDs, missing actuals
 and any formula mismatch >1e-8 s. This schema/branch assumption must be revisited
 if future serving arithmetic or trace fields change. A missing B is displayed

@@ -375,9 +375,13 @@ impl PreparedWait {
         self.has_backlog = self.backlog_size > 0.0;
     }
 
+    fn measured_delay_only(self) -> bool {
+        self.fallback && !self.capacity_learned_ready && self.observed_delay_available
+    }
+
     fn seconds(self, dispatched_tokens: u64) -> f64 {
         let baseline = self.baseline.unwrap_or(0.0);
-        if !self.capacity_learned_ready && self.observed_delay_available {
+        if self.measured_delay_only() {
             // Measured delay is useful before rate calibration. Do not let an
             // untrusted default rate amplify that evidence into a huge TTFT.
             return baseline + self.observed_delay_floor;
@@ -1117,6 +1121,7 @@ impl AdmissionGuard<'_> {
                 observed_backlog = sample.prepared.backlog_size,
                 pending_first_text_requests = entry.pending_first_text.len(),
                 observed_delay_available = sample.prepared.observed_delay_available,
+                measured_delay_only = sample.prepared.measured_delay_only(),
                 capacity_learned_ready = sample.prepared.capacity_learned_ready,
                 snapshot_age_seconds = sample.started.elapsed().as_secs_f64(),
                 native_capacity = sample.prepared.native_prefill_capacity,
@@ -1485,6 +1490,33 @@ mod tests {
             prepared.excess_seconds(100),
             uncalibrated.excess_seconds(100)
         );
+    }
+
+    #[test]
+    fn measured_active_prefill_is_not_discarded_during_capacity_warmup() {
+        let mut report = load(Some(3_000), 3, 1_000.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = Some(0.25);
+        report.loads[0].learned_prefill_capacity = None;
+        report.loads[0].prefill_capacity_learning_active = Some(true);
+        report.loads[0].prefill_throughput = Some(1_000.0);
+        let mut prepared = config().prepare(&report).unwrap();
+        prepared.observed_delay_available = true;
+        prepared.observed_delay_floor = 1.0;
+        assert!(!prepared.capacity_learned_ready);
+        assert!(!prepared.capacity_ready);
+        assert!(!prepared.measured_delay_only());
+        // Preserve the measured 3,000 / 1,000 queue estimate. The readiness
+        // gate still prevents this warm-up estimate from rejecting traffic.
+        assert_eq!(prepared.seconds(0), 3.25);
+
+        report.loads[0].prefill_throughput = None;
+        let mut fallback = config().prepare(&report).unwrap();
+        fallback.observed_delay_available = true;
+        fallback.observed_delay_floor = 1.0;
+        assert!(fallback.measured_delay_only());
+        // An unmeasured default must not inflate the observation to 30 s.
+        assert_eq!(fallback.seconds(0), 1.25);
+        assert!(!fallback.capacity_ready);
     }
 
     #[test]
