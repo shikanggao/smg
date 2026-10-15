@@ -65,10 +65,11 @@ The request-level baseline-availability strip identifies these cases.
 
 The extra-delay graph subtracts **B at admission** from actual TTFT. This is a
 formula diagnostic, not the test classifier's prompt-specific low-load reference.
-Generation TPS, KV usage and visibility delay are diagnostics, not additional
-terms in this formula. The first-text backlog fix uses the pending-stream count
-to preserve/scale measured F until first-text work clears; it never converts that
-count into remaining prompt work W. Native TTFT histogram means
+Generation TPS, KV usage, pending-stream counts and visibility delay are
+diagnostics in the retained implementation. Rejected intermediate traces may
+record pending-stream counts contributing to F scaling; their exact logged
+branches remain supported for comparison. No version converts pending count to
+full remaining prompt work W. Native TTFT histogram means
 may have a different first-token boundary from first text. All native histogram
 means use counter delta sum / delta count, never cumulative sum / count.
 Counter resets and unavailable/negative sentinel values become gaps, not zeros.
