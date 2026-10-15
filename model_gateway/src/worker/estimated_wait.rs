@@ -755,6 +755,7 @@ struct Entry {
     calibration: ExcessCalibration,
     calibration_generation: Arc<()>,
     calibration_epoch: u64,
+    calibration_profile: Option<(bool, Option<u64>)>,
 }
 
 impl Entry {
@@ -777,6 +778,7 @@ impl Entry {
             calibration: ExcessCalibration::default(),
             calibration_generation: Arc::new(()),
             calibration_epoch: 0,
+            calibration_profile: None,
         }
     }
 
@@ -795,6 +797,7 @@ impl Entry {
         self.calibration = ExcessCalibration::default();
         self.calibration_generation = Arc::new(());
         self.calibration_epoch = self.calibration_epoch.wrapping_add(1);
+        self.calibration_profile = None;
         self.backlog_generation = self.backlog_generation.wrapping_add(1);
     }
 
@@ -1191,23 +1194,27 @@ impl EstimatedWaitAdmission {
         // Native capacity samples only shrink when the monitor resets its
         // counter/profile history. Do not let pre-reset responses train the
         // new profile, and leave all raw estimator state untouched.
-        if config.estimated_wait_calibration_shadow
-            && entry
-                .sample
-                .as_ref()
-                .zip(prepared)
-                .is_some_and(|(old, new)| {
-                    (old.prepared.capacity_learned_ready && !new.capacity_learned_ready)
-                        || old
-                            .prepared
-                            .capacity_profile_sample_count
+        if let Some(new) = prepared.filter(|_| config.estimated_wait_calibration_shadow) {
+            if entry
+                .calibration_profile
+                .is_some_and(|(old_ready, old_count)| {
+                    (old_ready && !new.capacity_learned_ready)
+                        || old_count
                             .zip(new.capacity_profile_sample_count)
                             .is_some_and(|(old, new)| new < old)
                 })
-        {
-            entry.calibration = ExcessCalibration::default();
-            entry.calibration_generation = Arc::new(());
-            entry.calibration_epoch = entry.calibration_epoch.wrapping_add(1);
+            {
+                entry.calibration = ExcessCalibration::default();
+                entry.calibration_generation = Arc::new(());
+                entry.calibration_epoch = entry.calibration_epoch.wrapping_add(1);
+            }
+            // A failed scrape invalidates the raw report, not this reset
+            // watermark. Otherwise a counter reset across one failed poll
+            // could silently retain the preceding calibration history.
+            entry.calibration_profile = Some((
+                new.capacity_learned_ready,
+                new.capacity_profile_sample_count,
+            ));
         }
         // A verified idle worker begins a new queue epoch. Responses from the
         // preceding busy epoch cannot recalibrate a later workload after drain.
@@ -1832,6 +1839,8 @@ mod tests {
             (2.0, 4)
         );
         let late = calibration_probe(admission, &worker);
+        let watermark = admission.poll_started(&worker);
+        admission.publish(&worker, None, watermark, Instant::now());
         let mut report = load(Some(1_000), 2, 100.0, 0.0);
         report.loads[0].prefill_capacity_sample_count = Some(1);
         publish_load(admission, &worker, &report);
