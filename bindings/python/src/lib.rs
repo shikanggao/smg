@@ -868,6 +868,8 @@ impl Router {
             .estimated_wait(EstimatedWaitConfig {
                 max_estimated_wait_secs: self.max_estimated_wait_secs,
                 estimated_wait_shadow: self.estimated_wait_shadow,
+                // Experimental calibration is currently exposed by the Rust CLI/config.
+                estimated_wait_calibration_shadow: false,
                 estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
                 estimated_wait_base_overhead_secs: self.estimated_wait_base_overhead_secs,
                 estimated_wait_queue_work_correction: self.estimated_wait_queue_work_correction,

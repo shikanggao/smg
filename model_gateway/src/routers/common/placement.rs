@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use axum::{http::HeaderMap, response::Response};
+use parking_lot::Mutex;
 use tracing::{debug, warn};
 
 use crate::{
@@ -25,8 +26,8 @@ use crate::{
     },
     routers::common::overload,
     worker::{
-        ConnectionMode, ConnectionModeExt, PdPairIndex, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry,
+        estimated_wait::CalibrationForecast, ConnectionMode, ConnectionModeExt, PdPairIndex,
+        RoutingPool, RuntimeType, Worker, WorkerRegistry,
     },
 };
 
@@ -52,6 +53,8 @@ pub(crate) struct PlacementInputs<'a> {
     pub rid_key: Option<&'a str>,
     /// The request's cache partition, when set.
     pub cache_namespace: Option<CacheNamespace>,
+    /// Optional HTTP SSE observer handoff, captured atomically before credit.
+    pub calibration: Option<&'a Mutex<Option<CalibrationForecast>>>,
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -222,6 +225,15 @@ pub(crate) fn select_from(
     );
 
     if let Some(guard) = &mut admission {
+        if let Some(capture) = inputs.calibration {
+            *capture.lock() = guard.capture_calibration(
+                &selected,
+                inputs
+                    .headers
+                    .and_then(|headers| headers.get("opc-request-id"))
+                    .and_then(|value| value.to_str().ok()),
+            );
+        }
         guard.credit(&selected, inputs.tokens);
     }
     Ok(Some(selected))

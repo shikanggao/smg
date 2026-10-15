@@ -494,6 +494,7 @@ impl WorkerSelectionStage {
                 headers,
                 rid_key,
                 cache_namespace,
+                ..Default::default()
             },
         )
     }
@@ -548,6 +549,7 @@ impl WorkerSelectionStage {
                 headers,
                 rid_key,
                 cache_namespace,
+                ..Default::default()
             },
         )
         .map_err(|failure| self.pair_failure(model_id, *failure))?;

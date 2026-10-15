@@ -307,6 +307,11 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     estimated_wait_shadow: bool,
 
+    /// Learn per-worker excess-TTFT correction in shadow diagnostics only.
+    /// Requires a gateway or worker wait budget; never changes rejection behavior.
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    estimated_wait_calibration_shadow: bool,
+
     /// Deprecated compatibility option; only zero is accepted. Admission has no KV term.
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     estimated_wait_kv_pressure_weight: f64,
@@ -1913,6 +1918,7 @@ impl CliArgs {
             .estimated_wait(EstimatedWaitConfig {
                 max_estimated_wait_secs: self.max_estimated_wait_secs,
                 estimated_wait_shadow: self.estimated_wait_shadow,
+                estimated_wait_calibration_shadow: self.estimated_wait_calibration_shadow,
                 estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
                 estimated_wait_base_overhead_secs: self.estimated_wait_base_overhead_secs,
                 estimated_wait_queue_work_correction: self.estimated_wait_queue_work_correction,
@@ -2644,6 +2650,7 @@ mod tests {
             "--max-estimated-wait-secs",
             "12",
             "--estimated-wait-shadow",
+            "--estimated-wait-calibration-shadow",
             "--estimated-wait-queue-tokens-per-request",
             "2048",
             "--estimated-wait-fallback-prefill-throughput",
@@ -2668,6 +2675,8 @@ mod tests {
         let config = &server.router_config.estimated_wait;
         assert_eq!(config.max_estimated_wait_secs, Some(12.0));
         assert!(config.estimated_wait_shadow);
+        assert!(config.estimated_wait_calibration_shadow);
+        assert!(!cli_args_from(&[]).estimated_wait_calibration_shadow);
         assert!(!cli_args_from(&[]).estimated_wait_shadow);
         assert_eq!(config.estimated_wait_queue_tokens_per_request, 2048);
         assert_eq!(config.estimated_wait_fallback_prefill_throughput, 500.0);
