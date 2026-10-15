@@ -214,11 +214,11 @@ def draw(path, metrics, requests, info, view, focus, output, title, floor):
         sampled(axes[1], 'excess_seconds', 'Scraped extra delay', '#64748b')
         sampled(axes[1], 'threshold', 'Admission budget', '#b91c1c')
         panel(axes[1], 'Extra delay compared with the shared budget', 'Seconds')
-        traced(axes[2], 'token_work', 'Exact W = Q + 0.05D', '#7c3aed')
+        traced(axes[2], 'token_work', 'Recorded W = Q + 0.05D', '#7c3aed')
         if all('queued_tokens' in row for row in selected):
-            traced(axes[2], 'queued_tokens', 'Exact Q: queued work', '#2563eb')
+            traced(axes[2], 'queued_tokens', 'Recorded Q (queue proxy)', '#2563eb')
             axes[2].scatter(rx, [.05*row['dispatched_tokens_since_poll'] for row in selected],
-                            s=7, alpha=.45, color='#059669', label='Exact 0.05D: dispatch contribution')
+                            s=7, alpha=.45, color='#059669', label='Recorded 0.05D (router credit)')
             panel(axes[2], 'Work numerator at admission: recorded queue and dispatch contributions', 'Tokens')
         else:
             panel(axes[2], 'Work numerator at admission (Q and D not separately logged)', 'Tokens')
@@ -232,12 +232,19 @@ def draw(path, metrics, requests, info, view, focus, output, title, floor):
         sampled(axes[4], 'native_queue_delay', 'Native recent queue delay', '#7c3aed')
         traced(axes[4], 'observed_delay_floor', 'F at admission', '#b45309')
         panel(axes[4], 'Delay components; missing baseline is a gap, not measured zero', 'Seconds')
-        flags(axes[5], [('ready', 'Admission ready', 'trace'),
-                        ('native_ready', 'Native capacity ready', 'trace'),
-                        ('baseline_available', 'Baseline available', 'trace'),
-                        ('data_usable', 'Usable snapshot', 'sample')])
+        readiness_flags = [('ready', 'Admission ready', 'trace'),
+                           ('native_ready', 'Native capacity ready', 'trace'),
+                           ('baseline_available', 'Baseline available', 'trace'),
+                           ('data_usable', 'Usable snapshot', 'sample')]
+        if all('measured_delay_only' in row for row in selected):
+            readiness_flags.append(('measured_delay_only', 'Delay-only fallback', 'trace'))
+        flags(axes[5], readiness_flags)
         panel(axes[5], 'Readiness: each lane moves upward when true', 'Low=0; high=1')
-        sampled(axes[6], 'snapshot_age', 'Engine snapshot age', '#2563eb')
+        if len(readiness_flags) > 4:
+            axes[5].set_title('Readiness: each lane moves upward when true', loc='left', fontsize=11, pad=42)
+        sampled(axes[6], 'snapshot_age', 'Scraped age (last SMG refresh)', '#2563eb')
+        if all('snapshot_age_seconds' in row for row in selected):
+            traced(axes[6], 'snapshot_age_seconds', 'Snapshot age at admission', '#7c3aed')
         sampled(axes[6], '', 'Metric fetch duration', '#d97706', values=[
             float(r['sample_completed_elapsed_seconds'])-float(r['elapsed_seconds']) for r in metrics])
         panel(axes[6], 'Freshness and collection delay', 'Seconds')

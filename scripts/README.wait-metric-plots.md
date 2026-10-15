@@ -79,7 +79,10 @@ Counter resets and unavailable/negative sentinel values become gaps, not zeros.
 Older traces log only the combined `W`; do not derive Q or D by matching
 asynchronous scrapes. New traces log Q, post-poll D, the backlog used to scale F,
 pending first-text count and branch availability. The generator plots exact Q
-and 0.05D when available.
+and 0.05D arithmetic inputs when available; Q and D can themselves be estimated
+token work. New traces also show snapshot age at admission beside the scraped
+age gauge (which holds its value from the last SMG refresh), plus the explicit
+delay-only fallback branch in a separate lane.
 SGLang `cached_tokens_total`, `num_requests_total`, and vLLM histogram buckets /
 prefill-size count were not captured continuously in the TSV. The recorded SMG
 derived mean, blended size, prefill rate, learned capacity and sample counts
