@@ -359,6 +359,22 @@ struct PreparedWait {
 }
 
 impl PreparedWait {
+    fn refresh_observed_backlog(&mut self, pending_first_text: usize) {
+        // Moving from the scheduler queue into a running stream does not
+        // finish first-text work. Use SMG's observed stream count only to
+        // retain/scale measured delay, never to invent remaining token work.
+        // One isolated stream is not evidence of congestion.
+        self.backlog_size = self
+            .native_waiting
+            .max(if self.native_estimate.queued_work() > 0.0 {
+                1.0
+            } else {
+                0.0
+            })
+            .max(pending_first_text.saturating_sub(1) as f64);
+        self.has_backlog = self.backlog_size > 0.0;
+    }
+
     fn seconds(self, dispatched_tokens: u64) -> f64 {
         let baseline = self.baseline.unwrap_or(0.0);
         if !self.capacity_learned_ready && self.observed_delay_available {
@@ -804,19 +820,7 @@ impl EstimatedWaitAdmission {
         let pending = (entry.pending_first_text.len() as f64)
             .min(prepared.native_waiting + prepared.native_running);
         prepared.pending_engine = (pending - prepared.native_waiting).max(0.0);
-        // A stream awaiting text may have partly completed prefill or may be
-        // formatting reasoning. Keep its count diagnostic; never treat every
-        // such stream as a full remaining prompt in the token-work numerator.
-        prepared.backlog_size =
-            prepared
-                .native_waiting
-                .max(if prepared.native_estimate.queued_work() > 0.0 {
-                    1.0
-                } else {
-                    0.0
-                });
-        prepared.has_backlog =
-            prepared.native_estimate.queued_work() > 0.0 || prepared.native_waiting > 0.0;
+        prepared.refresh_observed_backlog(entry.pending_first_text.len());
         if let Some(baseline) = baseline {
             prepared.estimate = prepared
                 .estimate
@@ -937,7 +941,7 @@ impl EstimatedWaitAdmission {
         // Rank aggregation, validation and the queue/KV formula are report work,
         // outside the admission transaction lock.
         let config = self.config();
-        let prepared = load.and_then(|load| config.prepare(load));
+        let mut prepared = load.and_then(|load| config.prepare(load));
         let threshold = config.threshold(worker);
         let mut entries = self.entries.lock();
         let Some(entry) = entries.get_mut(worker.url()) else {
@@ -949,6 +953,9 @@ impl EstimatedWaitAdmission {
             return;
         }
         entry.last_published = Some(started);
+        if let Some(prepared) = &mut prepared {
+            prepared.refresh_observed_backlog(entry.pending_first_text.len());
+        }
         // A verified idle worker begins a new queue epoch. Responses from the
         // preceding busy epoch cannot recalibrate a later workload after drain.
         if prepared.is_some_and(|prepared| prepared.low_load) && entry.pending_first_text.len() <= 1
@@ -1097,6 +1104,13 @@ impl AdmissionGuard<'_> {
                 native_ready = fresh && sample.prepared.capacity_learned_ready,
                 legacy_baseline_gate_ready = fresh && sample.prepared.capacity_learned_ready && sample.prepared.baseline.is_some(),
                 token_work = sample.prepared.estimate.token_work(dispatched),
+                queued_tokens = sample.prepared.estimate.queued_work(),
+                dispatched_tokens_since_poll = dispatched,
+                observed_backlog = sample.prepared.backlog_size,
+                pending_first_text_requests = entry.pending_first_text.len(),
+                observed_delay_available = sample.prepared.observed_delay_available,
+                capacity_learned_ready = sample.prepared.capacity_learned_ready,
+                snapshot_age_seconds = sample.started.elapsed().as_secs_f64(),
                 native_capacity = sample.prepared.native_prefill_capacity,
                 effective_capacity = sample.prepared.effective_prefill_capacity,
                 visibility_seconds = sample.prepared.visibility_delay,
@@ -1535,6 +1549,8 @@ mod tests {
         report.loads[0].num_waiting_reqs = 1;
         report.loads[0].num_waiting_uncached_tokens = 100;
         publish_load(&admission, &worker, &report);
+        // Four other streams still await first text even though the native
+        // queue has shrunk. Their measured delay must not disappear early.
         assert_eq!(
             admission.entries.lock()[worker.url()]
                 .sample
@@ -1542,7 +1558,7 @@ mod tests {
                 .unwrap()
                 .prepared
                 .observed_delay_floor,
-            2.5
+            10.0
         );
         // Late responses must retain their larger dispatch-time queue as the
         // reference; they cannot reinflate a now smaller queue's correction.
@@ -1577,6 +1593,63 @@ mod tests {
         let entries = admission.entries.lock();
         assert!(entries[worker.url()].observed_delays.is_empty());
         assert!(entries[worker.url()].busy_visibility.is_empty());
+        worker.decrement_load();
+    }
+
+    #[test]
+    fn measured_delay_survives_queue_to_running_transition_and_clears_after_text() {
+        let admission = EstimatedWaitAdmission::default();
+        admission.configure(config());
+        let worker = worker("http://first-text-backlog:1");
+        worker.increment_load();
+        publish(&admission, &worker, 0);
+        for _ in 0..TTFT_MIN_SAMPLES {
+            let probe = admission.ttft_probe(worker.url()).unwrap();
+            admission.observe_ttft(probe, 0.25, 0.05);
+        }
+        let mut report = load(Some(400), 4, 1_000.0, 0.0);
+        report.loads[0].num_running_reqs = 20;
+        publish_load(&admission, &worker, &report);
+        for _ in 0..TTFT_MIN_SAMPLES {
+            let probe = admission.ttft_probe(worker.url()).unwrap();
+            admission.observe_ttft(probe, 10.25, 8.0);
+        }
+        let mut probes: Vec<_> = (0..5)
+            .map(|_| admission.ttft_probe(worker.url()).unwrap())
+            .collect();
+        report.loads[0].num_waiting_reqs = 0;
+        report.loads[0].num_waiting_uncached_tokens = 0;
+        publish_load(&admission, &worker, &report);
+        {
+            let entries = admission.entries.lock();
+            let prepared = entries[worker.url()].sample.as_ref().unwrap().prepared;
+            assert_eq!(prepared.estimate.token_work(0), 0.0);
+            assert_eq!(prepared.observed_delay_floor, 10.0);
+            assert_eq!(prepared.seconds(0), 10.25);
+            assert!(prepared.capacity_ready);
+        }
+        // First-text evidence arriving with native waiting=0 must still be
+        // learned in the same busy epoch, rather than silently discarded.
+        let probe = admission.ttft_probe(worker.url()).unwrap();
+        assert!(probe.backlogged);
+        admission.observe_ttft(probe, 8.25, 0.0);
+        while probes.len() > 1 {
+            admission.finish_ttft_probe(&probes.pop().unwrap());
+        }
+        {
+            let entries = admission.entries.lock();
+            let prepared = entries[worker.url()].sample.as_ref().unwrap().prepared;
+            // A single isolated pending stream, or decode after first text,
+            // cannot keep a past overload correction alive.
+            assert_eq!(prepared.observed_delay_floor, 0.0);
+            assert_eq!(prepared.excess_seconds(0), 0.0);
+        }
+        admission.finish_ttft_probe(&probes.pop().unwrap());
+        report.loads[0].num_running_reqs = 0;
+        publish_load(&admission, &worker, &report);
+        assert!(admission.entries.lock()[worker.url()]
+            .observed_delays
+            .is_empty());
         worker.decrement_load();
     }
 
