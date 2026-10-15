@@ -8,6 +8,9 @@
 //! scaled term. A per-worker weighted median fits g from the last 32 usable
 //! first-text observations (minimum 4, otherwise g=1), weighted by saved raw
 //! extra delay. Native-capacity unready/ready states have separate histories.
+//! The applied scale approaches that median target at at most 0.1 absolute
+//! scale units per second. New targets start at the old trajectory's current
+//! value, so callback bursts and prior idle time cannot cause scale jumps.
 //! Regular HTTP OpenAI-compatible SSE carries the admission-time snapshot to
 //! its first nonempty reasoning/content text callback. Metadata, cancellation,
 //! completion, and nonstreaming responses never supply training observations.
@@ -432,6 +435,7 @@ fn invalidate_diagnostic_metrics(worker_url: &str) {
         "smg_estimated_wait_calibrated_seconds",
         "smg_estimated_wait_calibrated_excess_seconds",
         "smg_estimated_wait_calibration_scale",
+        "smg_estimated_wait_calibration_target_scale",
         "smg_estimated_wait_calibration_sample_count",
         "smg_estimated_wait_calibration_ready",
         "smg_estimated_wait_calibration_native_capacity_ready",
@@ -445,6 +449,7 @@ fn invalidate_diagnostic_metrics(worker_url: &str) {
 const TTFT_WINDOW_SAMPLES: usize = 32;
 const TTFT_MIN_SAMPLES: usize = 4;
 const MAX_TTFT_EVENT_BYTES: usize = 64 * 1024;
+const CALIBRATION_MAX_SCALE_CHANGE_PER_SECOND: f64 = 0.1;
 
 /// Admission-time inputs travel with the request, not with the mutable load sample.
 #[derive(Clone, Debug)]
@@ -458,6 +463,8 @@ pub(crate) struct CalibrationForecast {
     raw_ready: bool,
     fresh: bool,
     scale: f64,
+    target_scale: f64,
+    time_seconds: f64,
     sample_count: usize,
     observation_sequence: u64,
     threshold: f64,
@@ -485,19 +492,86 @@ impl CalibrationForecast {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct ScaleTrajectory {
+    anchor_scale: f64,
+    target_scale: f64,
+    anchor_time: Instant,
+}
+
+impl ScaleTrajectory {
+    fn new(now: Instant) -> Self {
+        Self {
+            anchor_scale: 1.0,
+            target_scale: 1.0,
+            anchor_time: now,
+        }
+    }
+
+    fn applied(&self, now: Instant) -> f64 {
+        let limit = CALIBRATION_MAX_SCALE_CHANGE_PER_SECOND
+            * now
+                .saturating_duration_since(self.anchor_time)
+                .as_secs_f64();
+        if self.target_scale >= self.anchor_scale {
+            self.anchor_scale + (self.target_scale - self.anchor_scale).min(limit)
+        } else {
+            self.anchor_scale - (self.anchor_scale - self.target_scale).min(limit)
+        }
+    }
+
+    fn retarget(&mut self, target: f64, now: Instant) {
+        self.anchor_scale = self.applied(now);
+        self.anchor_time = now;
+        self.target_scale = target;
+    }
+}
+
+#[derive(Debug)]
 struct ExcessCalibration {
     // Separate histories across native capacity warm-up, even when F promotes
     // the independent raw admission-readiness gate.
     samples: [VecDeque<(f64, f64)>; 2],
     accepted: [u64; 2],
+    trajectories: [ScaleTrajectory; 2],
+    started: Instant,
+}
+
+impl Default for ExcessCalibration {
+    fn default() -> Self {
+        Self::new(Instant::now())
+    }
 }
 
 impl ExcessCalibration {
-    fn stats(&self, native_ready: bool) -> (f64, usize) {
-        let samples = &self.samples[usize::from(native_ready)];
+    fn new(now: Instant) -> Self {
+        Self {
+            samples: Default::default(),
+            accepted: [0; 2],
+            trajectories: [ScaleTrajectory::new(now), ScaleTrajectory::new(now)],
+            started: now,
+        }
+    }
+
+    fn time_seconds(&self, now: Instant) -> f64 {
+        now.saturating_duration_since(self.started).as_secs_f64()
+    }
+
+    fn stats(&self, native_ready: bool, now: Instant) -> (f64, usize) {
+        let index = usize::from(native_ready);
+        (
+            self.trajectories[index].applied(now),
+            self.samples[index].len(),
+        )
+    }
+
+    fn target(&self, native_ready: bool) -> f64 {
+        self.trajectories[usize::from(native_ready)].target_scale
+    }
+
+    fn median_target(samples: &VecDeque<(f64, f64)>) -> f64 {
         if samples.len() < TTFT_MIN_SAMPLES {
-            return (1.0, samples.len());
+            return 1.0;
         }
         let mut ratios: Vec<_> = samples.iter().copied().collect();
         ratios.sort_by(|left, right| left.0.total_cmp(&right.0));
@@ -513,13 +587,13 @@ impl ExcessCalibration {
         for (ratio, weight) in ratios {
             cumulative += weight / largest;
             if cumulative >= half {
-                return (ratio, samples.len());
+                return ratio;
             }
         }
-        (1.0, samples.len())
+        1.0
     }
 
-    fn observe(&mut self, forecast: &CalibrationForecast, ttft: f64) -> &'static str {
+    fn observe(&mut self, forecast: &CalibrationForecast, ttft: f64, now: Instant) -> &'static str {
         if !forecast.fresh {
             return "stale_at_admission";
         }
@@ -542,6 +616,8 @@ impl ExcessCalibration {
         while samples.len() > TTFT_WINDOW_SAMPLES {
             samples.pop_front();
         }
+        let target = Self::median_target(samples);
+        self.trajectories[usize::from(forecast.native_capacity_ready)].retarget(target, now);
         "accepted"
     }
 }
@@ -801,16 +877,20 @@ impl Entry {
         self.backlog_generation = self.backlog_generation.wrapping_add(1);
     }
 
-    fn calibration_forecast(&self, config: &EstimatedWaitConfig) -> Option<CalibrationForecast> {
+    fn calibration_forecast(
+        &self,
+        config: &EstimatedWaitConfig,
+        now: Instant,
+    ) -> Option<CalibrationForecast> {
         if !config.estimated_wait_calibration_shadow {
             return None;
         }
         let sample = self.sample.as_ref()?;
-        let fresh =
-            sample.started.elapsed().as_secs_f64() <= config.estimated_wait_max_snapshot_age_secs;
+        let fresh = now.saturating_duration_since(sample.started).as_secs_f64()
+            <= config.estimated_wait_max_snapshot_age_secs;
         let (scale, sample_count) = self
             .calibration
-            .stats(sample.prepared.capacity_learned_ready);
+            .stats(sample.prepared.capacity_learned_ready, now);
         Some(CalibrationForecast {
             generation: Arc::clone(&self.generation),
             calibration_generation: Arc::clone(&self.calibration_generation),
@@ -823,6 +903,10 @@ impl Entry {
             raw_ready: fresh && sample.prepared.capacity_ready,
             fresh,
             scale,
+            target_scale: self
+                .calibration
+                .target(sample.prepared.capacity_learned_ready),
+            time_seconds: self.calibration.time_seconds(now),
             sample_count,
             observation_sequence: self.calibration.accepted
                 [usize::from(sample.prepared.capacity_learned_ready)],
@@ -831,6 +915,7 @@ impl Entry {
     }
 
     fn refresh(&mut self, worker: &Arc<dyn Worker>, config: &EstimatedWaitConfig) {
+        let now = Instant::now();
         if let Some(sample) = &mut self.sample {
             let seconds = sample
                 .prepared
@@ -846,7 +931,7 @@ impl Entry {
                 .set(seconds);
             metrics::gauge!("smg_estimated_wait_excess_seconds", "worker" => worker.url().to_owned())
                 .set(excess);
-            metrics::gauge!("smg_estimated_wait_snapshot_age_seconds", "worker" => worker.url().to_owned()).set(sample.started.elapsed().as_secs_f64());
+            metrics::gauge!("smg_estimated_wait_snapshot_age_seconds", "worker" => worker.url().to_owned()).set(now.saturating_duration_since(sample.started).as_secs_f64());
             metrics::gauge!("smg_estimated_wait_capacity_ready", "worker" => worker.url().to_owned())
                 .set(u8::from(sample.prepared.capacity_ready));
             metrics::gauge!("smg_estimated_wait_effective_prefill_capacity", "worker" => worker.url().to_owned())
@@ -864,13 +949,14 @@ impl Entry {
             if config.estimated_wait_calibration_shadow {
                 let (scale, count) = self
                     .calibration
-                    .stats(sample.prepared.capacity_learned_ready);
+                    .stats(sample.prepared.capacity_learned_ready, now);
                 let calibrated_extra = scale * excess;
-                let fresh = sample.started.elapsed().as_secs_f64()
+                let fresh = now.saturating_duration_since(sample.started).as_secs_f64()
                     <= config.estimated_wait_max_snapshot_age_secs;
                 metrics::gauge!("smg_estimated_wait_calibrated_seconds", "worker" => worker.url().to_owned()).set(sample.prepared.baseline.unwrap_or(0.0) + calibrated_extra);
                 metrics::gauge!("smg_estimated_wait_calibrated_excess_seconds", "worker" => worker.url().to_owned()).set(calibrated_extra);
                 metrics::gauge!("smg_estimated_wait_calibration_scale", "worker" => worker.url().to_owned()).set(scale);
+                metrics::gauge!("smg_estimated_wait_calibration_target_scale", "worker" => worker.url().to_owned()).set(self.calibration.target(sample.prepared.capacity_learned_ready));
                 metrics::gauge!("smg_estimated_wait_calibration_sample_count", "worker" => worker.url().to_owned()).set(count as f64);
                 metrics::gauge!("smg_estimated_wait_calibration_ready", "worker" => worker.url().to_owned()).set(u8::from(count >= TTFT_MIN_SAMPLES));
                 metrics::gauge!("smg_estimated_wait_calibration_native_capacity_ready", "worker" => worker.url().to_owned()).set(u8::from(sample.prepared.capacity_learned_ready));
@@ -880,7 +966,7 @@ impl Entry {
         metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned()).set(
             u8::from(self.sample.as_ref().is_some_and(|s| {
                 s.overloaded.is_some()
-                    && s.started.elapsed().as_secs_f64()
+                    && now.saturating_duration_since(s.started).as_secs_f64()
                         <= config.estimated_wait_max_snapshot_age_secs
             })),
         );
@@ -965,7 +1051,9 @@ impl EstimatedWaitAdmission {
             .as_ref()
             .filter(|_| self.config().estimated_wait_calibration_shadow)
         {
-            let before = entry.calibration.stats(forecast.native_capacity_ready);
+            let now = Instant::now();
+            let before = entry.calibration.stats(forecast.native_capacity_ready, now);
+            let target_before = entry.calibration.target(forecast.native_capacity_ready);
             let sequence_before =
                 entry.calibration.accepted[usize::from(forecast.native_capacity_ready)];
             let reason = if Arc::ptr_eq(&entry.generation, &forecast.generation)
@@ -973,11 +1061,11 @@ impl EstimatedWaitAdmission {
                     &entry.calibration_generation,
                     &forecast.calibration_generation,
                 ) {
-                entry.calibration.observe(forecast, ttft)
+                entry.calibration.observe(forecast, ttft, now)
             } else {
                 "calibration_generation_changed"
             };
-            let after = entry.calibration.stats(forecast.native_capacity_ready);
+            let after = entry.calibration.stats(forecast.native_capacity_ready, now);
             let sequence_after =
                 entry.calibration.accepted[usize::from(forecast.native_capacity_ready)];
             tracing::debug!(
@@ -991,6 +1079,8 @@ impl EstimatedWaitAdmission {
                 calibration_epoch = forecast.epoch, current_calibration_epoch = entry.calibration_epoch,
                 scale_before = before.0, sample_count_before = before.1,
                 scale_after = after.0, sample_count_after = after.1,
+                target_scale_before = target_before, target_scale_after = entry.calibration.target(forecast.native_capacity_ready),
+                calibration_time_seconds = entry.calibration.time_seconds(now), admission_calibration_time_seconds = forecast.time_seconds,
             );
         }
         let Some(worker) = entry.source.upgrade() else {
@@ -1325,7 +1415,7 @@ impl AdmissionGuard<'_> {
         let forecast = self
             .entries
             .get(worker.url())?
-            .calibration_forecast(self.config)?;
+            .calibration_forecast(self.config, Instant::now())?;
         tracing::debug!(
             target: "smg::estimated_wait::observation", event = "calibration_forecast",
             request_id = request_id.unwrap_or(""), worker = worker.url(),
@@ -1333,6 +1423,7 @@ impl AdmissionGuard<'_> {
             calibration_epoch = forecast.epoch,
             calibration_observation_sequence = forecast.observation_sequence,
             calibration_scale = forecast.scale, calibration_sample_count = forecast.sample_count,
+            calibration_target_scale = forecast.target_scale, calibration_time_seconds = forecast.time_seconds,
             calibration_ready = forecast.sample_count >= TTFT_MIN_SAMPLES,
             baseline_seconds = forecast.baseline.unwrap_or(0.0), baseline_available = forecast.baseline.is_some(),
             predicted_ttft_seconds = forecast.baseline.unwrap_or(0.0) + forecast.raw_extra,
@@ -1353,6 +1444,7 @@ impl AdmissionGuard<'_> {
             return;
         }
         for worker in candidates.iter().filter(|worker| worker.is_available()) {
+            let now = Instant::now();
             let Some(entry) = self.entries.get(worker.url()) else {
                 continue;
             };
@@ -1360,7 +1452,7 @@ impl AdmissionGuard<'_> {
                 continue;
             };
             let dispatched = entry.total_dispatched.saturating_sub(sample.watermark);
-            let fresh = sample.started.elapsed().as_secs_f64()
+            let fresh = now.saturating_duration_since(sample.started).as_secs_f64()
                 <= self.config.estimated_wait_max_snapshot_age_secs;
             let ready = fresh && sample.prepared.capacity_ready;
             let legacy_visibility = if sample.prepared.low_load {
@@ -1377,7 +1469,7 @@ impl AdmissionGuard<'_> {
                 + legacy_visibility
                 + sample.prepared.native_estimate.token_work(dispatched)
                     / sample.prepared.native_prefill_capacity;
-            let calibration = entry.calibration_forecast(self.config);
+            let calibration = entry.calibration_forecast(self.config, now);
             tracing::debug!(
                 target: "smg::estimated_wait::observation",
                 event = "forecast",
@@ -1400,7 +1492,7 @@ impl AdmissionGuard<'_> {
                 observed_delay_available = sample.prepared.observed_delay_available,
                 measured_delay_only = sample.prepared.measured_delay_only(),
                 capacity_learned_ready = sample.prepared.capacity_learned_ready,
-                snapshot_age_seconds = sample.started.elapsed().as_secs_f64(),
+                snapshot_age_seconds = now.saturating_duration_since(sample.started).as_secs_f64(),
                 native_capacity = sample.prepared.native_prefill_capacity,
                 effective_capacity = sample.prepared.effective_prefill_capacity,
                 visibility_seconds = sample.prepared.visibility_delay,
@@ -1414,6 +1506,8 @@ impl AdmissionGuard<'_> {
                 calibrated_ttft_seconds = calibration.as_ref().map_or(-1.0, CalibrationForecast::seconds),
                 calibrated_excess_seconds = calibration.as_ref().map_or(-1.0, CalibrationForecast::extra),
                 calibration_scale = calibration.as_ref().map_or(-1.0, |forecast| forecast.scale),
+                calibration_target_scale = calibration.as_ref().map_or(-1.0, |forecast| forecast.target_scale),
+                calibration_time_seconds = calibration.as_ref().map_or(-1.0, |forecast| forecast.time_seconds),
                 calibration_sample_count = calibration.as_ref().map_or(0, |forecast| forecast.sample_count),
                 calibration_state = calibration.as_ref().map_or("disabled", CalibrationForecast::state),
                 calibration_epoch = calibration.as_ref().map_or(0, |forecast| forecast.epoch),
@@ -1620,6 +1714,173 @@ mod tests {
     }
 
     #[test]
+    fn calibration_slew_rises_falls_clamps_and_recovers_from_zero() {
+        let start = Instant::now();
+        let mut trajectory = ScaleTrajectory::new(start);
+        trajectory.retarget(3.0, start);
+        assert_eq!(trajectory.applied(start), 1.0);
+        assert_eq!(trajectory.applied(start + Duration::from_secs(5)), 1.5);
+        assert_eq!(trajectory.applied(start + Duration::from_secs(30)), 3.0);
+        trajectory.retarget(0.0, start + Duration::from_secs(30));
+        assert_eq!(trajectory.applied(start + Duration::from_secs(30)), 3.0);
+        assert_eq!(trajectory.applied(start + Duration::from_secs(40)), 2.0);
+        assert_eq!(trajectory.applied(start + Duration::from_secs(60)), 0.0);
+        // Seventy idle seconds at zero cannot be spent on a newly seen target.
+        trajectory.retarget(2.0, start + Duration::from_secs(100));
+        assert_eq!(trajectory.applied(start + Duration::from_secs(100)), 0.0);
+        assert_eq!(trajectory.applied(start + Duration::from_secs(105)), 0.5);
+        assert_eq!(trajectory.applied(start + Duration::from_secs(130)), 2.0);
+    }
+
+    #[test]
+    fn calibration_fourth_sample_has_no_jump_or_prior_idle_credit() {
+        let (registry, worker) = calibration_registry(true);
+        let forecast = registry
+            .estimated_wait()
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let start = Instant::now();
+        let update = start + Duration::from_secs(3_600);
+        let mut calibration = ExcessCalibration::new(start);
+        for _ in 0..3 {
+            calibration.observe(&forecast, 20.2, update);
+        }
+        assert_eq!(calibration.target(true), 1.0);
+        assert_eq!(calibration.stats(true, update), (1.0, 3));
+        calibration.observe(&forecast, 20.2, update);
+        assert_eq!(calibration.target(true), 2.0);
+        assert_eq!(calibration.stats(true, update), (1.0, 4));
+        for _ in 0..64 {
+            calibration.observe(&forecast, 20.2, update);
+        }
+        assert_eq!(calibration.stats(true, update), (1.0, 32));
+        assert_eq!(
+            calibration.stats(true, update + Duration::from_secs(1)).0,
+            1.1
+        );
+        assert_eq!(
+            calibration.stats(false, update + Duration::from_secs(100)),
+            (1.0, 0)
+        );
+    }
+
+    #[test]
+    fn calibration_slew_is_independent_of_callback_frequency() {
+        let (registry, worker) = calibration_registry(true);
+        let forecast = registry
+            .estimated_wait()
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let start = Instant::now();
+        let mut sparse = ExcessCalibration::new(start);
+        let mut dense = ExcessCalibration::new(start);
+        for _ in 0..4 {
+            sparse.observe(&forecast, 50.2, start);
+            dense.observe(&forecast, 50.2, start);
+        }
+        for step in 1..=1_000 {
+            dense.observe(&forecast, 50.2, start + Duration::from_millis(step * 10));
+        }
+        let later = start + Duration::from_secs(15);
+        assert_eq!(sparse.stats(true, later).0, 2.5);
+        assert!((sparse.stats(true, later).0 - dense.stats(true, later).0).abs() < 1e-12);
+        assert_eq!(dense.target(true), 5.0);
+        assert_eq!(sparse.target(true), 5.0);
+    }
+
+    #[test]
+    fn calibration_new_median_reverses_old_trajectory_without_a_jump() {
+        let (registry, worker) = calibration_registry(true);
+        let forecast = registry
+            .estimated_wait()
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let start = Instant::now();
+        let mut calibration = ExcessCalibration::new(start);
+        for _ in 0..4 {
+            calibration.observe(&forecast, 50.2, start);
+        }
+        let reversal = start + Duration::from_secs(5);
+        assert_eq!(calibration.stats(true, reversal).0, 1.5);
+        for _ in 0..32 {
+            calibration.observe(&forecast, 0.1, reversal);
+        }
+        assert_eq!(calibration.target(true), 0.0);
+        assert_eq!(calibration.stats(true, reversal).0, 1.5);
+        assert_eq!(
+            calibration.stats(true, reversal + Duration::from_secs(5)).0,
+            1.0
+        );
+        assert_eq!(
+            calibration
+                .stats(true, reversal + Duration::from_secs(20))
+                .0,
+            0.0
+        );
+    }
+
+    #[test]
+    fn calibration_snapshot_advances_purely_with_time_and_records_one_clock() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        let start = Instant::now();
+        entry.calibration = ExcessCalibration::new(start);
+        let original = entry
+            .calibration_forecast(admission.config(), start)
+            .unwrap();
+        for _ in 0..4 {
+            entry.calibration.observe(&original, 20.2, start);
+        }
+        let at_start = entry
+            .calibration_forecast(admission.config(), start)
+            .unwrap();
+        assert_eq!(
+            (at_start.scale, at_start.target_scale, at_start.time_seconds),
+            (1.0, 2.0, 0.0)
+        );
+        let later = start + Duration::from_secs(5);
+        let mut unready = original.clone();
+        unready.native_capacity_ready = false;
+        for _ in 0..4 {
+            entry.calibration.observe(&unready, 0.1, start);
+        }
+        assert_eq!(entry.calibration.stats(false, later), (0.5, 4));
+        let first = entry
+            .calibration_forecast(admission.config(), later)
+            .unwrap();
+        let repeated = entry
+            .calibration_forecast(admission.config(), later)
+            .unwrap();
+        assert_eq!(
+            (first.scale, first.target_scale, first.time_seconds),
+            (1.5, 2.0, 5.0)
+        );
+        assert_eq!(first.scale, repeated.scale);
+        assert_eq!((first.observation_sequence, first.sample_count), (4, 4));
+        assert_eq!(original.scale, 1.0);
+        assert_eq!(entry.calibration.trajectories[1].anchor_time, start);
+        assert_eq!(entry.calibration.trajectories[1].anchor_scale, 1.0);
+        // Resetting a history also discards its elapsed movement and old target.
+        entry.calibration = ExcessCalibration::new(later);
+        let reset = entry
+            .calibration_forecast(admission.config(), later)
+            .unwrap();
+        assert_eq!(
+            (reset.scale, reset.target_scale, reset.time_seconds),
+            (1.0, 1.0, 0.0)
+        );
+        assert_eq!((reset.observation_sequence, reset.sample_count), (0, 0));
+    }
+
+    #[test]
     fn excess_calibration_weighted_median_window_and_invalid_inputs() {
         let (registry, worker) = calibration_registry(true);
         let admission = registry.estimated_wait();
@@ -1628,38 +1889,42 @@ mod tests {
             .unwrap()
             .capture_calibration(&worker, None)
             .unwrap();
-        let mut learned = ExcessCalibration::default();
-        assert_eq!(learned.stats(true), (1.0, 0));
+        let now = Instant::now();
+        let mut learned = ExcessCalibration::new(now);
+        assert_eq!(learned.stats(true, now), (1.0, 0));
         for _ in 0..3 {
-            assert_eq!(learned.observe(&forecast, 20.2), "accepted");
+            assert_eq!(learned.observe(&forecast, 20.2, now), "accepted");
         }
-        assert_eq!(learned.stats(true), (1.0, 3));
-        assert_eq!(learned.observe(&forecast, 20.2), "accepted");
-        assert_eq!(learned.stats(true), (2.0, 4));
+        assert_eq!(learned.stats(true, now), (1.0, 3));
+        assert_eq!(learned.observe(&forecast, 20.2, now), "accepted");
+        assert_eq!(learned.target(true), 2.0);
+        assert_eq!(learned.stats(true, now), (1.0, 4));
         // A huge ratio from tiny extra delay gets tiny weight, not a huge influence.
         forecast.raw_extra = 0.000_001;
-        learned.observe(&forecast, 10.2);
-        assert_eq!(learned.stats(true).0, 2.0);
+        learned.observe(&forecast, 10.2, now);
+        assert_eq!(learned.target(true), 2.0);
         forecast.raw_extra = 10.0;
         for _ in 0..TTFT_WINDOW_SAMPLES {
-            learned.observe(&forecast, 5.2);
+            learned.observe(&forecast, 5.2, now);
         }
-        assert_eq!(learned.stats(true), (0.5, 32));
-        assert_eq!(learned.stats(false), (1.0, 0));
+        assert_eq!(learned.target(true), 0.5);
+        assert_eq!(learned.stats(true, now), (1.0, 32));
+        assert_eq!(learned.stats(false, now), (1.0, 0));
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             forecast.raw_extra = bad;
-            assert_eq!(learned.observe(&forecast, 5.0), "nonpositive_extra");
+            assert_eq!(learned.observe(&forecast, 5.0, now), "nonpositive_extra");
         }
         forecast.raw_extra = 10.0;
         forecast.baseline = None;
-        assert_eq!(learned.observe(&forecast, 5.0), "baseline_unavailable");
+        assert_eq!(learned.observe(&forecast, 5.0, now), "baseline_unavailable");
         forecast.baseline = Some(0.2);
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            assert_eq!(learned.observe(&forecast, bad), "invalid_observation");
+            assert_eq!(learned.observe(&forecast, bad, now), "invalid_observation");
         }
         forecast.fresh = false;
-        assert_eq!(learned.observe(&forecast, 5.0), "stale_at_admission");
-        assert_eq!(learned.stats(true), (0.5, 32));
+        assert_eq!(learned.observe(&forecast, 5.0, now), "stale_at_admission");
+        assert_eq!(learned.target(true), 0.5);
+        assert_eq!(learned.stats(true, now), (1.0, 32));
     }
 
     #[test]
@@ -1671,7 +1936,9 @@ mod tests {
         let sample = entry.sample.as_mut().unwrap();
         sample.prepared.observed_delay_floor = 30.0;
         sample.prepared.observed_delay_available = true;
-        let mut forecast = entry.calibration_forecast(admission.config()).unwrap();
+        let mut forecast = entry
+            .calibration_forecast(admission.config(), Instant::now())
+            .unwrap();
         assert_eq!(forecast.raw_extra, 30.0);
         forecast.scale = 0.5;
         assert_eq!(forecast.seconds(), 15.2);
@@ -1705,14 +1972,14 @@ mod tests {
         assert_eq!(
             admission.entries.lock()[worker.url()]
                 .calibration
-                .stats(true),
+                .stats(true, Instant::now()),
             (1.0, 0)
         );
         observer.push(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thi");
         assert_eq!(
             admission.entries.lock()[worker.url()]
                 .calibration
-                .stats(true)
+                .stats(true, Instant::now())
                 .1,
             0
         );
@@ -1731,7 +1998,7 @@ mod tests {
         assert_eq!(
             admission.entries.lock()[worker.url()]
                 .calibration
-                .stats(true)
+                .stats(true, Instant::now())
                 .1,
             1
         );
@@ -1746,7 +2013,7 @@ mod tests {
         assert_eq!(
             admission.entries.lock()[worker.url()]
                 .calibration
-                .stats(true)
+                .stats(true, Instant::now())
                 .1,
             1
         );
@@ -1818,8 +2085,20 @@ mod tests {
             admission.observe_ttft(probe, 20.2, 0.0);
         }
         let entries = admission.entries.lock();
-        assert_eq!(entries[worker.url()].calibration.stats(false), (2.0, 4));
-        assert_eq!(entries[worker.url()].calibration.stats(true), (1.0, 0));
+        assert_eq!(entries[worker.url()].calibration.target(false), 2.0);
+        assert_eq!(
+            entries[worker.url()]
+                .calibration
+                .stats(false, Instant::now())
+                .1,
+            4
+        );
+        assert_eq!(
+            entries[worker.url()]
+                .calibration
+                .stats(true, Instant::now()),
+            (1.0, 0)
+        );
     }
 
     #[test]
@@ -1835,20 +2114,36 @@ mod tests {
         assert_eq!(
             admission.entries.lock()[worker.url()]
                 .calibration
-                .stats(true),
-            (2.0, 4)
+                .target(true),
+            2.0
+        );
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .calibration
+                .stats(true, Instant::now())
+                .1,
+            4
         );
         let late = calibration_probe(admission, &worker);
+        let old_epoch = late.calibration.as_ref().unwrap().epoch;
         let watermark = admission.poll_started(&worker);
         admission.publish(&worker, None, watermark, Instant::now());
         let mut report = load(Some(1_000), 2, 100.0, 0.0);
         report.loads[0].prefill_capacity_sample_count = Some(1);
         publish_load(admission, &worker, &report);
         admission.observe_ttft(late, 40.0, 0.0);
+        let reset = admission
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        assert_eq!(reset.epoch, old_epoch + 1);
+        assert_eq!((reset.scale, reset.target_scale), (1.0, 1.0));
+        assert_eq!(reset.observation_sequence, 0);
         assert_eq!(
             admission.entries.lock()[worker.url()]
                 .calibration
-                .stats(true),
+                .stats(true, Instant::now()),
             (1.0, 0)
         );
         for evict in [true, false] {
@@ -1862,7 +2157,7 @@ mod tests {
             assert_eq!(
                 admission.entries.lock()[worker.url()]
                     .calibration
-                    .stats(true),
+                    .stats(true, Instant::now()),
                 (1.0, 0)
             );
             publish_load(admission, &worker, &report);
@@ -1876,12 +2171,16 @@ mod tests {
             let admission = registry.estimated_wait();
             let mut entries = admission.entries.lock();
             let entry = entries.get_mut(worker.url()).unwrap();
-            let forecast = entry.calibration_forecast(admission.config()).unwrap();
+            let now = Instant::now();
+            let forecast = entry.calibration_forecast(admission.config(), now).unwrap();
             for _ in 0..4 {
-                entry.calibration.observe(&forecast, 100.2);
+                entry.calibration.observe(&forecast, 100.2, now);
             }
-            let calibrated = entry.calibration_forecast(admission.config()).unwrap();
-            assert_eq!(calibrated.scale, 10.0);
+            let calibrated = entry
+                .calibration_forecast(admission.config(), now + Duration::from_secs(15))
+                .unwrap();
+            assert_eq!(calibrated.target_scale, 10.0);
+            assert_eq!(calibrated.scale, 2.5);
             assert!(!calibrated.raw_ready);
             assert!(!calibrated.would_reject());
             assert!(!entry.sample.as_ref().unwrap().prepared.capacity_ready);
@@ -1903,13 +2202,14 @@ mod tests {
             publish(&unchanged, &worker, 1_000);
             let mut entries = unchanged.entries.lock();
             let entry = entries.get_mut(worker.url()).unwrap();
-            let forecast = entry.calibration_forecast(unchanged.config()).unwrap();
+            let now = Instant::now();
+            let forecast = entry.calibration_forecast(unchanged.config(), now).unwrap();
             for _ in 0..4 {
-                entry.calibration.observe(&forecast, 0.01);
+                entry.calibration.observe(&forecast, 0.01, now);
             }
             assert!(
                 entry
-                    .calibration_forecast(unchanged.config())
+                    .calibration_forecast(unchanged.config(), now + Duration::from_secs(10))
                     .unwrap()
                     .extra()
                     < 2.0
