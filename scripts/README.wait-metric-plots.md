@@ -123,6 +123,14 @@ The learning-context view also places completed-request input usage at dispatch
 for a diagnostic comparison with the historical queue-size proxy. That usage is
 known only after completion, is not an admission input, and includes prompt tokens
 that may have been cached; it is not exact uncached work remaining in the queue.
+The pressure timeline includes a gray step line from every recorded SMG estimate
+sample, including periods without scored probe arrivals. Colored TTFT points and
+Q/W points remain exact request-at-admission observations. Do not connect them
+across a period without requests and treat that interpolation as measured TTFT.
+The vLLM rate panel also shows local-compute counter deltas including valid zeros.
+SMG's positive-prefill-rate signal has gaps when no positive rate is available;
+those gaps are not metric-scrape failures. SGLang's captured prompt counter has
+different semantics and is not plotted as a local-compute rate.
 
 The 300-second **full-response completion deadline** and the serving router's
 300-second **extra-TTFT budget** are different quantities. Both are recorded;

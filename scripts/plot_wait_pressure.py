@@ -233,6 +233,7 @@ def draw(meta,metrics,rows,result,out):
             origin=next((v for v in yy if finite(v)),0)
             yy=[v-origin if finite(v) else v for v in yy]
         if any(finite(v) for v in yy):ax.step(xx,yy,where='post',label=name,color=color,linewidth=1)
+    sampled(axes[0],'estimated_wait','Sampled SMG TTFT estimate (between arrivals)','#4b5563')
     for key,name,color in [('actual_ttft','Actual SMG first-text TTFT','#2563eb'),('raw_ttft','Recorded SMG TTFT estimate','#d97706'),('learned_ttft','Learned rate: analysis replay','#059669')]:
         rs=[r for r in probes if finite(r.get(key))]
         axes[0].scatter([r['start'] for r in rs],[r[key] for r in rs],s=10,label=name,alpha=.6,color=color)
@@ -249,6 +250,14 @@ def draw(meta,metrics,rows,result,out):
     axes[2].axhline(.9,color='#b91c1c',linestyle='--',label='90% test target')
     for key,name in [('vllm_waiting','Native waiting'),('vllm_running','Native running'),('client_background_active','Client background in flight')]:sampled(axes[3],key,name)
     for key,name in [('generation_tps','SMG generation TPS'),('prefill_tps','SMG measured prefill TPS')]:sampled(axes[4],key,name)
+    if meta['engine']=='vllm':
+        # Local-compute counter deltas remain zero when the engine publishes no
+        # prefill progress. SMG's positive-rate-only signal stays unavailable.
+        counts=[number(r.get('prompt_compute_tokens')) for r in metrics]
+        rates=[math.nan]+[(b-a)/(t1-t0) if a>=0 and b>=a and t1>t0 else math.nan
+                         for a,b,t0,t1 in zip(counts,counts[1:],xx,xx[1:])]
+        axes[4].step(xx,rates,where='post',linewidth=.8,alpha=.65,color='#7c3aed',
+                     label='Native local-compute Δ / Δt (includes zero)')
     traced=[r for r in probes if r['f']]
     for key,name in [('queued_tokens','Q: recorded queue proxy'),('token_work','W: recorded Q + 0.05 D')]:
         axes[5].scatter([r['start'] for r in traced],[r['f'][key] for r in traced],s=8,label=name,alpha=.5)
@@ -259,9 +268,9 @@ def draw(meta,metrics,rows,result,out):
     for key,name in [('baseline_seconds','B: measured low-load TTFT'),('observed_delay_floor','F: observed delay floor'),('native_queue_delay','Native recent queue delay')]:sampled(axes[7],key,name)
     sampled(axes[8],'retractions_sum' if meta['engine']=='sglang' else 'preemptions','Native retractions/preemptions since test start',zero_at_start=True)
     sampled(axes[8],'retracted','Currently retracted requests')
-    titles=[('Same request at admission: predicted and actual first text','Seconds'),('Full response completion: different target from TTFT','Seconds'),
+    titles=[('Sampled estimate over time; same-request TTFT points at admission','Seconds'),('Full response completion: different target from TTFT','Seconds'),
         ('Reported native KV/token usage','Fraction'),('Resident work and queue','Requests'),('Engine rates','Tokens/s'),
-        ('Recorded arithmetic numerator','Tokens'),('Prefill rate: actual and experimental','Tokens/s'),('Delay components','Seconds'),('Memory pressure events','Count')]
+        ('Recorded arithmetic numerator: admission samples','Tokens'),('Prefill rate: actual and experimental','Tokens/s'),('Delay components','Seconds'),('Memory pressure events','Count')]
     for ax,(title,unit) in zip(axes,titles):
         ax.set_title(title,loc='left',pad=45);ax.set_ylabel(unit);ax.grid(alpha=.2)
         ax.legend(loc='lower left',bbox_to_anchor=(0,1.005),ncol=3,fontsize=8)
