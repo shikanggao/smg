@@ -658,6 +658,21 @@ impl Entry {
         self.backlog_generation = self.backlog_generation.wrapping_add(1);
     }
 
+    fn update_backlog_epoch(&mut self, backlog_size: f64) {
+        if backlog_size == 0.0 {
+            if !self.pipeline_idle {
+                self.backlog_generation = self.backlog_generation.wrapping_add(1);
+            }
+            self.pipeline_idle = true;
+            self.backlog_peak_size = 0.0;
+            self.observed_delays.clear();
+            self.busy_visibility.clear();
+        } else {
+            self.pipeline_idle = false;
+            self.backlog_peak_size = self.backlog_peak_size.max(backlog_size);
+        }
+    }
+
     fn refresh(&mut self, worker: &Arc<dyn Worker>, max_age_secs: f64) {
         if let Some(sample) = &mut self.sample {
             let seconds = sample
@@ -807,6 +822,13 @@ impl EstimatedWaitAdmission {
     }
 
     fn apply_observations(entry: &mut Entry, config: &EstimatedWaitConfig) {
+        let Some(mut prepared) = entry.sample.as_ref().map(|sample| sample.prepared) else {
+            return;
+        };
+        prepared.refresh_observed_backlog(entry.pending_first_text.len());
+        // Decode can continue after all first-text work has cleared. End the
+        // busy epoch immediately so its delay cannot reappear in a new burst.
+        entry.update_backlog_epoch(prepared.backlog_size);
         let baseline = ttft_median(&entry.low_load_ttfts);
         let busy_visibility = observation_quantile(&entry.busy_visibility, 0.75);
         let low_visibility = ttft_median(&entry.low_load_visibility);
@@ -956,22 +978,8 @@ impl EstimatedWaitAdmission {
         if let Some(prepared) = &mut prepared {
             prepared.refresh_observed_backlog(entry.pending_first_text.len());
         }
-        // A verified idle worker begins a new queue epoch. Responses from the
-        // preceding busy epoch cannot recalibrate a later workload after drain.
-        if prepared.is_some_and(|prepared| prepared.low_load) && entry.pending_first_text.len() <= 1
-        {
-            if !entry.pipeline_idle {
-                entry.backlog_generation = entry.backlog_generation.wrapping_add(1);
-            }
-            entry.pipeline_idle = true;
-            entry.backlog_peak_size = 0.0;
-            entry.observed_delays.clear();
-            entry.busy_visibility.clear();
-        } else {
-            entry.pipeline_idle = false;
-        }
         if let Some(prepared) = prepared {
-            entry.backlog_peak_size = entry.backlog_peak_size.max(prepared.backlog_size);
+            entry.update_backlog_epoch(prepared.backlog_size);
             if let Some(delay) = prepared.native_queue_delay.filter(|_| prepared.has_backlog) {
                 entry
                     .observed_delays
@@ -1643,6 +1651,24 @@ mod tests {
             // cannot keep a past overload correction alive.
             assert_eq!(prepared.observed_delay_floor, 0.0);
             assert_eq!(prepared.excess_seconds(0), 0.0);
+            assert!(entries[worker.url()].observed_delays.is_empty());
+        }
+        // A fresh burst may overlap ongoing decode of the preceding one.
+        // Its pending streams cannot resurrect the old first-text delay.
+        let fresh: Vec<_> = (0..5)
+            .map(|_| admission.ttft_probe(worker.url()).unwrap())
+            .collect();
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .sample
+                .as_ref()
+                .unwrap()
+                .prepared
+                .observed_delay_floor,
+            0.0
+        );
+        for probe in fresh {
+            admission.finish_ttft_probe(&probe);
         }
         admission.finish_ttft_probe(&probes.pop().unwrap());
         report.loads[0].num_running_reqs = 0;
