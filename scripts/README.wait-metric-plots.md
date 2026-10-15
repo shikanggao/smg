@@ -119,6 +119,10 @@ three figures per run: pressure/latency timeline, accuracy by traffic phase,
 and learning evidence. JSON exports contain phase outcomes and per-probe
 predictions. Metrics are placed at collection completion; native-rate inputs to
 experimental forecasts must have been available before client dispatch.
+The learning-context view also places completed-request input usage at dispatch
+for a diagnostic comparison with the historical queue-size proxy. That usage is
+known only after completion, is not an admission input, and includes prompt tokens
+that may have been cached; it is not exact uncached work remaining in the queue.
 
 The 300-second **full-response completion deadline** and the serving router's
 300-second **extra-TTFT budget** are different quantities. Both are recorded;

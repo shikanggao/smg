@@ -178,6 +178,9 @@ def analyze(path,prior=None):
             native_capacity_ready=sum(bool(r['f'] and r['f']['capacity_learned_ready']) for r in subset),
             learned_factor_min=min((r['learned_factor'] for r in subset),default=None),
             learned_factor_max=max((r['learned_factor'] for r in subset),default=None),
+            actual_prompt_usage_samples=sum(finite(r['prompt_tokens']) for r in subset),
+            actual_prompt_tokens_median=statistics.median(r['prompt_tokens'] for r in subset if finite(r['prompt_tokens'])) if any(finite(r['prompt_tokens']) for r in subset) else None,
+            queue_proxy_tokens_per_waiting_median=statistics.median(r['f']['queued_tokens']/r['f']['native_waiting'] for r in subset if r['f'] and r['f']['native_waiting']>0) if any(r['f'] and r['f']['native_waiting']>0 for r in subset) else None,
             observed_first_text_over_deadline=sum(finite(r['actual_ttft']) and r['actual_ttft']>300 for r in subset),
             first_text_unobserved=sum(not finite(r['actual_ttft']) for r in subset if r['status']!=503),
             ttft_pairs=len(paired),raw_ttft_mae=statistics.mean(abs(r['raw_ttft']-r['actual_ttft']) for r in paired) if paired else None,
@@ -288,11 +291,13 @@ def draw(meta,metrics,rows,result,out):
     for key,name in [('capacity_samples','Qualified capacity intervals'),('prefill_size_samples','Completed-prompt size samples')]:sampled(axes[1],key,name)
     for key,name in [('capacity_ready','SMG capacity/admission readiness'),('capacity_learning_active','Current saturated learning interval')]:sampled(axes[2],key,name)
     for key,name in [('mean_prefill_tokens','SMG mean uncached prompt size'),('median_prefill_tokens','SMG recent prompt size'),('blended_prompt_tokens','Q proxy tokens per waiting request')]:sampled(axes[3],key,name)
+    sized=[r for r in probes if r['complete'] and finite(r['prompt_tokens'])]
+    axes[3].scatter([r['start'] for r in sized],[r['prompt_tokens'] for r in sized],s=8,color='#7c3aed',label='Actual input tokens after completion: diagnostic')
     observed=[r for r in probes if r['f']]
     axes[4].scatter([r['start'] for r in observed],[r['f']['snapshot_age_seconds'] for r in observed],s=8,label='Exact SMG snapshot age at admission')
     sampled(axes[4],'snapshot_age','Scraped age gauge (last refresh value)')
-    for ax,title,unit in zip(axes,['Learned relative gap: no model-specific assigned factor','Learning evidence available to SMG','Readiness and learning activity','Input-size evidence driving the queue proxy','Snapshot freshness'],['Scale','Samples','0/1','Tokens','Seconds']):
-        ax.set_title(title,loc='left',pad=25);ax.set_ylabel(unit);ax.grid(alpha=.2)
+    for ax,title,unit in zip(axes,['Learned relative gap: no model-specific assigned factor','Learning evidence available to SMG','Readiness and learning activity','Queue-size history versus completed-request input size','Snapshot freshness'],['Scale','Samples','0/1','Tokens','Seconds']):
+        ax.set_title(title,loc='left',pad=45);ax.set_ylabel(unit);ax.grid(alpha=.2)
         ax.legend(loc='lower left',bbox_to_anchor=(0,1.005),ncol=3,fontsize=8);ax.tick_params(axis='x',labelbottom=True)
     axes[-1].set_xlabel('Seconds since test start')
     fig.suptitle(label+' · Learning evidence and causal calibration',fontsize=15)
