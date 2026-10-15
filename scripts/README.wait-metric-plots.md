@@ -1,5 +1,8 @@
 # Engine metrics, calculated estimates and actual TTFT over time
 
+For the sustained KV-pressure / completion-deadline experiment, use the companion
+`plot_wait_pressure.py` described at the end of this document.
+
 `plot_wait_metrics.py` reads recorded files only. It produces three aligned views
 per run (formula, engine inputs/learning, diagnostics). Every view includes the
 same request's calculated estimate and observed first-text TTFT at its start time.
@@ -94,3 +97,56 @@ prefill-time histograms are absent in these recordings and explicitly labelled.
 The collector paused 0.25 seconds after fetching; actual start-to-start intervals
 include fetch time and are reported per run. SMG's engine poll interval was one
 second in the recorded experiment. No interpolation can recover sub-poll spikes.
+
+## Sustained KV pressure and full-response deadlines
+
+`plot_wait_pressure.py` reads `MODEL/MODE` directories containing `metrics.tsv`,
+`requests.tsv`, exact `router-events.jsonl`, and `summary.json` from the pressure
+harness. It supports completed probes, planned background cancellation, deadline
+misses with incomplete responses, and enforced rejections with unknown outcomes.
+
+```sh
+python scripts/plot_wait_pressure.py \
+  --input recorded-pressure-tests/results \
+  --prior earlier-tests/results/candidate \
+  --output-dir pressure-graphs
+```
+
+The optional prior is earlier calibration inference data, not model training.
+Its final metric timestamp must precede the new experiment. The script replays
+every serving forecast, joins SMG first-text events by request ID, and produces
+three figures per run: pressure/latency timeline, accuracy by traffic phase,
+and learning evidence. JSON exports contain phase outcomes and per-probe
+predictions. Metrics are placed at collection completion; native-rate inputs to
+experimental forecasts must have been available before client dispatch.
+
+The 300-second **full-response completion deadline** and the serving router's
+300-second **extra-TTFT budget** are different quantities. Both are recorded;
+setting the latter cannot establish an end-to-end deadline guarantee. Background
+traffic holds KV blocks resident while probes test actual new-arrival latency.
+Observation continues beyond the deadline to identify late completion. A response
+still open after the deadline is a known miss even when its exact completion is
+unknown. Rejected requests receive no invented completion-time label.
+
+The analysis-only learner uses the same 32-completion window, four-sample minimum,
+and 2,000-token/s capacity floor for every model. It learns a queue-delay ratio
+only from prior completed requests with a ready native queue term dominating F,
+then corrects effective capacity while preserving B, F, the delay-only branch and
+readiness gates. A request's result cannot affect an earlier prediction. This
+learned scale is a diagnostic hypothesis, not a measured physical GPU capacity.
+It can worsen false positives when traffic changes; it is not a serving change.
+
+For each eligible completed observation, the learned ratio is
+`max(0, actual_TTFT - B) / (W / C)`. Its rolling median `k` selects
+`C_corrected = max(2000, C / k)` and the diagnostic estimate remains
+`B + max(W / C_corrected, F)`. A zero queue contributes zero after correction;
+there is no added global offset that would inflate idle traffic. The fixed
+delay-only branch is preserved. These properties do not prove safety under a new
+traffic mix: the tests can still show an increased false-positive rate.
+
+A second diagnostic adds an estimated decode duration using aggregate generated
+tokens/s divided by the sampled native running count. That fair-share approximation
+does not account exactly for prefill stages, heterogeneous remaining outputs,
+preemptions, future arrivals or scheduling. It is labelled experimental and must
+not be interpreted as a reliable deadline bound. The script deliberately reports
+regressions as well as improvements. No model-specific constants are assigned.
