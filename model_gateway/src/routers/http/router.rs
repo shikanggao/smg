@@ -241,11 +241,7 @@ impl Router {
     fn select_worker_for_model(
         &self,
         model_id: &str,
-        text: Option<&str>,
-        tokens: Option<&[u32]>,
-        headers: Option<&HeaderMap>,
-        rid_key: Option<&str>,
-        cache_namespace: Option<CacheNamespace>,
+        inputs: PlacementInputs<'_>,
     ) -> Result<Option<Arc<dyn Worker>>, Response> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
@@ -255,14 +251,7 @@ impl Router {
             model_id,
             RoutingPool::HttpRegular,
             None,
-            PlacementInputs {
-                text,
-                tokens,
-                headers,
-                rid_key,
-                cache_namespace,
-                ..Default::default()
-            },
+            inputs,
         )
     }
 
@@ -496,12 +485,8 @@ impl Router {
     ) -> Response {
         let calibration = Mutex::new(None);
         let worker = match lease.with_view(|view| {
-            placement::select_single(
-                &self.worker_registry,
-                &self.policy_registry,
+            self.select_worker_for_model(
                 model_id,
-                RoutingPool::HttpRegular,
-                None,
                 PlacementInputs {
                     text: view.text,
                     tokens: view.tokens,
@@ -1724,12 +1709,8 @@ impl Router {
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
         let calibration = Mutex::new(None);
-        let selection = placement::select_single(
-            &self.worker_registry,
-            &self.policy_registry,
+        let selection = self.select_worker_for_model(
             model_id,
-            RoutingPool::HttpRegular,
-            None,
             PlacementInputs {
                 tokens: hinted_tokens.as_deref(),
                 headers: Some(req.headers()),
@@ -2400,14 +2381,7 @@ mod tests {
         let router = create_test_unhealthy_router();
 
         let selected = router
-            .select_worker_for_model(
-                crate::worker::UNKNOWN_MODEL_ID,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, PlacementInputs::default())
             .unwrap()
             .unwrap();
         assert!(selected.is_available());
@@ -2416,14 +2390,7 @@ mod tests {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
         }
         assert!(router
-            .select_worker_for_model(
-                crate::worker::UNKNOWN_MODEL_ID,
-                None,
-                None,
-                None,
-                None,
-                None
-            )
+            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, PlacementInputs::default(),)
             .unwrap()
             .is_none());
     }
