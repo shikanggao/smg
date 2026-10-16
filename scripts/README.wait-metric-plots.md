@@ -325,3 +325,46 @@ zero risk. The timeline preserves continuous metric samples through pressure,
 unload, drain and recovery, with a 300-second reference. Exact outcomes remain
 individual dots; they are never interpolated. Graphs show only raw and the current
 calibrated estimate; all outliers are retained.
+
+### Freeze deadline truth before background intervention
+
+Planned unload can accelerate queued probes. A client timeout, cancellation,
+error or incomplete background stream can do the same **earlier**. Use the
+earliest such background termination or planned unload as the pressure cutoff.
+Natural background completion with `[DONE]` and `finish_reason` does not create
+an artificial cutoff. Controlled HTTP503 admission rejection does not withdraw
+admitted work and remains an unknown latency counterfactual.
+
+```sh
+python scripts/stratify_wait_deadline.py results/llama/shadow-attempt1
+python scripts/plot_wait_deadline_stratified.py \
+  --input results/llama/shadow-attempt1 --title 'Llama — pressure cutoff'
+python scripts/test_stratify_wait_deadline.py
+```
+
+Schema version 2 in `deadline-strata.json` provides `cutoff_elapsed_seconds`,
+`cutoff_reason`, `completion_deadline_at_cutoff`,
+`first_text_deadline_at_cutoff`, `completed_paired_proof_before_cutoff`,
+`healthy_boundary_completed_before_cutoff`, and the corresponding request IDs.
+Primary truth includes completed outcomes observed before cutoff and requests
+whose own 300-second deadline already passed while still observed before cutoff.
+Other pending outcomes are unknown. A request canceled before its deadline stays
+unknown even if the clock passes 300 seconds later. First-text deadline truth
+uses the client clock; measured SMG first-text proof remains separate.
+
+`paired-deadline-stratified.json` keeps every original paired row and its later
+observed latency. `requests-deadline-stratified.json` additionally retains every
+raw request, including rejected and unselected canceled requests, with its exact
+original TSV fields under `raw_request`. Original requests, analyses and paired
+data remain untouched. The stratifier records its own SHA256 and hashes of
+`requests.tsv`, `paired-deadline.json` and `stages.json` so stale derived scores
+can be detected. Compatibility fields named `*_unload` keep their literal
+planned-unload meaning; they are not aliases for an earlier cutoff.
+
+Plots retain all probe observations and outliers. Crosses mark probes pending
+at cutoff; circles mark probes not pending then, including later recovery
+controls. Metric curves remain sampled values rather than interpolated actual
+latencies. The cutoff and planned unload are marked separately when they differ.
+Healthy outcomes completed only after cutoff cannot establish specificity under
+sustained pressure. An empty 240–300-second healthy bucket before cutoff means
+that boundary remains untested, rather than proving zero false positives.
