@@ -208,7 +208,8 @@ def audit(log):
             versions[key + (sequence, fit_sequence)] = previous
             prior_fit = fit_sequence
             if event.get('timestamp'):
-                feedback_times[key + (sequence, fit_sequence)] = datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00'))
+                feedback_times[key + (sequence, fit_sequence)] = datetime.fromisoformat(
+                    event['timestamp'].replace('Z', '+00:00'))
             if not is_fit and event['admission_observation_sequence'] > event['sequence_before']:
                 errors.append(['feedback_uses_own_or_future_observation', event['request_id']])
     for event in selected + gate_forecasts:
