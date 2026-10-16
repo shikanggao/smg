@@ -49,15 +49,29 @@ def events(path):
         yield obj.get('fields', {}) | obj
 
 
+SCALE_UNITS_PER_SECOND = 0.1
+
+
+def applied_scale(version, at):
+    """Evaluate a saved target trajectory; elapsed time never banks a new target."""
+    anchor, target, since, _ = version
+    budget = SCALE_UNITS_PER_SECOND * max(at - since, 0)
+    return min(anchor + budget, max(anchor - budget, target))
+
+
 def audit(log):
-    """Reconstruct each state version using accepted sequence, not log ordering."""
+    """Replay windows and elapsed-time trajectories by accepted sequence."""
     updates = defaultdict(dict)
     selected = []
+    gate_forecasts = []
     feedback = []
     errors = []
+    limited = any('calibration_time_seconds' in e for e in log)
     for event in log:
         if event.get('event') == 'calibration_forecast':
             selected.append(event)
+        if event.get('event') == 'forecast' and event.get('calibration_enabled'):
+            gate_forecasts.append(event)
         if event.get('event') != 'calibration_feedback':
             continue
         feedback.append(event)
@@ -69,39 +83,76 @@ def audit(log):
             updates[key][sequence] = event
     versions = {}
     feedback_times = {}
+    largest_rate = 0.0
+    largest_same_time_change = 0.0
+    largest_instant_update = 0.0
+    busiest_second = 0
     for key, changes in updates.items():
         history = deque(maxlen=32)
-        versions[key + (0,)] = (1.0, 0)
+        previous = (1.0, 1.0, 0.0, 0) # applied anchor, target, epoch-relative time, count
+        versions[key + (0,)] = previous
+        prior_sequence = 0
+        recent_times = deque()
         for sequence, event in sorted(changes.items()):
-            if sequence != event['sequence_before'] + 1 or sequence != max((k[-1] for k in versions if k[:-1] == key), default=0) + 1:
+            if sequence != event['sequence_before'] + 1 or sequence != prior_sequence + 1:
                 errors.append(['missing_history_sequence', key, sequence])
+            prior_sequence = sequence
             if event['calibration_epoch'] != event['current_calibration_epoch']:
                 errors.append(['accepted_old_epoch', event['request_id']])
-            if not close(event['scale_before'], median_scale(history)) or event['sample_count_before'] != len(history):
+            now = event['calibration_time_seconds'] if limited else float(sequence)
+            before = applied_scale(previous, now) if limited else previous[1]
+            if limited and now < previous[2]:
+                errors.append(['monotonic_time_regressed', event['request_id']])
+            if not close(event['scale_before'], before) or event['sample_count_before'] != len(history):
                 errors.append(['incorrect_feedback_before', event['request_id']])
+            if limited and not close(event['target_scale_before'], median_scale(history)):
+                errors.append(['incorrect_target_before', event['request_id']])
             ratio = max(event['ttft_seconds'] - event['baseline_seconds'], 0) / event['raw_excess_seconds']
             history.append((ratio, event['raw_excess_seconds']))
-            value = median_scale(history)
-            if not close(value, event['scale_after']) or len(history) != event['sample_count_after']:
+            target = median_scale(history)
+            after = before if limited else target
+            if not close(after, event['scale_after']) or len(history) != event['sample_count_after']:
                 errors.append(['incorrect_feedback_after', event['request_id']])
-            versions[key + (sequence,)] = (value, len(history))
+            if limited:
+                recent_times.append(now)
+                while recent_times and now - recent_times[0] >= 1:
+                    recent_times.popleft()
+                busiest_second = max(busiest_second, len(recent_times))
+                largest_instant_update = max(largest_instant_update, abs(event['scale_after'] - event['scale_before']))
+                if not close(target, event['target_scale_after']):
+                    errors.append(['incorrect_target_after', event['request_id']])
+                dt = now - previous[2]
+                movement = abs(after - previous[0])
+                if movement > SCALE_UNITS_PER_SECOND * max(dt, 0) + 2e-8:
+                    errors.append(['elapsed_time_rate_exceeded', event['request_id']])
+                if dt > 1e-8:
+                    largest_rate = max(largest_rate, movement / dt)
+                else:
+                    largest_same_time_change = max(largest_same_time_change, movement)
+            previous = (after, target, now, len(history))
+            versions[key + (sequence,)] = previous
             if event.get('timestamp'):
                 feedback_times[key + (sequence,)] = datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00'))
             if event['admission_observation_sequence'] > event['sequence_before']:
                 errors.append(['feedback_uses_own_or_future_observation', event['request_id']])
-    for event in selected:
+    for event in selected + gate_forecasts:
         seq = event['calibration_observation_sequence']
         key = (event['worker'], event['calibration_epoch'], event['calibration_state'], seq)
-        expected = versions.get(key, (1.0, 0) if seq == 0 else None)
-        if expected is None or not close(expected[0], event['calibration_scale']) or expected[1] != event['calibration_sample_count']:
-            errors.append(['incorrect_selected_history', event['request_id'], key])
-        if key in feedback_times and event.get('timestamp'):
+        expected = versions.get(key, (1.0, 1.0, 0.0, 0) if seq == 0 else None)
+        now = event['calibration_time_seconds'] if limited else float(seq)
+        applied = applied_scale(expected, now) if limited and expected else expected[1] if expected else None
+        if expected is None or not close(applied, event['calibration_scale']) or expected[3] != event['calibration_sample_count']:
+            errors.append(['incorrect_selected_history', event['request_id'], event['event'], key])
+        if limited and expected:
+            if now < expected[2] or not close(expected[1], event['calibration_target_scale']):
+                errors.append(['incorrect_selected_target_or_time', event['request_id'], event['event']])
+        elif key in feedback_times and event.get('timestamp'):
             if feedback_times[key] > datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00')):
                 errors.append(['forecast_uses_future_feedback', event['request_id']])
         base = event['baseline_seconds']
         extra = event['predicted_excess_seconds']
         if not close(event['predicted_ttft_seconds'], base + extra) or not close(event['calibrated_ttft_seconds'], base + event['calibration_scale'] * extra):
-            errors.append(['incorrect_forecast_arithmetic', event['request_id']])
+            errors.append(['incorrect_forecast_arithmetic', event['request_id'], event['event']])
         expected_reject = event['ready'] and math.isfinite(event['calibrated_excess_seconds']) and event['calibrated_excess_seconds'] >= event['threshold_seconds']
         if expected_reject != event['calibrated_would_reject']:
             errors.append(['incorrect_calibrated_readiness_gate', event['request_id']])
@@ -111,14 +162,22 @@ def audit(log):
         if not forecast:
             errors.append(['feedback_missing_selected_snapshot', event['request_id']])
             continue
-        for source, target in [('baseline_seconds', 'baseline_seconds'), ('predicted_excess_seconds', 'raw_excess_seconds'), ('calibration_scale', 'admission_scale'), ('calibration_observation_sequence', 'admission_observation_sequence'), ('calibration_epoch', 'calibration_epoch')]:
+        inputs = [('baseline_seconds', 'baseline_seconds'), ('predicted_excess_seconds', 'raw_excess_seconds'), ('calibration_scale', 'admission_scale'), ('calibration_observation_sequence', 'admission_observation_sequence'), ('calibration_epoch', 'calibration_epoch')]
+        if limited:
+            inputs.append(('calibration_time_seconds', 'admission_calibration_time_seconds'))
+        for source, target in inputs:
             if not close(forecast[source], event[target]):
                 errors.append(['feedback_changed_saved_input', event['request_id'], source])
     return dict(ok=not errors, errors=errors[:100], error_count=len(errors),
-                selected_forecasts=len(selected), feedback=len(feedback),
+                selected_forecasts=len(selected), gate_forecasts=len(gate_forecasts), feedback=len(feedback),
                 accepted=sum(len(v) for v in updates.values()),
                 feedback_reasons=dict(Counter(event['reason'] for event in feedback)),
-                history_versions=len(versions), states=len(updates))
+                history_versions=len(versions), states=len(updates), elapsed_time_limited=limited,
+                scale_units_per_second=SCALE_UNITS_PER_SECOND if limited else None,
+                largest_observed_feedback_scale_rate=largest_rate if limited else None,
+                largest_same_instant_feedback_movement=largest_same_time_change if limited else None,
+                largest_instant_update_movement=largest_instant_update if limited else None,
+                peak_accepted_feedback_in_one_second=busiest_second if limited else None)
 
 
 def percentile(values, q):
@@ -138,7 +197,7 @@ def score(rows):
     result['actual_mean'] = statistics.mean(r['actual_ttft'] for r in rows)
     result['actual_p95'] = percentile([r['actual_ttft'] for r in rows], .95)
     result['client_minus_smg_p50_p95'] = [percentile([r['client_ttft'] - r['actual_ttft'] for r in rows], q) for q in [.5, .95]]
-    for name in ['raw', 'calibrated']:
+    for name in ['raw', 'target', 'calibrated']:
         errors = [r[name + '_ttft'] - r['actual_ttft'] for r in rows]
         counts = Counter()
         for r in rows:
@@ -156,6 +215,9 @@ def score(rows):
                             fpr=counts['fp'] / negatives if negatives else None,
                             ready_fn=sum(r['ready'] and r['actual_extra'] >= 5 and not r[name + '_would_reject'] for r in rows),
                             unready_fn=sum(not r['ready'] and r['actual_extra'] >= 5 for r in rows))
+    result['target_scale_p10_p50_p90'] = [percentile([r['target_scale'] for r in rows], q) for q in [.1, .5, .9]]
+    result['max_target_scale'] = max(r['target_scale'] for r in rows)
+    result['max_applied_scale'] = max(r['scale'] for r in rows)
     result['unready'] = sum(not r['ready'] for r in rows)
     result['calibration_mature'] = sum(r['calibration_count'] >= 4 for r in rows)
     result['baseline_missing'] = sum(not r['baseline_available'] for r in rows)
@@ -220,6 +282,10 @@ def analyze(path):
                          baseline_available=forecast['baseline_available'], raw_ttft=forecast['predicted_ttft_seconds'],
                          raw_extra=forecast['predicted_excess_seconds'], calibrated_ttft=forecast['calibrated_ttft_seconds'],
                          calibrated_extra=forecast['calibrated_excess_seconds'], scale=forecast['calibration_scale'],
+                         target_scale=forecast.get('calibration_target_scale', forecast['calibration_scale']),
+                         calibration_time_seconds=forecast.get('calibration_time_seconds'),
+                         target_ttft=forecast['baseline_seconds'] + forecast.get('calibration_target_scale', forecast['calibration_scale']) * forecast['predicted_excess_seconds'],
+                         target_would_reject=bool(forecast['ready'] and forecast.get('calibration_target_scale', forecast['calibration_scale']) * forecast['predicted_excess_seconds'] >= forecast['threshold_seconds']),
                          calibration_count=forecast['calibration_sample_count'], calibration_sequence=forecast['calibration_observation_sequence'],
                          calibration_state=forecast['calibration_state'], calibration_epoch=forecast['calibration_epoch'],
                          ready=forecast['ready'], raw_would_reject=forecast['would_reject'],
@@ -251,7 +317,8 @@ def analyze(path):
                   notes=['Raw/calibrated accuracy uses the same selected snapshot. Original pre-admission gate is audited separately.',
                          'Truth is prompt-shape-matched median low-load first-text TTFT plus the shared five-second extra-delay budget.',
                          'Rejected hard-mode requests have no observed counterfactual TTFT. Calibrated gate remains hypothetical.',
-                         'The holdout is later unseen traffic with online updates enabled; it is not a frozen fit.'])
+                         'The holdout is later unseen traffic with online updates enabled; it is not a frozen fit.',
+                         'Target is the unrestricted weighted median from the same prior live history; applied scale is the live elapsed-time-limited trajectory. Neither is an offline fit.'])
     (path / 'paired-calibration.json').write_text(json.dumps(rows, indent=2) + '\n')
     (path / 'calibration-analysis.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(dict(path=str(path), checks=checks, pairs=len(rows), rejections=len(rejected), low=result['low'], high=result['high']), indent=2))

@@ -3,7 +3,7 @@
 
 Run analyze_wait_calibration.py for each suite first, then:
   python plot_wait_calibration.py --input results/llama --title 'vLLM Llama 3.1 8B'
-No calibration is fitted here: all predictions are recorded live at selection.
+No calibration is fitted here: applied forecasts and their unrestricted targets use the same recorded live history at selection.
 """
 from __future__ import annotations
 import argparse
@@ -18,7 +18,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-COLORS = {'actual': '#172f44', 'raw': '#dc762b', 'calibrated': '#087e8b'}
+COLORS = {'actual': '#172f44', 'raw': '#dc762b', 'calibrated': '#087e8b', 'target': '#ad65ac'}
 SUITES = ['train', 'holdout', 'cold', 'hard']
 
 
@@ -39,18 +39,26 @@ def timeseries(path, title):
     fig, axes = plt.subplots(4, 1, figsize=(16, 12), sharex=True, layout='constrained', gridspec_kw={'height_ratios': [2.3, 1, 1.3, 1.3]})
     ax = axes[0]
     series(ax, metrics, 'estimated_wait', 'Raw TTFT, sampled gauge', COLORS['raw'], lw=1.5, alpha=.8)
-    series(ax, metrics, 'calibrated_ttft', 'Calibrated TTFT, sampled gauge', COLORS['calibrated'], lw=1.5, alpha=.8)
+    series(ax, metrics, 'calibrated_ttft', 'Time-limited TTFT, sampled gauge', COLORS['calibrated'], lw=1.5, alpha=.9)
+    if 'calibration_target_scale' in metrics[0]:
+        base, scale, extra = (values(metrics, k) for k in ['baseline_seconds','calibration_target_scale','excess_seconds'])
+        target = base + scale * extra
+        target[(base < 0) | (scale < 0) | (extra < 0)] = np.nan
+        ax.plot(values(metrics, 'sample_completed_elapsed_seconds'), target, label='Unrestricted target TTFT, sampled', color=COLORS['target'], lw=1, alpha=.6)
     x = [r['started_elapsed_seconds'] for r in requests]
     ax.scatter(x, [r['actual_ttft'] for r in requests], s=8, c=COLORS['actual'], alpha=.35, label='Actual first text, at request start', rasterized=True)
     ax.set_yscale('symlog', linthresh=1)
     ax.set_ylabel('TTFT (s; log above 1s)')
     ax.set_ylim(bottom=0)
-    ax.legend(loc='upper left', ncols=3, fontsize=8)
+    ax.legend(loc='upper left', ncols=2, fontsize=8)
     ax.set_title(f'{title} — {summary["suite"]}\nCurves are sampled estimates; dots are individual observed TTFTs. Exact same-request accuracy is scored separately.', loc='left', fontsize=12)
     ax = axes[1]
+    if 'calibration_target_scale' in metrics[0]:
+        series(ax, metrics, 'calibration_target_scale', 'Unrestricted target g', COLORS['target'], lw=1, alpha=.7)
+        series(ax, metrics, 'calibration_scale', 'Applied g, ≤0.1 units/s in each state', COLORS['calibrated'], lw=1.3, alpha=.85)
     ready = [r for r in requests if r['calibration_state'] == 'capacity_ready']
     unready = [r for r in requests if r['calibration_state'] == 'capacity_unready']
-    for rows, label, color in [(ready, 'Native capacity ready', '#087e8b'), (unready, 'Native capacity unready', '#935fa7')]:
+    for rows, label, color in [(ready, 'Applied g: native capacity ready', '#087e8b'), (unready, 'Applied g: native capacity unready', '#935fa7')]:
         ax.scatter([r['started_elapsed_seconds'] for r in rows], [r['scale'] for r in rows], s=6, color=color, alpha=.65, label=label, rasterized=True)
     ax.axhline(1, ls='--', color='#999999', lw=.8)
     ax.set_yscale('symlog', linthresh=1)
@@ -100,10 +108,12 @@ def accuracy(model_path, title):
     for ax, suite in zip(axes, ['train', 'holdout', 'cold']):
         path = model_path / suite
         rows = [r for r in json.loads((path / 'paired-calibration.json').read_text()) if not r['case'].startswith('baseline-')]
+        for row in rows:
+            row.setdefault('target_ttft', row['calibrated_ttft']) # Older runs applied the target directly.
         actual = [r['actual_ttft'] for r in rows]
-        maximum = max(actual + [r['raw_ttft'] for r in rows] + [r['calibrated_ttft'] for r in rows]) * 1.03
-        for key in ['raw', 'calibrated']:
-            ax.scatter(actual, [r[key + '_ttft'] for r in rows], s=7, alpha=.25, color=COLORS[key], label=key.capitalize(), rasterized=True)
+        maximum = max(actual + [r[key + '_ttft'] for r in rows for key in ['raw', 'target', 'calibrated']]) * 1.03
+        for key in ['raw', 'target', 'calibrated']:
+            ax.scatter(actual, [r[key + '_ttft'] for r in rows], s=7, alpha=.25, color=COLORS[key], label={'raw':'Raw','target':'Unrestricted target','calibrated':'Time-limited'}[key], rasterized=True)
         ax.plot([0, maximum], [0, maximum], color='#64707b', lw=1, ls='--', label='Perfect agreement')
         ax.set(xlim=(0, maximum), ylim=(0, maximum), xlabel='Actual first-text TTFT (seconds)', ylabel='Predicted TTFT (seconds)', title=suite)
         ax.set_xscale('symlog', linthresh=1)
@@ -113,7 +123,8 @@ def accuracy(model_path, title):
         report = json.loads((path / 'calibration-analysis.json').read_text())
         raw = report['all']['raw']['mae']
         calibrated = report['all']['calibrated']['mae']
-        ax.text(.04, .96, f'MAE: raw {raw:.3f}s → calibrated {calibrated:.3f}s\nn={len(rows):,}', transform=ax.transAxes, va='top', fontsize=9)
+        target = report['all'].get('target', report['all']['calibrated'])['mae']
+        ax.text(.04, .96, f'MAE: raw {raw:.3f}s\ntarget {target:.3f}s → limited {calibrated:.3f}s\nn={len(rows):,}', transform=ax.transAxes, va='top', fontsize=9)
     axes[0].legend(loc='lower right', fontsize=8)
     fig.suptitle(title + ' — exact same-request accuracy (baseline probes excluded)\nAbove diagonal = overprediction; below = underprediction. Axes linear 0–1s, logarithmic above 1s; all outliers retained.', fontsize=12)
     output = model_path / 'graphs'

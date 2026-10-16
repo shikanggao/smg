@@ -192,12 +192,13 @@ At worker selection, a snapshot saves B, E_raw, capacity-readiness state, epoch,
 observation sequence and g before dispatch credit. The first nonempty supported
 OpenAI-compatible SSE reasoning/content text contributes
 `max(actual_TTFT - saved_B, 0) / saved_E_raw`, weighted by saved E_raw. Each native
-capacity state uses its own rolling 32-observation weighted median, with g=1
-until four valid observations. Those shared policies apply to every engine/model.
+capacity state uses its own rolling 32-observation weighted-median target, with
+initial g=1 and four valid observations required for a different target. Those shared policies apply to every engine/model.
 Only supported regular HTTP streaming responses supply learning feedback.
 
 The audit rebuilds each live history by worker, epoch, state and accepted
-observation sequence. It checks window weights, before/after scales, saved inputs,
+observation sequence. It checks window weights, before/after targets and applied
+scales, saved inputs,
 exact forecast arithmetic and that forecasts did not use later feedback. It
 separately audits the original pre-admission raw gate. Selected snapshots can
 slightly differ from that earlier gate during concurrent dispatch; accuracy
@@ -227,3 +228,48 @@ estimate can teach a huge ratio before the queue becomes visible, then amplify
 an accurate later raw estimate. Sparse observations can also teach g near zero.
 Keep this diagnostic until transition, false-positive and false-negative checks
 pass. This flag provides no calibrated enforcement mode.
+
+## Elapsed-time scale limit
+
+The live shadow scale now approaches the weighted-median target at a shared
+maximum of **0.1 absolute scale units per second**, in either direction. This is
+an absolute rate, not a percentage. For one native-capacity history/epoch, with
+applied anchor `a`, target `h` and monotonic anchor time `t0`:
+
+```
+g(t) = clamp(h, a - 0.1 * (t - t0), a + 0.1 * (t - t0))
+T_cal = B + g(t) * E_raw
+```
+
+On accepted feedback, first evaluate the old trajectory at the feedback time,
+then anchor the new target at that current applied scale/time. Earlier idle time
+cannot be spent on a new target. Callback bursts do not increase the movement
+budget. Read-only snapshots evaluate the trajectory even with no new feedback.
+Separate native-ready/unready histories and epoch resets are unchanged: switching
+histories or resetting to initial g=1 can still cause a displayed transition.
+Changes in B, F or raw token work can still change the final TTFT prediction fast.
+
+The `calibration_target_scale` and `calibration_time_seconds` fields accompany
+selected/general forecasts; time is monotonic seconds since the calibration epoch.
+Feedback records `target_scale_before/after`, `calibration_time_seconds` and the
+saved `admission_calibration_time_seconds`. Existing scale fields refer to the
+applied scale. The existing readiness/sample-count diagnostic means the history has at least
+four valid observations; it does not mean the applied scale has reached its
+target. The additional gauge is
+`smg_estimated_wait_calibration_target_scale`.
+
+The analyzer reconstructs each old-target trajectory, checks continuity at
+accepted updates and the 0.1/s bound, then evaluates saved selected snapshots
+at their exact monotonic times. It also reports `target` scores: the unrestricted
+median from that same prior live history, applied to the same raw snapshot.
+That comparison isolates the limiter without a future-data fit or another live
+execution. It does not simulate queues from calibrated enforcement. Old traces
+without elapsed-time fields retain their original unrestricted replay behavior.
+
+New graphs show raw (orange), unrestricted target (purple) and time-limited
+(teal) predictions, plus target and applied scales over time. A target/applied
+gap can reveal useful smoothing or excessive lag; inspect false positives and
+false negatives as well as typical error. A time limit controls movement speed,
+not whether a learned target is valid for the next traffic regime. The existing
+observation eligibility, baseline, whole-extra-delay scaling including F,
+readiness gates and default-off shadow setting are preserved.
