@@ -266,9 +266,11 @@ That comparison isolates the limiter without a future-data fit or another live
 execution. It does not simulate queues from calibrated enforcement. Old traces
 without elapsed-time fields retain their original unrestricted replay behavior.
 
-New graphs show raw (orange), unrestricted target (purple) and time-limited
-(teal) predictions, plus target and applied scales over time. A target/applied
-gap can reveal useful smoothing or excessive lag; inspect false positives and
+Graphs show raw (orange) and current time-limited (teal) predictions against
+actual TTFT, plus the applied scale over time. Unrestricted targets are omitted
+from the figures, legends, MAE annotations and axis limits to keep the current
+version readable. Their values remain in the analysis tables and retained data.
+All actual/raw/current outliers remain visible. Inspect false positives and
 false negatives as well as typical error. A time limit controls movement speed,
 not whether a learned target is valid for the next traffic regime. The existing
 observation eligibility, baseline, whole-extra-delay scaling including F,
