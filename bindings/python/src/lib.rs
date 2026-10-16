@@ -545,9 +545,8 @@ struct Router {
     estimated_wait_dispatch_blocking_factor: f64,
     estimated_wait_min_prefill_throughput: Option<f64>,
     estimated_wait_prompt_size_prior_samples: u32,
-    estimated_wait_base_overhead_secs: f64,
-    estimated_wait_queue_work_correction: f64,
     estimated_wait_fallback_prefill_throughput: Option<f64>,
+    estimated_wait_calibration_shadow: bool,
 }
 
 impl Router {
@@ -868,11 +867,8 @@ impl Router {
             .estimated_wait(EstimatedWaitConfig {
                 max_estimated_wait_secs: self.max_estimated_wait_secs,
                 estimated_wait_shadow: self.estimated_wait_shadow,
-                // Experimental calibration is currently exposed by the Rust CLI/config.
-                estimated_wait_calibration_shadow: false,
+                estimated_wait_calibration_shadow: self.estimated_wait_calibration_shadow,
                 estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
-                estimated_wait_base_overhead_secs: self.estimated_wait_base_overhead_secs,
-                estimated_wait_queue_work_correction: self.estimated_wait_queue_work_correction,
                 estimated_wait_dispatch_blocking_factor: self
                     .estimated_wait_dispatch_blocking_factor,
                 estimated_wait_mean_prefill_tokens: self.estimated_wait_mean_prefill_tokens,
@@ -1162,9 +1158,8 @@ impl Router {
         estimated_wait_dispatch_blocking_factor = 0.05,
         estimated_wait_min_prefill_throughput = None,
         estimated_wait_prompt_size_prior_samples = 32,
-        estimated_wait_base_overhead_secs = 0.0,
-        estimated_wait_queue_work_correction = 1.0,
         estimated_wait_fallback_prefill_throughput = None,
+        estimated_wait_calibration_shadow = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1334,9 +1329,8 @@ impl Router {
         estimated_wait_dispatch_blocking_factor: f64,
         estimated_wait_min_prefill_throughput: Option<f64>,
         estimated_wait_prompt_size_prior_samples: u32,
-        estimated_wait_base_overhead_secs: f64,
-        estimated_wait_queue_work_correction: f64,
         estimated_wait_fallback_prefill_throughput: Option<f64>,
+        estimated_wait_calibration_shadow: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1518,9 +1512,8 @@ impl Router {
             estimated_wait_dispatch_blocking_factor,
             estimated_wait_min_prefill_throughput,
             estimated_wait_prompt_size_prior_samples,
-            estimated_wait_base_overhead_secs,
-            estimated_wait_queue_work_correction,
             estimated_wait_fallback_prefill_throughput,
+            estimated_wait_calibration_shadow,
         })
     }
 

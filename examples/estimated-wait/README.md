@@ -10,12 +10,12 @@ static overload guard:
 
 ```
 dispatch_work = dispatch_blocking_factor * since_poll_dispatch_tokens
-wait_seconds = base_overhead
-             + queue_work_correction
-               * (queued_uncached_tokens + dispatch_work) / prefill_capacity
+work_delay = (queued_uncached_tokens + dispatch_work) / prefill_capacity
+extra_delay = max(work_delay, observed_delay_floor)
+wait_seconds = learned_low_load_baseline + extra_delay
 ```
 
-Each worker's score is compared inclusively to its effective budget. When every
+Each worker's extra delay is compared inclusively to its effective budget. When every
 eligible worker in the pool has a budget and is at or above it,
 enforcement mode returns HTTP 503 with `worker_overload_protection_shed` in both the
 JSON error code and the `X-SMG-Error-Code` header, matching static overload
@@ -35,13 +35,12 @@ builder's `estimated_wait(EstimatedWaitConfig)` method.
 | --- | --- | --- |
 | `--max-estimated-wait-secs` | unset | Gateway wait budget; disabled unless a worker sets its own |
 | `--estimated-wait-shadow` | false | Record would-reject decisions and continue routing |
+| `--estimated-wait-calibration-shadow` | false | Experimental multiplicative TTFT diagnostics only; never affects admission |
 | `--estimated-wait-queue-tokens-per-request` | 0 | Explicit waiting-request proxy; 0 disables it |
 | `--estimated-wait-fallback-prefill-throughput` | 2000 | Cold-start prefill capacity until a qualified value is learned; `--estimated-wait-min-prefill-throughput` and `--estimated-wait-default-throughput` remain aliases |
 | `--estimated-wait-prompt-size-prior-samples` | 32 | Effective sample count assigned to the configured prompt-size prior |
 | `--estimated-wait-mean-prefill-tokens` | 1024 | Dispatch credit when tokenized input is unavailable |
 | `--estimated-wait-kv-pressure-weight` | 0 | Deprecated compatibility option; only zero is accepted because the KV term was removed |
-| `--estimated-wait-base-overhead-secs` | 0 | Fixed wait overhead |
-| `--estimated-wait-queue-work-correction` | 1 | Correction applied to queued token work |
 | `--estimated-wait-dispatch-blocking-factor` | 0.05 | Fraction of newly dispatched work that blocks an arrival; range 0–1 |
 | `--estimated-wait-max-snapshot-age-secs` | 30 | Age after which a sample is unusable |
 
@@ -90,9 +89,34 @@ intervals are required. Cold start and sparse traffic use the configured fallbac
 prefill throughput. Both vLLM KV metric names are supported. SGLang Prometheus
 fallback and native load endpoints retain their existing behavior.
 
-The calibrated formula is
-`base + alpha * (queued + rho * dispatched) / capacity`.
-The generic defaults are `base=0`, `alpha=1`, and `rho=0.05`.
+The manual additive overhead and work multiplier options have been removed.
+Their former defaults (`b=0`, `alpha=1`) are fixed; the learned baseline remains.
+Remove these options from launch commands and configurations. Python constructor
+arguments for these two options were also removed; use keyword arguments when
+migrating positional callers. The dispatch factor remains configurable (`rho=0.05`).
+
+The optional correction `g` defaults off in Rust and Python. When enabled, it
+remains shadow-only. Eligible first-text callbacks collect the last 32 observations.
+Each fresh, distinct load poll fits `g = sum(x*y) / sum(x*x)` if new feedback has
+arrived, using saved raw extra delay `x` and observed extra delay
+`y = max(TTFT - saved_baseline, 0)`. Four observations are required before the
+MSE target can differ from 1. Failed/stale/duplicate polls do not fit; no new
+feedback leaves the target unchanged. The applied scale approaches the target at
+at most 0.1 absolute units per second, independent of polling frequency.
+
+Two consecutive fresh queue-empty polls, with no local
+pending first-text requests or admissions during either poll, reset its history,
+scale and target. Decoding may continue: this confirms queue drain, not engine
+idle. A failed, stale or nonempty poll breaks drain confirmation.
+
+Each learned calibration epoch expires 600 seconds after its first accepted
+observation, even if newer observations have replaced the original window. This
+also bounds stale influence in the applied scale, not just in retained samples.
+This is a fixed diagnostic validity horizon, not a latency guarantee. Feedback
+from admission snapshots at least 600 seconds old or a previous calibration epoch
+is ignored. Reset returns `g=1` and requires four new eligible observations to
+learn a new target. Raw admission, capacity, baseline and observed-delay floor
+are unaffected by these calibration resets.
 Admission discounts newly dispatched work and does not read KV usage in its
 wait calculation. The retired KV-weight option accepts only zero for old
 configuration and Python positional-argument compatibility. Least-load
@@ -211,9 +235,10 @@ between profiles without rerunning this procedure.
    at or faster than load polling cadence; retain per-request queue delay, TTFT,
    TPOT, errors, and timestamps. A simulator can validate control flow but cannot
    provide model/accelerator calibration.
-4. After the rolling P50 and saturated-capacity windows are warm, fit only the
-   base overhead (`b`), queue-work correction (`alpha`), and dispatch-blocking
-   factor (`rho`) against request-level wait evidence. The wait formula has no
+4. After the rolling prompt-size and saturated-capacity windows are warm, validate
+   the dispatch-blocking factor (`rho`) against request-level wait evidence.
+   Manual `b` and `alpha` tuning is removed; experimental `g` remains off unless
+   explicitly enabled for shadow diagnostics. The wait formula has no
    KV-pressure term. Report the upper-tail underprediction
    `max(0, observed_queue_wait - estimated_wait)` for each shape.
 5. Derive `W_max <= max(0, TTFT_SLO - no_queue_TTFT - polling_margin -

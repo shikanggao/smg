@@ -36,6 +36,19 @@ def median_scale(history):
     return 1.0
 
 
+def mse_scale(history):
+    if len(history) < 4:
+        return 1.0
+    largest = max(x for _, x in history)
+    total = target = 0.0
+    for ratio, x in history:
+        weight = (x / largest) ** 2
+        if weight > 0:
+            total += weight
+            target += (ratio - target) * (weight / total)
+    return target
+
+
 def close(a, b):
     return math.isclose(float(a), float(b), rel_tol=2e-8, abs_tol=2e-8)
 
@@ -70,6 +83,9 @@ def feedback_reason(event, eligibility_required):
         return event['reason']
     if event['calibration_epoch'] != event['current_calibration_epoch']:
         return 'calibration_generation_changed'
+    if ('feedback_age_seconds' in event and 'calibration_max_age_seconds' in event
+            and event['feedback_age_seconds'] >= event['calibration_max_age_seconds']):
+        return 'feedback_expired'
     if not event.get('baseline_available', True):
         return 'baseline_unavailable'
     baseline, ttft, extra = event['baseline_seconds'], event['ttft_seconds'], event['raw_excess_seconds']
@@ -88,12 +104,22 @@ def feedback_reason(event, eligibility_required):
 
 
 def audit(log):
-    """Replay windows and elapsed-time trajectories by accepted sequence."""
+    """Replay windows/trajectories by observation and poll-fit sequence.
+
+    Unmarked historical traces retain their feedback-time median semantics.
+    """
     updates = defaultdict(dict)
     selected = []
     gate_forecasts = []
     feedback = []
     errors = []
+    methods = {e.get('calibration_method', 'median_feedback') for e in log
+               if e.get('event') in ('calibration_forecast', 'calibration_feedback', 'calibration_update')
+               or e.get('event') == 'forecast' and e.get('calibration_enabled')}
+    poll_fitted = 'mse_poll' in methods
+    if methods - {'median_feedback', 'mse_poll'} or len(methods) > 1:
+        return dict(ok=False, errors=[['mixed_or_unknown_calibration_methods', sorted(methods)]],
+                    error_count=1, calibration_method='mixed_or_unknown')
     limited = any('calibration_time_seconds' in e for e in log)
     eligibility_required = any(
         e.get('event') == 'calibration_forecast' and 'native_queue_visible' in e
@@ -104,15 +130,19 @@ def audit(log):
             selected.append(event)
         if event.get('event') == 'forecast' and event.get('calibration_enabled'):
             gate_forecasts.append(event)
-        if event.get('event') != 'calibration_feedback':
+        is_fit = event.get('event') == 'calibration_update'
+        if event.get('event') != 'calibration_feedback' and not is_fit:
             continue
-        feedback.append(event)
-        if event['reason'] == 'accepted':
+        if poll_fitted and any(field not in event for field in ('fit_sequence_before', 'fit_sequence_after')):
+            errors.append(['missing_fit_sequence_fields', event.get('request_id', 'poll')])
+        if not is_fit:
+            feedback.append(event)
+        if is_fit or event['reason'] == 'accepted':
             key = (event['worker'], event['current_calibration_epoch'], event['calibration_state'])
-            sequence = event['sequence_after']
+            sequence = (event['sequence_after'], event.get('fit_sequence_after', 0))
             if sequence in updates[key]:
                 errors.append(['duplicate_accepted_sequence', key, sequence])
-            updates[key][sequence] = event
+            updates[key][sequence] = dict(event, request_id=event.get('request_id', 'poll'))
     versions = {}
     feedback_times = {}
     largest_rate = 0.0
@@ -122,13 +152,24 @@ def audit(log):
     for key, changes in updates.items():
         history = deque(maxlen=32)
         previous = (1.0, 1.0, 0.0, 0) # applied anchor, target, epoch-relative time, count
-        versions[key + (0,)] = previous
+        versions[key + (0, 0)] = previous
         prior_sequence = 0
+        prior_fit = 0
         recent_times = deque()
-        for sequence, event in sorted(changes.items()):
-            if sequence != event['sequence_before'] + 1 or sequence != prior_sequence + 1:
-                errors.append(['missing_history_sequence', key, sequence])
-            prior_sequence = sequence
+        for (sequence, fit_sequence), event in sorted(changes.items()):
+            is_fit = event['event'] == 'calibration_update'
+            if event.get('fit_sequence_before', 0) != prior_fit:
+                errors.append(['missing_fit_sequence', key, sequence, fit_sequence])
+            if is_fit:
+                if (not poll_fitted or sequence != prior_sequence or event['sequence_before'] != sequence
+                        or fit_sequence != sequence or fit_sequence <= prior_fit):
+                    errors.append(['invalid_poll_fit_sequence', key, sequence, fit_sequence])
+            else:
+                if sequence != event['sequence_before'] + 1 or sequence != prior_sequence + 1:
+                    errors.append(['missing_history_sequence', key, sequence])
+                if fit_sequence != prior_fit:
+                    errors.append(['feedback_changed_fit_sequence', event['request_id']])
+                prior_sequence = sequence
             if event['calibration_epoch'] != event['current_calibration_epoch']:
                 errors.append(['accepted_old_epoch', event['request_id']])
             now = event['calibration_time_seconds'] if limited else float(sequence)
@@ -137,16 +178,18 @@ def audit(log):
                 errors.append(['monotonic_time_regressed', event['request_id']])
             if not close(event['scale_before'], before) or event['sample_count_before'] != len(history):
                 errors.append(['incorrect_feedback_before', event['request_id']])
-            if limited and not close(event['target_scale_before'], median_scale(history)):
+            if limited and not close(event['target_scale_before'], previous[1]):
                 errors.append(['incorrect_target_before', event['request_id']])
-            ratio = max(event['ttft_seconds'] - event['baseline_seconds'], 0) / event['raw_excess_seconds']
-            history.append((ratio, event['raw_excess_seconds']))
-            target = median_scale(history)
+            if not is_fit:
+                ratio = max(event['ttft_seconds'] - event['baseline_seconds'], 0) / event['raw_excess_seconds']
+                history.append((ratio, event['raw_excess_seconds']))
+            target = mse_scale(history) if is_fit else previous[1] if poll_fitted else median_scale(history)
             after = before if limited else target
             if not close(after, event['scale_after']) or len(history) != event['sample_count_after']:
                 errors.append(['incorrect_feedback_after', event['request_id']])
             if limited:
-                recent_times.append(now)
+                if not is_fit:
+                    recent_times.append(now)
                 while recent_times and now - recent_times[0] >= 1:
                     recent_times.popleft()
                 busiest_second = max(busiest_second, len(recent_times))
@@ -162,15 +205,19 @@ def audit(log):
                 else:
                     largest_same_time_change = max(largest_same_time_change, movement)
             previous = (after, target, now, len(history))
-            versions[key + (sequence,)] = previous
+            versions[key + (sequence, fit_sequence)] = previous
+            prior_fit = fit_sequence
             if event.get('timestamp'):
-                feedback_times[key + (sequence,)] = datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00'))
-            if event['admission_observation_sequence'] > event['sequence_before']:
+                feedback_times[key + (sequence, fit_sequence)] = datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00'))
+            if not is_fit and event['admission_observation_sequence'] > event['sequence_before']:
                 errors.append(['feedback_uses_own_or_future_observation', event['request_id']])
     for event in selected + gate_forecasts:
+        if poll_fitted and 'calibration_fit_sequence' not in event:
+            errors.append(['missing_selected_fit_sequence', event['request_id']])
         seq = event['calibration_observation_sequence']
-        key = (event['worker'], event['calibration_epoch'], event['calibration_state'], seq)
-        expected = versions.get(key, (1.0, 1.0, 0.0, 0) if seq == 0 else None)
+        fit_seq = event.get('calibration_fit_sequence', 0)
+        key = (event['worker'], event['calibration_epoch'], event['calibration_state'], seq, fit_seq)
+        expected = versions.get(key, (1.0, 1.0, 0.0, 0) if seq == fit_seq == 0 else None)
         now = event['calibration_time_seconds'] if limited else float(seq)
         applied = applied_scale(expected, now) if limited and expected else expected[1] if expected else None
         if expected is None or not close(applied, event['calibration_scale']) or expected[3] != event['calibration_sample_count']:
@@ -209,6 +256,8 @@ def audit(log):
             errors.append(['feedback_missing_selected_snapshot', event['request_id']])
             continue
         inputs = [('baseline_seconds', 'baseline_seconds'), ('predicted_excess_seconds', 'raw_excess_seconds'), ('calibration_scale', 'admission_scale'), ('calibration_observation_sequence', 'admission_observation_sequence'), ('calibration_epoch', 'calibration_epoch')]
+        if poll_fitted:
+            inputs.append(('calibration_fit_sequence', 'admission_fit_sequence'))
         if limited:
             inputs.append(('calibration_time_seconds', 'admission_calibration_time_seconds'))
         if eligibility_required:
@@ -236,13 +285,16 @@ def audit(log):
             if event['reason'] != expected_reason:
                 errors.append(['incorrect_feedback_reason', event['request_id'], event['reason'], expected_reason])
         if event['reason'] != 'accepted':
+            if event.get('fit_sequence_before', 0) != event.get('fit_sequence_after', 0):
+                errors.append(['skipped_feedback_changed_fit_sequence', event['request_id']])
             if event['sequence_before'] != event['sequence_after'] or event['sample_count_before'] != event['sample_count_after']:
                 errors.append(['skipped_feedback_changed_history', event['request_id']])
             if not close(event['scale_before'], event['scale_after']) or limited and not close(event['target_scale_before'], event['target_scale_after']):
                 errors.append(['skipped_feedback_changed_trajectory', event['request_id']])
             sequence = event['sequence_before']
-            key = (event['worker'], event['current_calibration_epoch'], event['calibration_state'], sequence)
-            version = versions.get(key, (1.0, 1.0, 0.0, 0) if sequence == 0 else None)
+            fit_seq = event.get('fit_sequence_before', 0)
+            key = (event['worker'], event['current_calibration_epoch'], event['calibration_state'], sequence, fit_seq)
+            version = versions.get(key, (1.0, 1.0, 0.0, 0) if sequence == fit_seq == 0 else None)
             now = event['calibration_time_seconds'] if limited else float(sequence)
             expected_scale = applied_scale(version, now) if version is not None and limited else version[1] if version else None
             if version is None or version[3] != event['sample_count_before'] or not close(expected_scale, event['scale_before']):
@@ -251,7 +303,9 @@ def audit(log):
                 errors.append(['incorrect_skipped_target_or_time', event['request_id']])
     return dict(ok=not errors, errors=errors[:100], error_count=len(errors),
                 selected_forecasts=len(selected), gate_forecasts=len(gate_forecasts), feedback=len(feedback),
-                accepted=sum(len(v) for v in updates.values()),
+                accepted=sum(e['reason'] == 'accepted' for e in feedback),
+                poll_fits=sum(e.get('event') == 'calibration_update' for e in log),
+                calibration_method='mse_poll' if poll_fitted else 'median_feedback',
                 feedback_reasons=dict(Counter(event['reason'] for event in feedback)),
                 history_versions=len(versions), states=len(updates), elapsed_time_limited=limited,
                 native_queue_eligibility_required=eligibility_required,
@@ -411,7 +465,7 @@ def analyze(path):
                          'Rejected hard-mode requests have no observed counterfactual TTFT. Calibrated gate remains hypothetical.',
                          'The holdout is later unseen traffic with online updates enabled; it is not a frozen fit.',
                          'Native queue learning eligibility uses the selected admission snapshot, never queue or capacity measured at response completion. Historical traces without the added fields do not claim eligibility verification.',
-                         'Target is the unrestricted weighted median from the same prior live history; applied scale is the live elapsed-time-limited trajectory. Neither is an offline fit.'])
+                         'Target is the recorded unrestricted fitting target: MSE at the last poll for mse_poll, weighted median for historical traces. Applied scale is the live elapsed-time-limited trajectory. Neither is an offline fit.'])
     (path / 'paired-calibration.json').write_text(json.dumps(rows, indent=2) + '\n')
     (path / 'calibration-analysis.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(dict(path=str(path), checks=checks, pairs=len(rows), rejections=len(rejected), low=result['low'], high=result['high']), indent=2))

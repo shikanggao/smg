@@ -316,14 +316,6 @@ struct CliArgs {
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     estimated_wait_kv_pressure_weight: f64,
 
-    /// Fixed estimated-wait overhead in seconds.
-    #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
-    estimated_wait_base_overhead_secs: f64,
-
-    /// Correction applied to queued token work.
-    #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
-    estimated_wait_queue_work_correction: f64,
-
     /// Fraction of newly dispatched token work that blocks an arrival.
     #[arg(long, default_value_t = 0.05, help_heading = "Routing Policy")]
     estimated_wait_dispatch_blocking_factor: f64,
@@ -1920,8 +1912,6 @@ impl CliArgs {
                 estimated_wait_shadow: self.estimated_wait_shadow,
                 estimated_wait_calibration_shadow: self.estimated_wait_calibration_shadow,
                 estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
-                estimated_wait_base_overhead_secs: self.estimated_wait_base_overhead_secs,
-                estimated_wait_queue_work_correction: self.estimated_wait_queue_work_correction,
                 estimated_wait_dispatch_blocking_factor: self
                     .estimated_wait_dispatch_blocking_factor,
                 estimated_wait_mean_prefill_tokens: self.estimated_wait_mean_prefill_tokens,
@@ -2657,10 +2647,6 @@ mod tests {
             "500",
             "--estimated-wait-prompt-size-prior-samples",
             "24",
-            "--estimated-wait-base-overhead-secs",
-            "0.1",
-            "--estimated-wait-queue-work-correction",
-            "0.7",
             "--estimated-wait-kv-pressure-weight",
             "0",
             "--estimated-wait-mean-prefill-tokens",
@@ -2681,8 +2667,6 @@ mod tests {
         assert_eq!(config.estimated_wait_queue_tokens_per_request, 2048);
         assert_eq!(config.estimated_wait_fallback_prefill_throughput, 500.0);
         assert_eq!(config.estimated_wait_prompt_size_prior_samples, 24);
-        assert_eq!(config.estimated_wait_base_overhead_secs, 0.1);
-        assert_eq!(config.estimated_wait_queue_work_correction, 0.7);
         assert_eq!(config.estimated_wait_kv_pressure_weight, 0.0);
         assert_eq!(config.estimated_wait_mean_prefill_tokens, 800);
         assert_eq!(config.estimated_wait_max_snapshot_age_secs, 8.0);
@@ -2698,6 +2682,16 @@ mod tests {
             defaults.estimated_wait.estimated_wait_kv_pressure_weight,
             0.0
         );
+    }
+
+    #[test]
+    fn estimated_wait_removed_coefficients_are_not_cli_options() {
+        for flag in [
+            "--estimated-wait-base-overhead-secs",
+            "--estimated-wait-queue-work-correction",
+        ] {
+            assert!(Cli::try_parse_from(["smg", flag, "1"]).is_err());
+        }
     }
 
     #[test]

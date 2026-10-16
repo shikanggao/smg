@@ -163,7 +163,7 @@ pub(crate) fn select_from(
     inputs: PlacementInputs<'_>,
 ) -> Result<Option<Arc<dyn Worker>>, Response> {
     let mut admission = registry.estimated_wait().begin();
-    if let Some(guard) = &admission {
+    if let Some(guard) = &mut admission {
         guard.record_forecast(
             candidates,
             inputs

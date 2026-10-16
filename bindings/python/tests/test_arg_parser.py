@@ -666,6 +666,7 @@ class TestParseRouterArgs:
             namespace = parser.parse_args(
                 [
                     f"--{prefix}estimated-wait-shadow",
+                    f"--{prefix}estimated-wait-calibration-shadow",
                     f"--{prefix}max-estimated-wait-secs",
                     "12",
                     f"--{prefix}estimated-wait-queue-tokens-per-request",
@@ -676,10 +677,6 @@ class TestParseRouterArgs:
                     "450",
                     f"--{prefix}estimated-wait-prompt-size-prior-samples",
                     "24",
-                    f"--{prefix}estimated-wait-base-overhead-secs",
-                    "0.1",
-                    f"--{prefix}estimated-wait-queue-work-correction",
-                    "0.7",
                     f"--{prefix}estimated-wait-kv-pressure-weight",
                     "0",
                     f"--{prefix}estimated-wait-mean-prefill-tokens",
@@ -693,22 +690,33 @@ class TestParseRouterArgs:
             args = RouterArgs.from_cli_args(namespace, use_router_prefix=bool(prefix))
             assert args.max_estimated_wait_secs == 12.0
             assert args.estimated_wait_shadow is True
+            assert args.estimated_wait_calibration_shadow is True
             assert args.estimated_wait_queue_tokens_per_request == 2048
             assert args.estimated_wait_default_throughput == 500.0
             assert args.estimated_wait_fallback_prefill_throughput == 450.0
             assert args.estimated_wait_prompt_size_prior_samples == 24
-            assert args.estimated_wait_base_overhead_secs == 0.1
-            assert args.estimated_wait_queue_work_correction == 0.7
             assert args.estimated_wait_kv_pressure_weight == 0.0
             assert args.estimated_wait_mean_prefill_tokens == 800
             assert args.estimated_wait_max_snapshot_age_secs == 8.0
             assert args.estimated_wait_dispatch_blocking_factor == 0.2
         assert RouterArgs().max_estimated_wait_secs is None
         assert RouterArgs().estimated_wait_shadow is False
+        assert RouterArgs().estimated_wait_calibration_shadow is False
         assert RouterArgs().estimated_wait_queue_tokens_per_request == 0
         assert RouterArgs().estimated_wait_dispatch_blocking_factor == 0.05
         assert RouterArgs().estimated_wait_kv_pressure_weight == 0.0
         assert RouterArgs().estimated_wait_prompt_size_prior_samples == 32
+
+    def test_removed_estimated_wait_coefficients_are_rejected(self):
+        for prefix in ("", "router-"):
+            parser = argparse.ArgumentParser()
+            RouterArgs.add_cli_args(parser, use_router_prefix=bool(prefix))
+            for flag in ("base-overhead-secs", "queue-work-correction"):
+                with pytest.raises(SystemExit):
+                    parser.parse_args([f"--{prefix}estimated-wait-{flag}", "1"])
+        for name in ("estimated_wait_base_overhead_secs", "estimated_wait_queue_work_correction"):
+            with pytest.raises(TypeError):
+                RouterArgs(**{name: 1.0})
 
     def test_prefixed_overload_protection_and_monitoring_flags(self):
         """The --router-prefixed aliases reach the same fields."""
@@ -1529,9 +1537,8 @@ class TestRouterArgsFieldOrder:
         "estimated_wait_dispatch_blocking_factor",
         "estimated_wait_min_prefill_throughput",
         "estimated_wait_prompt_size_prior_samples",
-        "estimated_wait_base_overhead_secs",
-        "estimated_wait_queue_work_correction",
         "estimated_wait_fallback_prefill_throughput",
+        "estimated_wait_calibration_shadow",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1572,8 +1579,6 @@ class TestRouterArgsFieldOrder:
             "rl_fanout_concurrency",
             "estimated_wait_min_prefill_throughput",
             "estimated_wait_prompt_size_prior_samples",
-            "estimated_wait_base_overhead_secs",
-            "estimated_wait_queue_work_correction",
             "estimated_wait_fallback_prefill_throughput",
         ):
             assert names.index(appended) > marker, (

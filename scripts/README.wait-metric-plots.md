@@ -181,7 +181,15 @@ python scripts/plot_wait_calibration.py \
 ```
 
 Enable serving diagnostics with `--estimated-wait-calibration-shadow` and
-`RUST_LOG=info,smg::estimated_wait::observation=debug`. The flag defaults off.
+`RUST_LOG=info,smg::estimated_wait::observation=debug`. The flag defaults off
+in both Rust and Python. Calibration resets after two consecutive fresh
+queue-empty polls without pending first-text requests or admissions during the
+polls, or 600 seconds after the first accepted observation in an epoch.
+New feedback does not extend that epoch lifetime. Each reset starts
+a new calibration epoch at g=1. Feedback from previous epochs or admission
+snapshots at least 600 seconds old is rejected. The latter logs
+`feedback_age_seconds`, `calibration_max_age_seconds` and `feedback_expired`;
+older traces without these fields retain their original audit semantics.
 Raw readiness and admission stay unchanged, including when raw hard admission is
 enabled. The experimental estimate is `B + g * E_raw`, scaling the entire extra
 delay (including F) while preserving B. It does not replace physical capacity C.
@@ -189,15 +197,19 @@ This differs from the older pressure script's offline capacity-correction
 hypothesis described above.
 
 At worker selection, a snapshot saves B, E_raw, capacity-readiness state, epoch,
-observation sequence and g before dispatch credit. The first nonempty supported
-OpenAI-compatible SSE reasoning/content text contributes
-`max(actual_TTFT - saved_B, 0) / saved_E_raw`, weighted by saved E_raw. Each native
-capacity state uses its own rolling 32-observation weighted-median target, with
-initial g=1 and four valid observations required for a different target. Those shared policies apply to every engine/model.
+observation sequence, fit sequence and g before dispatch credit. The first nonempty
+supported OpenAI-compatible SSE reasoning/content text contributes saved raw extra
+delay `x = saved_E_raw` and observed extra delay `y = max(actual_TTFT - saved_B, 0)`.
+Each native capacity state uses its own rolling 32-observation window. A fresh,
+distinct load poll fits the MSE target `g = sum(x*y) / sum(x*x)` only when new
+eligible feedback is available. This is the x-squared-weighted mean of y/x, not
+an unweighted mean of ratios. Initial g=1 and four valid observations are required
+for a different target. Failed/stale/duplicate polls cannot fit; no new feedback
+leaves the target unchanged. These shared policies apply to every engine/model.
 Only supported regular HTTP streaming responses supply learning feedback.
 
 The audit rebuilds each live history by worker, epoch, state and accepted
-observation sequence. It checks window weights, before/after targets and applied
+observation and fit sequences. It checks window weights, before/after targets and applied
 scales, saved inputs,
 exact forecast arithmetic and that forecasts did not use later feedback. It
 separately audits the original pre-admission raw gate. Selected snapshots can
@@ -223,7 +235,7 @@ second; both use the same scale, so the diagonal still means perfect agreement.
 TTFT and scale timelines use the same compression above one. All outliers remain
 in the plots and error scores.
 
-A typical-error fit does not optimize admission classification. A tiny raw work
+An MSE fit penalizes large errors but does not directly optimize admission classification. A tiny raw work
 estimate can teach a huge ratio before the queue becomes visible, then amplify
 an accurate later raw estimate. Sparse observations can also teach g near zero.
 Keep this diagnostic until transition, false-positive and false-negative checks
@@ -231,7 +243,7 @@ pass. This flag provides no calibrated enforcement mode.
 
 ## Elapsed-time scale limit
 
-The live shadow scale now approaches the weighted-median target at a shared
+The live shadow scale approaches the MSE target at a shared
 maximum of **0.1 absolute scale units per second**, in either direction. This is
 an absolute rate, not a percentage. For one native-capacity history/epoch, with
 applied anchor `a`, target `h` and monotonic anchor time `t0`:
@@ -241,8 +253,8 @@ g(t) = clamp(h, a - 0.1 * (t - t0), a + 0.1 * (t - t0))
 T_cal = B + g(t) * E_raw
 ```
 
-On accepted feedback, first evaluate the old trajectory at the feedback time,
-then anchor the new target at that current applied scale/time. Earlier idle time
+On a poll with new eligible feedback, first evaluate the old trajectory at the
+poll publication time, then anchor the new target at that current applied scale/time. Earlier idle time
 cannot be spent on a new target. Callback bursts do not increase the movement
 budget. Read-only snapshots evaluate the trajectory even with no new feedback.
 Separate native-ready/unready histories and epoch resets are unchanged: switching
@@ -252,19 +264,25 @@ Changes in B, F or raw token work can still change the final TTFT prediction fas
 The `calibration_target_scale` and `calibration_time_seconds` fields accompany
 selected/general forecasts; time is monotonic seconds since the calibration epoch.
 Feedback records `target_scale_before/after`, `calibration_time_seconds` and the
-saved `admission_calibration_time_seconds`. Existing scale fields refer to the
+saved `admission_calibration_time_seconds`. It changes the observation sequence,
+not the fit sequence or target. A `calibration_update` event records each poll fit
+with `fit_sequence_before/after`, observation sequence, epoch, state and trajectory
+values. New forecasts/feedback/updates carry `calibration_method="mse_poll"` and
+forecasts save `calibration_fit_sequence`. Existing scale fields refer to the
 applied scale. The existing readiness/sample-count diagnostic means the history has at least
 four valid observations; it does not mean the applied scale has reached its
 target. The additional gauge is
 `smg_estimated_wait_calibration_target_scale`.
 
 The analyzer reconstructs each old-target trajectory, checks continuity at
-accepted updates and the 0.1/s bound, then evaluates saved selected snapshots
+poll updates and the 0.1/s bound, then evaluates saved selected snapshots
 at their exact monotonic times. It also reports `target` scores: the unrestricted
-median from that same prior live history, applied to the same raw snapshot.
+MSE target from the last preceding poll fit, applied to the same raw snapshot.
 That comparison isolates the limiter without a future-data fit or another live
-execution. It does not simulate queues from calibrated enforcement. Old traces
-without elapsed-time fields retain their original unrestricted replay behavior.
+execution. It does not simulate queues from calibrated enforcement. Unmarked old
+traces retain feedback-time weighted-median replay; traces without elapsed-time
+fields retain their original unrestricted behavior. Mixed fitting methods in one
+log are rejected explicitly rather than silently reinterpreted.
 
 Graphs show raw (orange) and current time-limited (teal) predictions against
 actual TTFT, plus the applied scale over time. Unrestricted targets are omitted
