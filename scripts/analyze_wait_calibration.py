@@ -59,6 +59,34 @@ def applied_scale(version, at):
     return min(anchor + budget, max(anchor - budget, target))
 
 
+def feedback_reason(event, eligibility_required):
+    """Replay observable guards in engine order; freshness was not logged.
+
+    Generation and stale skips remain authoritative because their saved Arc /
+    freshness values are not present in these traces. All subsequent guards,
+    including native queue eligibility, are directly observable.
+    """
+    if event['reason'] in ['calibration_generation_changed', 'stale_at_admission']:
+        return event['reason']
+    if event['calibration_epoch'] != event['current_calibration_epoch']:
+        return 'calibration_generation_changed'
+    if not event.get('baseline_available', True):
+        return 'baseline_unavailable'
+    baseline, ttft, extra = event['baseline_seconds'], event['ttft_seconds'], event['raw_excess_seconds']
+    if not math.isfinite(baseline) or baseline < 0 or not math.isfinite(ttft) or ttft <= 0:
+        return 'invalid_observation'
+    if not math.isfinite(extra) or extra <= 0:
+        return 'nonpositive_extra'
+    if not math.isfinite(max(ttft - baseline, 0) / extra):
+        return 'invalid_ratio'
+    if eligibility_required:
+        if not event.get('admission_native_capacity_ready'):
+            return 'native_capacity_unready'
+        if not event.get('admission_native_queue_visible'):
+            return 'native_queue_not_visible'
+    return 'accepted'
+
+
 def audit(log):
     """Replay windows and elapsed-time trajectories by accepted sequence."""
     updates = defaultdict(dict)
@@ -67,6 +95,10 @@ def audit(log):
     feedback = []
     errors = []
     limited = any('calibration_time_seconds' in e for e in log)
+    eligibility_required = any(
+        e.get('event') == 'calibration_forecast' and 'native_queue_visible' in e
+        or e.get('event') == 'calibration_feedback' and 'admission_native_queue_visible' in e
+        for e in log)
     for event in log:
         if event.get('event') == 'calibration_forecast':
             selected.append(event)
@@ -156,6 +188,20 @@ def audit(log):
         expected_reject = event['ready'] and math.isfinite(event['calibrated_excess_seconds']) and event['calibrated_excess_seconds'] >= event['threshold_seconds']
         if expected_reject != event['calibrated_would_reject']:
             errors.append(['incorrect_calibrated_readiness_gate', event['request_id']])
+        if eligibility_required:
+            required = ['native_waiting', 'native_queue_visible', 'native_ready']
+            if any(field not in event for field in required):
+                errors.append(['missing_native_eligibility_snapshot', event['request_id'], event['event']])
+            else:
+                if type(event['native_ready']) is not bool or type(event['native_queue_visible']) is not bool:
+                    errors.append(['invalid_native_eligibility_snapshot', event['request_id'], event['event']])
+                if event['native_queue_visible'] != (event['native_waiting'] > 0):
+                    errors.append(['incorrect_native_queue_visibility', event['request_id'], event['event']])
+                # Selected native_ready is saved maturity. The earlier general
+                # forecast native_ready additionally includes scrape freshness.
+                mature = event['native_ready'] if event['event'] == 'calibration_forecast' else event.get('capacity_learned_ready')
+                if mature is not None and (event['calibration_state'] == 'capacity_ready') != mature:
+                    errors.append(['incorrect_native_capacity_state', event['request_id'], event['event']])
     selected_by_id = {event['request_id']: event for event in selected}
     for event in feedback:
         forecast = selected_by_id.get(event['request_id'])
@@ -165,14 +211,50 @@ def audit(log):
         inputs = [('baseline_seconds', 'baseline_seconds'), ('predicted_excess_seconds', 'raw_excess_seconds'), ('calibration_scale', 'admission_scale'), ('calibration_observation_sequence', 'admission_observation_sequence'), ('calibration_epoch', 'calibration_epoch')]
         if limited:
             inputs.append(('calibration_time_seconds', 'admission_calibration_time_seconds'))
+        if eligibility_required:
+            inputs.extend([('baseline_available', 'baseline_available'),
+                           ('native_waiting', 'admission_native_waiting'),
+                           ('native_queue_visible', 'admission_native_queue_visible'),
+                           ('native_ready', 'admission_native_capacity_ready')])
         for source, target in inputs:
-            if not close(forecast[source], event[target]):
+            if source not in forecast or target not in event:
+                errors.append(['feedback_missing_saved_input', event['request_id'], source])
+            elif not close(forecast[source], event[target]):
                 errors.append(['feedback_changed_saved_input', event['request_id'], source])
+        if eligibility_required:
+            required = ['admission_native_waiting', 'admission_native_queue_visible', 'admission_native_capacity_ready']
+            if any(field not in event for field in required):
+                errors.append(['missing_native_eligibility_feedback', event['request_id']])
+            else:
+                if type(event['admission_native_capacity_ready']) is not bool or type(event['admission_native_queue_visible']) is not bool:
+                    errors.append(['invalid_native_eligibility_feedback', event['request_id']])
+                if event['admission_native_queue_visible'] != (event['admission_native_waiting'] > 0):
+                    errors.append(['incorrect_admission_queue_visibility', event['request_id']])
+                if event['reason'] == 'accepted' and not (event['admission_native_capacity_ready'] and event['admission_native_queue_visible']):
+                    errors.append(['accepted_ineligible_observation', event['request_id']])
+            expected_reason = feedback_reason(event, True)
+            if event['reason'] != expected_reason:
+                errors.append(['incorrect_feedback_reason', event['request_id'], event['reason'], expected_reason])
+        if event['reason'] != 'accepted':
+            if event['sequence_before'] != event['sequence_after'] or event['sample_count_before'] != event['sample_count_after']:
+                errors.append(['skipped_feedback_changed_history', event['request_id']])
+            if not close(event['scale_before'], event['scale_after']) or limited and not close(event['target_scale_before'], event['target_scale_after']):
+                errors.append(['skipped_feedback_changed_trajectory', event['request_id']])
+            sequence = event['sequence_before']
+            key = (event['worker'], event['current_calibration_epoch'], event['calibration_state'], sequence)
+            version = versions.get(key, (1.0, 1.0, 0.0, 0) if sequence == 0 else None)
+            now = event['calibration_time_seconds'] if limited else float(sequence)
+            expected_scale = applied_scale(version, now) if version is not None and limited else version[1] if version else None
+            if version is None or version[3] != event['sample_count_before'] or not close(expected_scale, event['scale_before']):
+                errors.append(['incorrect_skipped_history', event['request_id']])
+            elif limited and (now < version[2] or not close(version[1], event['target_scale_before'])):
+                errors.append(['incorrect_skipped_target_or_time', event['request_id']])
     return dict(ok=not errors, errors=errors[:100], error_count=len(errors),
                 selected_forecasts=len(selected), gate_forecasts=len(gate_forecasts), feedback=len(feedback),
                 accepted=sum(len(v) for v in updates.values()),
                 feedback_reasons=dict(Counter(event['reason'] for event in feedback)),
                 history_versions=len(versions), states=len(updates), elapsed_time_limited=limited,
+                native_queue_eligibility_required=eligibility_required,
                 scale_units_per_second=SCALE_UNITS_PER_SECOND if limited else None,
                 largest_observed_feedback_scale_rate=largest_rate if limited else None,
                 largest_same_instant_feedback_movement=largest_same_time_change if limited else None,
@@ -222,6 +304,8 @@ def score(rows):
     result['calibration_mature'] = sum(r['calibration_count'] >= 4 for r in rows)
     result['baseline_missing'] = sum(not r['baseline_available'] for r in rows)
     result['scale_p10_p50_p90'] = [percentile([r['scale'] for r in rows], q) for q in [.1, .5, .9]]
+    result['native_queue_eligibility_observed'] = sum(r.get('native_queue_eligibility_observed', False) for r in rows)
+    result['native_queue_learning_eligible'] = sum(r.get('native_queue_learning_eligible') is True for r in rows)
     return result
 
 
@@ -275,6 +359,10 @@ def analyze(path):
             missing.append([rid, 'missing joined event'])
             continue
         baseline = matched[shape(row)]
+        native_waiting = forecast.get('native_waiting', gate.get('native_waiting'))
+        native_ready = forecast.get('native_ready', forecast['calibration_state'] == 'capacity_ready')
+        native_queue_visible = forecast.get('native_queue_visible')
+        eligibility_observed = all(key in forecast for key in ['native_waiting', 'native_queue_visible', 'native_ready'])
         rows.append(dict(case=row['case'], request_id=rid, started_elapsed_seconds=float(row['started_elapsed_seconds']),
                          prompt_words=int(row['prompt_words']), actual_ttft=text['ttft_seconds'],
                          client_ttft=float(row['ttft_seconds']), actual_extra=max(text['ttft_seconds'] - baseline, 0),
@@ -288,6 +376,10 @@ def analyze(path):
                          target_would_reject=bool(forecast['ready'] and forecast.get('calibration_target_scale', forecast['calibration_scale']) * forecast['predicted_excess_seconds'] >= forecast['threshold_seconds']),
                          calibration_count=forecast['calibration_sample_count'], calibration_sequence=forecast['calibration_observation_sequence'],
                          calibration_state=forecast['calibration_state'], calibration_epoch=forecast['calibration_epoch'],
+                         native_waiting=native_waiting, native_capacity_ready=native_ready,
+                         native_queue_visible=native_queue_visible,
+                         native_queue_eligibility_observed=eligibility_observed,
+                         native_queue_learning_eligible=bool(native_ready and native_queue_visible) if eligibility_observed else None,
                          ready=forecast['ready'], raw_would_reject=forecast['would_reject'],
                          calibrated_would_reject=forecast['calibrated_would_reject'],
                          gate_would_reject=gate['would_reject'], gate_excess=gate['predicted_excess_seconds'],
@@ -318,6 +410,7 @@ def analyze(path):
                          'Truth is prompt-shape-matched median low-load first-text TTFT plus the shared five-second extra-delay budget.',
                          'Rejected hard-mode requests have no observed counterfactual TTFT. Calibrated gate remains hypothetical.',
                          'The holdout is later unseen traffic with online updates enabled; it is not a frozen fit.',
+                         'Native queue learning eligibility uses the selected admission snapshot, never queue or capacity measured at response completion. Historical traces without the added fields do not claim eligibility verification.',
                          'Target is the unrestricted weighted median from the same prior live history; applied scale is the live elapsed-time-limited trajectory. Neither is an offline fit.'])
     (path / 'paired-calibration.json').write_text(json.dumps(rows, indent=2) + '\n')
     (path / 'calibration-analysis.json').write_text(json.dumps(result, indent=2) + '\n')

@@ -275,3 +275,53 @@ false negatives as well as typical error. A time limit controls movement speed,
 not whether a learned target is valid for the next traffic regime. The existing
 observation eligibility, baseline, whole-extra-delay scaling including F,
 readiness gates and default-off shadow setting are preserved.
+
+
+## Admission-snapshot eligibility and real 300-second waits
+
+The current learner accepts a scale observation only when the **saved admission
+snapshot** has both mature native prefill capacity and engine-reported
+`native_waiting > 0`. Earlier freshness, baseline and finite-positive-extra checks
+still apply. Dispatch credit and SMG pending-first-text counts cannot substitute
+for a visible native queue. Completion-time queue changes cannot make an earlier
+request eligible. Healthy low-load observations still update the baseline B;
+they no longer teach the queue multiplier. The shared 32-observation window,
+four-observation minimum, initial scale 1 and 0.1 absolute units/second limiter
+are unchanged for all models and engines. Native-unready history remains at 1.
+
+Selected forecasts save `native_waiting`, `native_queue_visible` and `native_ready`.
+Feedback saves `admission_native_waiting`, `admission_native_queue_visible` and
+`admission_native_capacity_ready`. New skip reasons are
+`native_capacity_unready` and `native_queue_not_visible`; original guard reasons
+retain precedence. The analyzer verifies saved inputs, accepted eligibility and
+that skips do not change the accepted sequence, count or target. It can still
+replay older traces that lack these fields.
+
+The stronger deadline pressure experiment uses short 100-word/8-token sentinels
+behind unique 4,096-word/8,192-token background inference, with common bounded
+adaptive load across all engines. It keeps a 1,200-second observation window while
+scoring the production 300-second **client full-completion deadline**. Shadow
+coverage requires at least three completed sentinel IDs with client first text
+≥330s and independently joined SMG first text ≥300s. Age alone is not measured
+TTFT. Full completion requires both SSE `[DONE]` and a finish reason. The separate
+router budget is 300 seconds of **extra TTFT above B**; it cannot guarantee full
+completion for arbitrary long outputs. Both boundaries are reported separately.
+
+Retain `requests.tsv`, `metrics.tsv`, `summary.json`, `stages.json` and the complete
+`router-events.jsonl` for each mode, including capacity warm-up feedback. Then:
+
+```sh
+python scripts/analyze_wait_deadline.py results/llama/shadow-attempt1
+python scripts/plot_wait_deadline.py \
+  --input results/llama/shadow-attempt1 --title 'Llama — 300-second pressure'
+```
+
+The analyzer separates measured SMG first text, client first text, full completion,
+known deadline misses with censored exact times, and unknown rejected
+counterfactuals. It reports low/recovery false positives, sentinel late-request
+misses, raw-ready/unready misses, and observed 240–300s healthy / 300–360s late
+boundary buckets. Empty buckets mean insufficient coverage in that slice, not
+zero risk. The timeline preserves continuous metric samples through pressure,
+unload, drain and recovery, with a 300-second reference. Exact outcomes remain
+individual dots; they are never interpolated. Graphs show only raw and the current
+calibrated estimate; all outliers are retained.
