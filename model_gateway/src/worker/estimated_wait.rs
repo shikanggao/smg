@@ -11,6 +11,9 @@
 //! The applied scale approaches that median target at at most 0.1 absolute
 //! scale units per second. New targets start at the old trajectory's current
 //! value, so callback bursts and prior idle time cannot cause scale jumps.
+//! Only admission snapshots with mature native capacity and a visible native
+//! waiting queue train this correction; idle/dispatch-only delay is not queue
+//! calibration evidence. Baseline learning and raw admission are independent.
 //! Regular HTTP OpenAI-compatible SSE carries the admission-time snapshot to
 //! its first nonempty reasoning/content text callback. Metadata, cancellation,
 //! completion, and nonstreaming responses never supply training observations.
@@ -460,6 +463,7 @@ pub(crate) struct CalibrationForecast {
     baseline: Option<f64>,
     raw_extra: f64,
     native_capacity_ready: bool,
+    native_waiting: f64,
     raw_ready: bool,
     fresh: bool,
     scale: f64,
@@ -471,6 +475,10 @@ pub(crate) struct CalibrationForecast {
 }
 
 impl CalibrationForecast {
+    fn queue_visible(&self) -> bool {
+        self.native_waiting > 0.0
+    }
+
     fn state(&self) -> &'static str {
         if self.native_capacity_ready {
             "capacity_ready"
@@ -609,6 +617,12 @@ impl ExcessCalibration {
         let ratio = (ttft - baseline).max(0.0) / forecast.raw_extra;
         if !ratio.is_finite() {
             return "invalid_ratio";
+        }
+        if !forecast.native_capacity_ready {
+            return "native_capacity_unready";
+        }
+        if !forecast.queue_visible() {
+            return "native_queue_not_visible";
         }
         let samples = &mut self.samples[usize::from(forecast.native_capacity_ready)];
         samples.push_back((ratio, forecast.raw_extra));
@@ -900,6 +914,7 @@ impl Entry {
                 .prepared
                 .excess_seconds(self.total_dispatched.saturating_sub(sample.watermark)),
             native_capacity_ready: sample.prepared.capacity_learned_ready,
+            native_waiting: sample.prepared.native_waiting,
             raw_ready: fresh && sample.prepared.capacity_ready,
             fresh,
             scale,
@@ -1081,6 +1096,8 @@ impl EstimatedWaitAdmission {
                 scale_after = after.0, sample_count_after = after.1,
                 target_scale_before = target_before, target_scale_after = entry.calibration.target(forecast.native_capacity_ready),
                 calibration_time_seconds = entry.calibration.time_seconds(now), admission_calibration_time_seconds = forecast.time_seconds,
+                admission_native_waiting = forecast.native_waiting, admission_native_queue_visible = forecast.queue_visible(),
+                admission_native_capacity_ready = forecast.native_capacity_ready,
             );
         }
         let Some(worker) = entry.source.upgrade() else {
@@ -1430,6 +1447,7 @@ impl AdmissionGuard<'_> {
             predicted_excess_seconds = forecast.raw_extra,
             calibrated_ttft_seconds = forecast.seconds(), calibrated_excess_seconds = forecast.extra(),
             ready = forecast.raw_ready, native_ready = forecast.native_capacity_ready,
+            native_waiting = forecast.native_waiting, native_queue_visible = forecast.queue_visible(),
             would_reject = forecast.raw_ready && forecast.raw_extra >= forecast.threshold,
             threshold_seconds = forecast.threshold, calibrated_would_reject = forecast.would_reject(),
         );
@@ -1500,6 +1518,7 @@ impl AdmissionGuard<'_> {
                 observed_delay_floor = sample.prepared.observed_delay_floor,
                 pending_engine = sample.prepared.pending_engine,
                 native_waiting = sample.prepared.native_waiting,
+                native_queue_visible = sample.prepared.native_waiting > 0.0,
                 native_queue_delay = sample.prepared.native_queue_delay.unwrap_or(-1.0),
                 baseline_available = sample.prepared.baseline.is_some(),
                 calibration_enabled = calibration.is_some(),
@@ -1714,6 +1733,136 @@ mod tests {
     }
 
     #[test]
+    fn calibration_ignores_dispatch_and_pending_without_a_native_queue() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let mut report = load(Some(0), 0, 100.0, 0.0);
+        report.loads[0].num_running_reqs = 1;
+        report.loads[0].low_load_ttft_seconds = Some(0.2);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        publish_load(admission, &worker, &report);
+        admission.begin().unwrap().credit(&worker, Some(&[0; 100]));
+        let probes: Vec<_> = (0..4)
+            .map(|_| calibration_probe(admission, &worker))
+            .collect();
+        {
+            let entries = admission.entries.lock();
+            let entry = &entries[worker.url()];
+            let now = Instant::now();
+            let forecast = entry.calibration_forecast(admission.config(), now).unwrap();
+            assert!(forecast.raw_extra > 0.0 && forecast.native_capacity_ready);
+            assert_eq!(forecast.native_waiting, 0.0);
+            assert!(!forecast.queue_visible());
+            assert!(entry.sample.as_ref().unwrap().prepared.pending_engine > 0.0);
+            let mut isolated = ExcessCalibration::new(now);
+            assert_eq!(
+                isolated.observe(&forecast, 20.2, now),
+                "native_queue_not_visible"
+            );
+        }
+        for probe in probes {
+            admission.observe_ttft(probe, 20.2, 0.0);
+        }
+        let entries = admission.entries.lock();
+        let entry = &entries[worker.url()];
+        let now = Instant::now() + Duration::from_secs(100);
+        assert_eq!(entry.calibration.stats(true, now), (1.0, 0));
+        assert_eq!(entry.calibration.target(true), 1.0);
+        assert_eq!(entry.calibration.accepted, [0, 0]);
+    }
+
+    #[test]
+    fn calibration_skips_immature_capacity_even_when_floor_promotes_raw_readiness() {
+        let (registry, worker) = calibration_registry(false);
+        let admission = registry.estimated_wait();
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        for _ in 0..4 {
+            entry.observed_delays.push_back((10.0, 2.0));
+        }
+        EstimatedWaitAdmission::apply_observations(entry, admission.config());
+        let now = Instant::now();
+        let forecast = entry.calibration_forecast(admission.config(), now).unwrap();
+        assert!(forecast.raw_ready && forecast.queue_visible());
+        assert!(!forecast.native_capacity_ready);
+        assert_eq!(forecast.raw_extra, 10.0);
+        for _ in 0..4 {
+            assert_eq!(
+                entry.calibration.observe(&forecast, 20.2, now),
+                "native_capacity_unready"
+            );
+        }
+        assert_eq!(
+            entry
+                .calibration
+                .stats(false, now + Duration::from_secs(100)),
+            (1.0, 0)
+        );
+        assert_eq!(entry.calibration.target(false), 1.0);
+    }
+
+    #[test]
+    fn calibration_rejects_a_saved_zero_queue_even_if_it_grows_before_first_text() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let mut report = load(Some(0), 0, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = Some(0.2);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        publish_load(admission, &worker, &report);
+        admission.begin().unwrap().credit(&worker, Some(&[0; 100]));
+        let probes: Vec<_> = (0..4)
+            .map(|_| calibration_probe(admission, &worker))
+            .collect();
+        report.loads[0].num_waiting_reqs = 8;
+        report.loads[0].num_waiting_uncached_tokens = 800;
+        publish_load(admission, &worker, &report);
+        for probe in probes {
+            admission.observe_ttft(probe, 20.2, 0.0);
+        }
+        let entries = admission.entries.lock();
+        assert!(
+            entries[worker.url()]
+                .sample
+                .as_ref()
+                .unwrap()
+                .prepared
+                .native_waiting
+                > 0.0
+        );
+        assert_eq!(
+            entries[worker.url()]
+                .calibration
+                .stats(true, Instant::now()),
+            (1.0, 0)
+        );
+    }
+
+    #[test]
+    fn calibration_ineligible_healthy_requests_still_learn_the_low_load_baseline() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        worker.increment_load();
+        let mut report = load(Some(0), 0, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = None;
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        publish_load(admission, &worker, &report);
+        for _ in 0..8 {
+            let probe = calibration_probe(admission, &worker);
+            admission.observe_ttft(probe, 0.25, 0.05);
+        }
+        let entries = admission.entries.lock();
+        let entry = &entries[worker.url()];
+        assert_eq!(ttft_median(&entry.low_load_ttfts), Some(0.25));
+        assert_eq!(entry.sample.as_ref().unwrap().prepared.baseline, Some(0.25));
+        assert_eq!(entry.calibration.accepted, [0, 0]);
+        assert_eq!(entry.calibration.stats(true, Instant::now()), (1.0, 0));
+        worker.decrement_load();
+    }
+
+    #[test]
     fn calibration_slew_rises_falls_clamps_and_recovers_from_zero() {
         let start = Instant::now();
         let mut trajectory = ScaleTrajectory::new(start);
@@ -1850,9 +1999,12 @@ mod tests {
         let mut unready = original.clone();
         unready.native_capacity_ready = false;
         for _ in 0..4 {
-            entry.calibration.observe(&unready, 0.1, start);
+            assert_eq!(
+                entry.calibration.observe(&unready, 0.1, start),
+                "native_capacity_unready"
+            );
         }
-        assert_eq!(entry.calibration.stats(false, later), (0.5, 4));
+        assert_eq!(entry.calibration.stats(false, later), (1.0, 0));
         let first = entry
             .calibration_forecast(admission.config(), later)
             .unwrap();
@@ -2021,7 +2173,12 @@ mod tests {
 
     #[test]
     fn excess_calibration_placement_captures_before_dispatch_credit() {
-        let (registry, worker) = calibration_registry(false);
+        let (registry, worker) = calibration_registry(true);
+        let mut report = load(Some(100), 2, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = Some(0.2);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        publish_load(registry.estimated_wait(), &worker, &report);
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let capture = Mutex::new(None);
         let selected = placement::select_from(
@@ -2039,7 +2196,8 @@ mod tests {
         .unwrap();
         assert_eq!(selected.url(), worker.url());
         let saved = capture.into_inner().unwrap();
-        assert_eq!(saved.raw_extra, 10.0);
+        assert_eq!(saved.raw_extra, 1.0);
+        assert!(saved.native_capacity_ready && saved.queue_visible());
         assert_eq!(
             registry.estimated_wait().entries.lock()[worker.url()].total_dispatched,
             100
@@ -2051,7 +2209,7 @@ mod tests {
                 .unwrap()
                 .prepared
                 .excess_seconds(100),
-            11.0
+            2.0
         );
         let mut observer = StreamTtftObserver::new(
             &registry,
@@ -2063,42 +2221,40 @@ mod tests {
         assert_eq!(
             registry.estimated_wait().entries.lock()[worker.url()]
                 .calibration
-                .samples[0][0]
+                .samples[1][0]
                 .1,
-            10.0
+            1.0
         );
     }
 
     #[test]
-    fn excess_calibration_uses_saved_baseline_and_native_state() {
-        let (registry, worker) = calibration_registry(false);
-        let admission = registry.estimated_wait();
-        let probes: Vec<_> = (0..4)
-            .map(|_| calibration_probe(admission, &worker))
-            .collect();
-        let mut report = load(Some(1_000), 2, 100.0, 0.0);
-        report.loads[0].low_load_ttft_seconds = Some(9.0);
-        report.loads[0].prefill_capacity_learning_active = Some(false);
-        report.loads[0].prefill_capacity_sample_count = Some(8);
-        publish_load(admission, &worker, &report);
-        for probe in probes {
-            admission.observe_ttft(probe, 20.2, 0.0);
+    fn excess_calibration_uses_saved_baseline_native_state_and_queue() {
+        for initially_ready in [false, true] {
+            let (registry, worker) = calibration_registry(initially_ready);
+            let admission = registry.estimated_wait();
+            let probes: Vec<_> = (0..4)
+                .map(|_| calibration_probe(admission, &worker))
+                .collect();
+            let mut report = load(Some(0), 0, 100.0, 0.0);
+            report.loads[0].low_load_ttft_seconds = Some(9.0);
+            report.loads[0].prefill_capacity_learning_active = Some(false);
+            report.loads[0].prefill_capacity_sample_count = Some(8);
+            publish_load(admission, &worker, &report);
+            for probe in probes {
+                admission.observe_ttft(probe, 20.2, 0.0);
+            }
+            let entries = admission.entries.lock();
+            let calibration = &entries[worker.url()].calibration;
+            assert_eq!(
+                calibration.target(true),
+                if initially_ready { 2.0 } else { 1.0 }
+            );
+            assert_eq!(
+                calibration.stats(true, Instant::now()).1,
+                if initially_ready { 4 } else { 0 }
+            );
+            assert_eq!(calibration.stats(false, Instant::now()), (1.0, 0));
         }
-        let entries = admission.entries.lock();
-        assert_eq!(entries[worker.url()].calibration.target(false), 2.0);
-        assert_eq!(
-            entries[worker.url()]
-                .calibration
-                .stats(false, Instant::now())
-                .1,
-            4
-        );
-        assert_eq!(
-            entries[worker.url()]
-                .calibration
-                .stats(true, Instant::now()),
-            (1.0, 0)
-        );
     }
 
     #[test]
@@ -2174,13 +2330,16 @@ mod tests {
             let now = Instant::now();
             let forecast = entry.calibration_forecast(admission.config(), now).unwrap();
             for _ in 0..4 {
-                entry.calibration.observe(&forecast, 100.2, now);
+                assert_eq!(
+                    entry.calibration.observe(&forecast, 100.2, now),
+                    "native_capacity_unready"
+                );
             }
             let calibrated = entry
                 .calibration_forecast(admission.config(), now + Duration::from_secs(15))
                 .unwrap();
-            assert_eq!(calibrated.target_scale, 10.0);
-            assert_eq!(calibrated.scale, 2.5);
+            assert_eq!(calibrated.target_scale, 1.0);
+            assert_eq!(calibrated.scale, 1.0);
             assert!(!calibrated.raw_ready);
             assert!(!calibrated.would_reject());
             assert!(!entry.sample.as_ref().unwrap().prepared.capacity_ready);
@@ -2199,7 +2358,10 @@ mod tests {
                 estimated_wait_calibration_shadow: true,
                 ..cfg
             });
-            publish(&unchanged, &worker, 1_000);
+            let mut queued = load(Some(1_000), 2, 100.0, 0.0);
+            queued.loads[0].prefill_capacity_learning_active = Some(false);
+            queued.loads[0].prefill_capacity_sample_count = Some(8);
+            publish_load(&unchanged, &worker, &queued);
             let mut entries = unchanged.entries.lock();
             let entry = entries.get_mut(worker.url()).unwrap();
             let now = Instant::now();
