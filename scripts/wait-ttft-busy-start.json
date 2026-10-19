@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "description": "Synthetic production-style simulation, not a measured production trace",
+  "seed": 20261019,
+  "deadline_seconds": 300,
+  "router_extra_ttft_budget_seconds": 300,
+  "max_requests": 2400,
+  "max_inflight": 2048,
+  "sample_interval_seconds": 1,
+  "drain_timeout_seconds": 660,
+  "shared_prefix_fraction": 0.35,
+  "prefix_sessions": 16,
+  "maximum_p99_dispatch_lag_seconds": 0.25,
+  "coverage": {
+    "minimum_pressure_timeouts": 3,
+    "minimum_healthy_controls_per_cohort": 1,
+    "minimum_kv_90_observed_seconds": 30,
+    "minimum_completed_long_outputs": 3,
+    "minimum_healthy_boundary_completions": 10,
+    "long_output_tokens": 512,
+    "minimum_pressure_ttft_misses": 1,
+    "minimum_observed_late_ttft": 1
+  },
+  "cohorts": [
+    {
+      "name": "short-chat",
+      "weight": 40,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "rag",
+      "weight": 25,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "summarization",
+      "weight": 10,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "long-generation",
+      "weight": 10,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "code",
+      "weight": 10,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "long-context-generation",
+      "weight": 5,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    }
+  ],
+  "phases": [
+    {
+      "name": "readiness-learn",
+      "seconds": 60,
+      "rps": 4,
+      "arrivals": "periodic",
+      "balanced_controls": true,
+      "input_words": [
+        8192,
+        16384
+      ]
+    },
+    {
+      "name": "ramp-low",
+      "seconds": 120,
+      "rps": 0.5,
+      "arrivals": "periodic"
+    },
+    {
+      "name": "ramp-mid",
+      "seconds": 180,
+      "rps": 1,
+      "arrivals": "periodic"
+    },
+    {
+      "name": "pressure",
+      "seconds": 420,
+      "rps": 2,
+      "arrivals": "periodic"
+    },
+    {
+      "name": "pressure-high",
+      "seconds": 180,
+      "rps": 4,
+      "arrivals": "periodic"
+    },
+    {
+      "name": "recovery",
+      "seconds": 180,
+      "rps": 0.1,
+      "arrivals": "periodic",
+      "balanced_controls": true,
+      "drain_before": false
+    }
+  ],
+  "measurement_target": "ttft",
+  "startup_scenario": "busy_start",
+  "observation_horizon_seconds": 420,
+  "readiness": {
+    "before_phase": "ramp-low",
+    "timeout_seconds": 180
+  },
+  "capture_content_chars": 0,
+  "cache_namespace": "queueonly-busy-20261019",
+  "interpretation": {
+    "primary_target": "Observed or truthfully censored TTFT>=300s; no full-completion FP/FN substitution.",
+    "stream": "Abort after first content or reasoning text; maximum32generationtokens, horizon420s.",
+    "history": "Fresh owned router with configured provisional baseline starts against bounded owned background engine load; verify two fresh busy samples and empty calibration history. No initial quiet drain. Final drain mandatory.",
+    "workload": "Long-prefill ramp; changed from previous longdecode tests. No historical causal comparison.",
+    "baseline_seed": "Prior to each focused main case, run representative sequential seed profile; configure medianSMGfirsttext with frozen raw/model/runtime provenance.",
+    "template_labels": "Cohort names are prompttemplate keys. Inputs standardizedlongprefill; no productionmix or answerquality claim."
+  },
+  "busy_start_timeout_seconds": 60
+}

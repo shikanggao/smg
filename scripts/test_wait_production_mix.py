@@ -112,6 +112,26 @@ class PlannerTests(unittest.TestCase):
                 dict(pred=False, truth=True), dict(pred=True, truth=False)]
         self.assertEqual(p.classify(rows, "pred", "truth"), dict(tp=0, fn=1, fp=1, tn=0, unknown=2))
 
+    def test_versioned_ttft_profiles_validate_and_busy_start_is_focused_skip(self):
+        for name in ["wait-ttft-focused.json", "wait-ttft-busy-start.json", "wait-ttft-seed.json"]:
+            profile = json.loads((HERE / name).read_text())
+            p.validate(profile)
+            rows = p.make_plan(profile)
+            self.assertLessEqual(len(rows), profile["max_requests"])
+        suite = json.loads((HERE / "wait-ttft-suite.json").read_text())
+        busy = next(c for c in suite["full_suite_cases"] if c["name"] == "busy-start-provisional")
+        self.assertFalse(busy["focused_enabled"])
+        self.assertEqual(json.loads((HERE / busy["profile"]).read_text())["startup_scenario"], "busy_start")
+
+    def test_ttft_profile_requires_longer_bounded_horizon_and_generation_bound(self):
+        profile = json.loads((HERE / "wait-ttft-focused.json").read_text())
+        for horizon in [300, 601, float("inf")]:
+            with self.assertRaises(AssertionError):
+                p.validate(dict(profile, observation_horizon_seconds=horizon))
+        profile["cohorts"][0]["max_output_tokens"] = [32, 16384]
+        with self.assertRaisesRegex(AssertionError, "unnecessary generation"):
+            p.validate(profile)
+
 
 class HTTPTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -149,7 +169,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(.2)
             return response
         index = int(request.headers["opc-request-id"].rsplit("-", 1)[1])
-        mode = index % 4 if self.mode == "mixed" else 1 if self.mode == "slow" else 0
+        mode = index % 4 if self.mode == "mixed" else 1 if self.mode in {"slow", "late-first-text"} else 0
         if mode == 3:
             return self.web.Response(status=503, text="estimated wait budgets exceeded")
         self.active += 1
@@ -162,6 +182,9 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             await event({"choices": [{"delta": {"role": "assistant"}}]})
             if mode == 1:
                 await asyncio.sleep(.2)
+                if self.mode == "late-first-text":
+                    await event({"choices": [{"delta": {"content": "late"}}]})
+                    await asyncio.sleep(.1)
             elif mode == 2:
                 await event({"choices": [{"delta": {"content": "first"}}]})
                 await asyncio.sleep(.2)
@@ -224,6 +247,167 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         for row in self.rows():
             self.assertEqual(row["content_preview"], "ans")
             self.assertEqual(row["content_characters"], len("answer"))
+
+    async def ttft_request(self, horizon=.3):
+        import aiohttp
+        profile = dict(smoke_profile(), measurement_target="ttft", observation_horizon_seconds=horizon,
+                       readiness=dict(before_phase="pressure", timeout_seconds=.05))
+        output = self.root / "ttft-request"
+        output.mkdir()
+        events = self.root / "router-events.jsonl"
+        events.touch()
+        args = argparse.Namespace(output=output, model="mock", url=self.url, run_id="ttft", router_events=events)
+        workload = p.Run(args, profile)
+        item = p.make_plan(profile)[0]
+        async with aiohttp.ClientSession() as session:
+            await workload.request(session, item, p.time.monotonic())
+        workload.stream.close()
+        workload.metrics_stream.close()
+        return workload.rows[0]
+
+    async def test_ttft_mode_stops_after_first_text_without_claiming_completion(self):
+        self.mode = "normal"
+        row = await self.ttft_request()
+        self.assertTrue(row["intentional_stream_abort"])
+        self.assertIsNone(row["error"])
+        self.assertFalse(row["complete"])
+        self.assertIsNone(row["completion_late"])
+        self.assertFalse(row["first_text_late"])
+        self.assertIsNotNone(row["client_ttft_seconds"])
+
+    async def test_ttft_horizon_observes_numeric_late_first_text(self):
+        self.mode = "late-first-text"
+        row = await self.ttft_request()
+        self.assertGreater(row["client_ttft_seconds"], .07)
+        self.assertTrue(row["first_text_late"])
+        self.assertTrue(row["intentional_stream_abort"])
+        self.assertFalse(row["timed_out"])
+        self.assertIsNone(row["completion_late"])
+
+    async def test_ttft_horizon_censoring_has_binary_late_but_no_numeric_ttft(self):
+        self.mode = "slow"
+        row = await self.ttft_request(horizon=.1)
+        self.assertTrue(row["timed_out"])
+        self.assertTrue(row["first_text_late"])
+        self.assertIsNone(row["client_ttft_seconds"])
+        self.assertIsNone(row["completion_late"])
+        self.assertFalse(row["intentional_stream_abort"])
+
+    async def test_short_observation_error_does_not_become_ttft_late(self):
+        self.mode = "stalled-http-error"
+        row = await self.ttft_request(horizon=.1)
+        self.assertEqual(row["status"], 500)
+        self.assertIsNone(row["first_text_late"])
+        self.assertIsNone(row["client_ttft_seconds"])
+
+    async def test_readiness_timeout_prevents_main_pressure(self):
+        profile = dict(smoke_profile(), measurement_target="ttft", observation_horizon_seconds=.3,
+                       readiness=dict(before_phase="pressure", timeout_seconds=.03))
+        output = self.root / "readiness-timeout"
+        output.mkdir()
+        events = self.root / "router-events.jsonl"
+        events.touch()
+        args = argparse.Namespace(output=output, model="mock", url=self.url, run_id="readiness", router_events=events)
+        workload = p.Run(args, profile)
+        with self.assertRaisesRegex(RuntimeError, "Readiness failed"):
+            await workload.exercise(None, p.make_plan(profile))
+        self.assertEqual(self.posts, 0)
+        self.assertFalse(json.loads((output / "readiness.json").read_text())["ready"])
+        workload.stream.close()
+        workload.metrics_stream.close()
+
+    async def test_sequential_seed_proves_idle_and_never_overlaps_requests(self):
+        self.mode = "normal"
+        profile = smoke_profile()
+        profile["phases"] = [dict(name="seed", seconds=.1, rps=40, arrivals="periodic", sequential_seed=True)]
+        result = await self.exercise(profile)
+        self.assertEqual(result["execution_status"], "PASS")
+        self.assertEqual(self.peak, 1)
+        stages = json.loads((self.root / "run/stages.json").read_text())
+        self.assertEqual(sum(s["name"] == "sequential_seed_idle_verified" for s in stages), len(self.rows()))
+
+    async def test_busy_start_verifies_actual_busy_metrics_without_drain(self):
+        profile = dict(smoke_profile(), measurement_target="ttft", observation_horizon_seconds=.3,
+                       readiness=dict(before_phase="pressure", timeout_seconds=.05), busy_start_timeout_seconds=.1,
+                       startup_scenario="busy_start")
+        output = self.root / "busy-start"
+        output.mkdir()
+        events = self.root / "router-events.jsonl"
+        events.touch()
+        args = argparse.Namespace(output=output, run_id="busy", router_events=events)
+        workload = p.Run(args, profile)
+        async def samples():
+            for _ in range(30):
+                now = p.time.monotonic() - workload.started
+                workload.latest = dict(elapsed_seconds=now, sample_completed_elapsed_seconds=now,
+                    native_running=2, native_waiting=3, calibration_baseline_provisional=1,
+                    calibration_baseline_measured=0, calibration_sample_count=0, calibration_fitted_revision=0)
+                await asyncio.sleep(.002)
+        sampler = asyncio.create_task(samples())
+        await workload.verify_busy_start()
+        self.assertTrue(workload.initial_native_busy)
+        self.assertFalse(workload.initial_native_idle)
+        self.assertEqual(self.posts, 0)
+        await sampler
+        workload.stream.close()
+        workload.metrics_stream.close()
+
+    async def test_fresh_http_with_stale_internal_snapshot_cannot_pass_readiness(self):
+        profile = dict(smoke_profile(), measurement_target="ttft", observation_horizon_seconds=.3,
+                       readiness=dict(before_phase="pressure", timeout_seconds=.03))
+        output = self.root / "stale-snapshot"
+        output.mkdir()
+        events = self.root / "stale-events.jsonl"
+        events.touch()
+        args = argparse.Namespace(output=output, run_id="stale", router_events=events)
+        workload = p.Run(args, profile)
+        workload.initial_native_idle = True
+        workload.readiness.snapshot = lambda *unused: dict(ready=True, workers=[dict(epoch=1)], errors=[])
+        async def samples():
+            for _ in range(30):
+                now = p.time.monotonic() - workload.started
+                workload.latest = dict(elapsed_seconds=now, sample_completed_elapsed_seconds=now,
+                    calibration_native_capacity_ready=1, calibration_sample_count=32, calibration_epoch=1,
+                    data_usable=0)
+                await asyncio.sleep(.002)
+        sampler = asyncio.create_task(samples())
+        with self.assertRaisesRegex(RuntimeError, "Readiness failed"):
+            await workload.require_readiness()
+        await sampler
+        proof = json.loads((output / "readiness.json").read_text())
+        self.assertFalse(proof["ready"])
+        self.assertFalse(proof["fresh_native_metrics"])
+        self.assertEqual(self.posts, 0)
+        workload.stream.close()
+        workload.metrics_stream.close()
+
+    async def test_live_event_readiness_passes_only_after_current_fit_and_fresh_metrics(self):
+        profile = dict(smoke_profile(), measurement_target="ttft", observation_horizon_seconds=.3,
+                       readiness=dict(before_phase="pressure", timeout_seconds=.1))
+        output = self.root / "ready"
+        output.mkdir()
+        events = self.root / "ready-events.jsonl"
+        base = dict(worker="http://engine", calibration_method="mse_poll_two_wave_queue_v2", calibration_epoch=1,
+                    calibration_state="capacity_ready")
+        initial = dict(base, event="calibration_forecast", request_id="prod-ready-0", native_ready=True,
+            calibration_observation_sequence=0, calibration_fit_sequence=0, calibration_history_revision=0,
+            calibration_fitted_revision=0, calibration_sample_count=0, calibration_baseline_available=True,
+            calibration_baseline_source="provisional", calibration_baseline_seconds=.2)
+        log = [initial] + [dict(base, event="calibration_feedback", request_id=f"prod-ready-{i}", reason="accepted") for i in range(4)]
+        log += [dict(base, event="calibration_update", sample_count_after=4, fit_sequence_after=4, calibration_fitted_revision=4),
+                dict(initial, request_id="prod-ready-4", calibration_observation_sequence=4, calibration_fit_sequence=4,
+                     calibration_history_revision=4, calibration_fitted_revision=4, calibration_sample_count=4)]
+        events.write_text("".join(json.dumps(e) + "\n" for e in log))
+        args = argparse.Namespace(output=output, run_id="ready", router_events=events)
+        workload = p.Run(args, profile)
+        workload.initial_native_idle = True
+        workload.latest = dict(elapsed_seconds=0, sample_completed_elapsed_seconds=0, calibration_epoch=1,
+                              calibration_native_capacity_ready=1, calibration_sample_count=4, data_usable=1)
+        await workload.require_readiness()
+        self.assertTrue(json.loads((output / "readiness.json").read_text())["ready"])
+        self.assertEqual(workload.stages[-1]["name"], "readiness_verified")
+        workload.stream.close()
+        workload.metrics_stream.close()
 
     async def test_stalled_http_error_is_not_model_timeout_truth(self):
         self.mode = "stalled-http-error"

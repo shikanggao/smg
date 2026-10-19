@@ -56,6 +56,20 @@ def validate(profile, smoke=False):
     assert math.isfinite(profile["deadline_seconds"])
     assert math.isfinite(profile["router_extra_ttft_budget_seconds"]) and profile["router_extra_ttft_budget_seconds"] > 0
     assert smoke or profile["deadline_seconds"] == 300, "Production coverage requires a 300-second deadline"
+    target = profile.get("measurement_target", "completion")
+    assert target in {"completion", "ttft"}
+    if target == "ttft":
+        assert profile.get("startup_scenario", "isolated") in {"isolated", "busy_start"}
+        if profile.get("startup_scenario") == "busy_start":
+            assert 0 < profile["busy_start_timeout_seconds"] <= 60
+            assert not profile["phases"][0].get("drain_before"), "Busy startup must not silently force a quiet drain"
+        horizon = profile["observation_horizon_seconds"]
+        assert math.isfinite(horizon) and profile["deadline_seconds"] < horizon <= (1 if smoke else 600)
+        readiness = profile["readiness"]
+        assert readiness["timeout_seconds"] > 0 and readiness["timeout_seconds"] <= 300
+        assert readiness["before_phase"] in {p["name"] for p in profile["phases"]}
+        assert profile["phases"][0]["name"] != readiness["before_phase"], "Readiness needs a bounded learning phase"
+        assert max(c["max_output_tokens"][1] for c in profile["cohorts"]) <= 128, "TTFT observation must bound unnecessary generation"
     for key in ["max_requests", "max_inflight", "prefix_sessions"]:
         assert type(profile[key]) is int and profile[key] > 0
     assert 0 <= profile["shared_prefix_fraction"] <= 1
@@ -77,6 +91,12 @@ def validate(profile, smoke=False):
         assert phase["seconds"] > 0 and phase["rps"] > 0
         assert math.isfinite(phase["seconds"]) and math.isfinite(phase["rps"])
         assert phase["arrivals"] in ["periodic", "poisson"]
+        for key in ["input_words", "max_output_tokens"]:
+            if key in phase:
+                lo, hi = phase[key]
+                assert type(lo) is int and type(hi) is int and 0 < lo <= hi
+                assert key != "input_words" or lo >= 64
+                assert target != "ttft" or key != "max_output_tokens" or hi <= 128
 
 
 def messages(item, profile):
@@ -122,8 +142,8 @@ def make_plan(profile):
                       else rng.choices(cohorts, [c["weight"] for c in cohorts])[0])
             item = dict(index=len(rows), phase=phase["name"], scheduled_phase_seconds=elapsed,
                         cohort=cohort["name"], control=bool(phase.get("balanced_controls")),
-                        input_words=rng.randint(*cohort["input_words"]),
-                        max_output_tokens=rng.randint(*cohort["max_output_tokens"]),
+                        input_words=rng.randint(*phase.get("input_words", cohort["input_words"])),
+                        max_output_tokens=rng.randint(*phase.get("max_output_tokens", cohort["max_output_tokens"])),
                         shared_prefix=rng.random() < profile["shared_prefix_fraction"],
                         session=rng.randrange(profile["prefix_sessions"]))
             item["prompt_sha256"] = digest(messages(item, profile))
@@ -214,6 +234,20 @@ class Run:
         self.stop = asyncio.Event()
         self.stream = (args.output / "requests.jsonl").open("w")
         self.metrics_stream = (args.output / "metrics.jsonl").open("w")
+        self.event_offset, self.event_pending = 0, b""
+        self.initial_native_idle = False
+        self.initial_native_busy = False
+        self.readiness = None
+        if profile.get("measurement_target") == "ttft":
+            try:
+                from .wait_ttft_readiness import Readiness
+            except ImportError:
+                try:
+                    from wait_ttft_readiness import Readiness
+                except ModuleNotFoundError:
+                    from scripts.wait_ttft_readiness import Readiness
+            assert args.router_events is not None, "TTFT readiness requires the live owned-router event stream"
+            self.readiness = Readiness(f"prod-{args.run_id}-", profile.get("startup_scenario", "isolated"))
 
     def record(self, row):
         self.rows.append(row)
@@ -241,8 +275,12 @@ class Run:
                                           ("scale", "smg_estimated_wait_calibration_scale"),
                                           ("capacity", "smg_estimated_wait_effective_prefill_capacity"),
                                           ("baseline", "smg_estimated_wait_baseline_seconds"),
+                                          ("data_usable", "smg_estimated_wait_data_usable"),
                                           ("delay_floor", "smg_estimated_wait_observed_delay_floor_seconds")]:
                             row[key] = metric(text, [name], maximum=True)
+                        for key in ["baseline_seconds", "baseline_provisional", "baseline_measured", "epoch",
+                                    "observation_sequence", "history_revision", "fitted_revision", "sample_count", "native_capacity_ready", "input_excess_seconds"]:
+                            row["calibration_" + key] = metric(text, ["smg_estimated_wait_calibration_" + key], maximum=True)
                 except Exception as error:
                     row[kind + "_error"] = type(error).__name__ + ": " + str(error)
             row["sample_completed_elapsed_seconds"] = time.monotonic() - self.started
@@ -267,6 +305,10 @@ class Run:
                    client_ttft_seconds=None, first_answer_seconds=None, first_sse_seconds=None,
                    done_seen=False, finish_reason=None, complete=False, timed_out=False,
                    cancelled=False, error=None, usage={})
+        ttft_only = self.profile.get("measurement_target") == "ttft"
+        horizon = self.profile.get("observation_horizon_seconds", self.profile["deadline_seconds"])
+        if ttft_only:
+            row.update(measurement_target="ttft", observation_horizon_seconds=horizon, intentional_stream_abort=False)
         capture = self.profile.get("capture_content_chars", 0)
         if capture:
             row.update(content_preview="", content_characters=0)
@@ -300,7 +342,7 @@ class Run:
                        stream=True, temperature=0, stream_options=dict(include_usage=True))
         try:
             # One wall-clock deadline includes headers, first text and generation.
-            async with asyncio.timeout(self.profile["deadline_seconds"]):
+            async with asyncio.timeout(horizon):
                 async with session.post(self.args.url.rstrip("/") + "/v1/chat/completions", json=payload,
                                         headers={"opc-request-id": rid}, timeout=aiohttp.ClientTimeout(total=None)) as response:
                     row["status"] = response.status
@@ -313,10 +355,14 @@ class Run:
                         async for chunk in response.content.iter_any():
                             for data in frames.feed(chunk):
                                 consume(data)
-                        for data in frames.feed(b"", final=True):
-                            consume(data)
+                            if ttft_only and row["client_ttft_seconds"] is not None:
+                                row["intentional_stream_abort"] = not (row["done_seen"] and row["finish_reason"] is not None)
+                                break
+                        if not row.get("intentional_stream_abort"):
+                            for data in frames.feed(b"", final=True):
+                                consume(data)
                         row["complete"] = bool(row["done_seen"] and row["finish_reason"] is not None and row["client_ttft_seconds"] is not None)
-                        if not row["complete"]:
+                        if not row["complete"] and not row.get("intentional_stream_abort"):
                             row["error"] = "Incomplete SSE response"
         except TimeoutError:
             row["timed_out"] = True
@@ -329,10 +375,76 @@ class Run:
         row["e2e_seconds"] = time.monotonic() - start
         row["controlled_rejection"] = row["status"] == 503 and "estimated wait budgets" in (row["error"] or "")
         valid_timeout = row["timed_out"] and row["status"] in (0, 200) and row["error"] is None
-        row["completion_late"] = (True if valid_timeout else row["e2e_seconds"] >= self.profile["deadline_seconds"] if row["complete"] else None)
-        row["first_text_late"] = (row["client_ttft_seconds"] >= self.profile["deadline_seconds"] if row["client_ttft_seconds"] is not None else True if valid_timeout else None)
+        row["completion_late"] = (True if valid_timeout and not ttft_only else row["e2e_seconds"] >= self.profile["deadline_seconds"] if row["complete"] else None)
+        row["first_text_late"] = (row["client_ttft_seconds"] >= self.profile["deadline_seconds"] if row["client_ttft_seconds"] is not None else True if valid_timeout and horizon >= self.profile["deadline_seconds"] else None)
         # A deadline without first text is censored, not an invented 300s TTFT.
         self.record(row)
+
+    def read_readiness_events(self):
+        path = self.args.router_events
+        if not path.exists():
+            return
+        with path.open("rb") as stream:
+            stream.seek(self.event_offset)
+            data = stream.read()
+            self.event_offset = stream.tell()
+        lines = (self.event_pending + data).split(b"\n")
+        self.event_pending = lines.pop()
+        for line in lines:
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            self.readiness.observe(obj.get("fields", {}) | obj)
+
+    async def require_readiness(self):
+        until = time.monotonic() + self.profile["readiness"]["timeout_seconds"]
+        while True:
+            self.read_readiness_events()
+            proof = self.readiness.snapshot(self.initial_native_idle, self.initial_native_busy)
+            now = time.monotonic() - self.started
+            sample = self.latest
+            proof["fresh_native_metrics"] = (sample.get("sample_completed_elapsed_seconds", -1) >= now - 3 * self.profile["sample_interval_seconds"]
+                and not sample.get("engine_error") and not sample.get("router_error")
+                and sample.get("data_usable") == 1
+                and sample.get("calibration_native_capacity_ready") == 1
+                and sample.get("calibration_sample_count", 0) >= 4
+                and any(w["epoch"] == sample.get("calibration_epoch") for w in proof["workers"]))
+            proof["ready"] = proof["ready"] and proof["fresh_native_metrics"]
+            proof["elapsed_seconds"] = now
+            save(self.args.output / "readiness.json", proof)
+            if proof["ready"]:
+                self.stages.append(dict(name="readiness_verified", elapsed_seconds=now, proof=proof))
+                return
+            if proof["errors"] or time.monotonic() >= until:
+                raise RuntimeError("Readiness failed before main pressure; preserve readiness.json")
+            await asyncio.sleep(min(.25, self.profile["sample_interval_seconds"]))
+
+    async def verify_busy_start(self):
+        """Full-suite scenario: require actual busy startup and a fresh provisional state."""
+        until = time.monotonic() + self.profile["busy_start_timeout_seconds"]
+        newer_than = time.monotonic() - self.started
+        previous, samples = None, []
+        while time.monotonic() < until:
+            row = self.latest
+            stamp = row.get("sample_completed_elapsed_seconds")
+            if stamp is not None and stamp != previous and row["elapsed_seconds"] >= newer_than:
+                previous = stamp
+                busy = (not row.get("engine_error") and not row.get("router_error")
+                    and row.get("native_running") is not None and row.get("native_waiting") is not None
+                    and row["native_running"] + row["native_waiting"] > 0
+                    and row.get("calibration_baseline_provisional") == 1
+                    and row.get("calibration_baseline_measured") == 0
+                    and row.get("calibration_sample_count") == 0 and row.get("calibration_fitted_revision") == 0)
+                samples = samples + [row] if busy else []
+                if len(samples) >= 2:
+                    self.initial_native_busy = True
+                    save(self.args.output / "busy-start.json", dict(verified=True, samples=samples[-2:],
+                         note="Busy engine and empty new-router calibration state; no quiet drain was required."))
+                    self.stages.append(dict(name="busy_start_verified", elapsed_seconds=time.monotonic() - self.started))
+                    return
+            await asyncio.sleep(min(.1, self.profile["sample_interval_seconds"]))
+        raise RuntimeError("Busy-start scenario did not prove busy native load with fresh provisional calibration")
 
     async def drained(self):
         self.phase = "drain"
@@ -353,6 +465,8 @@ class Run:
 
     async def exercise(self, session, rows):
         for phase in self.profile["phases"]:
+            if self.readiness and phase["name"] == self.profile["readiness"]["before_phase"]:
+                await self.require_readiness()
             if phase.get("drain_before"):
                 if self.active:
                     await asyncio.gather(*list(self.active))
@@ -362,6 +476,13 @@ class Run:
             self.stages.append(dict(name=self.phase, elapsed_seconds=start - self.started))
             for item in (r for r in rows if r["phase"] == self.phase):
                 scheduled = start + item["scheduled_phase_seconds"]
+                if phase.get("sequential_seed"):
+                    if self.active:
+                        await asyncio.gather(*list(self.active))
+                    await self.drained()
+                    self.phase = phase["name"]
+                    self.stages.append(dict(name="sequential_seed_idle_verified", index=item["index"], elapsed_seconds=time.monotonic() - self.started))
+                    scheduled = time.monotonic()
                 await asyncio.sleep(max(0, scheduled - time.monotonic()))
                 if len(self.active) >= self.profile["max_inflight"]:
                     self.record(dict(item, opc_request_id=f"prod-{self.args.run_id}-{item['index']}",
@@ -373,6 +494,10 @@ class Run:
                 task = asyncio.create_task(self.request(session, item, scheduled))
                 self.active.add(task)
                 task.add_done_callback(self.active.discard)
+                if phase.get("sequential_seed"):
+                    await task
+                    if not self.rows[-1].get("complete"):
+                        raise RuntimeError("Sequential baseline seed failed; no further seed requests sent")
             await asyncio.sleep(max(0, start + phase["seconds"] - time.monotonic()))
         if self.active:
             await asyncio.gather(*list(self.active))
@@ -406,7 +531,9 @@ async def run(args):
     save(args.output / "run-config.json", dict(model=args.model, engine=args.engine, run_id=args.run_id,
          synthetic=True, smoke=manifest["smoke"], runner_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
          profile_sha256=manifest["profile_sha256"], plan_sha256=manifest["plan_sha256"],
-         fd_soft_limit=fd_limit, aiohttp_version=aiohttp.__version__, deadline_seconds=profile["deadline_seconds"]))
+         fd_soft_limit=fd_limit, aiohttp_version=aiohttp.__version__, deadline_seconds=profile["deadline_seconds"],
+         measurement_target=profile.get("measurement_target", "completion"),
+         observation_horizon_seconds=profile.get("observation_horizon_seconds", profile["deadline_seconds"])))
     workload = Run(args, profile)
     workload.prompts = prompts
     error, drained = None, False
@@ -418,7 +545,11 @@ async def run(args):
                 router_metrics = await response.text()
             assert metric(router_metrics, ["smg_estimated_wait_threshold_seconds"], maximum=True) == profile["router_extra_ttft_budget_seconds"], "Router extra-TTFT budget does not match the recorded profile"
             (args.output / "router-before.prom").write_text(router_metrics)
-            await workload.drained()
+            if profile.get("startup_scenario") == "busy_start":
+                await workload.verify_busy_start()
+            else:
+                await workload.drained()
+                workload.initial_native_idle = True
             await workload.exercise(session, rows)
             drained = True
         except BaseException as exc:
@@ -490,7 +621,9 @@ def analyze(path, events_path=None):
             assert gate["threshold_seconds"] == profile["router_extra_ttft_budget_seconds"], "Admission gate uses a different budget"
         row["smg_ttft_seconds"] = first_text.get(row["opc_request_id"], {}).get("ttft_seconds")
         for label, key in [("raw", "predicted_ttft_seconds"), ("calibrated", "calibrated_ttft_seconds")]:
-            value = f.get(key) if f and f.get("baseline_seconds") is not None and f.get("baseline_available", True) else None
+            known = (f.get("calibration_baseline_available") if label == "calibrated" and f and f.get("calibration_method") == "mse_poll_two_wave_queue_v2"
+                     else f.get("baseline_available", True) if f else False)
+            value = f.get(key) if f and known else None
             if value is not None and (not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0):
                 value = None
             row[label + "_ttft_seconds"] = value
@@ -498,7 +631,32 @@ def analyze(path, events_path=None):
         row["raw_gate_would_reject"] = gate.get("would_reject") if gate else None
         row["calibrated_gate_would_reject"] = f.get("calibrated_would_reject") if f else None
         row["smg_first_text_late"] = row["smg_ttft_seconds"] >= deadline if row["smg_ttft_seconds"] is not None else None
-    errors = [r for r in rows if not r.get("local_drop") and not (r.get("complete") or (r.get("timed_out") and r.get("completion_late") is True) or r.get("controlled_rejection"))]
+        row["pre_admission_total_ttft_predictions"] = {}
+        if gate:
+            row["pre_admission_components"] = {k: gate.get(k) for k in ["baseline_seconds", "baseline_available",
+                "calibration_baseline_seconds", "calibration_baseline_source", "calibration_baseline_available",
+                "queue_excess_seconds", "calibration_input_excess_seconds", "observed_delay_floor",
+                "predicted_excess_seconds", "calibration_scale", "calibration_epoch", "calibration_bank_index",
+                "calibration_history_revision", "calibration_fitted_revision", "native_ready", "ready"]}
+        for label in ("raw", "queue_only_raw", "calibrated"):
+            value = None
+            if gate:
+                if label == "raw" and gate.get("baseline_available", True):
+                    value = gate.get("predicted_ttft_seconds")
+                elif label != "raw" and gate.get("calibration_baseline_available"):
+                    value = (gate.get("calibrated_ttft_seconds") if label == "calibrated" else
+                             gate["calibration_baseline_seconds"] + gate["calibration_input_excess_seconds"])
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                value = None
+            row["pre_admission_total_ttft_predictions"][label] = value
+            row[label + "_pre_admission_total_ttft_over_deadline"] = value >= deadline if value is not None else None
+    ttft_only = profile.get("measurement_target") == "ttft"
+    def valid_ttft_measurement(row):
+        return ttft_only and row.get("error") is None and not row.get("cancelled") and (
+            row.get("intentional_stream_abort") and row.get("client_ttft_seconds") is not None
+            or row.get("timed_out") and row.get("first_text_late") is True)
+    errors = [r for r in rows if not r.get("local_drop") and not (r.get("complete") or valid_ttft_measurement(r)
+              or (r.get("timed_out") and r.get("completion_late") is True) or r.get("controlled_rejection"))]
     lag = quantile([r.get("dispatch_lag_seconds") for r in rows], .99)
     checks = dict(no_execution_error=execution["error"] is None,
                   all_planned_arrivals_recorded=len(rows) == execution["planned_requests"],
@@ -525,6 +683,16 @@ def analyze(path, events_path=None):
                    exact_request_forecasts=bool(forecasts) and all(r["opc_request_id"] in forecasts and r["opc_request_id"] in gates for r in rows if not r.get("local_drop") and not r.get("controlled_rejection")),
                    controlled_rejections_audited=all(gates.get(r["opc_request_id"], {}).get("would_reject") is True and gates[r["opc_request_id"]].get("ready") is True for r in rows if r.get("controlled_rejection")),
                    exact_first_text_events=bool(first_text) and all(r["opc_request_id"] in first_text for r in rows if r.get("client_ttft_seconds") is not None))
+    if ttft_only:
+        readiness_path = path / "readiness.json"
+        readiness = json.loads(readiness_path.read_text()) if readiness_path.exists() else {}
+        healthy = Counter(r["cohort"] for r in controls if r.get("first_text_late") is False)
+        covered = {k: covered[k] for k in ["actual_300_second_deadline", "exact_request_forecasts", "controlled_rejections_audited", "exact_first_text_events"]}
+        covered.update(observation_beyond_ttft_threshold=profile["observation_horizon_seconds"] > deadline,
+            readiness_verified_before_pressure=readiness.get("ready") is True,
+            healthy_ttft_controls_every_cohort=all(healthy[c["name"]] >= coverage["minimum_healthy_controls_per_cohort"] for c in profile["cohorts"]),
+            pressure_ttft_misses=sum(r.get("first_text_late") is True for r in pressure) >= coverage["minimum_pressure_ttft_misses"],
+            actual_observed_late_ttft=sum(r.get("client_ttft_seconds") is not None and r["client_ttft_seconds"] >= deadline for r in pressure) >= coverage["minimum_observed_late_ttft"])
     scores = {}
     for group, subset in [("controls", controls), ("pressure", pressure)]:
         scores[group] = {}
@@ -533,6 +701,8 @@ def analyze(path, events_path=None):
                 total_ttft_prediction=classify(subset, policy + "_total_ttft_over_deadline", "first_text_late"),
                 observed_smg_ttft_prediction=classify(subset, policy + "_total_ttft_over_deadline", "smg_first_text_late"),
                 gate_vs_completion_deadline=classify(subset, policy + "_gate_would_reject", "completion_late"))
+        for policy in ["raw", "queue_only_raw", "calibrated"]:
+            scores[group].setdefault(policy, {})["pre_admission_total_ttft_prediction"] = classify(subset, policy + "_pre_admission_total_ttft_over_deadline", "first_text_late")
     groups = defaultdict(list)
     for row in rows:
         groups[(row["phase"], row["cohort"])].append(row)
@@ -561,6 +731,16 @@ def analyze(path, events_path=None):
                          "Rejected counterfactual latency and locally dropped arrivals remain unknown.",
                          "Completed-only percentiles omit timeout tails; do not interpret them as all-request percentiles.",
                          "Without exact router events, forecast scores are unknown; metric snapshots are not paired predictions."])
+    result.update(measurement_target=profile.get("measurement_target", "completion"),
+                  observed_first_text=sum(r.get("client_ttft_seconds") is not None for r in rows),
+                  observed_late_first_text=sum(r.get("client_ttft_seconds") is not None and r["client_ttft_seconds"] >= deadline for r in rows),
+                  censored_late_first_text=sum(r.get("client_ttft_seconds") is None and r.get("first_text_late") is True for r in rows),
+                  unknown_first_text_truth=sum(r.get("first_text_late") is None for r in rows),
+                  intentional_first_text_aborts=sum(r.get("intentional_stream_abort", False) for r in rows))
+    if ttft_only:
+        result["notes"] += ["Primary scores compare exact pre-admission total TTFT with the300s first-text threshold. Production extra-delay flags are distinct.",
+            "TTFT mode closes the stream after first text; this is intentional measurement, not a full completion or answer-quality result.",
+            "Missing first text after the longer observation horizon is a known late binary label with numeric TTFT unavailable. Short cancellations/errors remain unknown."]
     save(path / "summary.json", result)
     with (path / "paired-production.jsonl").open("w") as stream:
         for row in rows:

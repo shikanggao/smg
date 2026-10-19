@@ -64,6 +64,8 @@ def events(path):
 
 SCALE_UNITS_PER_SECOND = 0.1
 TWO_WAVE_METHOD = 'mse_poll_two_wave_v1'
+QUEUE_METHOD = 'mse_poll_two_wave_queue_v2'
+TWO_WAVE_METHODS = (TWO_WAVE_METHOD, QUEUE_METHOD)
 TWO_WAVE_RATE = 0.5
 
 
@@ -88,9 +90,12 @@ def feedback_reason(event, eligibility_required):
     if ('feedback_age_seconds' in event and 'calibration_max_age_seconds' in event
             and event['feedback_age_seconds'] >= event['calibration_max_age_seconds']):
         return 'feedback_expired'
-    if not event.get('baseline_available', True):
+    queue_only = event.get('calibration_method') == QUEUE_METHOD
+    if not event.get('calibration_baseline_available' if queue_only else 'baseline_available', True):
         return 'baseline_unavailable'
-    baseline, ttft, extra = event['baseline_seconds'], event['ttft_seconds'], event['raw_excess_seconds']
+    baseline = event['calibration_baseline_seconds' if queue_only else 'baseline_seconds']
+    ttft = event['ttft_seconds']
+    extra = event['calibration_input_excess_seconds' if queue_only else 'raw_excess_seconds']
     if not math.isfinite(baseline) or baseline < 0 or not math.isfinite(ttft) or ttft <= 0:
         return 'invalid_observation'
     if not math.isfinite(extra) or extra <= 0:
@@ -116,6 +121,24 @@ def two_wave_trace(log, keep_records=False):
     records, errors = [], []
     counts = Counter()
     peak_samples = 0
+    methods = {e['calibration_method'] for e in log if e.get('event') in ('calibration_forecast', 'calibration_feedback', 'calibration_update', 'calibration_rotation', 'calibration_baseline')
+               or e.get('event') == 'forecast' and e.get('calibration_enabled')}
+    method = next(iter(methods)) if len(methods) == 1 else 'mixed_or_unknown'
+    queue_only = method == QUEUE_METHOD
+    baselines, last_resets, worker_epochs, pending_baseline_resets = {}, {}, {}, {}
+
+    def baseline_fields(event):
+        source = event['calibration_baseline_source']
+        value = event['calibration_baseline_seconds']
+        available = event['calibration_baseline_available']
+        if source not in ('unknown', 'provisional', 'measured') or type(available) is not bool:
+            raise ValueError('unknown_calibration_baseline_source_or_availability')
+        if source == 'unknown':
+            if available or value != -1.0:
+                raise ValueError('unknown_baseline_must_remain_unavailable')
+        elif not available or not math.isfinite(value) or value < 0 or source == 'provisional' and value <= 0:
+            raise ValueError('invalid_calibration_baseline')
+        return source, value
 
     def check(label, actual, expected):
         if not close(actual, expected):
@@ -129,11 +152,61 @@ def two_wave_trace(log, keep_records=False):
         if kind == 'calibration_reset' and event.get('reason') == 'history_expired':
             errors.append(['two_wave_history_expiry_generation_reset', event.get('worker')])
             break
-        if kind not in ('calibration_forecast', 'calibration_feedback', 'calibration_update', 'calibration_rotation') and not (kind == 'forecast' and event.get('calibration_enabled')):
+        if kind == 'calibration_reset' and queue_only:
+            try:
+                if event['calibration_epoch'] <= worker_epochs.get(event['worker'], -1):
+                    raise ValueError('generation_reset_did_not_advance_epoch')
+                worker_epochs[event['worker']] = event['calibration_epoch']
+                last_resets[event['worker']] = (event['calibration_epoch'], event['reason'])
+                # All generation resets clear provenance. Baseline-triggered
+                # resets log the captured pre-reset value in the next event.
+                previous = baselines.get(event['worker'], ('unknown', -1.0))
+                if event['reason'] in ('baseline_promoted', 'baseline_fallback_changed'):
+                    pending_baseline_resets[event['worker']] = previous
+                else:
+                    pending_baseline_resets.pop(event['worker'], None)
+                baselines[event['worker']] = ('unknown', -1.0)
+            except (KeyError, ValueError) as error:
+                errors.append(['malformed_calibration_reset', str(error)])
+                break
+        if kind not in ('calibration_forecast', 'calibration_feedback', 'calibration_update', 'calibration_rotation', 'calibration_baseline') and not (kind == 'forecast' and event.get('calibration_enabled')):
             continue
         try:
-            if event['calibration_method'] != TWO_WAVE_METHOD:
+            if method not in TWO_WAVE_METHODS or event['calibration_method'] != method:
                 raise ValueError('mixed_or_unknown_calibration_methods')
+            if queue_only:
+                epoch = event.get('current_calibration_epoch', event['calibration_epoch'])
+                previous_epoch = worker_epochs.setdefault(event['worker'], epoch)
+                if epoch != previous_epoch:
+                    raise ValueError('epoch_changed_without_generation_reset')
+            if kind == 'calibration_baseline':
+                if not queue_only:
+                    raise ValueError('baseline_transition_in_legacy_method')
+                previous = pending_baseline_resets.get(event['worker'],
+                    baselines.get(event['worker'], ('unknown', -1.0)))
+                if event['baseline_previous_source'] != previous[0]:
+                    raise ValueError('baseline_previous_source_mismatch')
+                check('baseline_previous_seconds', event['baseline_previous_seconds'], previous[1])
+                current = baseline_fields(event)
+                if current == previous:
+                    raise ValueError('redundant_baseline_transition')
+                promoted = previous[0] == 'provisional' and current[0] == 'measured' and abs(current[1] - previous[1]) > max(.1, .2 * previous[1])
+                if event['calibration_baseline_material_promotion'] is not promoted:
+                    raise ValueError('incorrect_material_baseline_promotion')
+                if promoted and last_resets.get(event['worker']) != (event['calibration_epoch'], 'baseline_promoted'):
+                    raise ValueError('material_baseline_promotion_missing_epoch_reset')
+                fallback_changed = previous[0] != 'unknown' and current[0] != 'measured' and previous != current
+                if fallback_changed and last_resets.get(event['worker']) != (event['calibration_epoch'], 'baseline_fallback_changed'):
+                    raise ValueError('baseline_fallback_change_missing_epoch_reset')
+                if event['worker'] in pending_baseline_resets and not (promoted or fallback_changed):
+                    raise ValueError('baseline_reset_does_not_match_transition')
+                baselines[event['worker']] = current
+                pending_baseline_resets.pop(event['worker'], None)
+                counts['baseline_transitions'] += 1
+                counts['baseline_promotions'] += promoted
+                continue
+            if queue_only and event['worker'] in pending_baseline_resets:
+                raise ValueError('baseline_reset_missing_transition')
             epoch = event.get('current_calibration_epoch', event['calibration_epoch'])
             worker_epoch = (event['worker'], epoch)
             key = worker_epoch + (event['calibration_state'],)
@@ -182,6 +255,22 @@ def two_wave_trace(log, keep_records=False):
                 if due != state['bank']:
                     raise ValueError('missing_bank_rotation')
                 if kind in ('calibration_forecast', 'forecast'):
+                    if queue_only:
+                        current_baseline = baseline_fields(event)
+                        expected_baseline = baselines.get(event['worker'], ('unknown', -1.0))
+                        if current_baseline[0] != expected_baseline[0]:
+                            raise ValueError('forecast_baseline_source_without_transition')
+                        check('forecast_calibration_baseline', current_baseline[1], expected_baseline[1])
+                        if event['baseline_available']:
+                            if current_baseline[0] != 'measured':
+                                raise ValueError('measured_baseline_did_not_win')
+                            check('measured_calibration_baseline', current_baseline[1], event['baseline_seconds'])
+                        elif current_baseline[0] == 'measured':
+                            raise ValueError('measured_calibration_baseline_without_raw_measurement')
+                        check('queue_only_input', event['calibration_input_excess_seconds'], event['queue_excess_seconds'])
+                        if not math.isfinite(event['queue_excess_seconds']) or event['queue_excess_seconds'] < 0:
+                            raise ValueError('invalid_queue_calibration_input')
+                        counts['baseline_source:' + current_baseline[0]] += 1
                     seen = selected if kind == 'calibration_forecast' else gates
                     if event['request_id'] in seen:
                         raise ValueError('duplicate_request_forecast')
@@ -196,9 +285,15 @@ def two_wave_trace(log, keep_records=False):
                         raise ValueError('incorrect_calibration_readiness')
                     base, extra = event['baseline_seconds'], event['predicted_excess_seconds']
                     check('raw_forecast_arithmetic', event['predicted_ttft_seconds'], base + extra)
-                    check('calibrated_forecast_arithmetic', event['calibrated_ttft_seconds'], base + before * extra)
+                    if queue_only:
+                        base, extra = event['calibration_baseline_seconds'], event['calibration_input_excess_seconds']
+                    check('calibrated_forecast_arithmetic', event['calibrated_ttft_seconds'], base + before * extra if not queue_only or event['calibration_baseline_available'] else -1.0)
                     check('calibrated_excess_arithmetic', event['calibrated_excess_seconds'], before * extra)
-                    reject = event['ready'] and math.isfinite(event['calibrated_excess_seconds']) and event['calibrated_excess_seconds'] >= event['threshold_seconds']
+                    # Raw readiness can be promoted by the empirical floor.
+                    # Queue calibration additionally requires native capacity;
+                    # raw readiness supplies the selected snapshot's freshness.
+                    reject_ready = event['ready'] and (not queue_only or event['native_ready'] and event['calibration_baseline_available'])
+                    reject = reject_ready and math.isfinite(event['calibrated_excess_seconds']) and event['calibrated_excess_seconds'] >= event['threshold_seconds']
                     if event['calibrated_would_reject'] is not reject:
                         raise ValueError('incorrect_calibrated_readiness_gate')
                     if type(event['native_ready']) is not bool or type(event['native_queue_visible']) is not bool or event['native_queue_visible'] != (event['native_waiting'] > 0):
@@ -229,6 +324,12 @@ def two_wave_trace(log, keep_records=False):
                         ('calibration_fitted_revision', 'admission_fitted_revision'), ('native_waiting', 'admission_native_waiting'),
                         ('native_queue_visible', 'admission_native_queue_visible'), ('native_ready', 'admission_native_capacity_ready')):
                         check('saved_' + source, event[target], forecast[source])
+                    if queue_only:
+                        baseline_fields(event)
+                        for field in ('calibration_baseline_seconds', 'calibration_baseline_available', 'calibration_input_excess_seconds', 'queue_excess_seconds'):
+                            check('saved_' + field, event[field], forecast[field])
+                        if event['calibration_baseline_source'] != forecast['calibration_baseline_source']:
+                            raise ValueError('feedback_changed_saved_baseline_source')
                     check('snapshot_max_age', event['calibration_max_age_seconds'], 600)
                     if type(event['admission_native_capacity_ready']) is not bool or type(event['admission_native_queue_visible']) is not bool or event['admission_native_queue_visible'] != (event['admission_native_waiting'] > 0):
                         raise ValueError('invalid_native_eligibility_feedback')
@@ -240,8 +341,9 @@ def two_wave_trace(log, keep_records=False):
                     if event['reason'] != reason:
                         raise ValueError('incorrect_feedback_reason')
                     if reason == 'accepted':
-                        x = event['raw_excess_seconds']
-                        state['current'].append((max(event['ttft_seconds'] - event['baseline_seconds'], 0) / x, x, now, event['feedback_age_seconds']))
+                        x = event['calibration_input_excess_seconds' if queue_only else 'raw_excess_seconds']
+                        base = event['calibration_baseline_seconds' if queue_only else 'baseline_seconds']
+                        state['current'].append((max(event['ttft_seconds'] - base, 0) / x, x, now, event['feedback_age_seconds']))
                         state['accepted'] += 1
                         state['revision'] += 1
                         if origin is None:
@@ -273,7 +375,7 @@ def two_wave_trace(log, keep_records=False):
             break
     if not errors and any(states != {'capacity_ready', 'capacity_unready'} for states in rotation_states.values()):
         errors.append(['missing_rotation_state_record'])
-    result = dict(ok=not errors, errors=errors, error_count=len(errors), calibration_method=TWO_WAVE_METHOD,
+    result = dict(ok=not errors, errors=errors, error_count=len(errors), calibration_method=method,
         selected_forecasts=len(selected), gate_forecasts=len(gates), feedback=counts['feedback'], accepted=counts['accepted'],
         poll_fits=counts['poll_fits'], rotations=counts['rotations'], bank_rotations=len(rotation_states), removed_samples=counts['removed_samples'],
         feedback_reasons={k[7:]: v for k, v in counts.items() if k.startswith('reason:')}, states=len(states),
@@ -282,6 +384,10 @@ def two_wave_trace(log, keep_records=False):
         revision_semantics='Accepted feedback increments history revision; removal increments it once. Poll fits key by history/fitted revision because accepted/fit sequence can repeat on removal-only fits.',
         final_states=[dict(worker=k[0], calibration_epoch=k[1], calibration_state=k[2], bank_index=s['bank'],
             history_revision=s['revision'], fitted_revision=s['fitted_revision'], previous_sample_count=len(s['previous']), current_sample_count=len(s['current'])) for k, s in states.items()])
+    if queue_only:
+        result.update(calibration_input='saved queue_excess_seconds N, excluding empirical floor and visibility',
+            baseline_transitions=counts['baseline_transitions'], material_baseline_promotions=counts['baseline_promotions'],
+            forecast_baseline_sources={source: counts['baseline_source:' + source] for source in ('unknown', 'provisional', 'measured')})
     return result, records
 
 
@@ -300,15 +406,15 @@ def audit(log):
     feedback = []
     errors = []
     methods = {e.get('calibration_method', 'median_feedback') for e in log
-               if e.get('event') in ('calibration_forecast', 'calibration_feedback', 'calibration_update', 'calibration_rotation')
+               if e.get('event') in ('calibration_forecast', 'calibration_feedback', 'calibration_update', 'calibration_rotation', 'calibration_baseline')
                or e.get('event') == 'forecast' and e.get('calibration_enabled')}
     if any(('calibration_bank_index' in e or 'calibration_history_revision' in e)
-           and e.get('calibration_method') != TWO_WAVE_METHOD for e in log
+           and e.get('calibration_method') not in TWO_WAVE_METHODS for e in log
            if e.get('event') in ('calibration_forecast', 'calibration_feedback', 'calibration_update', 'calibration_rotation')
            or e.get('event') == 'forecast' and e.get('calibration_enabled')):
         return dict(ok=False, errors=[['mixed_or_unknown_calibration_methods', sorted(methods, key=str)]],
                     error_count=1, calibration_method='mixed_or_unknown')
-    if methods == {TWO_WAVE_METHOD}:
+    if len(methods) == 1 and methods <= set(TWO_WAVE_METHODS):
         return audit_two_wave(log)
     poll_fitted = 'mse_poll' in methods
     if methods - {'median_feedback', 'mse_poll'} or len(methods) > 1:

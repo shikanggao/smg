@@ -25,6 +25,7 @@ def render(path, output=None, linear=False):
     time_scale = "linear" if linear else "symlog"
     output.mkdir(parents=True, exist_ok=True)
     profile = json.loads((path / "profile.json").read_text())
+    ttft_only = profile.get("measurement_target") == "ttft"
     plan = read_rows(path / "plan.jsonl")
     figures = []
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
@@ -63,21 +64,42 @@ def render(path, output=None, linear=False):
         title += f"\n{config['engine']} · {config['run_id']}"
         t = values(metrics, "sample_completed_elapsed_seconds")
         fig, axes = plt.subplots(4, 1, figsize=(14, 14), sharex=True)
-        axes[0].plot(t, values(metrics, "raw_ttft"), color="tab:orange", label="Raw TTFT, sampled gauge")
-        axes[0].plot(t, values(metrics, "calibrated_ttft"), color="tab:cyan", label="Current TTFT, sampled gauge")
+        comparisons = [("raw", "tab:orange", "Raw floor-inclusive total"),
+                       ("queue_only_raw", "tab:green", "Queue-only uncalibrated B + N"),
+                       ("calibrated", "tab:cyan", "Queue-only calibrated B + gN")]
+        if ttft_only:
+            # The old raw gauge can exist without a measured baseline. Only
+            # independently available exact totals belong on a total-TTFT plot.
+            for key, color, label in comparisons:
+                known = [r for r in rows if r.get("pre_admission_total_ttft_predictions", {}).get(key) is not None]
+                axes[0].scatter(values(known, "started_elapsed_seconds"),
+                    [r["pre_admission_total_ttft_predictions"][key] for r in known], s=10, marker="x", color=color,
+                    label=label + f", exact pre-admission (n={len(known)})")
+        else:
+            axes[0].plot(t, values(metrics, "raw_ttft"), color="tab:orange", label="Raw TTFT, sampled gauge")
+            axes[0].plot(t, values(metrics, "calibrated_ttft"), color="tab:cyan", label="Current TTFT, sampled gauge")
         axes[0].scatter(values(rows, "started_elapsed_seconds"), values(rows, "client_ttft_seconds"), s=12, color="navy", label="Client first text, measured")
-        paired = [r for r in rows if r.get("raw_ttft_seconds") is not None]
-        axes[0].scatter(values(paired, "started_elapsed_seconds"), values(paired, "raw_ttft_seconds"), s=10, marker="x", color="tab:orange", label="Raw, exact request snapshot")
-        axes[0].scatter(values(paired, "started_elapsed_seconds"), values(paired, "calibrated_ttft_seconds"), s=10, marker="x", color="tab:cyan", label="Current, exact request snapshot")
+        if not ttft_only:
+            paired = [r for r in rows if r.get("raw_ttft_seconds") is not None]
+            axes[0].scatter(values(paired, "started_elapsed_seconds"), values(paired, "raw_ttft_seconds"), s=10, marker="x", color="tab:orange", label="Raw, exact request snapshot")
+            axes[0].scatter(values(paired, "started_elapsed_seconds"), values(paired, "calibrated_ttft_seconds"), s=10, marker="x", color="tab:cyan", label="Current, exact request snapshot")
         censored = [r for r in rows if r.get("timed_out") and r.get("first_text_late") is True and r.get("client_ttft_seconds") is None]
-        axes[0].scatter(values(censored, "started_elapsed_seconds"), [deadline] * len(censored), marker="^", color="red", s=15, label="No first text at deadline: lower bound only")
+        axes[0].scatter(values(censored, "started_elapsed_seconds"),
+            [r.get("observation_horizon_seconds", deadline) for r in censored], marker="^", color="red", s=15,
+            label="No first text by observation horizon: lower bound only")
         axes[0].set(ylabel="First-text TTFT (s)", yscale=time_scale, ylim=(0, None))
         axes[0].legend(fontsize=7, ncol=2)
         complete = [r for r in rows if r.get("complete")]
         timed_out = [r for r in rows if r.get("timed_out") and r.get("completion_late") is True]
-        axes[1].scatter(values(complete, "started_elapsed_seconds"), values(complete, "e2e_seconds"), s=10, label="Full completion: finish reason + DONE")
-        axes[1].scatter(values(timed_out, "started_elapsed_seconds"), [deadline] * len(timed_out), marker="^", color="red", s=15, label="Client canceled at deadline; exact completion unknown")
-        axes[1].set(ylabel="Client completion (s)", yscale=time_scale, ylim=(0, None))
+        if ttft_only:
+            observed = [r for r in rows if r.get("client_ttft_seconds") is not None]
+            axes[1].scatter(values(observed, "started_elapsed_seconds"), values(observed, "e2e_seconds"), s=10, label="Observation ended after first text; generation not the target")
+            axes[1].scatter(values(censored, "started_elapsed_seconds"), values(censored, "observation_horizon_seconds"), marker="^", color="red", s=15, label="Horizon reached without first text")
+            axes[1].set(ylabel="Observation duration (s)", yscale=time_scale, ylim=(0, None))
+        else:
+            axes[1].scatter(values(complete, "started_elapsed_seconds"), values(complete, "e2e_seconds"), s=10, label="Full completion: finish reason + DONE")
+            axes[1].scatter(values(timed_out, "started_elapsed_seconds"), [deadline] * len(timed_out), marker="^", color="red", s=15, label="Client canceled at deadline; exact completion unknown")
+            axes[1].set(ylabel="Client completion (s)", yscale=time_scale, ylim=(0, None))
         axes[1].legend(fontsize=8)
         axes[2].plot(t, values(metrics, "native_waiting"), label="Native waiting")
         axes[2].plot(t, values(metrics, "native_running"), label="Native running")
@@ -107,32 +129,64 @@ def render(path, output=None, linear=False):
         plt.close(fig)
         figures.append(name)
         fig, axes = plt.subplots(1, 2, figsize=(13, 6))
-        exact = [r for r in rows if r.get("smg_ttft_seconds") is not None and r.get("raw_ttft_seconds") is not None]
-        for key, color, label in [("raw_ttft_seconds", "tab:orange", "Raw"), ("calibrated_ttft_seconds", "tab:cyan", "Current")]:
-            axes[0].scatter(values(exact, "smg_ttft_seconds"), values(exact, key), s=10, alpha=.6, color=color, label=label)
-        maximum = max([deadline] + [r[k] for r in exact for k in ["smg_ttft_seconds", "raw_ttft_seconds", "calibrated_ttft_seconds"] if r.get(k) is not None])
+        if ttft_only:
+            exact = [r for r in rows if r.get("client_ttft_seconds") is not None]
+            predictions = []
+            for key, color, label in comparisons:
+                known = [r for r in exact if r.get("pre_admission_total_ttft_predictions", {}).get(key) is not None]
+                y = [r["pre_admission_total_ttft_predictions"][key] for r in known]
+                predictions += y
+                axes[0].scatter(values(known, "client_ttft_seconds"), y, s=10, alpha=.6, color=color, label=f"{label} (n={len(known)})")
+            maximum = max([deadline] + values(exact, "client_ttft_seconds") + predictions)
+            axes[0].axhline(deadline, color="red", linestyle=":", linewidth=.8)
+            axes[0].axvline(deadline, color="red", linestyle=":", linewidth=.8)
+        else:
+            exact = [r for r in rows if r.get("smg_ttft_seconds") is not None and r.get("raw_ttft_seconds") is not None]
+            for key, color, label in [("raw_ttft_seconds", "tab:orange", "Raw"), ("calibrated_ttft_seconds", "tab:cyan", "Current")]:
+                axes[0].scatter(values(exact, "smg_ttft_seconds"), values(exact, key), s=10, alpha=.6, color=color, label=label)
+            maximum = max([deadline] + [r[k] for r in exact for k in ["smg_ttft_seconds", "raw_ttft_seconds", "calibrated_ttft_seconds"] if r.get(k) is not None])
         axes[0].plot([0, maximum], [0, maximum], "k--", linewidth=.8)
-        axes[0].set(xlabel="Actual SMG first text (s); exact pairs only", ylabel="Selected estimate (s)", xscale=time_scale, yscale=time_scale, xlim=(0, None), ylim=(0, None))
-        axes[0].text(.03, .97, f"Exact pairs: {len(exact)}\nCensored actual TTFTs are omitted, not invented", transform=axes[0].transAxes, va="top", fontsize=8)
+        axes[0].set(xlabel="Actual client first text (s); numeric observations only" if ttft_only else "Actual SMG first text (s); exact pairs only",
+            ylabel="Pre-admission total estimate (s)" if ttft_only else "Selected estimate (s)", xscale=time_scale, yscale=time_scale, xlim=(0, None), ylim=(0, None))
+        axes[0].text(.03, .97, f"{'Observed TTFTs' if ttft_only else 'Exact pairs'}: {len(exact)}\nCensored actual TTFTs are omitted, not invented", transform=axes[0].transAxes, va="top", fontsize=8)
         axes[0].legend(fontsize=8)
         for cohort in profile["cohorts"]:
-            admitted = [r for r in rows if r["cohort"] == cohort["name"] and (r.get("complete") or (r.get("timed_out") and r.get("completion_late") is True))]
-            observed = sorted(r["e2e_seconds"] for r in admitted if r.get("complete"))
+            admitted = [r for r in rows if r["cohort"] == cohort["name"] and (
+                r.get("first_text_late") is not None if ttft_only else r.get("complete") or (r.get("timed_out") and r.get("completion_late") is True))]
+            observed = sorted(r["client_ttft_seconds"] for r in admitted if r.get("client_ttft_seconds") is not None) if ttft_only else sorted(r["e2e_seconds"] for r in admitted if r.get("complete"))
             if admitted:
                 end = max([deadline] + observed)
                 axes[1].step([0] + observed + [end], [0] + [(i + 1) / len(admitted) for i in range(len(observed))] + [len(observed) / len(admitted)], where="post", label=cohort["name"])
         axes[1].axvline(deadline, color="red", linestyle="--")
-        axes[1].set(xlabel="Observed full completion time (s)", ylabel="Completed / all completed-or-timeout requests", ylim=(0, 1.05))
+        axes[1].set(xlabel="Observed first-text TTFT (s)" if ttft_only else "Observed full completion time (s)",
+            ylabel="Observed / known first-text outcomes" if ttft_only else "Completed / all completed-or-timeout requests", ylim=(0, 1.05))
         axes[1].text(.03, .03, "Unfinished timeouts remain in the denominator.\nPlateaus below 1 show the censored tail.", transform=axes[1].transAxes, fontsize=8)
         axes[1].legend(fontsize=7)
-        fig.suptitle(title + "\nExact forecast accuracy and deadline-aware completion distribution")
+        fig.suptitle(title + ("\nCurrent = queue-only calibrated diagnostic; first-text distribution" if ttft_only else "\nExact forecast accuracy and deadline-aware completion distribution"))
         fig.tight_layout()
         name = "production-mix-accuracy.png"
         fig.savefig(output / name, dpi=160)
         plt.close(fig)
         figures.append(name)
+        if ttft_only:
+            fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+            snapshots = [dict(elapsed=r["started_elapsed_seconds"], **r.get("pre_admission_components", {})) for r in rows]
+            for field, label in [("calibration_baseline_seconds", "Calibration baseline B"), ("queue_excess_seconds", "Native queue input N"),
+                                 ("observed_delay_floor", "Empirical floor F (raw comparator only)"), ("predicted_excess_seconds", "Raw extra delay")]:
+                points = [r for r in snapshots if isinstance(r.get(field), (int, float)) and r[field] >= 0]
+                axes[0].scatter(values(points, "elapsed"), values(points, field), s=3, label=label)
+            axes[0].set(ylabel="Input decomposition (seconds)", ylim=(0, None))
+            axes[0].legend(fontsize=8)
+            axes[1].scatter(values(snapshots, "elapsed"), values(snapshots, "calibration_scale"), s=3, label="Gain g; no F in fit or forecast")
+            axes[1].set(ylabel="Gain", ylim=(0, None));axes[1].legend(fontsize=8)
+            axes[2].scatter(values(snapshots, "elapsed"), values(snapshots, "calibration_epoch"), s=3, label="Epoch")
+            axes[2].scatter(values(snapshots, "elapsed"), values(snapshots, "calibration_bank_index"), s=3, label="Bank index")
+            axes[2].set(xlabel="Admission time (s), linear", ylabel="Epoch / bank");axes[2].legend(fontsize=8)
+            for ax in axes:ax.grid(alpha=.15)
+            fig.suptitle(title + "\nExact pre-admission decomposition: calibrated total = B + g × N")
+            fig.tight_layout();name="production-mix-components.png";fig.savefig(output/name,dpi=160);plt.close(fig);figures.append(name)
         inputs += ["summary.json", "run-config.json", "paired-production.jsonl", "metrics.jsonl", "stages.json"]
-    manifest = dict(plot_schema_version=3, time_axis_scale=time_scale, plotter_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    manifest = dict(plot_schema_version=4 if ttft_only else 3, measurement_target=profile.get("measurement_target", "completion"), time_axis_scale=time_scale, plotter_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     inputs={n: hashlib.sha256((path / n).read_bytes()).hexdigest() for n in inputs}, figures=figures)
     (output / "production-plot-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
