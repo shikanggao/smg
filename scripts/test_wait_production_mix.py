@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Planner, deadline, SSE and real overlapping HTTP checks; no engine required."""
+import argparse
+import asyncio
+import copy
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("production_mix", HERE / "run_wait_production_mix.py")
+p = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(p)
+DEFAULT = json.loads((HERE / "wait-production-mix.json").read_text())
+
+
+def smoke_profile():
+    value = copy.deepcopy(DEFAULT)
+    value.update(deadline_seconds=.07, router_extra_ttft_budget_seconds=.07, max_inflight=32, sample_interval_seconds=.01,
+                 drain_timeout_seconds=1, maximum_p99_dispatch_lag_seconds=.2)
+    value["phases"] = [dict(name="pressure", seconds=.3, rps=80, arrivals="periodic")]
+    return value
+
+
+class PlannerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        p.validate(DEFAULT)
+        cls.rows = p.make_plan(DEFAULT)
+
+    def test_reproducible_and_bounded_arrivals(self):
+        self.assertEqual(self.rows, p.make_plan(DEFAULT))
+        self.assertLessEqual(len(self.rows), DEFAULT["max_requests"])
+        for phase in DEFAULT["phases"]:
+            arrivals = [r["scheduled_phase_seconds"] for r in self.rows if r["phase"] == phase["name"]]
+            self.assertTrue(arrivals)
+            self.assertEqual(arrivals, sorted(set(arrivals)))
+            self.assertLess(max(arrivals), phase["seconds"])
+
+    def test_all_length_quadrants_and_natural_output_budgets(self):
+        for small_input, long_output in [(True, False), (True, True), (False, False), (False, True)]:
+            self.assertTrue(any((r["input_words"] < 1024) == small_input and (r["max_output_tokens"] >= 1024) == long_output for r in self.rows))
+        self.assertEqual({r["cohort"] for r in self.rows}, set(p.TASKS))
+        self.assertTrue(any(r["shared_prefix"] for r in self.rows))
+        self.assertTrue(any(not r["shared_prefix"] for r in self.rows))
+
+    def test_actual_prompt_words_and_saved_hash(self):
+        for row in self.rows[::97]:
+            messages = p.messages(row, DEFAULT)
+            self.assertEqual(sum(len(m["content"].split()) for m in messages), row["input_words"])
+            self.assertEqual(p.digest(messages), row["prompt_sha256"])
+
+    def test_shared_prefix_survives_unique_request_suffix(self):
+        row = dict(self.rows[0], shared_prefix=True, input_words=1024, session=3)
+        other = dict(row, index=row["index"] + 9999)
+        self.assertEqual(p.messages(row, DEFAULT)[0], p.messages(other, DEFAULT)[0])
+        self.assertNotEqual(p.messages(row, DEFAULT)[1], p.messages(other, DEFAULT)[1])
+        row["shared_prefix"] = other["shared_prefix"] = False
+        self.assertNotEqual(p.messages(row, DEFAULT)[0], p.messages(other, DEFAULT)[0])
+
+    def test_cache_namespace_changes_prefix_without_changing_arrivals_or_words(self):
+        profile = dict(DEFAULT, cache_namespace="repeat_a")
+        for row in self.rows[::97]:
+            changed = p.messages(row, profile)
+            self.assertEqual(sum(len(m["content"].split()) for m in changed), row["input_words"])
+            self.assertNotEqual(p.digest(changed), row["prompt_sha256"])
+            self.assertTrue(changed[0]["content"].startswith("Experiment repeat_a."))
+        other = p.make_plan(profile)
+        self.assertEqual([{k: v for k, v in r.items() if k != "prompt_sha256"} for r in self.rows],
+                         [{k: v for k, v in r.items() if k != "prompt_sha256"} for r in other])
+
+    def test_balanced_sparse_controls_and_pressure_longer_than_deadline(self):
+        for phase in DEFAULT["phases"]:
+            if phase.get("balanced_controls"):
+                counts = p.Counter(r["cohort"] for r in self.rows if r["phase"] == phase["name"])
+                self.assertGreaterEqual(min(counts.values()), DEFAULT["coverage"]["minimum_healthy_controls_per_cohort"])
+            if phase["name"].startswith("pressure"):
+                self.assertGreater(phase["seconds"], DEFAULT["deadline_seconds"])
+
+    def test_smoke_never_claims_300_seconds(self):
+        with self.assertRaisesRegex(AssertionError, "300-second"):
+            p.validate(smoke_profile())
+        p.validate(smoke_profile(), smoke=True)
+
+    def test_invalid_or_unbounded_profiles_rejected(self):
+        for key, value in [("max_inflight", 0), ("shared_prefix_fraction", 1.1), ("sample_interval_seconds", 0)]:
+            profile = dict(DEFAULT, **{key: value})
+            with self.assertRaises(AssertionError):
+                p.validate(profile)
+        with self.assertRaisesRegex(AssertionError, "safety bound"):
+            p.make_plan(dict(smoke_profile(), max_requests=1))
+
+    def test_frames_split_utf8_crlf_comments_and_multiline(self):
+        decoder = p.Frames()
+        raw = ': heartbeat\r\ndata: {"text":"世"}\r\n\r\ndata: one\r\ndata: two\r\n\r\ndata: [DONE]\r\n\r\n'.encode()
+        actual = []
+        for byte in raw:
+            actual += decoder.feed(bytes([byte]))
+        actual += decoder.feed(b"", final=True)
+        self.assertEqual(actual, ['{"text":"世"}', 'one\ntwo', '[DONE]'])
+
+    def test_native_metric_profiles_and_missing_not_zero(self):
+        value = p.native_metrics('vllm:num_requests_waiting{model="a"} 2\nvllm:num_requests_running 3\nvllm:gpu_cache_usage_perc .95\n', "vllm")
+        self.assertEqual(value, dict(native_waiting=2, native_running=3, native_kv=.95))
+        self.assertEqual(p.native_metrics('sglang_num_queue_reqs 4\nsglang_num_running_reqs 5\nsglang_token_usage .9\n', "sglang"), dict(native_waiting=4, native_running=5, native_kv=.9))
+        self.assertIsNone(p.native_metrics('vllm:num_requests_running NaN\n', "vllm")["native_running"])
+
+    def test_unknown_outcomes_do_not_become_false_positives(self):
+        rows = [dict(pred=True, truth=None), dict(pred=True, truth=False, controlled_rejection=True),
+                dict(pred=False, truth=True), dict(pred=True, truth=False)]
+        self.assertEqual(p.classify(rows, "pred", "truth"), dict(tp=0, fn=1, fp=1, tn=0, unknown=2))
+
+
+class HTTPTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from aiohttp import web
+        self.web = web
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.mode = "mixed"
+        self.active = self.peak = self.posts = 0
+        self.router_budget = .07
+        self.payloads = []
+        app = web.Application()
+        app.router.add_get("/metrics", self.metrics)
+        app.router.add_post("/v1/chat/completions", self.completion)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await site.start()
+        self.url = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+
+    async def asyncTearDown(self):
+        await self.runner.cleanup()
+        self.temp.cleanup()
+
+    async def metrics(self, request):
+        return self.web.Response(text='vllm:num_requests_waiting 0\nvllm:num_requests_running 0\nvllm:kv_cache_usage_perc .95\n' + f'smg_estimated_wait_threshold_seconds {self.router_budget}\n')
+
+    async def completion(self, request):
+        body = await request.json()
+        self.payloads.append(body)
+        self.posts += 1
+        if self.mode == "stalled-http-error":
+            response = self.web.StreamResponse(status=500)
+            await response.prepare(request)
+            await asyncio.sleep(.2)
+            return response
+        index = int(request.headers["opc-request-id"].rsplit("-", 1)[1])
+        mode = index % 4 if self.mode == "mixed" else 1 if self.mode == "slow" else 0
+        if mode == 3:
+            return self.web.Response(status=503, text="estimated wait budgets exceeded")
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        response = self.web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        async def event(value):
+            await response.write(("data: " + json.dumps(value) + "\n\n").encode())
+        try:
+            await event({"choices": [{"delta": {"role": "assistant"}}]})
+            if mode == 1:
+                await asyncio.sleep(.2)
+            elif mode == 2:
+                await event({"choices": [{"delta": {"content": "first"}}]})
+                await asyncio.sleep(.2)
+            else:
+                await asyncio.sleep(.005)
+                await event({"choices": [{"delta": {"reasoning_content": "reason"}}]})
+                await asyncio.sleep(.005)
+                await event({"choices": [{"delta": {"content": "answer"}}]})
+            if self.mode != "incomplete":
+                await event({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 100, "completion_tokens": 8}})
+                await response.write(b"data: [DONE]\n\n")
+            await response.write_eof()
+        except ConnectionResetError:
+            pass
+        finally:
+            self.active -= 1
+        return response
+
+    async def exercise(self, profile=None):
+        profile = profile or smoke_profile()
+        p.write_plan(self.root / "plan", profile, smoke=True)
+        args = argparse.Namespace(plan=self.root / "plan", output=self.root / "run", url=self.url,
+                                  model="mock", engine="vllm", engine_metrics_url=self.url + "/metrics",
+                                  router_metrics_url=self.url + "/metrics", router_events=None, run_id="smoke")
+        return await p.run(args)
+
+    def rows(self):
+        return [json.loads(s) for s in (self.root / "run/requests.jsonl").read_text().splitlines()]
+
+    async def test_overlapping_arrivals_natural_eos_and_deadline_censoring(self):
+        summary = await self.exercise()
+        rows = self.rows()
+        self.assertGreater(self.peak, 1, "Slow responses must not serialize offered arrivals")
+        self.assertEqual(summary["execution_status"], "PASS")
+        self.assertEqual(summary["production_coverage"], "INSUFFICIENT")
+        self.assertFalse(summary["coverage_checks"]["actual_300_second_deadline"])
+        self.assertTrue(all("ignore_eos" not in b and "min_tokens" not in b for b in self.payloads))
+        self.assertTrue(any(r["timed_out"] and r["client_ttft_seconds"] is None and r["first_text_late"] is True for r in rows))
+        self.assertTrue(any(r["timed_out"] and r["client_ttft_seconds"] is not None and r["first_text_late"] is False for r in rows))
+        for row in rows:
+            if row["complete"]:
+                self.assertGreater(row["client_ttft_seconds"], row["first_sse_seconds"])
+                self.assertGreater(row["first_answer_seconds"], row["client_ttft_seconds"])
+                self.assertEqual(row["usage"]["completion_tokens"], 8)
+                self.assertLess(8, row["max_output_tokens"])
+            if row["controlled_rejection"]:
+                self.assertIsNone(row["completion_late"])
+        self.assertTrue(all(v["unknown"] == len(rows) for v in [summary["scores"]["pressure"]["raw"]["total_ttft_prediction"]]))
+
+    async def test_incomplete_stream_is_not_success(self):
+        self.mode = "incomplete"
+        with self.assertRaisesRegex(RuntimeError, "invalid"):
+            await self.exercise()
+        self.assertTrue(all(not r["complete"] and r["completion_late"] is None for r in self.rows()))
+
+    async def test_opt_in_content_preview_is_bounded_and_excludes_reasoning(self):
+        self.mode = "normal"
+        profile = dict(smoke_profile(), capture_content_chars=3)
+        await self.exercise(profile)
+        for row in self.rows():
+            self.assertEqual(row["content_preview"], "ans")
+            self.assertEqual(row["content_characters"], len("answer"))
+
+    async def test_stalled_http_error_is_not_model_timeout_truth(self):
+        self.mode = "stalled-http-error"
+        with self.assertRaisesRegex(RuntimeError, "invalid"):
+            await self.exercise()
+        rows = self.rows()
+        self.assertTrue(rows)
+        self.assertTrue(all(r["status"] == 500 and r["timed_out"] for r in rows))
+        self.assertTrue(all(r["error"] == "HTTP 500" for r in rows))
+        self.assertTrue(all(r["completion_late"] is None and r["first_text_late"] is None for r in rows))
+        summary = json.loads((self.root / "run/summary.json").read_text())
+        self.assertEqual(summary["execution_status"], "INVALID")
+        self.assertFalse(summary["coverage_checks"]["pressure_deadline_misses"])
+
+    async def test_exact_forecasts_distinguish_ttft_from_full_completion(self):
+        await self.exercise()
+        rows = self.rows()
+        events = []
+        selected_changed = False
+        for row in rows:
+            events.append(dict(event="forecast", request_id=row["opc_request_id"], threshold_seconds=.07,
+                               ready=True, would_reject=row["controlled_rejection"]))
+            if row["controlled_rejection"]:
+                continue
+            changed = row["complete"] and not selected_changed
+            selected_changed |= changed
+            events.append(dict(event="calibration_forecast", request_id=row["opc_request_id"],
+                               baseline_seconds=.001, predicted_ttft_seconds=.1 if changed else .005,
+                               calibrated_ttft_seconds=.11 if changed else .1, threshold_seconds=.07,
+                               would_reject=changed, calibrated_would_reject=True))
+            if row["client_ttft_seconds"] is not None:
+                events.append(dict(event="first_text", request_id=row["opc_request_id"], ttft_seconds=.005))
+        log = self.root / "events.jsonl"
+        log.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+        result = p.analyze(self.root / "run", log)
+        scores = result["scores"]["pressure"]
+        after_text = sum(r["timed_out"] and r["client_ttft_seconds"] is not None for r in rows)
+        self.assertGreater(after_text, 0)
+        self.assertEqual(scores["raw"]["gate_vs_completion_deadline"]["fn"] - scores["raw"]["total_ttft_prediction"]["fn"], after_text)
+        self.assertEqual(scores["calibrated"]["gate_vs_completion_deadline"]["fn"], 0)
+        self.assertEqual(scores["raw"]["gate_vs_completion_deadline"]["fp"], 0)
+        self.assertEqual(scores["raw"]["total_ttft_prediction"]["fp"], 1)
+        self.assertTrue(result["coverage_checks"]["exact_request_forecasts"])
+        paired = [json.loads(line) for line in (self.root / "run/paired-production.jsonl").read_text().splitlines()]
+        self.assertTrue(all(r["smg_ttft_seconds"] is None for r in paired if r["client_ttft_seconds"] is None))
+        log.write_text(log.read_text() + json.dumps(events[0]) + "\n")
+        with self.assertRaisesRegex(AssertionError, "Duplicate exact"):
+            p.analyze(self.root / "run", log)
+
+    async def test_wrong_router_budget_stops_before_inference(self):
+        self.router_budget = 5
+        with self.assertRaisesRegex(RuntimeError, "invalid"):
+            await self.exercise()
+        self.assertEqual(self.posts, 0)
+
+    async def test_local_saturation_explicitly_invalidates_load_test(self):
+        self.mode = "slow"
+        with self.assertRaisesRegex(RuntimeError, "invalid"):
+            await self.exercise(dict(smoke_profile(), max_inflight=1))
+        rows = self.rows()
+        self.assertTrue(any(r.get("local_drop") for r in rows))
+        self.assertTrue(all(r["completion_late"] is None for r in rows if r.get("local_drop")))
+        summary = json.loads((self.root / "run/summary.json").read_text())
+        self.assertFalse(summary["execution_checks"]["no_local_saturation"])
+
+    async def test_tampered_prompt_rejected_before_any_http(self):
+        p.write_plan(self.root / "plan", smoke_profile(), smoke=True)
+        plan = self.root / "plan/plan.jsonl"
+        rows = [json.loads(line) for line in plan.read_text().splitlines()]
+        rows[0]["prompt_sha256"] = "0" * 64
+        plan.write_text("\n".join(p.encoded(row).decode() for row in rows) + "\n")
+        manifest_path = self.root / "plan/plan-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["plan_sha256"] = p.hashlib.sha256(plan.read_bytes()).hexdigest()
+        p.save(manifest_path, manifest)
+        args = argparse.Namespace(plan=self.root / "plan", output=self.root / "run", url=self.url,
+                                  model="mock", engine="vllm", engine_metrics_url=self.url + "/metrics",
+                                  router_metrics_url=self.url + "/metrics", router_events=None, run_id="smoke")
+        with self.assertRaisesRegex(AssertionError, "Prompt differs"):
+            await p.run(args)
+        self.assertEqual(self.posts, 0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

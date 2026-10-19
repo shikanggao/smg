@@ -63,12 +63,14 @@ def events(path):
 
 
 SCALE_UNITS_PER_SECOND = 0.1
+TWO_WAVE_METHOD = 'mse_poll_two_wave_v1'
+TWO_WAVE_RATE = 0.5
 
 
-def applied_scale(version, at):
+def applied_scale(version, at, rate=SCALE_UNITS_PER_SECOND):
     """Evaluate a saved target trajectory; elapsed time never banks a new target."""
     anchor, target, since, _ = version
-    budget = SCALE_UNITS_PER_SECOND * max(at - since, 0)
+    budget = rate * max(at - since, 0)
     return min(anchor + budget, max(anchor - budget, target))
 
 
@@ -103,6 +105,190 @@ def feedback_reason(event, eligibility_required):
     return 'accepted'
 
 
+def two_wave_trace(log, keep_records=False):
+    """Replay chronological banks; revisions identify removal-only poll fits.
+
+    Bank age starts at the first accepted feedback for the worker epoch, not
+    admission time. Ordinary rotations never create a new generation.
+    """
+    states, origins, clocks, selected, gates = {}, {}, {}, {}, {}
+    rotation_states, rotation_times = defaultdict(set), {}
+    records, errors = [], []
+    counts = Counter()
+    peak_samples = 0
+
+    def check(label, actual, expected):
+        if not close(actual, expected):
+            raise ValueError(f'{label}: recorded={actual!r}, expected={expected!r}')
+
+    def samples(state):
+        return list(state['previous']) + list(state['current'])
+
+    for event in log:
+        kind = event.get('event')
+        if kind == 'calibration_reset' and event.get('reason') == 'history_expired':
+            errors.append(['two_wave_history_expiry_generation_reset', event.get('worker')])
+            break
+        if kind not in ('calibration_forecast', 'calibration_feedback', 'calibration_update', 'calibration_rotation') and not (kind == 'forecast' and event.get('calibration_enabled')):
+            continue
+        try:
+            if event['calibration_method'] != TWO_WAVE_METHOD:
+                raise ValueError('mixed_or_unknown_calibration_methods')
+            epoch = event.get('current_calibration_epoch', event['calibration_epoch'])
+            worker_epoch = (event['worker'], epoch)
+            key = worker_epoch + (event['calibration_state'],)
+            if key[2] not in ('capacity_ready', 'capacity_unready'):
+                raise ValueError('unknown_calibration_state')
+            now = event['calibration_time_seconds']
+            if not math.isfinite(now) or now < clocks.get(worker_epoch, 0):
+                raise ValueError('monotonic_time_regressed')
+            clocks[worker_epoch] = now
+            state = states.setdefault(key, dict(previous=deque(maxlen=32), current=deque(maxlen=32), bank=0,
+                revision=0, fitted_revision=0, accepted=0, fitted=0, trajectory=(1.0, 1.0, 0.0, 0)))
+            origins.setdefault(worker_epoch, None)
+            origin = origins[worker_epoch]
+            due = int((now - origin) // 300) if origin is not None else 0
+            before = applied_scale(state['trajectory'], now, TWO_WAVE_RATE)
+            before_count = len(samples(state))
+            removed = 0
+            if kind == 'calibration_rotation':
+                if origin is None or due <= state['bank']:
+                    raise ValueError('rotation_before_acceptance_or_duplicate')
+                steps = due - state['bank']
+                rotation_key = worker_epoch + (due,)
+                if rotation_key in rotation_times and now != rotation_times[rotation_key]:
+                    raise ValueError('rotation_state_timestamps_differ')
+                rotation_times[rotation_key] = now
+                rotation_states[rotation_key].add(key[2])
+                removed = before_count if steps >= 2 else len(state['previous'])
+                state['previous'] = deque(state['current'] if steps == 1 else (), maxlen=32)
+                state['current'].clear()
+                state['bank'] = due
+                if removed:
+                    state['revision'] += 1
+                    if len(samples(state)) < 4:
+                        state['trajectory'] = (1.0, 1.0, now, len(samples(state)))
+                check('rotation_bank_seconds', event['calibration_bank_seconds'], 300)
+                check('rotation_previous_count', event['calibration_previous_sample_count'], len(state['previous']))
+                check('rotation_current_count', event['calibration_current_sample_count'], len(state['current']))
+                check('rotation_count_before', event['sample_count_before'], before_count)
+                check('rotation_count_after', event['sample_count_after'], len(samples(state)))
+                check('rotation_scale_before', event['scale_before'], before)
+                check('rotation_scale_after', event['scale_after'], applied_scale(state['trajectory'], now, TWO_WAVE_RATE))
+                check('rotation_target_after', event['target_scale_after'], state['trajectory'][1])
+                counts['rotations'] += 1
+                counts['removed_samples'] += removed
+            else:
+                if due != state['bank']:
+                    raise ValueError('missing_bank_rotation')
+                if kind in ('calibration_forecast', 'forecast'):
+                    seen = selected if kind == 'calibration_forecast' else gates
+                    if event['request_id'] in seen:
+                        raise ValueError('duplicate_request_forecast')
+                    seen[event['request_id']] = event
+                    for field, value in (('calibration_observation_sequence', state['accepted']), ('calibration_fit_sequence', state['fitted']),
+                        ('calibration_history_revision', state['revision']), ('calibration_fitted_revision', state['fitted_revision']),
+                        ('calibration_bank_index', state['bank']), ('calibration_sample_count', before_count),
+                        ('calibration_scale', before), ('calibration_target_scale', state['trajectory'][1]),
+                        ('calibration_max_scale_change_per_second', TWO_WAVE_RATE), ('calibration_bank_seconds', 300), ('calibration_bank_max_samples', 32)):
+                        check('forecast_' + field, event[field], value)
+                    if event['calibration_ready'] is not (before_count >= 4):
+                        raise ValueError('incorrect_calibration_readiness')
+                    base, extra = event['baseline_seconds'], event['predicted_excess_seconds']
+                    check('raw_forecast_arithmetic', event['predicted_ttft_seconds'], base + extra)
+                    check('calibrated_forecast_arithmetic', event['calibrated_ttft_seconds'], base + before * extra)
+                    check('calibrated_excess_arithmetic', event['calibrated_excess_seconds'], before * extra)
+                    reject = event['ready'] and math.isfinite(event['calibrated_excess_seconds']) and event['calibrated_excess_seconds'] >= event['threshold_seconds']
+                    if event['calibrated_would_reject'] is not reject:
+                        raise ValueError('incorrect_calibrated_readiness_gate')
+                    if type(event['native_ready']) is not bool or type(event['native_queue_visible']) is not bool or event['native_queue_visible'] != (event['native_waiting'] > 0):
+                        raise ValueError('invalid_native_eligibility_snapshot')
+                    mature = event['native_ready'] if kind == 'calibration_forecast' else event.get('capacity_learned_ready')
+                    if mature is not None and (key[2] == 'capacity_ready') != mature:
+                        raise ValueError('incorrect_native_capacity_state')
+                    continue
+                check('sequence_before', event['sequence_before'], state['accepted'])
+                check('fit_sequence_before', event['fit_sequence_before'], state['fitted'])
+                check('sample_count_before', event['sample_count_before'], before_count)
+                check('scale_before', event['scale_before'], before)
+                check('target_scale_before', event['target_scale_before'], state['trajectory'][1])
+                if kind == 'calibration_feedback':
+                    counts['feedback'] += 1
+                    counts['reason:' + event['reason']] += 1
+                    forecast = selected.get(event['request_id'])
+                    if forecast is None:
+                        raise ValueError('feedback_missing_selected_snapshot')
+                    if forecast['worker'] != event['worker'] or forecast['calibration_state'] != event['calibration_state']:
+                        raise ValueError('feedback_changed_saved_worker_or_state')
+                    for source, target in (('baseline_seconds', 'baseline_seconds'), ('baseline_available', 'baseline_available'),
+                        ('predicted_excess_seconds', 'raw_excess_seconds'), ('calibration_scale', 'admission_scale'),
+                        ('calibration_sample_count', 'admission_sample_count'),
+                        ('calibration_observation_sequence', 'admission_observation_sequence'), ('calibration_fit_sequence', 'admission_fit_sequence'),
+                        ('calibration_epoch', 'calibration_epoch'), ('calibration_time_seconds', 'admission_calibration_time_seconds'),
+                        ('calibration_bank_index', 'admission_bank_index'), ('calibration_history_revision', 'admission_history_revision'),
+                        ('calibration_fitted_revision', 'admission_fitted_revision'), ('native_waiting', 'admission_native_waiting'),
+                        ('native_queue_visible', 'admission_native_queue_visible'), ('native_ready', 'admission_native_capacity_ready')):
+                        check('saved_' + source, event[target], forecast[source])
+                    check('snapshot_max_age', event['calibration_max_age_seconds'], 600)
+                    if type(event['admission_native_capacity_ready']) is not bool or type(event['admission_native_queue_visible']) is not bool or event['admission_native_queue_visible'] != (event['admission_native_waiting'] > 0):
+                        raise ValueError('invalid_native_eligibility_feedback')
+                    if now < event['admission_calibration_time_seconds'] and epoch == event['calibration_epoch']:
+                        raise ValueError('feedback_before_its_admission')
+                    if epoch == event['calibration_epoch']:
+                        check('feedback_age', event['feedback_age_seconds'], now - event['admission_calibration_time_seconds'])
+                    reason = feedback_reason(event, True)
+                    if event['reason'] != reason:
+                        raise ValueError('incorrect_feedback_reason')
+                    if reason == 'accepted':
+                        x = event['raw_excess_seconds']
+                        state['current'].append((max(event['ttft_seconds'] - event['baseline_seconds'], 0) / x, x, now, event['feedback_age_seconds']))
+                        state['accepted'] += 1
+                        state['revision'] += 1
+                        if origin is None:
+                            origins[worker_epoch] = now
+                        counts['accepted'] += 1
+                else:
+                    if state['revision'] == state['fitted_revision']:
+                        raise ValueError('redundant_poll_fit')
+                    target = mse_scale([(ratio, x) for ratio, x, _, _ in samples(state)])
+                    state['trajectory'] = (before, target, now, len(samples(state)))
+                    state['fitted'] = state['accepted']
+                    state['fitted_revision'] = state['revision']
+                    check('poll_fitted_revision', event['calibration_fitted_revision'], state['fitted_revision'])
+                    counts['poll_fits'] += 1
+                check('sequence_after', event['sequence_after'], state['accepted'])
+                check('fit_sequence_after', event['fit_sequence_after'], state['fitted'])
+                check('sample_count_after', event['sample_count_after'], len(samples(state)))
+                check('scale_after', event['scale_after'], applied_scale(state['trajectory'], now, TWO_WAVE_RATE))
+                check('target_scale_after', event['target_scale_after'], state['trajectory'][1])
+            check('bank_index', event['calibration_bank_index'], state['bank'])
+            check('history_revision', event['calibration_history_revision'], state['revision'])
+            peak_samples = max(peak_samples, len(samples(state)))
+            if keep_records:
+                records.append(dict(key=key, event=event, samples=samples(state), removed=removed,
+                    bank_index=state['bank'], history_revision=state['revision'], fitted_revision=state['fitted_revision'],
+                    previous_sample_count=len(state['previous']), current_sample_count=len(state['current'])))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError, OverflowError) as error:
+            errors.append(['two_wave_trace_mismatch', event.get('request_id', kind), str(error)])
+            break
+    if not errors and any(states != {'capacity_ready', 'capacity_unready'} for states in rotation_states.values()):
+        errors.append(['missing_rotation_state_record'])
+    result = dict(ok=not errors, errors=errors, error_count=len(errors), calibration_method=TWO_WAVE_METHOD,
+        selected_forecasts=len(selected), gate_forecasts=len(gates), feedback=counts['feedback'], accepted=counts['accepted'],
+        poll_fits=counts['poll_fits'], rotations=counts['rotations'], bank_rotations=len(rotation_states), removed_samples=counts['removed_samples'],
+        feedback_reasons={k[7:]: v for k, v in counts.items() if k.startswith('reason:')}, states=len(states),
+        scale_units_per_second=TWO_WAVE_RATE, bank_seconds=300, bank_max_samples=32, max_combined_samples=64,
+        peak_sample_count=peak_samples, elapsed_time_limited=True, native_queue_eligibility_required=True,
+        revision_semantics='Accepted feedback increments history revision; removal increments it once. Poll fits key by history/fitted revision because accepted/fit sequence can repeat on removal-only fits.',
+        final_states=[dict(worker=k[0], calibration_epoch=k[1], calibration_state=k[2], bank_index=s['bank'],
+            history_revision=s['revision'], fitted_revision=s['fitted_revision'], previous_sample_count=len(s['previous']), current_sample_count=len(s['current'])) for k, s in states.items()])
+    return result, records
+
+
+def audit_two_wave(log):
+    return two_wave_trace(log)[0]
+
+
 def audit(log):
     """Replay windows/trajectories by observation and poll-fit sequence.
 
@@ -114,11 +300,19 @@ def audit(log):
     feedback = []
     errors = []
     methods = {e.get('calibration_method', 'median_feedback') for e in log
-               if e.get('event') in ('calibration_forecast', 'calibration_feedback', 'calibration_update')
+               if e.get('event') in ('calibration_forecast', 'calibration_feedback', 'calibration_update', 'calibration_rotation')
                or e.get('event') == 'forecast' and e.get('calibration_enabled')}
+    if any(('calibration_bank_index' in e or 'calibration_history_revision' in e)
+           and e.get('calibration_method') != TWO_WAVE_METHOD for e in log
+           if e.get('event') in ('calibration_forecast', 'calibration_feedback', 'calibration_update', 'calibration_rotation')
+           or e.get('event') == 'forecast' and e.get('calibration_enabled')):
+        return dict(ok=False, errors=[['mixed_or_unknown_calibration_methods', sorted(methods, key=str)]],
+                    error_count=1, calibration_method='mixed_or_unknown')
+    if methods == {TWO_WAVE_METHOD}:
+        return audit_two_wave(log)
     poll_fitted = 'mse_poll' in methods
     if methods - {'median_feedback', 'mse_poll'} or len(methods) > 1:
-        return dict(ok=False, errors=[['mixed_or_unknown_calibration_methods', sorted(methods)]],
+        return dict(ok=False, errors=[['mixed_or_unknown_calibration_methods', sorted(methods, key=str)]],
                     error_count=1, calibration_method='mixed_or_unknown')
     limited = any('calibration_time_seconds' in e for e in log)
     eligibility_required = any(
@@ -466,7 +660,7 @@ def analyze(path):
                          'Rejected hard-mode requests have no observed counterfactual TTFT. Calibrated gate remains hypothetical.',
                          'The holdout is later unseen traffic with online updates enabled; it is not a frozen fit.',
                          'Native queue learning eligibility uses the selected admission snapshot, never queue or capacity measured at response completion. Historical traces without the added fields do not claim eligibility verification.',
-                         'Target is the recorded unrestricted fitting target: MSE at the last poll for mse_poll, weighted median for historical traces. Applied scale is the live elapsed-time-limited trajectory. Neither is an offline fit.'])
+                         'Target is the recorded unrestricted fitting target: MSE at the last poll for mse_poll/mse_poll_two_wave_v1, weighted median for historical traces. Applied scale is the live elapsed-time-limited trajectory. Neither is an offline fit.'])
     (path / 'paired-calibration.json').write_text(json.dumps(rows, indent=2) + '\n')
     (path / 'calibration-analysis.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(dict(path=str(path), checks=checks, pairs=len(rows), rejections=len(rejected), low=result['low'], high=result['high']), indent=2))

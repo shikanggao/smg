@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "description": "Synthetic production-style simulation, not a measured production trace",
+  "seed": 20261016,
+  "deadline_seconds": 300,
+  "router_extra_ttft_budget_seconds": 300,
+  "max_requests": 16384,
+  "max_inflight": 8192,
+  "sample_interval_seconds": 1,
+  "drain_timeout_seconds": 300,
+  "shared_prefix_fraction": 0.35,
+  "prefix_sessions": 16,
+  "maximum_p99_dispatch_lag_seconds": 0.25,
+  "coverage": {
+    "minimum_pressure_timeouts": 3,
+    "minimum_healthy_controls_per_cohort": 3,
+    "minimum_kv_90_observed_seconds": 30,
+    "minimum_completed_long_outputs": 3,
+    "minimum_healthy_boundary_completions": 10,
+    "long_output_tokens": 512
+  },
+  "cohorts": [
+    {"name": "short-chat", "weight": 40, "input_words": [64, 256], "max_output_tokens": [32, 128]},
+    {"name": "rag", "weight": 25, "input_words": [512, 2048], "max_output_tokens": [128, 512]},
+    {"name": "summarization", "weight": 10, "input_words": [2048, 4096], "max_output_tokens": [128, 512]},
+    {"name": "long-generation", "weight": 10, "input_words": [128, 512], "max_output_tokens": [1024, 2048]},
+    {"name": "code", "weight": 10, "input_words": [256, 1024], "max_output_tokens": [256, 1024]},
+    {"name": "long-context-generation", "weight": 5, "input_words": [2048, 4096], "max_output_tokens": [1024, 2048]}
+  ],
+  "phases": [
+    {"name": "low", "seconds": 120, "rps": 0.25, "arrivals": "periodic", "balanced_controls": true},
+    {"name": "steady", "seconds": 120, "rps": 1, "arrivals": "poisson"},
+    {"name": "burst", "seconds": 45, "rps": 16, "arrivals": "poisson"},
+    {"name": "settle", "seconds": 90, "rps": 1, "arrivals": "poisson"},
+    {"name": "pressure-8rps", "seconds": 360, "rps": 8, "arrivals": "poisson"},
+    {"name": "pressure-16rps", "seconds": 360, "rps": 16, "arrivals": "poisson"},
+    {"name": "recovery", "seconds": 120, "rps": 0.25, "arrivals": "periodic", "balanced_controls": true, "drain_before": true}
+  ]
+}
