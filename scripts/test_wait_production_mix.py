@@ -112,6 +112,45 @@ class PlannerTests(unittest.TestCase):
                 dict(pred=False, truth=True), dict(pred=True, truth=False)]
         self.assertEqual(p.classify(rows, "pred", "truth"), dict(tp=0, fn=1, fp=1, tn=0, unknown=2))
 
+    def test_post_run_foreign_forecast_invalidates_otherwise_valid_ttft_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = dict(DEFAULT, measurement_target="ttft", observation_horizon_seconds=420)
+            profile["coverage"] = dict(DEFAULT["coverage"], minimum_pressure_ttft_misses=1, minimum_observed_late_ttft=1)
+            row = dict(self.rows[0], opc_request_id="prod-isolated-0", complete=True,
+                client_ttft_seconds=1, first_text_late=False, completion_late=False,
+                e2e_seconds=2, first_answer_seconds=1, dispatch_lag_seconds=0,
+                timed_out=False, controlled_rejection=False, cancelled=False, error=None, usage={})
+            for name, value in {
+                "profile.json": profile, "run-config.json": dict(run_id="isolated", smoke=False),
+                "execution.json": dict(error=None, planned_requests=1, native_drained=True),
+                "readiness.json": dict(ready=True, elapsed_seconds=.5),
+            }.items():
+                (root / name).write_text(json.dumps(value))
+            (root / "requests.jsonl").write_text(json.dumps(row) + "\n")
+            (root / "metrics.jsonl").write_text("")
+            gate = dict(event="forecast", request_id=row["opc_request_id"], timestamp="2026-10-19 00:00:00",
+                threshold_seconds=300, predicted_ttft_seconds=1, calibrated_ttft_seconds=1,
+                would_reject=False, calibrated_would_reject=False, baseline_available=True,
+                calibration_baseline_available=True, calibration_baseline_seconds=1,
+                calibration_input_excess_seconds=0, calibration_method="mse_poll_two_wave_queue_v2")
+            events = [gate, dict(gate, event="calibration_forecast"),
+                      dict(event="first_text", request_id=row["opc_request_id"], ttft_seconds=1)]
+            log = root / "captured.jsonl"
+            log.write_text("".join(json.dumps(event) + "\n" for event in events))
+            before = p.analyze(root, log)
+            self.assertEqual(before["execution_status"], "PASS")
+            self.assertTrue(before["execution_checks"]["exclusive_workload_isolation"])
+            events.append(dict(gate, request_id="foreign-nonstream", timestamp="2026-10-19 00:01:00"))
+            log.write_text("".join(json.dumps(event) + "\n" for event in events))
+            after = p.analyze(root, log)
+            self.assertEqual(after["execution_status"], "INVALID")
+            self.assertFalse(after["execution_checks"]["exclusive_workload_isolation"])
+            self.assertEqual(after["runtime_isolation"]["foreign_request_count"], 1)
+            self.assertEqual(after["runtime_isolation"]["foreign_requests"][0]["request_id"], "foreign-nonstream")
+            missing = p.analyze(root)
+            self.assertFalse(missing["execution_checks"]["exclusive_workload_isolation"])
+
     def test_versioned_ttft_profiles_validate_and_busy_start_is_focused_skip(self):
         for name in ["wait-ttft-focused.json", "wait-ttft-busy-start.json", "wait-ttft-seed.json"]:
             profile = json.loads((HERE / name).read_text())

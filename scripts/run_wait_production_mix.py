@@ -590,18 +590,22 @@ def classify(rows, prediction, actual):
 
 def analyze(path, events_path=None):
     profile = json.loads((path / "profile.json").read_text())
+    ttft_only = profile.get("measurement_target") == "ttft"
     config = json.loads((path / "run-config.json").read_text())
     execution = json.loads((path / "execution.json").read_text())
     rows = [json.loads(line) for line in (path / "requests.jsonl").read_text().splitlines()]
     samples = [json.loads(line) for line in (path / "metrics.jsonl").read_text().splitlines()]
     forecasts, first_text, gates = {}, {}, {}
+    isolation_events = []
     if events_path:
         for line in events_path.read_text().splitlines():
             try:
-                obj = json.loads(line)
-            except ValueError:
+                obj = json.loads(line[line.index("{"):])
+            except (ValueError, TypeError):
                 continue
             event = obj.get("fields", {}) | obj
+            if ttft_only:
+                isolation_events.append(event)
             rid = event.get("request_id", "")
             if not rid.startswith("prod-" + config["run_id"] + "-"):
                 continue
@@ -650,7 +654,16 @@ def analyze(path, events_path=None):
                 value = None
             row["pre_admission_total_ttft_predictions"][label] = value
             row[label + "_pre_admission_total_ttft_over_deadline"] = value >= deadline if value is not None else None
-    ttft_only = profile.get("measurement_target") == "ttft"
+    isolation = None
+    if ttft_only:
+        try:
+            from .wait_ttft_readiness import audit_isolation
+        except ImportError:
+            try:
+                from wait_ttft_readiness import audit_isolation
+            except ImportError:
+                from scripts.wait_ttft_readiness import audit_isolation
+        isolation = audit_isolation(isolation_events, {r["opc_request_id"] for r in rows})
     def valid_ttft_measurement(row):
         return ttft_only and row.get("error") is None and not row.get("cancelled") and (
             row.get("intentional_stream_abort") and row.get("client_ttft_seconds") is not None
@@ -664,6 +677,8 @@ def analyze(path, events_path=None):
                   no_transport_or_protocol_errors=not errors,
                   producer_kept_up=lag is not None and lag <= profile["maximum_p99_dispatch_lag_seconds"],
                   native_drained=execution["native_drained"])
+    if ttft_only:
+        checks["exclusive_workload_isolation"] = isolation["ok"]
     controls = [r for r in rows if r["control"]]
     pressure = [r for r in rows if not r["control"]]
     high_seconds = 0
@@ -738,6 +753,7 @@ def analyze(path, events_path=None):
                   unknown_first_text_truth=sum(r.get("first_text_late") is None for r in rows),
                   intentional_first_text_aborts=sum(r.get("intentional_stream_abort", False) for r in rows))
     if ttft_only:
+        result["runtime_isolation"] = isolation
         result["notes"] += ["Primary scores compare exact pre-admission total TTFT with the300s first-text threshold. Production extra-delay flags are distinct.",
             "TTFT mode closes the stream after first text; this is intentional measurement, not a full completion or answer-quality result.",
             "Missing first text after the longer observation horizon is a known late binary label with numeric TTFT unavailable. Short cancellations/errors remain unknown."]

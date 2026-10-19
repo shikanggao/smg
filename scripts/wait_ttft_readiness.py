@@ -2,9 +2,69 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 
 
 METHOD = "mse_poll_two_wave_queue_v2"
+ISOLATION_REQUEST_EVENTS = frozenset({"forecast", "calibration_forecast", "calibration_feedback", "first_text"})
+
+
+def audit_isolation(events, owned_request_ids):
+    """Audit the whole parsed router capture against exact planned request IDs.
+
+    Raw ``forecast`` is the admission record for streaming and nonstreaming
+    requests. It must be checked even when no calibration feedback follows.
+    Every owned ID must have a raw forecast; absent/incomplete captures fail.
+    Flat and tracing ``fields`` event dictionaries are accepted. Capture
+    continuity and parsing of raw log lines remain the caller's responsibility.
+    Only IDs, event kinds, timestamps and capture indices enter this receipt;
+    request bodies, log messages and other payload fields are never returned.
+    """
+    if isinstance(owned_request_ids, str):
+        raise ValueError("Expected an explicit collection of owned request IDs")
+    owned = set(owned_request_ids)
+    if not owned or any(not isinstance(rid, str) or not rid.strip() for rid in owned):
+        raise ValueError("Expected nonempty, exact owned request IDs")
+    kinds, foreign, unattributed = Counter(), {}, []
+    owned_events, total, forecasts = 0, 0, set()
+    for index, event in enumerate(events, 1):
+        total += 1
+        fields = event.get("fields", {})
+        value = (fields if isinstance(fields, dict) else {}) | event
+        kind = value.get("event")
+        if kind not in ISOLATION_REQUEST_EVENTS:
+            continue
+        kinds[kind] += 1
+        stamp = value.get("timestamp")
+        occurrence = dict(capture_event_index=index, event_kind=kind,
+                          timestamp=stamp if isinstance(stamp, str) else None)
+        rid = value.get("request_id")
+        if not isinstance(rid, str) or not rid.strip():
+            unattributed.append(occurrence)
+        elif rid in owned:
+            owned_events += 1
+            if kind == "forecast":
+                forecasts.add(rid)
+        else:
+            foreign.setdefault(rid, []).append(occurrence)
+    missing = sorted(owned - forecasts)
+    reasons = []
+    if foreign:
+        reasons.append("Request events from outside the exact owned request ID set")
+    if unattributed:
+        reasons.append("Request events without an attributable request ID")
+    if missing:
+        reasons.append("Owned requests missing raw admission forecasts; capture is absent or incomplete")
+    return dict(ok=not reasons, scope="whole_router_capture", owned_request_id_count=len(owned),
+                capture_event_count=total, checked_event_count=sum(kinds.values()),
+                ignored_event_count=total-sum(kinds.values()), event_kind_counts=dict(sorted(kinds.items())),
+                owned_event_count=owned_events, owned_forecast_request_count=len(forecasts),
+                missing_owned_forecasts=missing,
+                foreign_event_count=sum(len(rows) for rows in foreign.values()), foreign_request_count=len(foreign),
+                foreign_requests=[dict(request_id=rid, event_count=len(rows),
+                                       event_kind_counts=dict(sorted(Counter(row["event_kind"] for row in rows).items())),
+                                       events=rows) for rid, rows in sorted(foreign.items())],
+                unattributed_event_count=len(unattributed), unattributed_events=unattributed, reasons=reasons)
 
 
 class Readiness:

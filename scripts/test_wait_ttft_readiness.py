@@ -1,11 +1,12 @@
 """Current-epoch readiness/isolation regressions, including busy-start controls."""
 import copy
+import json
 import unittest
 
 try:
-    from scripts.wait_ttft_readiness import METHOD, Readiness
+    from scripts.wait_ttft_readiness import METHOD, Readiness, audit_isolation
 except ModuleNotFoundError:
-    from wait_ttft_readiness import METHOD, Readiness
+    from wait_ttft_readiness import METHOD, Readiness, audit_isolation
 
 
 class ReadinessTests(unittest.TestCase):
@@ -89,6 +90,91 @@ class ReadinessTests(unittest.TestCase):
     def test_unknown_method_fails_closed(self):
         self.r.observe(dict(self.initial, calibration_method="unreviewed"))
         self.assertTrue(self.r.snapshot(True)["errors"])
+
+    def test_foreign_forecast_after_readiness_without_feedback_fails_whole_capture(self):
+        self.learn()
+        self.assertTrue(self.r.snapshot(True)["ready"])
+        capture = [dict(event="forecast", request_id="prod-test-0", timestamp="2026-10-19 08:18:31"),
+                   dict(event="readiness_verified", timestamp="2026-10-19 08:19:31"),
+                   dict(event="forecast", request_id="foreign-nonstream", timestamp="2026-10-19 08:23:55",
+                        calibration_enabled=False, stream=False)]
+        result = audit_isolation(capture, {"prod-test-0"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["foreign_event_count"], 1)
+        self.assertEqual(result["foreign_requests"][0]["request_id"], "foreign-nonstream")
+        self.assertEqual(result["foreign_requests"][0]["events"], [dict(capture_event_index=3,
+                         event_kind="forecast", timestamp="2026-10-19 08:23:55")])
+
+
+class WholeCaptureIsolationTests(unittest.TestCase):
+    def test_exact_owned_forecasts_and_feedback_pass(self):
+        events = [dict(event=kind, request_id=rid) for rid in ["owned-0", "owned-1"]
+                  for kind in ["forecast", "calibration_forecast", "first_text", "calibration_feedback"]]
+        result = audit_isolation(iter(events), {"owned-0", "owned-1"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["checked_event_count"], 8)
+        self.assertEqual(result["owned_forecast_request_count"], 2)
+        self.assertEqual(result["missing_owned_forecasts"], [])
+
+    def test_same_prefix_unplanned_id_is_foreign(self):
+        result = audit_isolation([dict(event="forecast", request_id="owned-0"),
+                                  dict(event="forecast", request_id="owned-999")], {"owned-0"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["foreign_requests"][0]["request_id"], "owned-999")
+
+    def test_each_request_event_kind_detects_foreign_without_worker_or_method(self):
+        for kind in ["forecast", "calibration_forecast", "calibration_feedback", "first_text"]:
+            with self.subTest(kind=kind):
+                result = audit_isolation([dict(event="forecast", request_id="owned"),
+                                          dict(event=kind, request_id="foreign")], {"owned"})
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["foreign_requests"][0]["event_kind_counts"], {kind: 1})
+
+    def test_unknown_request_kind_and_lifecycle_span_are_not_false_positives(self):
+        result = audit_isolation([dict(event="forecast", request_id="owned"),
+                                  dict(event="unrelated_request_log", request_id="foreign"),
+                                  dict(event="calibration_update", span=dict(request_id="foreign"))], {"owned"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["ignored_event_count"], 2)
+
+    def test_tracing_fields_are_normalized_and_foreign_events_are_grouped(self):
+        events = [dict(timestamp="t0", fields=dict(event="forecast", request_id="owned")),
+                  dict(timestamp="t1", fields=dict(event="forecast", request_id="foreign")),
+                  dict(timestamp="t2", event="first_text", request_id="foreign")]
+        result = audit_isolation(events, {"owned"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["foreign_request_count"], 1)
+        self.assertEqual(result["foreign_event_count"], 2)
+        self.assertEqual([x["timestamp"] for x in result["foreign_requests"][0]["events"]], ["t1", "t2"])
+
+    def test_missing_request_id_fails_closed(self):
+        for missing in [None, "", " "]:
+            with self.subTest(missing=missing):
+                result = audit_isolation([dict(event="forecast", request_id="owned"),
+                                          dict(event="first_text", request_id=missing)], {"owned"})
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["unattributed_event_count"], 1)
+
+    def test_empty_or_partial_capture_cannot_prove_isolation(self):
+        for events in [[], [dict(event="first_text", request_id="owned-0")],
+                       [dict(event="forecast", request_id="owned-0")]]:
+            with self.subTest(events=events):
+                result = audit_isolation(events, {"owned-0", "owned-1"})
+                self.assertFalse(result["ok"])
+                self.assertIn("owned-1", result["missing_owned_forecasts"])
+
+    def test_receipt_never_includes_request_body_or_log_message(self):
+        result = audit_isolation([dict(event="forecast", request_id="owned"),
+                                  dict(event="forecast", request_id="foreign", body="private-body",
+                                       message="private-message", fields=dict(prompt="private-prompt"))], {"owned"})
+        receipt = json.dumps(result)
+        for text in ["private-body", "private-message", "private-prompt"]:
+            self.assertNotIn(text, receipt)
+
+    def test_owned_set_must_be_explicit_and_nonempty(self):
+        for invalid in ["owned-prefix-", set(), {""}, {None}]:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                audit_isolation([], invalid)
 
 
 if __name__ == "__main__":
