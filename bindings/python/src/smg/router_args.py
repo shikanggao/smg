@@ -270,6 +270,7 @@ class RouterArgs:
     estimated_wait_prompt_size_prior_samples: int = 32
     estimated_wait_fallback_prefill_throughput: float | None = None
     estimated_wait_calibration_shadow: bool = False
+    estimated_wait_provisional_baseline_secs: float | None = None
 
     @staticmethod
     def add_cli_args(
@@ -655,6 +656,12 @@ class RouterArgs:
             type=float,
             default=RouterArgs.estimated_wait_fallback_prefill_throughput,
             help="Cold-start prefill capacity until saturated capacity is learned",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-provisional-baseline-secs",
+            type=float,
+            default=RouterArgs.estimated_wait_provisional_baseline_secs,
+            help="Same-model TTFT baseline for diagnostic calibration; measured baseline takes precedence",
         )
         routing_group.add_argument(
             f"--{prefix}estimated-wait-calibration-shadow",

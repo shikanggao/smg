@@ -4,11 +4,11 @@
 //! watermark before I/O so admissions during a poll survive its publication.
 //!
 //! `--estimated-wait-calibration-shadow` adds diagnostic excess-TTFT learning:
-//! T* = B + g * (T_raw - B), including the raw observed-delay floor in the
-//! scaled term. Each fresh load poll fits g = sum(x*y)/sum(x*x) from the last
+//! T* = B + g * N, where N=(Q+rho*D)/C excludes the observed-delay floor.
+//! Raw admission retains its independent floor-inclusive estimate. Each fresh load poll fits g = sum(x*y)/sum(x*x) from the last
 //! two 300-second banks of up to 32 usable first-text observations each
 //! (minimum 4 combined, otherwise g=1), where x is
-//! saved raw extra delay and y is observed extra delay. Only new feedback
+//! saved queue-only extra delay and y is observed extra delay. Only new feedback
 //! or removal of an old bank triggers a fit. Native-capacity unready/ready
 //! states have separate histories.
 //! The applied scale approaches that MSE target at at most 0.5 absolute
@@ -16,7 +16,9 @@
 //! value, so callback bursts and prior idle time cannot cause scale jumps.
 //! Only admission snapshots with mature native capacity and a visible native
 //! waiting queue train this correction; idle/dispatch-only delay is not queue
-//! calibration evidence. Baseline learning and raw admission are independent.
+//! calibration evidence. A configured same-model provisional baseline may seed
+//! calibration until measured low-load baseline is available; it never changes
+//! raw admission. A material provisional-to-measured shift starts a new epoch.
 //! Regular HTTP OpenAI-compatible SSE carries the admission-time snapshot to
 //! its first nonempty reasoning/content text callback. Metadata, cancellation,
 //! completion, and nonstreaming responses never supply training observations.
@@ -81,6 +83,8 @@ pub struct EstimatedWaitConfig {
     pub estimated_wait_shadow: bool,
     /// Learn excess-TTFT correction for diagnostics only; never changes admission.
     pub estimated_wait_calibration_shadow: bool,
+    /// Same-model deployment baseline for diagnostic calibration until measured.
+    pub estimated_wait_provisional_baseline_secs: Option<f64>,
 }
 
 impl Default for EstimatedWaitConfig {
@@ -96,6 +100,7 @@ impl Default for EstimatedWaitConfig {
             estimated_wait_max_snapshot_age_secs: 30.0,
             estimated_wait_shadow: false,
             estimated_wait_calibration_shadow: false,
+            estimated_wait_provisional_baseline_secs: None,
         }
     }
 }
@@ -108,6 +113,19 @@ impl EstimatedWaitConfig {
                 value: self.estimated_wait_kv_pressure_weight.to_string(),
                 reason: "KV pressure was removed from estimated-wait admission; use zero"
                     .to_string(),
+            });
+        }
+        if self
+            .estimated_wait_provisional_baseline_secs
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "estimated_wait_provisional_baseline_secs".to_owned(),
+                value: self
+                    .estimated_wait_provisional_baseline_secs
+                    .unwrap_or_default()
+                    .to_string(),
+                reason: "Must be a finite same-model baseline > 0; omit when unknown".to_owned(),
             });
         }
         for (field, value, allow_zero) in [
@@ -380,6 +398,11 @@ struct PreparedWait {
 }
 
 impl PreparedWait {
+    /// Queue arithmetic only: no observed floor or visibility adjustment.
+    fn queue_excess_seconds(self, dispatched_tokens: u64) -> f64 {
+        self.native_estimate.token_work(dispatched_tokens) / self.native_prefill_capacity
+    }
+
     fn measured_delay_only(self) -> bool {
         self.fallback && !self.capacity_learned_ready && self.observed_delay_available
     }
@@ -430,6 +453,14 @@ fn invalidate_diagnostic_metrics(worker_url: &str) {
     metrics::gauge!("smg_estimated_wait_baseline_sample_count", "worker" => worker.clone())
         .set(-1.0);
     for name in [
+        "smg_estimated_wait_calibration_epoch",
+        "smg_estimated_wait_calibration_observation_sequence",
+        "smg_estimated_wait_calibration_history_revision",
+        "smg_estimated_wait_calibration_fitted_revision",
+        "smg_estimated_wait_calibration_baseline_seconds",
+        "smg_estimated_wait_calibration_baseline_provisional",
+        "smg_estimated_wait_calibration_baseline_measured",
+        "smg_estimated_wait_calibration_input_excess_seconds",
         "smg_estimated_wait_calibrated_seconds",
         "smg_estimated_wait_calibrated_excess_seconds",
         "smg_estimated_wait_calibration_scale",
@@ -453,7 +484,29 @@ const CALIBRATION_MAX_SCALE_CHANGE_PER_SECOND: f64 = 0.5;
 // from feedback acceptance, subject to the 32-observation per-bank cap.
 const CALIBRATION_HISTORY_MAX_AGE: Duration = Duration::from_secs(600);
 const CALIBRATION_BANK_DURATION: Duration = Duration::from_secs(300);
-const CALIBRATION_METHOD: &str = "mse_poll_two_wave_v1";
+const CALIBRATION_METHOD: &str = "mse_poll_two_wave_queue_v2";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum BaselineSource {
+    #[default]
+    Unknown,
+    Provisional,
+    Measured,
+}
+
+impl BaselineSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Provisional => "provisional",
+            Self::Measured => "measured",
+        }
+    }
+}
+
+fn materially_different_baseline(provisional: f64, measured: f64) -> bool {
+    (measured - provisional).abs() > 0.1_f64.max(0.2 * provisional)
+}
 
 /// Admission-time inputs travel with the request, not with the mutable load sample.
 #[derive(Clone, Debug)]
@@ -463,6 +516,9 @@ pub(crate) struct CalibrationForecast {
     epoch: u64,
     baseline: Option<f64>,
     raw_extra: f64,
+    queue_extra: f64,
+    raw_baseline: Option<f64>,
+    baseline_source: BaselineSource,
     native_capacity_ready: bool,
     native_waiting: f64,
     raw_ready: bool,
@@ -494,15 +550,20 @@ impl CalibrationForecast {
     }
 
     fn extra(&self) -> f64 {
-        self.scale * self.raw_extra
+        self.scale * self.queue_extra
     }
 
     fn seconds(&self) -> f64 {
-        self.baseline.unwrap_or(0.0) + self.extra()
+        self.baseline
+            .map_or(-1.0, |baseline| baseline + self.extra())
     }
 
     fn would_reject(&self) -> bool {
-        self.raw_ready && self.extra().is_finite() && self.extra() >= self.threshold
+        self.fresh
+            && self.native_capacity_ready
+            && self.baseline.is_some()
+            && self.extra().is_finite()
+            && self.extra() >= self.threshold
     }
 }
 
@@ -675,10 +736,10 @@ impl ExcessCalibration {
         if !baseline.is_finite() || baseline < 0.0 || !ttft.is_finite() || ttft <= 0.0 {
             return "invalid_observation";
         }
-        if !forecast.raw_extra.is_finite() || forecast.raw_extra <= 0.0 {
+        if !forecast.queue_extra.is_finite() || forecast.queue_extra <= 0.0 {
             return "nonpositive_extra";
         }
-        let ratio = (ttft - baseline).max(0.0) / forecast.raw_extra;
+        let ratio = (ttft - baseline).max(0.0) / forecast.queue_extra;
         if !ratio.is_finite() {
             return "invalid_ratio";
         }
@@ -692,7 +753,7 @@ impl ExcessCalibration {
         self.bank_started.get_or_insert(now);
         let index = usize::from(forecast.native_capacity_ready);
         let samples = &mut self.samples[index];
-        samples.push_back((ratio, forecast.raw_extra));
+        samples.push_back((ratio, forecast.queue_extra));
         self.accepted[index] += 1;
         self.history_revision[index] += 1;
         if samples.len() - self.previous_count[index] > TTFT_WINDOW_SAMPLES {
@@ -913,6 +974,7 @@ struct Entry {
     calibration_epoch: u64,
     calibration_profile: Option<(bool, Option<u64>)>,
     calibration_empty_polls: u8,
+    calibration_baseline: (Option<f64>, BaselineSource),
 }
 
 impl Entry {
@@ -937,6 +999,7 @@ impl Entry {
             calibration_epoch: 0,
             calibration_profile: None,
             calibration_empty_polls: 0,
+            calibration_baseline: (None, BaselineSource::Unknown),
         }
     }
 
@@ -960,12 +1023,67 @@ impl Entry {
 
     fn reset_calibration(&mut self, now: Instant, reason: &'static str) {
         self.calibration = ExcessCalibration::new(now);
+        self.calibration_baseline = (None, BaselineSource::Unknown);
         self.calibration_generation = Arc::new(());
         self.calibration_epoch = self.calibration_epoch.wrapping_add(1);
         if let Some(worker) = self.source.upgrade() {
             tracing::debug!(target: "smg::estimated_wait::observation",
                 event = "calibration_reset", worker = worker.url(), reason,
                 calibration_epoch = self.calibration_epoch);
+        }
+    }
+
+    fn update_calibration_baseline(&mut self, config: &EstimatedWaitConfig, now: Instant) {
+        if !config.estimated_wait_calibration_shadow {
+            return;
+        }
+        // A failed scrape removes the raw sample, not calibration evidence.
+        // Re-evaluate provenance only when a usable load sample exists.
+        let Some(sample) = self.sample.as_ref() else {
+            return;
+        };
+        let measured = sample.prepared.baseline;
+        let next = if let Some(value) = measured {
+            (Some(value), BaselineSource::Measured)
+        } else if let Some(value) = config.estimated_wait_provisional_baseline_secs {
+            (Some(value), BaselineSource::Provisional)
+        } else {
+            (None, BaselineSource::Unknown)
+        };
+        let previous = self.calibration_baseline;
+        let material_promotion = previous.1 == BaselineSource::Provisional
+            && next.1 == BaselineSource::Measured
+            && previous
+                .0
+                .zip(next.0)
+                .is_some_and(|(old, new)| materially_different_baseline(old, new));
+        let changed_fallback = previous.1 != BaselineSource::Unknown
+            && next.1 != BaselineSource::Measured
+            && previous != next;
+        if material_promotion || changed_fallback {
+            self.reset_calibration(
+                now,
+                if material_promotion {
+                    "baseline_promoted"
+                } else {
+                    "baseline_fallback_changed"
+                },
+            );
+        }
+        self.calibration_baseline = next;
+        if previous != next {
+            if let Some(worker) = self.source.upgrade() {
+                tracing::debug!(target: "smg::estimated_wait::observation",
+                    event = "calibration_baseline", calibration_method = CALIBRATION_METHOD,
+                    worker = worker.url(), calibration_epoch = self.calibration_epoch,
+                    baseline_previous_source = previous.1.as_str(),
+                    baseline_previous_seconds = previous.0.unwrap_or(-1.0),
+                    calibration_baseline_source = next.1.as_str(),
+                    calibration_baseline_seconds = next.0.unwrap_or(-1.0),
+                    calibration_baseline_available = next.0.is_some(),
+                    calibration_baseline_material_promotion = material_promotion,
+                    calibration_time_seconds = self.calibration.time_seconds(now));
+            }
         }
     }
 
@@ -1005,6 +1123,7 @@ impl Entry {
         if !config.estimated_wait_calibration_shadow {
             return None;
         }
+        self.update_calibration_baseline(config, now);
         self.rotate_calibration(now);
         let sample = self.sample.as_ref()?;
         let fresh = now.saturating_duration_since(sample.started).as_secs_f64()
@@ -1016,7 +1135,12 @@ impl Entry {
             generation: Arc::clone(&self.generation),
             calibration_generation: Arc::clone(&self.calibration_generation),
             epoch: self.calibration_epoch,
-            baseline: sample.prepared.baseline,
+            baseline: self.calibration_baseline.0,
+            baseline_source: self.calibration_baseline.1,
+            raw_baseline: sample.prepared.baseline,
+            queue_extra: sample
+                .prepared
+                .queue_excess_seconds(self.total_dispatched.saturating_sub(sample.watermark)),
             raw_extra: sample
                 .prepared
                 .excess_seconds(self.total_dispatched.saturating_sub(sample.watermark)),
@@ -1047,6 +1171,7 @@ impl Entry {
     fn refresh(&mut self, worker: &Arc<dyn Worker>, config: &EstimatedWaitConfig) {
         let now = Instant::now();
         if config.estimated_wait_calibration_shadow {
+            self.update_calibration_baseline(config, now);
             self.rotate_calibration(now);
         }
         if let Some(sample) = &mut self.sample {
@@ -1083,17 +1208,29 @@ impl Entry {
                 let (scale, count) = self
                     .calibration
                     .stats(sample.prepared.capacity_learned_ready, now);
-                let calibrated_extra = scale * excess;
+                let index = usize::from(sample.prepared.capacity_learned_ready);
+                metrics::gauge!("smg_estimated_wait_calibration_epoch", "worker" => worker.url().to_owned()).set(self.calibration_epoch as f64);
+                metrics::gauge!("smg_estimated_wait_calibration_observation_sequence", "worker" => worker.url().to_owned()).set(self.calibration.accepted[index] as f64);
+                metrics::gauge!("smg_estimated_wait_calibration_history_revision", "worker" => worker.url().to_owned()).set(self.calibration.history_revision[index] as f64);
+                metrics::gauge!("smg_estimated_wait_calibration_fitted_revision", "worker" => worker.url().to_owned()).set(self.calibration.fitted_revision[index] as f64);
+                metrics::gauge!("smg_estimated_wait_calibration_baseline_seconds", "worker" => worker.url().to_owned()).set(self.calibration_baseline.0.unwrap_or(-1.0));
+                metrics::gauge!("smg_estimated_wait_calibration_baseline_provisional", "worker" => worker.url().to_owned()).set(u8::from(self.calibration_baseline.1 == BaselineSource::Provisional));
+                metrics::gauge!("smg_estimated_wait_calibration_baseline_measured", "worker" => worker.url().to_owned()).set(u8::from(self.calibration_baseline.1 == BaselineSource::Measured));
+                metrics::gauge!("smg_estimated_wait_calibration_input_excess_seconds", "worker" => worker.url().to_owned()).set(sample.prepared.queue_excess_seconds(self.total_dispatched.saturating_sub(sample.watermark)));
+                let calibrated_extra = scale
+                    * sample.prepared.queue_excess_seconds(
+                        self.total_dispatched.saturating_sub(sample.watermark),
+                    );
                 let fresh = now.saturating_duration_since(sample.started).as_secs_f64()
                     <= config.estimated_wait_max_snapshot_age_secs;
-                metrics::gauge!("smg_estimated_wait_calibrated_seconds", "worker" => worker.url().to_owned()).set(sample.prepared.baseline.unwrap_or(0.0) + calibrated_extra);
+                metrics::gauge!("smg_estimated_wait_calibrated_seconds", "worker" => worker.url().to_owned()).set(self.calibration_baseline.0.map_or(-1.0, |baseline| baseline + calibrated_extra));
                 metrics::gauge!("smg_estimated_wait_calibrated_excess_seconds", "worker" => worker.url().to_owned()).set(calibrated_extra);
                 metrics::gauge!("smg_estimated_wait_calibration_scale", "worker" => worker.url().to_owned()).set(scale);
                 metrics::gauge!("smg_estimated_wait_calibration_target_scale", "worker" => worker.url().to_owned()).set(self.calibration.target(sample.prepared.capacity_learned_ready));
                 metrics::gauge!("smg_estimated_wait_calibration_sample_count", "worker" => worker.url().to_owned()).set(count as f64);
                 metrics::gauge!("smg_estimated_wait_calibration_ready", "worker" => worker.url().to_owned()).set(u8::from(count >= TTFT_MIN_SAMPLES));
                 metrics::gauge!("smg_estimated_wait_calibration_native_capacity_ready", "worker" => worker.url().to_owned()).set(u8::from(sample.prepared.capacity_learned_ready));
-                metrics::gauge!("smg_estimated_wait_calibrated_would_reject", "worker" => worker.url().to_owned()).set(u8::from(fresh && sample.prepared.capacity_ready && calibrated_extra.is_finite() && calibrated_extra >= sample.threshold));
+                metrics::gauge!("smg_estimated_wait_calibrated_would_reject", "worker" => worker.url().to_owned()).set(u8::from(fresh && sample.prepared.capacity_learned_ready && self.calibration_baseline.0.is_some() && calibrated_extra.is_finite() && calibrated_extra >= sample.threshold));
             }
         }
         metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned()).set(
@@ -1185,6 +1322,7 @@ impl EstimatedWaitAdmission {
             .filter(|_| self.config().estimated_wait_calibration_shadow)
         {
             let now = Instant::now();
+            entry.update_calibration_baseline(self.config(), now);
             entry.rotate_calibration(now);
             let before = entry.calibration.stats(forecast.native_capacity_ready, now);
             let target_before = entry.calibration.target(forecast.native_capacity_ready);
@@ -1205,7 +1343,12 @@ impl EstimatedWaitAdmission {
             tracing::debug!(
                 target: "smg::estimated_wait::observation", event = "calibration_feedback",
                 request_id = probe.request_id.as_deref().unwrap_or(""), worker = probe.worker_url,
-                baseline_seconds = forecast.baseline.unwrap_or(0.0), baseline_available = forecast.baseline.is_some(),
+                baseline_seconds = forecast.raw_baseline.unwrap_or(0.0), baseline_available = forecast.raw_baseline.is_some(),
+                calibration_baseline_seconds = forecast.baseline.unwrap_or(-1.0),
+                calibration_baseline_available = forecast.baseline.is_some(),
+                calibration_baseline_source = forecast.baseline_source.as_str(),
+                queue_excess_seconds = forecast.queue_extra,
+                calibration_input_excess_seconds = forecast.queue_extra,
                 raw_excess_seconds = forecast.raw_extra, calibration_state = forecast.state(),
                 ttft_seconds = ttft, reason, admission_scale = forecast.scale,
                 admission_sample_count = forecast.sample_count,
@@ -1627,8 +1770,13 @@ impl AdmissionGuard<'_> {
             calibration_scale = forecast.scale, calibration_sample_count = forecast.sample_count,
             calibration_target_scale = forecast.target_scale, calibration_time_seconds = forecast.time_seconds,
             calibration_ready = forecast.sample_count >= TTFT_MIN_SAMPLES,
-            baseline_seconds = forecast.baseline.unwrap_or(0.0), baseline_available = forecast.baseline.is_some(),
-            predicted_ttft_seconds = forecast.baseline.unwrap_or(0.0) + forecast.raw_extra,
+            baseline_seconds = forecast.raw_baseline.unwrap_or(0.0), baseline_available = forecast.raw_baseline.is_some(),
+                calibration_baseline_seconds = forecast.baseline.unwrap_or(-1.0),
+                calibration_baseline_available = forecast.baseline.is_some(),
+                calibration_baseline_source = forecast.baseline_source.as_str(),
+                queue_excess_seconds = forecast.queue_extra,
+                calibration_input_excess_seconds = forecast.queue_extra,
+            predicted_ttft_seconds = forecast.raw_baseline.unwrap_or(0.0) + forecast.raw_extra,
             predicted_excess_seconds = forecast.raw_extra,
             calibrated_ttft_seconds = forecast.seconds(), calibrated_excess_seconds = forecast.extra(),
             ready = forecast.raw_ready, native_ready = forecast.native_capacity_ready,
@@ -1710,6 +1858,11 @@ impl AdmissionGuard<'_> {
                 native_queue_delay = sample.prepared.native_queue_delay.unwrap_or(-1.0),
                 baseline_available = sample.prepared.baseline.is_some(),
                 calibration_enabled = calibration.is_some(),
+                queue_excess_seconds = sample.prepared.queue_excess_seconds(dispatched),
+                calibration_input_excess_seconds = calibration.as_ref().map_or(-1.0, |forecast| forecast.queue_extra),
+                calibration_baseline_seconds = calibration.as_ref().and_then(|forecast| forecast.baseline).unwrap_or(-1.0),
+                calibration_baseline_available = calibration.as_ref().is_some_and(|forecast| forecast.baseline.is_some()),
+                calibration_baseline_source = calibration.as_ref().map_or("unknown", |forecast| forecast.baseline_source.as_str()),
                 calibration_method = CALIBRATION_METHOD,
                 calibration_fit_sequence = calibration.as_ref().map_or(0, |forecast| forecast.fit_sequence),
                 calibration_bank_index = calibration.as_ref().map_or(0, |forecast| forecast.bank_index),
@@ -2392,11 +2545,11 @@ mod tests {
         assert!((learned.target(true) - 2.0).abs() < 1e-6);
         assert_eq!(learned.stats(true, now), (1.0, 4));
         // A huge ratio from tiny extra delay gets tiny weight, not a huge influence.
-        forecast.raw_extra = 0.000_001;
+        forecast.queue_extra = 0.000_001;
         learned.observe(&forecast, 10.2, now);
         learned.fit_on_poll(true, now);
         assert!((learned.target(true) - 2.0).abs() < 1e-6);
-        forecast.raw_extra = 10.0;
+        forecast.queue_extra = 10.0;
         for _ in 0..TTFT_WINDOW_SAMPLES {
             learned.observe(&forecast, 5.2, now);
         }
@@ -2405,10 +2558,10 @@ mod tests {
         assert_eq!(learned.stats(true, now), (1.0, 32));
         assert_eq!(learned.stats(false, now), (1.0, 0));
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            forecast.raw_extra = bad;
+            forecast.queue_extra = bad;
             assert_eq!(learned.observe(&forecast, 5.0, now), "nonpositive_extra");
         }
-        forecast.raw_extra = 10.0;
+        forecast.queue_extra = 10.0;
         forecast.baseline = None;
         assert_eq!(learned.observe(&forecast, 5.0, now), "baseline_unavailable");
         forecast.baseline = Some(0.2);
@@ -2423,7 +2576,7 @@ mod tests {
     }
 
     #[test]
-    fn excess_calibration_preserves_baseline_and_scales_observed_floor() {
+    fn queue_only_calibration_ignores_floor_while_raw_keeps_it() {
         let (registry, worker) = calibration_registry(true);
         let admission = registry.estimated_wait();
         let mut entries = admission.entries.lock();
@@ -2435,12 +2588,197 @@ mod tests {
             .calibration_forecast(admission.config(), Instant::now())
             .unwrap();
         assert_eq!(forecast.raw_extra, 30.0);
+        assert_eq!(forecast.queue_extra, 10.0);
+        assert_eq!(entry.sample.as_ref().unwrap().prepared.seconds(0), 30.2);
+        let now = Instant::now();
+        let mut calibration = ExcessCalibration::new(now);
+        for _ in 0..4 {
+            assert_eq!(calibration.observe(&forecast, 20.2, now), "accepted");
+        }
+        calibration.fit_on_poll(true, now);
+        assert_eq!(calibration.target(true), 2.0);
         forecast.scale = 0.5;
-        assert_eq!(forecast.seconds(), 15.2);
-        forecast.raw_extra = 0.0;
+        assert_eq!(forecast.seconds(), 5.2);
+        forecast.queue_extra = 0.0;
         forecast.scale = 50.0;
         assert_eq!(forecast.seconds(), 0.2);
         drop(entries);
+    }
+
+    fn provisional_calibration_registry(
+        provisional: Option<f64>,
+    ) -> (Arc<WorkerRegistry>, Arc<dyn Worker>) {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.estimated_wait().configure(EstimatedWaitConfig {
+            estimated_wait_calibration_shadow: true,
+            estimated_wait_provisional_baseline_secs: provisional,
+            ..config()
+        });
+        let worker = worker("http://provisional:1");
+        registry.register(worker.clone()).unwrap();
+        let mut report = load(Some(1_000), 2, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = None;
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        publish_load(registry.estimated_wait(), &worker, &report);
+        (registry, worker)
+    }
+
+    #[test]
+    fn provisional_baseline_bootstraps_fit_without_changing_raw_baseline() {
+        let (registry, worker) = provisional_calibration_registry(Some(2.0));
+        let admission = registry.estimated_wait();
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        let now = Instant::now();
+        let forecast = entry.calibration_forecast(admission.config(), now).unwrap();
+        assert_eq!(forecast.baseline, Some(2.0));
+        assert_eq!(forecast.baseline_source, BaselineSource::Provisional);
+        assert_eq!(forecast.raw_baseline, None);
+        assert_eq!(forecast.seconds(), 12.0);
+        for _ in 0..4 {
+            assert_eq!(entry.calibration.observe(&forecast, 22.0, now), "accepted");
+        }
+        entry.calibration.fit_on_poll(true, now);
+        assert_eq!(entry.calibration.target(true), 2.0);
+        assert_eq!(entry.sample.as_ref().unwrap().prepared.baseline, None);
+        assert_eq!(entry.sample.as_ref().unwrap().prepared.seconds(0), 10.0);
+        assert!(entry.sample.as_ref().unwrap().prepared.capacity_ready);
+    }
+
+    #[test]
+    fn unknown_baseline_never_becomes_zero_calibration_baseline() {
+        let (registry, worker) = provisional_calibration_registry(None);
+        let mut forecast = registry
+            .estimated_wait()
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        assert_eq!(forecast.baseline_source, BaselineSource::Unknown);
+        assert_eq!(forecast.baseline, None);
+        assert_eq!(forecast.seconds(), -1.0);
+        forecast.threshold = 0.01;
+        assert!(!forecast.would_reject());
+        let now = Instant::now();
+        assert_eq!(
+            ExcessCalibration::new(now).observe(&forecast, 20.0, now),
+            "baseline_unavailable"
+        );
+    }
+
+    #[test]
+    fn measured_baseline_needs_four_observations_and_material_promotion_isolates_feedback() {
+        let (registry, worker) = provisional_calibration_registry(Some(2.0));
+        let admission = registry.estimated_wait();
+        let old_probe = calibration_probe(admission, &worker);
+        let saved = old_probe.calibration.as_ref().unwrap().clone();
+        {
+            let mut entries = admission.entries.lock();
+            let entry = entries.get_mut(worker.url()).unwrap();
+            let now = Instant::now();
+            for _ in 0..4 {
+                entry.calibration.observe(&saved, 22.0, now);
+            }
+            entry.calibration.fit_on_poll(true, now);
+            for _ in 0..3 {
+                push_ttft_sample(&mut entry.low_load_ttfts, 3.0);
+            }
+            EstimatedWaitAdmission::apply_observations(entry);
+            let before = entry.calibration_forecast(admission.config(), now).unwrap();
+            assert_eq!(before.baseline_source, BaselineSource::Provisional);
+            assert_eq!(before.epoch, saved.epoch);
+            push_ttft_sample(&mut entry.low_load_ttfts, 3.0);
+            EstimatedWaitAdmission::apply_observations(entry);
+            let after = entry.calibration_forecast(admission.config(), now).unwrap();
+            assert_eq!(after.baseline, Some(3.0));
+            assert_eq!(after.baseline_source, BaselineSource::Measured);
+            assert_eq!(after.epoch, saved.epoch + 1);
+            assert_eq!((after.scale, after.sample_count), (1.0, 0));
+            assert!(!Arc::ptr_eq(
+                &after.calibration_generation,
+                &saved.calibration_generation
+            ));
+            assert_eq!(saved.baseline, Some(2.0));
+            // Re-reading the new baseline must not repeatedly reset.
+            assert_eq!(
+                entry
+                    .calibration_forecast(admission.config(), now)
+                    .unwrap()
+                    .epoch,
+                after.epoch
+            );
+        }
+        admission.observe_ttft(old_probe, 22.0, 0.0);
+        assert_eq!(
+            admission.entries.lock()[worker.url()].calibration.accepted[1],
+            0
+        );
+    }
+
+    #[test]
+    fn small_baseline_promotion_keeps_history_and_saved_baseline() {
+        let (registry, worker) = provisional_calibration_registry(Some(2.0));
+        let admission = registry.estimated_wait();
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        let now = Instant::now();
+        let saved = entry.calibration_forecast(admission.config(), now).unwrap();
+        for _ in 0..4 {
+            entry.calibration.observe(&saved, 22.0, now);
+        }
+        entry.sample.as_mut().unwrap().prepared.baseline = Some(2.25);
+        let promoted = entry.calibration_forecast(admission.config(), now).unwrap();
+        assert_eq!(promoted.baseline_source, BaselineSource::Measured);
+        assert_eq!(promoted.baseline, Some(2.25));
+        assert_eq!(promoted.epoch, saved.epoch);
+        assert_eq!(promoted.sample_count, 4);
+        assert_eq!(saved.baseline, Some(2.0));
+        assert_eq!(entry.calibration.observe(&saved, 22.0, now), "accepted");
+        assert_eq!(entry.calibration.samples[1].back(), Some(&(2.0, 10.0)));
+    }
+
+    #[test]
+    fn provisional_baseline_validation_and_material_change_boundaries() {
+        assert!(!materially_different_baseline(5.0, 6.0));
+        assert!(materially_different_baseline(5.0, 6.000_001));
+        assert!(!materially_different_baseline(5.0, 4.0));
+        assert!(materially_different_baseline(5.0, 3.999_999));
+        assert!(!materially_different_baseline(0.1, 0.2));
+        assert!(materially_different_baseline(0.1, 0.200_001));
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(EstimatedWaitConfig {
+                estimated_wait_provisional_baseline_secs: Some(invalid),
+                ..config()
+            }
+            .validate()
+            .is_err());
+        }
+        assert!(EstimatedWaitConfig {
+            estimated_wait_provisional_baseline_secs: Some(0.2),
+            ..config()
+        }
+        .validate()
+        .is_ok());
+        assert_eq!(
+            EstimatedWaitConfig::default().estimated_wait_provisional_baseline_secs,
+            None
+        );
+    }
+
+    #[test]
+    fn calibrated_verdict_never_uses_floor_promoted_native_readiness() {
+        let (registry, worker) = calibration_registry(false);
+        let mut entries = registry.estimated_wait().entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        entry.sample.as_mut().unwrap().prepared.capacity_ready = true;
+        let mut forecast = entry
+            .calibration_forecast(registry.estimated_wait().config(), Instant::now())
+            .unwrap();
+        forecast.threshold = 0.01;
+        assert!(forecast.raw_ready);
+        assert!(!forecast.native_capacity_ready);
+        assert!(!forecast.would_reject());
     }
 
     #[test]

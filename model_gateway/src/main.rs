@@ -312,6 +312,11 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     estimated_wait_calibration_shadow: bool,
 
+    /// Same-model representative TTFT baseline for diagnostic calibration startup.
+    /// Omit when unknown; measured low-load baseline takes precedence.
+    #[arg(long, help_heading = "Routing Policy")]
+    estimated_wait_provisional_baseline_secs: Option<f64>,
+
     /// Deprecated compatibility option; only zero is accepted. Admission has no KV term.
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     estimated_wait_kv_pressure_weight: f64,
@@ -1911,6 +1916,8 @@ impl CliArgs {
                 max_estimated_wait_secs: self.max_estimated_wait_secs,
                 estimated_wait_shadow: self.estimated_wait_shadow,
                 estimated_wait_calibration_shadow: self.estimated_wait_calibration_shadow,
+                estimated_wait_provisional_baseline_secs: self
+                    .estimated_wait_provisional_baseline_secs,
                 estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
                 estimated_wait_dispatch_blocking_factor: self
                     .estimated_wait_dispatch_blocking_factor,
@@ -2635,12 +2642,26 @@ mod tests {
     /// into `ServerConfig.router_config` — the consumer (load monitor) reads
     /// them off `RouterConfig`. Two-path config-plumbing guard.
     #[test]
+    fn estimated_wait_provisional_baseline_rejects_invalid_cli_values() {
+        for value in ["0", "-1", "NaN", "inf"] {
+            let argument = format!("--estimated-wait-provisional-baseline-secs={value}");
+            let cli = cli_args_from(&[argument.as_str()]);
+            assert!(
+                cli.to_router_config(vec![], vec![]).is_err(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
     fn estimated_wait_options_flow_into_server_config() {
         let cli = cli_args_from(&[
             "--max-estimated-wait-secs",
             "12",
             "--estimated-wait-shadow",
             "--estimated-wait-calibration-shadow",
+            "--estimated-wait-provisional-baseline-secs",
+            "0.25",
             "--estimated-wait-queue-tokens-per-request",
             "2048",
             "--estimated-wait-fallback-prefill-throughput",
@@ -2662,6 +2683,11 @@ mod tests {
         assert_eq!(config.max_estimated_wait_secs, Some(12.0));
         assert!(config.estimated_wait_shadow);
         assert!(config.estimated_wait_calibration_shadow);
+        assert_eq!(config.estimated_wait_provisional_baseline_secs, Some(0.25));
+        assert_eq!(
+            cli_args_from(&[]).estimated_wait_provisional_baseline_secs,
+            None
+        );
         assert!(!cli_args_from(&[]).estimated_wait_calibration_shadow);
         assert!(!cli_args_from(&[]).estimated_wait_shadow);
         assert_eq!(config.estimated_wait_queue_tokens_per_request, 2048);

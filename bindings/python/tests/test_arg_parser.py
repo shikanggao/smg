@@ -667,6 +667,8 @@ class TestParseRouterArgs:
                 [
                     f"--{prefix}estimated-wait-shadow",
                     f"--{prefix}estimated-wait-calibration-shadow",
+                    f"--{prefix}estimated-wait-provisional-baseline-secs",
+                    "0.25",
                     f"--{prefix}max-estimated-wait-secs",
                     "12",
                     f"--{prefix}estimated-wait-queue-tokens-per-request",
@@ -691,6 +693,7 @@ class TestParseRouterArgs:
             assert args.max_estimated_wait_secs == 12.0
             assert args.estimated_wait_shadow is True
             assert args.estimated_wait_calibration_shadow is True
+            assert args.estimated_wait_provisional_baseline_secs == 0.25
             assert args.estimated_wait_queue_tokens_per_request == 2048
             assert args.estimated_wait_default_throughput == 500.0
             assert args.estimated_wait_fallback_prefill_throughput == 450.0
@@ -702,6 +705,7 @@ class TestParseRouterArgs:
         assert RouterArgs().max_estimated_wait_secs is None
         assert RouterArgs().estimated_wait_shadow is False
         assert RouterArgs().estimated_wait_calibration_shadow is False
+        assert RouterArgs().estimated_wait_provisional_baseline_secs is None
         assert RouterArgs().estimated_wait_queue_tokens_per_request == 0
         assert RouterArgs().estimated_wait_dispatch_blocking_factor == 0.05
         assert RouterArgs().estimated_wait_kv_pressure_weight == 0.0
@@ -1539,6 +1543,7 @@ class TestRouterArgsFieldOrder:
         "estimated_wait_prompt_size_prior_samples",
         "estimated_wait_fallback_prefill_throughput",
         "estimated_wait_calibration_shadow",
+        "estimated_wait_provisional_baseline_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):

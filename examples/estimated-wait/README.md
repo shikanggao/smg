@@ -36,6 +36,7 @@ builder's `estimated_wait(EstimatedWaitConfig)` method.
 | `--max-estimated-wait-secs` | unset | Gateway wait budget; disabled unless a worker sets its own |
 | `--estimated-wait-shadow` | false | Record would-reject decisions and continue routing |
 | `--estimated-wait-calibration-shadow` | false | Experimental multiplicative TTFT diagnostics only; never affects admission |
+| `--estimated-wait-provisional-baseline-secs` | unset | Positive, finite same-model representative baseline for calibration startup only; measured baseline takes precedence |
 | `--estimated-wait-queue-tokens-per-request` | 0 | Explicit waiting-request proxy; 0 disables it |
 | `--estimated-wait-fallback-prefill-throughput` | 2000 | Cold-start prefill capacity until a qualified value is learned; `--estimated-wait-min-prefill-throughput` and `--estimated-wait-default-throughput` remain aliases |
 | `--estimated-wait-prompt-size-prior-samples` | 32 | Effective sample count assigned to the configured prompt-size prior |
@@ -100,11 +101,35 @@ remains shadow-only. Eligible first-text callbacks populate two 300-second banks
 each retaining at most 32 observations (64 combined). The first accepted feedback
 starts the bank clock; membership uses feedback acceptance time, not admission time.
 Each fresh, distinct load poll fits `g = sum(x*y) / sum(x*x)` when feedback arrives
-or rotation removes observations, using saved raw extra delay `x` and observed
+or rotation removes observations, using saved queue-only extra delay `x=(Q+rho*D)/C` and observed
 extra delay `y = max(TTFT - saved_baseline, 0)`. Four combined observations are
-required. Failed/stale/duplicate polls do not fit. The applied scale approaches
+required. The calibrated prediction is `B_cal + g*x`; the observed-delay floor
+and legacy visibility diagnostics are excluded from both training input and
+prediction. The raw floor-inclusive path remains the admission comparator.
+Failed/stale/duplicate polls do not fit. The applied scale approaches
 the target at at most **0.5 absolute units per second**, independent of polling
 frequency; retargeting starts from the current applied value without idle credit.
+
+For startup under an already busy workload, explicitly supply a representative
+same-model, same-deployment baseline using `--estimated-wait-provisional-baseline-secs`.
+There is no universal default and no zero substitution for an unknown baseline.
+This provisional value affects calibration only: raw baseline availability,
+observed-delay floor and readiness are unchanged. Calibrated total TTFT is
+unavailable (`-1` in telemetry) when neither baseline is available. Calibrated
+would-reject diagnostics require fresh native-capacity readiness and a baseline;
+a floor-promoted raw readiness signal cannot enable them.
+
+The measured baseline takes precedence once the existing low-load learner has
+four eligible observations (local first-text samples or qualified native monitor
+intervals). Every admission saves its baseline value and source (`unknown`,
+`provisional`, or `measured`). A provisional-to-measured change is material when
+`abs(measured-provisional) > max(0.1 seconds, 0.2*provisional)`. Material promotion
+starts a new calibration epoch and discards old-generation feedback; smaller
+changes keep history and use each observation's immutable saved baseline. These
+thresholds are explicit initial engineering choices, not measured accuracy bounds.
+The configured value is immutable after startup; removing/changing an effective
+fallback also resets learning if that situation arises. No baseline is fitted
+jointly with gain from the same busy-queue feedback.
 
 At 300 seconds the first bank becomes the previous bank and a new current bank
 starts. At 600 seconds discard the first bank, retain feedback accepted during
@@ -125,12 +150,23 @@ or nonempty poll breaks drain confirmation. Worker invalidation and detected nat
 capacity profile changes also reset the generation and reject prior-generation
 feedback. Raw admission, capacity, baseline and observed-delay floor are unaffected.
 
-Logs identify this algorithm as `mse_poll_two_wave_v1`. `calibration_rotation`
+Logs identify this algorithm as `mse_poll_two_wave_queue_v2`. `calibration_rotation`
 records bank index, previous/current counts, history revision, and before/after
 gain. Forecasts save history and fitted revisions because a removal-only poll fit
 can reuse the accepted-observation sequence. The method is distinct from historical
-`mse_poll` (32 observations, absolute 600-second epoch, 0.1/s gain movement); older
+`mse_poll` (32 observations, absolute 600-second epoch, 0.1/s gain movement) and
+`mse_poll_two_wave_v1` (two banks, floor-inclusive input); older
 analyzers must reject the new method rather than silently replay it as the old one.
+`queue_excess_seconds` and `calibration_input_excess_seconds` record the queue-only
+input; `calibration_baseline_seconds/source/available` describe its baseline.
+Existing `baseline_seconds/available` and raw prediction fields retain their raw
+meaning, including a missing raw baseline when only the calibration seed is known.
+The baseline, epoch, accepted-observation sequence, history/fitted revisions and
+input excess also have `smg_estimated_wait_calibration_*` gauges. Baseline-source
+gauges `baseline_provisional` and `baseline_measured` are one-hot; both zero mean
+unknown. `calibration_baseline` events record promotions; `calibration_reset`
+identifies `baseline_promoted`, `baseline_fallback_changed`, and existing lifecycle
+or `queue_drained` resets for audit and test isolation.
 
 Admission discounts newly dispatched work and does not read KV usage in its
 wait calculation. The retired KV-weight option accepts only zero for old
