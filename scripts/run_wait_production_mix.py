@@ -65,6 +65,7 @@ def validate(profile, smoke=False):
             assert not profile["phases"][0].get("drain_before"), "Busy startup must not silently force a quiet drain"
         horizon = profile["observation_horizon_seconds"]
         assert math.isfinite(horizon) and profile["deadline_seconds"] < horizon <= (1 if smoke else 600)
+        assert profile.get("ttft_stream_policy", "abort_after_first_text") in {"abort_after_first_text", "complete_bounded_response"}
         readiness = profile["readiness"]
         assert readiness["timeout_seconds"] > 0 and readiness["timeout_seconds"] <= 300
         assert readiness["before_phase"] in {p["name"] for p in profile["phases"]}
@@ -237,6 +238,7 @@ class Run:
         self.event_offset, self.event_pending = 0, b""
         self.initial_native_idle = False
         self.initial_native_busy = False
+        self.initial_engine_prometheus = None
         self.readiness = None
         if profile.get("measurement_target") == "ttft":
             try:
@@ -268,6 +270,8 @@ class Run:
                         text = await response.text()
                     row[kind + "_prometheus"] = text
                     if kind == "engine":
+                        if self.initial_engine_prometheus is None:
+                            self.initial_engine_prometheus = text
                         row.update(native_metrics(text, self.args.engine))
                     else:
                         for key, name in [("raw_ttft", "smg_estimated_wait_seconds"),
@@ -308,7 +312,8 @@ class Run:
         ttft_only = self.profile.get("measurement_target") == "ttft"
         horizon = self.profile.get("observation_horizon_seconds", self.profile["deadline_seconds"])
         if ttft_only:
-            row.update(measurement_target="ttft", observation_horizon_seconds=horizon, intentional_stream_abort=False)
+            row.update(measurement_target="ttft", observation_horizon_seconds=horizon, intentional_stream_abort=False,
+                       ttft_stream_policy=self.profile.get("ttft_stream_policy", "abort_after_first_text"))
         capture = self.profile.get("capture_content_chars", 0)
         if capture:
             row.update(content_preview="", content_characters=0)
@@ -355,7 +360,8 @@ class Run:
                         async for chunk in response.content.iter_any():
                             for data in frames.feed(chunk):
                                 consume(data)
-                            if ttft_only and row["client_ttft_seconds"] is not None:
+                            if (ttft_only and row["ttft_stream_policy"] == "abort_after_first_text"
+                                    and row["client_ttft_seconds"] is not None):
                                 row["intentional_stream_abort"] = not (row["done_seen"] and row["finish_reason"] is not None)
                                 break
                         if not row.get("intentional_stream_abort"):
@@ -411,6 +417,21 @@ class Run:
                 and sample.get("calibration_sample_count", 0) >= 4
                 and any(w["epoch"] == sample.get("calibration_epoch") for w in proof["workers"]))
             proof["ready"] = proof["ready"] and proof["fresh_native_metrics"]
+            if self.profile["readiness"].get("require_native_completion_stats"):
+                try:
+                    from .wait_ttft_readiness import native_completion_stats_proof
+                except ImportError:
+                    try:
+                        from wait_ttft_readiness import native_completion_stats_proof
+                    except ModuleNotFoundError:
+                        from scripts.wait_ttft_readiness import native_completion_stats_proof
+                stats = native_completion_stats_proof(self.initial_engine_prometheus or "",
+                    sample.get("engine_prometheus", ""), self.args.engine)
+                stats["completed_owned_responses"] = sum(r.get("complete") is True for r in self.rows)
+                stats["minimum_completed_owned_responses"] = 4
+                stats["ok"] = stats["ok"] and stats["completed_owned_responses"] >= 4
+                proof["native_completion_stats"] = stats
+                proof["ready"] = proof["ready"] and stats["ok"]
             proof["elapsed_seconds"] = now
             save(self.args.output / "readiness.json", proof)
             if proof["ready"]:

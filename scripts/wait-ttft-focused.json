@@ -133,7 +133,7 @@
     },
     {
       "name": "recovery",
-      "seconds": 180,
+      "seconds": 720,
       "rps": 0.1,
       "arrivals": "periodic",
       "balanced_controls": true,
@@ -145,16 +145,19 @@
   "observation_horizon_seconds": 420,
   "readiness": {
     "before_phase": "ramp-low",
-    "timeout_seconds": 180
+    "timeout_seconds": 180,
+    "require_native_completion_stats": true
   },
   "capture_content_chars": 0,
-  "cache_namespace": "queueonly-focused-20261019",
+  "cache_namespace": "queuecomplete-focused-20261019",
   "interpretation": {
     "primary_target": "Observed or truthfully censored TTFT>=300s; no full-completion FP/FN substitution.",
-    "stream": "Abort after first content or reasoning text; maximum32generationtokens, horizon420s.",
+    "stream": "Allow capped32-token responses to finish normally; scoreTTFTonly, bounded420s wallclockobservation. Cancellation occurs only atobservationhorizon or genuineinterrupt.",
     "history": "New owned router plus initial nativeidle and emptycalibrationhistory, thenmandatorycurrentepochfouraccepted+actualfit readiness.",
     "workload": "Long-prefill ramp; changed from previous longdecode tests. No historical causal comparison.",
     "baseline_seed": "Prior to each focused main case, run representative sequential seed profile; configure medianSMGfirsttext with frozen raw/model/runtime provenance.",
-    "template_labels": "Cohort names are prompttemplate keys. All main inputs are standardized longprefill16\u201332kwords with32outputtokens; labels do not imply actualshortchat/longdecode or representativeproductionmix. No answerquality claim."
-  }
+    "template_labels": "Cohort names are prompttemplate keys. All main inputs are standardized longprefill16\u201332kwords with32outputtokens; labels do not imply actualshortchat/longdecode or representativeproductionmix. No answerquality claim.",
+    "recovery": "Undrained720s lowrate probes continue beyond420s delayedfeedback horizon and gain adjustment; no convergence guarantee and no finalforceddrain before probes."
+  },
+  "ttft_stream_policy": "complete_bounded_response"
 }

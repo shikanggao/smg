@@ -208,7 +208,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(.2)
             return response
         index = int(request.headers["opc-request-id"].rsplit("-", 1)[1])
-        mode = index % 4 if self.mode == "mixed" else 1 if self.mode in {"slow", "late-first-text"} else 0
+        mode = index % 4 if self.mode == "mixed" else 1 if self.mode in {"slow", "late-first-text"} else 2 if self.mode == "early-text-stalled-generation" else 0
         if mode == 3:
             return self.web.Response(status=503, text="estimated wait budgets exceeded")
         self.active += 1
@@ -287,9 +287,10 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row["content_preview"], "ans")
             self.assertEqual(row["content_characters"], len("answer"))
 
-    async def ttft_request(self, horizon=.3):
+    async def ttft_request(self, horizon=.3, stream_policy="abort_after_first_text"):
         import aiohttp
         profile = dict(smoke_profile(), measurement_target="ttft", observation_horizon_seconds=horizon,
+                       ttft_stream_policy=stream_policy,
                        readiness=dict(before_phase="pressure", timeout_seconds=.05))
         output = self.root / "ttft-request"
         output.mkdir()
@@ -313,6 +314,36 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["completion_late"])
         self.assertFalse(row["first_text_late"])
         self.assertIsNotNone(row["client_ttft_seconds"])
+
+    async def test_ttft_normal_completion_keeps_usage_done_and_first_text(self):
+        self.mode = "normal"
+        row = await self.ttft_request(stream_policy="complete_bounded_response")
+        self.assertTrue(row["complete"])
+        self.assertTrue(row["done_seen"])
+        self.assertEqual(row["finish_reason"], "stop")
+        self.assertEqual(row["usage"], dict(prompt_tokens=100, completion_tokens=8))
+        self.assertFalse(row["intentional_stream_abort"])
+        self.assertFalse(row["first_text_late"])
+        self.assertLess(row["client_ttft_seconds"], row["e2e_seconds"])
+        self.assertIsNone(row["error"])
+
+    async def test_ttft_normal_completion_retains_numeric_late_first_text(self):
+        self.mode = "late-first-text"
+        row = await self.ttft_request(horizon=.4, stream_policy="complete_bounded_response")
+        self.assertTrue(row["complete"])
+        self.assertTrue(row["first_text_late"])
+        self.assertGreater(row["client_ttft_seconds"], .07)
+        self.assertFalse(row["intentional_stream_abort"])
+
+    async def test_ttft_generation_timeout_after_first_text_is_numeric_on_time(self):
+        self.mode = "early-text-stalled-generation"
+        row = await self.ttft_request(horizon=.1, stream_policy="complete_bounded_response")
+        self.assertTrue(row["timed_out"])
+        self.assertIsNotNone(row["client_ttft_seconds"])
+        self.assertFalse(row["first_text_late"])
+        self.assertFalse(row["intentional_stream_abort"])
+        self.assertFalse(row["complete"])
+        self.assertIsNone(row["completion_late"])
 
     async def test_ttft_horizon_observes_numeric_late_first_text(self):
         self.mode = "late-first-text"
@@ -419,6 +450,37 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.posts, 0)
         workload.stream.close()
         workload.metrics_stream.close()
+
+    async def test_native_stats_gate_blocks_unchanged_counters_then_accepts_completions(self):
+        profile = dict(smoke_profile(), measurement_target="ttft", observation_horizon_seconds=.3,
+            readiness=dict(before_phase="pressure", timeout_seconds=.02, require_native_completion_stats=True))
+        output = self.root / "native-stats-gate"
+        output.mkdir()
+        events = self.root / "native-stats-events.jsonl"
+        events.touch()
+        workload = p.Run(argparse.Namespace(output=output, run_id="stats", router_events=events, engine="vllm"), profile)
+        workload.initial_native_idle = True
+        workload.readiness.snapshot = lambda *unused: dict(ready=True, workers=[dict(epoch=1)], errors=[])
+        counters = ["request_prompt_tokens_count", "request_prompt_tokens_sum", "request_prefill_kv_computed_tokens_count",
+                    "request_prefill_kv_computed_tokens_sum", "e2e_request_latency_seconds_count"]
+        workload.initial_engine_prometheus = "".join("vllm:" + n + " 100\n" for n in counters)
+        workload.rows = [dict(complete=True) for _ in range(4)]
+        workload.latest = dict(sample_completed_elapsed_seconds=0, data_usable=1,
+            calibration_native_capacity_ready=1, calibration_sample_count=4, calibration_epoch=1,
+            engine_prometheus=workload.initial_engine_prometheus)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "Readiness failed"):
+                await workload.require_readiness()
+            proof = json.loads((output / "readiness.json").read_text())
+            self.assertFalse(proof["native_completion_stats"]["ok"])
+            self.assertEqual(self.posts, 0)
+            workload.latest.update(engine_prometheus="".join("vllm:" + n + " 200\n" for n in counters),
+                sample_completed_elapsed_seconds=p.time.monotonic()-workload.started)
+            await workload.require_readiness()
+            self.assertTrue(json.loads((output / "readiness.json").read_text())["ready"])
+        finally:
+            workload.stream.close()
+            workload.metrics_stream.close()
 
     async def test_live_event_readiness_passes_only_after_current_fit_and_fresh_metrics(self):
         profile = dict(smoke_profile(), measurement_target="ttft", observation_horizon_seconds=.3,

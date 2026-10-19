@@ -2,11 +2,99 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
+import re
 from collections import Counter
 
 
 METHOD = "mse_poll_two_wave_queue_v2"
 ISOLATION_REQUEST_EVENTS = frozenset({"forecast", "calibration_forecast", "calibration_feedback", "first_text"})
+
+
+def native_completion_stats_proof(initial_text, current_text, backend):
+    """Prove required native completion counters advanced on the same series.
+
+    This proves updates, not correctness of the counters or their averages.
+    Label values are hashed so receipts contain no raw scrape labels or text.
+    """
+    if backend == "vllm":
+        required = ["vllm:request_prompt_tokens_count", "vllm:request_prompt_tokens_sum",
+                    "vllm:request_prefill_kv_computed_tokens_count", "vllm:request_prefill_kv_computed_tokens_sum",
+                    "vllm:e2e_request_latency_seconds_count"]
+        names = {name: name for name in required}
+    elif backend == "sglang":
+        required = ["sglang:prompt_tokens_total", "sglang:e2e_request_latency_seconds_count"]
+        names = {alias: name for name in required for alias in [name, name.replace(":", "_")]}
+    else:
+        raise ValueError("Expected vllm or sglang backend")
+    sample = re.compile(r"([^\s{]+)(\{.*\})?\s+(\S+)(?:\s+\S+)?")
+    label = re.compile(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*("(?:\\.|[^"\\])*")\s*(?:,|$)')
+
+    def parse(text):
+        values, errors = {}, []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            name = re.split(r"[\s{]", line, maxsplit=1)[0]
+            if name not in names:
+                continue
+            match = sample.fullmatch(line)
+            labels, position = {}, 0
+            try:
+                if match is None:
+                    raise ValueError
+                raw_labels = (match[2] or "{}")[1:-1]
+                while position < len(raw_labels):
+                    item = label.match(raw_labels, position)
+                    if item is None or item[1] in labels:
+                        raise ValueError
+                    labels[item[1]] = json.loads(item[2])
+                    position = item.end()
+                labels_hash = hashlib.sha256(json.dumps(labels, sort_keys=True,
+                    separators=(",", ":")).encode()).hexdigest()
+                key = (name, labels_hash)
+                if key in values:
+                    raise ValueError
+                value = float(match[3])
+                values[key] = value if math.isfinite(value) and value >= 0 else None
+            except (ValueError, TypeError):
+                errors.append(f"Malformed or duplicate required metric sample: {name}")
+        return values, errors
+
+    before, initial_errors = parse(initial_text)
+    after, current_errors = parse(current_text)
+    reasons = [f"Initial scrape: {error}" for error in initial_errors]
+    reasons += [f"Current scrape: {error}" for error in current_errors]
+    for name in required:
+        for when, values in [("initial", before), ("current", after)]:
+            if not any(names[metric] == name for metric, _ in values):
+                reasons.append(f"Missing required metric in {when} scrape: {name}")
+    series = []
+    for metric, labels_hash in sorted(before.keys() | after.keys()):
+        key = (metric, labels_hash)
+        old, new = before.get(key), after.get(key)
+        issues, delta = [], None
+        if key not in before or key not in after:
+            issues.append("Series is not present in both scrapes")
+        elif old is None or new is None:
+            issues.append("Counter is not finite and nonnegative")
+        else:
+            delta = new - old
+            if not math.isfinite(delta):
+                delta = None
+                issues.append("Counter delta is not finite")
+            elif delta < 0:
+                issues.append("Counter reset or decreased")
+            elif delta == 0:
+                issues.append("Counter did not advance")
+        series.append(dict(metric=metric, labels_sha256=labels_hash, before=old, after=new,
+                           delta=delta, reasons=issues))
+    if any(row["reasons"] for row in series):
+        reasons.append("Required native completion counter series did not all advance")
+    return dict(ok=not reasons, backend=backend, required_metrics=required, series=series,
+                reasons=reasons)
 
 
 def audit_isolation(events, owned_request_ids):

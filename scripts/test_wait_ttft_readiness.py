@@ -4,9 +4,86 @@ import json
 import unittest
 
 try:
-    from scripts.wait_ttft_readiness import METHOD, Readiness, audit_isolation
+    from scripts.wait_ttft_readiness import METHOD, Readiness, audit_isolation, native_completion_stats_proof
 except ModuleNotFoundError:
-    from wait_ttft_readiness import METHOD, Readiness, audit_isolation
+    from wait_ttft_readiness import METHOD, Readiness, audit_isolation, native_completion_stats_proof
+
+
+class NativeCompletionStatsTests(unittest.TestCase):
+    VLLM = ["vllm:request_prompt_tokens_count", "vllm:request_prompt_tokens_sum",
+            "vllm:request_prefill_kv_computed_tokens_count", "vllm:request_prefill_kv_computed_tokens_sum",
+            "vllm:e2e_request_latency_seconds_count"]
+    SGLANG = ["sglang:prompt_tokens_total", "sglang:e2e_request_latency_seconds_count"]
+
+    def scrape(self, names, value, labels='model_name="test-model",engine="0"'):
+        return "\n".join(f"{name}{{{labels}}} {value}" for name in names)
+
+    def test_positive_delta_for_each_backend_and_native_sglang_alias(self):
+        for backend, names in [("vllm", self.VLLM), ("sglang", self.SGLANG),
+                               ("sglang", [name.replace(":", "_") for name in self.SGLANG])]:
+            with self.subTest(backend=backend, names=names):
+                proof = native_completion_stats_proof(self.scrape(names, 10), self.scrape(names, 12), backend)
+                self.assertTrue(proof["ok"], proof)
+                self.assertEqual(len(proof["series"]), len(names))
+                self.assertTrue(all(row["before"] == 10 and row["after"] == 12 and row["delta"] == 2
+                                    for row in proof["series"]))
+
+    def test_unchanged_vllm_completion_stats_fail(self):
+        initial = self.scrape(self.VLLM, 123131)
+        proof = native_completion_stats_proof(initial, initial, "vllm")
+        self.assertFalse(proof["ok"])
+        self.assertTrue(all(row["delta"] == 0 and "Counter did not advance" in row["reasons"]
+                            for row in proof["series"]))
+
+    def test_prompt_and_e2e_advance_cannot_hide_frozen_consumed_prefill_histogram(self):
+        current = "\n".join(self.scrape([name], 10 if "prefill_kv" in name else 12) for name in self.VLLM)
+        proof = native_completion_stats_proof(self.scrape(self.VLLM, 10), current, "vllm")
+        self.assertFalse(proof["ok"])
+        frozen = [row["metric"] for row in proof["series"] if row["reasons"]]
+        self.assertEqual(set(frozen), {name for name in self.VLLM if "prefill_kv" in name})
+
+    def test_reset_is_not_hidden_by_other_series_growth(self):
+        initial = self.scrape(self.SGLANG, 10) + "\n" + self.scrape(self.SGLANG, 10, 'engine="1"')
+        current = self.scrape(self.SGLANG, 9) + "\n" + self.scrape(self.SGLANG, 100, 'engine="1"')
+        proof = native_completion_stats_proof(initial, current, "sglang")
+        self.assertFalse(proof["ok"])
+        self.assertEqual(sum("Counter reset or decreased" in row["reasons"] for row in proof["series"]), 2)
+
+    def test_missing_or_new_unmatched_series_fail_closed(self):
+        initial = self.scrape(self.VLLM, 10)
+        for current in [self.scrape(self.VLLM[:-1], 12),
+                        self.scrape(self.VLLM, 12, 'model_name="other-model",engine="0"'),
+                        self.scrape(self.VLLM, 12) + "\n" + self.scrape(self.VLLM, 1, 'engine="new"')]:
+            with self.subTest(current=current):
+                proof = native_completion_stats_proof(initial, current, "vllm")
+                self.assertFalse(proof["ok"])
+                self.assertTrue(any("Series is not present in both scrapes" in row["reasons"]
+                                    for row in proof["series"]))
+        self.assertFalse(native_completion_stats_proof("", "", "vllm")["ok"])
+
+    def test_nonfinite_negative_or_malformed_required_samples_fail(self):
+        for value in ["NaN", "+Inf", "-1", "invalid"]:
+            with self.subTest(value=value):
+                proof = native_completion_stats_proof(self.scrape(self.SGLANG, 10),
+                                                       self.scrape(self.SGLANG, value), "sglang")
+                self.assertFalse(proof["ok"])
+                json.dumps(proof, allow_nan=False)
+        duplicate = self.scrape(self.SGLANG, 12) + "\n" + self.scrape(self.SGLANG, 13)
+        self.assertFalse(native_completion_stats_proof(self.scrape(self.SGLANG, 10), duplicate, "sglang")["ok"])
+
+    def test_label_order_is_canonical_and_receipt_excludes_raw_labels_and_scrape(self):
+        initial = self.scrape(self.SGLANG, 10, 'model_name="private-prompt",token="private-credential"')
+        current = self.scrape(self.SGLANG, 12, 'token="private-credential",model_name="private-prompt"')
+        current += '\n# private-comment\nunrelated_metric{body="private-body"} 1'
+        proof = native_completion_stats_proof(initial, current, "sglang")
+        self.assertTrue(proof["ok"], proof)
+        receipt = json.dumps(proof)
+        for secret in ["private-prompt", "private-credential", "private-comment", "private-body"]:
+            self.assertNotIn(secret, receipt)
+
+    def test_unknown_backend_is_rejected(self):
+        with self.assertRaises(ValueError):
+            native_completion_stats_proof("", "", "other")
 
 
 class ReadinessTests(unittest.TestCase):
