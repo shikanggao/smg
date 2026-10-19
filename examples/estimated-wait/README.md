@@ -96,27 +96,42 @@ arguments for these two options were also removed; use keyword arguments when
 migrating positional callers. The dispatch factor remains configurable (`rho=0.05`).
 
 The optional correction `g` defaults off in Rust and Python. When enabled, it
-remains shadow-only. Eligible first-text callbacks collect the last 32 observations.
-Each fresh, distinct load poll fits `g = sum(x*y) / sum(x*x)` if new feedback has
-arrived, using saved raw extra delay `x` and observed extra delay
-`y = max(TTFT - saved_baseline, 0)`. Four observations are required before the
-MSE target can differ from 1. Failed/stale/duplicate polls do not fit; no new
-feedback leaves the target unchanged. The applied scale approaches the target at
-at most 0.1 absolute units per second, independent of polling frequency.
+remains shadow-only. Eligible first-text callbacks populate two 300-second banks,
+each retaining at most 32 observations (64 combined). The first accepted feedback
+starts the bank clock; membership uses feedback acceptance time, not admission time.
+Each fresh, distinct load poll fits `g = sum(x*y) / sum(x*x)` when feedback arrives
+or rotation removes observations, using saved raw extra delay `x` and observed
+extra delay `y = max(TTFT - saved_baseline, 0)`. Four combined observations are
+required. Failed/stale/duplicate polls do not fit. The applied scale approaches
+the target at at most **0.5 absolute units per second**, independent of polling
+frequency; retargeting starts from the current applied value without idle credit.
 
-Two consecutive fresh queue-empty polls, with no local
-pending first-text requests or admissions during either poll, reset its history,
-scale and target. Decoding may continue: this confirms queue drain, not engine
-idle. A failed, stale or nonempty poll breaks drain confirmation.
+At 300 seconds the first bank becomes the previous bank and a new current bank
+starts. At 600 seconds discard the first bank, retain feedback accepted during
+300–600 seconds and start another current bank. Continue rotating every 300
+seconds. Thus retained observations are at most 600 seconds old and can be removed
+after 300–600 seconds, or earlier by the per-bank count limit. Ordinary rotation
+preserves the calibration generation and current gain trajectory when at least
+four observations remain. Removal triggers a fresh-poll refit even without new
+feedback. Fewer than four retained observations cause immediate raw fallback
+(`g=1`), including on forecast/feedback processing after idle; this fallback is
+an explicit exception to gradual gain movement. Delayed feedback across ordinary
+rotations remains eligible if its admission snapshot is less than 600 seconds old.
 
-Each learned calibration epoch expires 600 seconds after its first accepted
-observation, even if newer observations have replaced the original window. This
-also bounds stale influence in the applied scale, not just in retained samples.
-This is a fixed diagnostic validity horizon, not a latency guarantee. Feedback
-from admission snapshots at least 600 seconds old or a previous calibration epoch
-is ignored. Reset returns `g=1` and requires four new eligible observations to
-learn a new target. Raw admission, capacity, baseline and observed-delay floor
-are unaffected by these calibration resets.
+Two consecutive fresh queue-empty polls, with no local pending first-text requests
+or admissions during either poll, still reset history, scale, target and generation.
+Decoding may continue: this confirms queue drain, not engine idle. A failed, stale
+or nonempty poll breaks drain confirmation. Worker invalidation and detected native
+capacity profile changes also reset the generation and reject prior-generation
+feedback. Raw admission, capacity, baseline and observed-delay floor are unaffected.
+
+Logs identify this algorithm as `mse_poll_two_wave_v1`. `calibration_rotation`
+records bank index, previous/current counts, history revision, and before/after
+gain. Forecasts save history and fitted revisions because a removal-only poll fit
+can reuse the accepted-observation sequence. The method is distinct from historical
+`mse_poll` (32 observations, absolute 600-second epoch, 0.1/s gain movement); older
+analyzers must reject the new method rather than silently replay it as the old one.
+
 Admission discounts newly dispatched work and does not read KV usage in its
 wait calculation. The retired KV-weight option accepts only zero for old
 configuration and Python positional-argument compatibility. Least-load
