@@ -72,6 +72,8 @@
   "interpretation": {
     "purpose": "Bounded preparation:12 fully sequential requests,4 at each representative inputlength, outputcap32; freshnativeidle beforeeach. Fail immediately on incomplete seed.",
     "schedule": "Nominal plan selects12items. Actual dispatch occurs after priorcompletion andfreshidle, notanindependentarrival experiment.",
-    "baseline": "MedianobservedSMGfirsttext withactualusageprompttokens/contextheadroom verification; sourcehashes retained. Notarbitraryconstant."
-  }
+    "baseline": "MedianobservedSMGfirsttext withactualusageprompttokens/contextheadroom verification; sourcehashes retained. Notarbitraryconstant.",
+    "isolation": "Ownedephemeralservingkeyauth beforeadmission, no rawkeyinPodspec/config/logs. Missing/wrongkey401+correctinvalidbody400controls beforeSTART; finalwhole-captureexactrequest-IDaudit. Engine/directbypass notcovered."
+  },
+  "serving_auth_env": "SMG_EXPERIMENT_INGRESS_KEY"
 }

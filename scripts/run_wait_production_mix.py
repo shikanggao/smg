@@ -14,6 +14,7 @@ from collections import Counter, defaultdict
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
@@ -56,6 +57,8 @@ def validate(profile, smoke=False):
     assert math.isfinite(profile["deadline_seconds"])
     assert math.isfinite(profile["router_extra_ttft_budget_seconds"]) and profile["router_extra_ttft_budget_seconds"] > 0
     assert smoke or profile["deadline_seconds"] == 300, "Production coverage requires a 300-second deadline"
+    if "serving_auth_env" in profile:
+        assert profile["serving_auth_env"] == "SMG_EXPERIMENT_INGRESS_KEY", "Unexpected serving credential environment name"
     target = profile.get("measurement_target", "completion")
     assert target in {"completion", "ttft"}
     if target == "ttft":
@@ -226,6 +229,11 @@ def native_metrics(text, engine):
 class Run:
     def __init__(self, args, profile):
         self.args, self.profile = args, profile
+        self.serving_key = None
+        if profile.get("serving_auth_env"):
+            self.serving_key = os.environ.get(profile["serving_auth_env"])
+            if not self.serving_key or any(c.isspace() for c in self.serving_key):
+                raise RuntimeError("Required owned serving credential is unavailable")
         self.started = time.monotonic()
         self.active = set()
         self.phase = "startup"
@@ -345,11 +353,14 @@ class Run:
                     row["finish_reason"] = choice["finish_reason"]
         payload = dict(model=self.args.model, messages=prompt, max_tokens=item["max_output_tokens"],
                        stream=True, temperature=0, stream_options=dict(include_usage=True))
+        headers = {"opc-request-id": rid}
+        if self.serving_key:
+            headers["Authorization"] = "Bearer " + self.serving_key
         try:
             # One wall-clock deadline includes headers, first text and generation.
             async with asyncio.timeout(horizon):
                 async with session.post(self.args.url.rstrip("/") + "/v1/chat/completions", json=payload,
-                                        headers={"opc-request-id": rid}, timeout=aiohttp.ClientTimeout(total=None)) as response:
+                                        headers=headers, timeout=aiohttp.ClientTimeout(total=None)) as response:
                     row["status"] = response.status
                     if response.status != 200:
                         # Preserve error headers even if reading their body

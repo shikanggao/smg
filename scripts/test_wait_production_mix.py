@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("production_mix", HERE / "run_wait_production_mix.py")
@@ -182,6 +183,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.active = self.peak = self.posts = 0
         self.router_budget = .07
         self.payloads = []
+        self.authorizations = []
         app = web.Application()
         app.router.add_get("/metrics", self.metrics)
         app.router.add_post("/v1/chat/completions", self.completion)
@@ -199,6 +201,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         return self.web.Response(text='vllm:num_requests_waiting 0\nvllm:num_requests_running 0\nvllm:kv_cache_usage_perc .95\n' + f'smg_estimated_wait_threshold_seconds {self.router_budget}\n')
 
     async def completion(self, request):
+        self.authorizations.append(request.headers.get("Authorization"))
         body = await request.json()
         self.payloads.append(body)
         self.posts += 1
@@ -272,6 +275,24 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             if row["controlled_rejection"]:
                 self.assertIsNone(row["completion_late"])
         self.assertTrue(all(v["unknown"] == len(rows) for v in [summary["scores"]["pressure"]["raw"]["total_ttft_prediction"]]))
+
+    async def test_serving_credential_is_header_only_and_never_persisted(self):
+        self.mode = "normal"
+        token = "unit-test-ephemeral-not-a-real-credential"
+        with mock.patch.dict(p.os.environ, {"SMG_EXPERIMENT_INGRESS_KEY": token}):
+            result = await self.exercise(dict(smoke_profile(), serving_auth_env="SMG_EXPERIMENT_INGRESS_KEY"))
+        self.assertEqual(result["execution_status"], "PASS")
+        self.assertTrue(self.authorizations)
+        self.assertTrue(all(value == "Bearer " + token for value in self.authorizations))
+        for file in (self.root / "run").rglob("*"):
+            if file.is_file():
+                self.assertNotIn(token, file.read_text())
+
+    async def test_missing_serving_credential_fails_before_requests(self):
+        with mock.patch.dict(p.os.environ, {"SMG_EXPERIMENT_INGRESS_KEY": ""}):
+            with self.assertRaisesRegex(RuntimeError, "credential is unavailable"):
+                await self.exercise(dict(smoke_profile(), serving_auth_env="SMG_EXPERIMENT_INGRESS_KEY"))
+        self.assertEqual(self.posts, 0)
 
     async def test_incomplete_stream_is_not_success(self):
         self.mode = "incomplete"
