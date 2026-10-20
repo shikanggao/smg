@@ -4,7 +4,10 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from scripts.wait_recovery_candidate import METHOD, TRAINING, pair, scores
+try:
+    from scripts.wait_recovery_candidate import METHOD, TRAINING, pair, scores
+except ModuleNotFoundError:
+    from wait_recovery_candidate import METHOD, TRAINING, pair, scores
 
 
 class CandidateTests(unittest.TestCase):
@@ -99,7 +102,10 @@ class CandidateTests(unittest.TestCase):
 
 class CandidateJoinTests(unittest.TestCase):
     def fixture(self, root):
-        from scripts import run_wait_production_mix as driver
+        try:
+            from scripts import run_wait_production_mix as driver
+        except ModuleNotFoundError:
+            import run_wait_production_mix as driver
         profile = json.loads((driver.HERE / "wait-ttft-focused.json").read_text())
         row = dict(opc_request_id="prod-live-0", index=0, phase="pressure", cohort="short-chat",
                    control=False, input_words=16384, max_output_tokens=32, complete=True,

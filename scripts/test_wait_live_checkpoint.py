@@ -7,7 +7,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from scripts import wait_live_checkpoint as c
+try:
+    from scripts import wait_live_checkpoint as c
+except ModuleNotFoundError:
+    import wait_live_checkpoint as c
 
 
 class CheckpointTests(unittest.TestCase):
