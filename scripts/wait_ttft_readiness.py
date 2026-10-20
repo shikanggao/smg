@@ -9,7 +9,7 @@ from collections import Counter
 
 
 METHOD = "mse_poll_two_wave_queue_v2"
-ISOLATION_REQUEST_EVENTS = frozenset({"forecast", "calibration_forecast", "calibration_feedback", "first_text"})
+ISOLATION_REQUEST_EVENTS = frozenset({"forecast", "calibration_forecast", "calibration_feedback", "first_text", "request_transport"})
 
 
 def native_completion_stats_proof(initial_text, current_text, backend):

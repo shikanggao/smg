@@ -200,7 +200,7 @@ class WholeCaptureIsolationTests(unittest.TestCase):
         self.assertEqual(result["foreign_requests"][0]["request_id"], "owned-999")
 
     def test_each_request_event_kind_detects_foreign_without_worker_or_method(self):
-        for kind in ["forecast", "calibration_forecast", "calibration_feedback", "first_text"]:
+        for kind in ["forecast", "calibration_forecast", "calibration_feedback", "first_text", "request_transport"]:
             with self.subTest(kind=kind):
                 result = audit_isolation([dict(event="forecast", request_id="owned"),
                                           dict(event=kind, request_id="foreign")], {"owned"})

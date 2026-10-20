@@ -104,9 +104,28 @@ class PlannerTests(unittest.TestCase):
 
     def test_native_metric_profiles_and_missing_not_zero(self):
         value = p.native_metrics('vllm:num_requests_waiting{model="a"} 2\nvllm:num_requests_running 3\nvllm:gpu_cache_usage_perc .95\n', "vllm")
-        self.assertEqual(value, dict(native_waiting=2, native_running=3, native_kv=.95))
-        self.assertEqual(p.native_metrics('sglang_num_queue_reqs 4\nsglang_num_running_reqs 5\nsglang_token_usage .9\n', "sglang"), dict(native_waiting=4, native_running=5, native_kv=.9))
+        self.assertEqual({k: value[k] for k in ["native_waiting", "native_running", "native_kv"]}, dict(native_waiting=2, native_running=3, native_kv=.95))
+        self.assertIsNone(value["native_completed"])
+        sg = p.native_metrics('sglang_num_queue_reqs 4\nsglang_num_running_reqs 5\nsglang_token_usage .9\n', "sglang")
+        self.assertEqual({k: sg[k] for k in ["native_waiting", "native_running", "native_kv"]}, dict(native_waiting=4, native_running=5, native_kv=.9))
         self.assertIsNone(p.native_metrics('vllm:num_requests_running NaN\n', "vllm")["native_running"])
+
+    def test_native_progress_counters_keep_missing_unknown_and_avoid_alias_double_count(self):
+        text = ('vllm:request_success_total{finished_reason="stop"} 7\n'
+                'vllm:request_success_total{finished_reason="length"} 3\n'
+                'vllm:e2e_request_latency_seconds_count 10\n'
+                'vllm:generation_tokens_total 48\n'
+                'vllm:prompt_tokens_total 100\n'
+                'vllm:time_to_first_token_seconds_count 12\n')
+        value = p.native_metrics(text, "vllm")
+        self.assertEqual(value["native_completed"], 10)
+        self.assertEqual(value["native_generation_tokens"], 48)
+        self.assertEqual(value["native_first_tokens"], 12)
+        self.assertIsNone(value["native_preemptions"])
+        sg = p.native_metrics('sglang:e2e_request_latency_seconds_count 8\nsglang:prompt_tokens_total 123\n', "sglang")
+        self.assertEqual(sg["native_completed"], 8)
+        self.assertEqual(sg["native_prompt_tokens"], 123)
+        self.assertIsNone(sg["native_generation_tokens"])
 
     def test_unknown_outcomes_do_not_become_false_positives(self):
         rows = [dict(pred=True, truth=None), dict(pred=True, truth=False, controlled_rejection=True),
@@ -184,6 +203,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.router_budget = .07
         self.payloads = []
         self.authorizations = []
+        self.request_ids = []
         app = web.Application()
         app.router.add_get("/metrics", self.metrics)
         app.router.add_post("/v1/chat/completions", self.completion)
@@ -202,6 +222,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
 
     async def completion(self, request):
         self.authorizations.append(request.headers.get("Authorization"))
+        self.request_ids.append((request.headers.get("opc-request-id"), request.headers.get("x-request-id")))
         body = await request.json()
         self.payloads.append(body)
         self.posts += 1
@@ -216,9 +237,10 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             return self.web.Response(status=503, text="estimated wait budgets exceeded")
         self.active += 1
         self.peak = max(self.peak, self.active)
-        response = self.web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        response = self.web.StreamResponse(headers={"Content-Type": "text/event-stream", "x-request-id": "native-header-id"})
         await response.prepare(request)
         async def event(value):
+            value["id"] = "native-sse-id"
             await response.write(("data: " + json.dumps(value) + "\n\n").encode())
         try:
             await event({"choices": [{"delta": {"role": "assistant"}}]})
@@ -324,6 +346,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             await workload.request(session, item, p.time.monotonic())
         workload.stream.close()
         workload.metrics_stream.close()
+        workload.client_events.close()
         return workload.rows[0]
 
     async def test_ttft_mode_stops_after_first_text_without_claiming_completion(self):
@@ -347,6 +370,14 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(row["first_text_late"])
         self.assertLess(row["client_ttft_seconds"], row["e2e_seconds"])
         self.assertIsNone(row["error"])
+        self.assertEqual(self.request_ids, [(row["opc_request_id"], row["opc_request_id"])])
+        self.assertEqual(row["upstream_response_request_id"], "native-header-id")
+        self.assertEqual(row["upstream_sse_response_id"], "native-sse-id")
+        self.assertIsNone(row["cancellation_delivered_elapsed_seconds"])
+        self.assertIsNone(row["engine_cancellation_acknowledged"])
+        events = [json.loads(line) for line in (self.root / "ttft-request/client-events.jsonl").read_text().splitlines()]
+        self.assertEqual([event["phase"] for event in events], ["request_started", "response_headers_received", "first_text", "request_context_exited"])
+        self.assertTrue(all(event["opc_request_id"] == row["opc_request_id"] for event in events))
 
     async def test_ttft_normal_completion_retains_numeric_late_first_text(self):
         self.mode = "late-first-text"
@@ -383,6 +414,13 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["client_ttft_seconds"])
         self.assertIsNone(row["completion_late"])
         self.assertFalse(row["intentional_stream_abort"])
+        self.assertEqual(row["cancellation_reason"], "observation_horizon")
+        self.assertGreaterEqual(row["cancellation_delivered_elapsed_seconds"], row["observation_deadline_elapsed_seconds"])
+        self.assertLessEqual(row["cancellation_delivered_elapsed_seconds"], row["response_context_exited_elapsed_seconds"])
+        self.assertIsNone(row["engine_cancellation_acknowledged"])
+        events = [json.loads(line) for line in (self.root / "ttft-request/client-events.jsonl").read_text().splitlines()]
+        self.assertEqual(sum(event["phase"] == "cancellation_delivered" for event in events), 1)
+        self.assertNotIn("first_text", [event["phase"] for event in events])
 
     async def test_short_observation_error_does_not_become_ttft_late(self):
         self.mode = "stalled-http-error"
@@ -406,6 +444,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(json.loads((output / "readiness.json").read_text())["ready"])
         workload.stream.close()
         workload.metrics_stream.close()
+        workload.client_events.close()
 
     async def test_sequential_seed_proves_idle_and_never_overlaps_requests(self):
         self.mode = "normal"
@@ -442,6 +481,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         await sampler
         workload.stream.close()
         workload.metrics_stream.close()
+        workload.client_events.close()
 
     async def test_fresh_http_with_stale_internal_snapshot_cannot_pass_readiness(self):
         profile = dict(smoke_profile(), measurement_target="ttft", observation_horizon_seconds=.3,
@@ -471,6 +511,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.posts, 0)
         workload.stream.close()
         workload.metrics_stream.close()
+        workload.client_events.close()
 
     async def test_native_stats_gate_blocks_unchanged_counters_then_accepts_completions(self):
         profile = dict(smoke_profile(), measurement_target="ttft", observation_horizon_seconds=.3,
@@ -502,6 +543,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         finally:
             workload.stream.close()
             workload.metrics_stream.close()
+            workload.client_events.close()
 
     async def test_live_event_readiness_passes_only_after_current_fit_and_fresh_metrics(self):
         profile = dict(smoke_profile(), measurement_target="ttft", observation_horizon_seconds=.3,
@@ -530,6 +572,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(workload.stages[-1]["name"], "readiness_verified")
         workload.stream.close()
         workload.metrics_stream.close()
+        workload.client_events.close()
 
     async def test_stalled_http_error_is_not_model_timeout_truth(self):
         self.mode = "stalled-http-error"

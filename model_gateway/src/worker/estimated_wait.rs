@@ -486,6 +486,42 @@ const CALIBRATION_HISTORY_MAX_AGE: Duration = Duration::from_secs(600);
 const CALIBRATION_BANK_DURATION: Duration = Duration::from_secs(300);
 const CALIBRATION_METHOD: &str = "mse_poll_two_wave_queue_v2";
 
+// Shared across workers/epochs; diagnostic clock starts at its first use.
+fn diagnostic_time(now: Instant) -> f64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let origin = *ORIGIN.get_or_init(|| now);
+    now.checked_duration_since(origin).map_or_else(
+        || -origin.duration_since(now).as_secs_f64(),
+        |elapsed| elapsed.as_secs_f64(),
+    )
+}
+
+fn poll_outcome(
+    generation_matches: bool,
+    previous: Option<Instant>,
+    started: Instant,
+    now: Instant,
+    has_load: bool,
+    prepared: bool,
+    max_age: f64,
+) -> &'static str {
+    if !generation_matches {
+        "generation_changed"
+    } else if previous.is_some_and(|last| last > started) {
+        "out_of_order"
+    } else if previous == Some(started) {
+        "duplicate"
+    } else if !has_load {
+        "failed"
+    } else if !prepared {
+        "invalid_load"
+    } else if now.saturating_duration_since(started).as_secs_f64() > max_age {
+        "stale"
+    } else {
+        "success"
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum BaselineSource {
     #[default]
@@ -617,6 +653,8 @@ struct ExcessCalibration {
     bank_index: u64,
     history_revision: [u64; 2],
     fitted_revision: [u64; 2],
+    // Diagnostics only: never used for eligibility, retention or fitting.
+    last_feedback: [Option<(Instant, Instant)>; 2],
 }
 
 impl Default for ExcessCalibration {
@@ -638,6 +676,7 @@ impl ExcessCalibration {
             bank_index: 0,
             history_revision: [0; 2],
             fitted_revision: [0; 2],
+            last_feedback: [None; 2],
         }
     }
 
@@ -754,6 +793,7 @@ impl ExcessCalibration {
         let index = usize::from(forecast.native_capacity_ready);
         let samples = &mut self.samples[index];
         samples.push_back((ratio, forecast.queue_extra));
+        self.last_feedback[index] = Some((now, forecast.captured_at));
         self.accepted[index] += 1;
         self.history_revision[index] += 1;
         if samples.len() - self.previous_count[index] > TTFT_WINDOW_SAMPLES {
@@ -816,10 +856,21 @@ pub(crate) struct StreamTtftObserver {
     first_event: Option<Instant>,
     pending: Vec<u8>,
     done: bool,
+    worker_url: String,
     request_id: Option<String>,
 }
 
 impl StreamTtftObserver {
+    pub(crate) fn transport_event(&self, phase: &'static str) {
+        tracing::debug!(target: "smg::estimated_wait::observation",
+            event = "request_transport", phase, worker = self.worker_url,
+            request_id = self.request_id.as_deref().unwrap_or(""),
+            diagnostic_time_seconds = diagnostic_time(Instant::now()),
+            request_elapsed_seconds = self.started.elapsed().as_secs_f64(),
+            engine_cancellation_acknowledgement = "unavailable",
+            engine_ack_observable = false);
+    }
+
     pub(crate) fn cancel(&mut self) {
         self.finish_probe();
         self.pending.clear();
@@ -839,6 +890,7 @@ impl StreamTtftObserver {
             first_event: None,
             pending: Vec::new(),
             done: false,
+            worker_url: worker_url.to_owned(),
             request_id: None,
         }
     }
@@ -937,6 +989,7 @@ impl StreamTtftObserver {
 
 impl Drop for StreamTtftObserver {
     fn drop(&mut self) {
+        self.transport_event("observer_dropped");
         self.finish_probe();
     }
 }
@@ -1368,6 +1421,7 @@ impl EstimatedWaitAdmission {
                 target_scale_before = target_before, target_scale_after = entry.calibration.target(forecast.native_capacity_ready),
                 calibration_time_seconds = entry.calibration.time_seconds(now), admission_calibration_time_seconds = forecast.time_seconds,
                 feedback_age_seconds = now.saturating_duration_since(forecast.captured_at).as_secs_f64(),
+                diagnostic_time_seconds = diagnostic_time(now),
                 calibration_max_age_seconds = CALIBRATION_HISTORY_MAX_AGE.as_secs_f64(),
                 admission_native_waiting = forecast.native_waiting, admission_native_queue_visible = forecast.queue_visible(),
                 admission_native_capacity_ready = forecast.native_capacity_ready,
@@ -1533,6 +1587,9 @@ impl EstimatedWaitAdmission {
     }
 
     pub(crate) fn poll_started(&self, worker: &Arc<dyn Worker>) -> Option<PollWatermark> {
+        if tracing::enabled!(target: "smg::estimated_wait::observation", tracing::Level::DEBUG) {
+            diagnostic_time(Instant::now());
+        }
         if !self.needs_load(worker) {
             return None;
         }
@@ -1544,6 +1601,50 @@ impl EstimatedWaitAdmission {
         })
     }
 
+    fn log_poll(
+        worker: &Arc<dyn Worker>,
+        entry: Option<&Entry>,
+        prepared: Option<PreparedWait>,
+        started: Instant,
+        outcome: &'static str,
+        fit_executed: [bool; 2],
+    ) {
+        if !tracing::enabled!(target: "smg::estimated_wait::observation", tracing::Level::DEBUG) {
+            return;
+        }
+        let now = Instant::now();
+        for native_ready in [false, true] {
+            let index = usize::from(native_ready);
+            let calibration = entry.map(|entry| &entry.calibration);
+            let feedback = calibration.and_then(|c| c.last_feedback[index]);
+            tracing::debug!(target: "smg::estimated_wait::observation",
+                event = "calibration_poll", worker = worker.url(), outcome,
+                diagnostic_time_seconds = diagnostic_time(now),
+                poll_started_time_seconds = diagnostic_time(started),
+                poll_age_seconds = now.saturating_duration_since(started).as_secs_f64(),
+                calibration_state = if native_ready { "capacity_ready" } else { "capacity_unready" },
+                fit_executed = fit_executed[index],
+                calibration_epoch = entry.map(|e| e.calibration_epoch),
+                calibration_time_seconds = calibration.map(|c| c.time_seconds(now)),
+                calibration_bank_index = calibration.map(|c| c.bank_index),
+                bank_age_seconds = calibration.and_then(|c| c.bank_started).map(|t| now.saturating_duration_since(t).as_secs_f64()),
+                last_accepted_feedback_age_seconds = feedback.map(|(t, _)| now.saturating_duration_since(t).as_secs_f64()),
+                last_accepted_admission_age_seconds = feedback.map(|(_, t)| now.saturating_duration_since(t).as_secs_f64()),
+                sample_count = calibration.map(|c| c.samples[index].len()),
+                observation_sequence = calibration.map(|c| c.accepted[index]),
+                fit_sequence = calibration.map(|c| c.fitted[index]),
+                history_revision = calibration.map(|c| c.history_revision[index]),
+                fitted_revision = calibration.map(|c| c.fitted_revision[index]),
+                scale = calibration.map(|c| c.stats(native_ready, now).0),
+                target_scale = calibration.map(|c| c.target(native_ready)),
+                native_waiting = prepared.map(|p| p.native_waiting),
+                native_running = prepared.map(|p| p.native_running),
+                pending_engine = prepared.map(|p| p.pending_engine),
+                pending_first_text = entry.map(|e| e.pending_first_text.len()),
+                total_dispatched = entry.map(|e| e.total_dispatched));
+        }
+    }
+
     pub(crate) fn publish(
         &self,
         worker: &Arc<dyn Worker>,
@@ -1552,6 +1653,7 @@ impl EstimatedWaitAdmission {
         started: Instant,
     ) {
         let Some(watermark) = watermark else {
+            Self::log_poll(worker, None, None, started, "untracked", [false; 2]);
             return;
         };
         // Rank aggregation, validation and the queue/KV formula are report work,
@@ -1561,11 +1663,37 @@ impl EstimatedWaitAdmission {
         let threshold = config.threshold(worker);
         let mut entries = self.entries.lock();
         let Some(entry) = entries.get_mut(worker.url()) else {
+            Self::log_poll(
+                worker,
+                None,
+                prepared,
+                started,
+                "worker_removed",
+                [false; 2],
+            );
             return;
         };
+        let outcome = poll_outcome(
+            Arc::ptr_eq(&entry.generation, &watermark.generation),
+            entry.last_published,
+            started,
+            Instant::now(),
+            load.is_some(),
+            prepared.is_some(),
+            config.estimated_wait_max_snapshot_age_secs,
+        );
+        let mut fit_executed = [false; 2];
         if !Arc::ptr_eq(&entry.generation, &watermark.generation)
             || entry.last_published.is_some_and(|last| last > started)
         {
+            Self::log_poll(
+                worker,
+                Some(entry),
+                prepared,
+                started,
+                outcome,
+                fit_executed,
+            );
             return;
         }
         let new_poll = entry.last_published.is_none_or(|last| started > last);
@@ -1625,6 +1753,7 @@ impl EstimatedWaitAdmission {
                     let target_before = entry.calibration.target(native_ready);
                     let fitted_before = entry.calibration.fitted[index];
                     if entry.calibration.fit_on_poll(native_ready, now) {
+                        fit_executed[index] = true;
                         tracing::debug!(target: "smg::estimated_wait::observation",
                             event = "calibration_update", calibration_method = CALIBRATION_METHOD,
                             calibration_bank_index = entry.calibration.bank_index,
@@ -1644,6 +1773,14 @@ impl EstimatedWaitAdmission {
                 }
             }
         }
+        Self::log_poll(
+            worker,
+            Some(entry),
+            prepared,
+            started,
+            outcome,
+            fit_executed,
+        );
         // A verified idle worker begins a new queue epoch. Responses from the
         // preceding busy epoch cannot recalibrate a later workload after drain.
         if prepared.is_some_and(|prepared| prepared.low_load) && entry.pending_first_text.len() <= 1
@@ -1757,6 +1894,7 @@ impl AdmissionGuard<'_> {
         tracing::debug!(
             target: "smg::estimated_wait::observation", event = "calibration_forecast",
             request_id = request_id.unwrap_or(""), worker = worker.url(),
+            diagnostic_time_seconds = diagnostic_time(forecast.captured_at),
             calibration_enabled = true, calibration_state = forecast.state(),
             calibration_epoch = forecast.epoch,
             calibration_method = CALIBRATION_METHOD, calibration_fit_sequence = forecast.fit_sequence,
@@ -1995,6 +2133,103 @@ mod tests {
             monitor::WorkerMonitor, BasicWorkerBuilder, ConnectionMode, WorkerRegistry, WorkerType,
         },
     };
+
+    #[derive(Clone)]
+    struct DiagnosticWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for DiagnosticWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn diagnostic_poll_classification_and_monotonic_precision() {
+        let started = Instant::now();
+        let now = started + Duration::from_millis(100);
+        let outcome = |generation, previous, has_load, prepared, age| {
+            poll_outcome(generation, previous, started, now, has_load, prepared, age)
+        };
+        assert_eq!(outcome(true, None, true, true, 1.0), "success");
+        assert_eq!(outcome(true, None, false, false, 1.0), "failed");
+        assert_eq!(outcome(true, None, true, false, 1.0), "invalid_load");
+        assert_eq!(outcome(true, None, true, true, 0.05), "stale");
+        assert_eq!(outcome(true, Some(started), true, true, 1.0), "duplicate");
+        assert_eq!(outcome(true, Some(now), true, true, 1.0), "out_of_order");
+        assert_eq!(outcome(false, None, true, true, 1.0), "generation_changed");
+        let delta = diagnostic_time(now) - diagnostic_time(started);
+        assert!((delta - 0.1).abs() < 1e-8);
+    }
+
+    #[test]
+    fn diagnostic_poll_and_transport_json_preserve_numeric_fields_and_identity() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = DiagnosticWriter(Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let (registry, worker) = calibration_registry(true);
+            bytes.lock().clear();
+            let admission = registry.estimated_wait();
+            let started = Instant::now();
+            let stamp = admission.poll_started(&worker);
+            admission.publish(
+                &worker,
+                Some(&load(Some(100), 1, 100.0, 0.0)),
+                stamp,
+                started,
+            );
+            let duplicate = admission.poll_started(&worker);
+            admission.publish(
+                &worker,
+                Some(&load(Some(100), 1, 100.0, 0.0)),
+                duplicate,
+                started,
+            );
+            let mut observer = StreamTtftObserver::new(&registry, worker.url(), started)
+                .with_request_id(Some("diagnostic-request"));
+            observer.cancel(); // Identity must survive first-text probe removal.
+            observer.transport_event("downstream_receiver_closed");
+            observer.transport_event("upstream_stream_released");
+        });
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes.lock())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let polls: Vec<_> = events
+            .iter()
+            .map(|e| &e["fields"])
+            .filter(|e| e["event"] == "calibration_poll")
+            .collect();
+        assert_eq!(polls.len(), 4);
+        assert!(polls
+            .iter()
+            .all(|e| e["diagnostic_time_seconds"].is_number()
+                && e["calibration_epoch"].is_u64()
+                && e["fit_executed"] == false));
+        assert_eq!(polls[0]["outcome"], "success");
+        assert_eq!(polls[2]["outcome"], "duplicate");
+        assert!(polls[0]["native_waiting"].is_number());
+        assert_eq!(polls[0]["sample_count"], 0);
+        let transport: Vec<_> = events
+            .iter()
+            .map(|e| &e["fields"])
+            .filter(|e| e["event"] == "request_transport")
+            .collect();
+        assert_eq!(transport.len(), 3);
+        assert!(transport
+            .iter()
+            .all(|e| e["request_id"] == "diagnostic-request"
+                && e["engine_cancellation_acknowledgement"] == "unavailable"));
+    }
 
     fn config() -> EstimatedWaitConfig {
         EstimatedWaitConfig {
@@ -3905,6 +4140,7 @@ mod tests {
             first_event: None,
             pending: Vec::new(),
             done: false,
+            worker_url: "http://observer-test".to_owned(),
             request_id: None,
         };
         assert_eq!(
@@ -3944,6 +4180,7 @@ mod tests {
             first_event: None,
             pending: Vec::new(),
             done: false,
+            worker_url: "http://observer-test".to_owned(),
             request_id: None,
         };
         observer.cancel();

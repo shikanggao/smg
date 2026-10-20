@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import codecs
 from collections import Counter, defaultdict
+from contextlib import asynccontextmanager
 import hashlib
 import json
 import math
@@ -222,8 +223,19 @@ def native_metrics(text, engine):
         names = [["sglang:num_queue_reqs", "sglang_num_queue_reqs"],
                  ["sglang:num_running_reqs", "sglang_num_running_reqs"],
                  ["sglang:token_usage", "sglang_token_usage"]]
-    return dict(zip(["native_waiting", "native_running", "native_kv"],
-                    [metric(text, n, i == 2) for i, n in enumerate(names)]))
+    result = dict(zip(["native_waiting", "native_running", "native_kv"],
+                      [metric(text, n, i == 2) for i, n in enumerate(names)]))
+    # Aggregate counters show progress, not per-request cancellation acknowledgement.
+    # Missing metrics remain None; full original Prometheus is retained alongside them.
+    counters = {
+        "native_completed": ["vllm:request_success_total", "vllm:e2e_request_latency_seconds_count"] if engine == "vllm" else ["sglang:e2e_request_latency_seconds_count", "sglang_e2e_request_latency_seconds_count"],
+        "native_prompt_tokens": ["vllm:prompt_tokens_total"] if engine == "vllm" else ["sglang:prompt_tokens_total", "sglang_prompt_tokens_total"],
+        "native_generation_tokens": ["vllm:generation_tokens_total"] if engine == "vllm" else ["sglang:generation_tokens_total", "sglang_generation_tokens_total"],
+        "native_first_tokens": ["vllm:time_to_first_token_seconds_count"] if engine == "vllm" else ["sglang:time_to_first_token_seconds_count", "sglang_time_to_first_token_seconds_count"],
+        "native_preemptions": ["vllm:num_preemptions_total"] if engine == "vllm" else ["sglang:num_retracted_reqs_total", "sglang_num_retracted_reqs_total"],
+    }
+    result.update({name: metric(text, aliases) for name, aliases in counters.items()})
+    return result
 
 
 class Run:
@@ -243,6 +255,7 @@ class Run:
         self.stop = asyncio.Event()
         self.stream = (args.output / "requests.jsonl").open("w")
         self.metrics_stream = (args.output / "metrics.jsonl").open("w")
+        self.client_events = (args.output / "client-events.jsonl").open("w")
         self.event_offset, self.event_pending = 0, b""
         self.initial_native_idle = False
         self.initial_native_busy = False
@@ -263,6 +276,26 @@ class Run:
         self.rows.append(row)
         self.stream.write(encoded(row).decode() + "\n")
         self.stream.flush()
+
+    def client_event(self, row, phase):
+        event = dict(event="client_transport", phase=phase, opc_request_id=row["opc_request_id"],
+                     elapsed_seconds=time.monotonic() - self.started,
+                     request_elapsed_seconds=time.monotonic() - self.started - row["started_elapsed_seconds"],
+                     engine_cancellation_acknowledged=None)
+        self.client_events.write(encoded(event).decode() + "\n")
+        self.client_events.flush()
+        return event["elapsed_seconds"]
+
+    @asynccontextmanager
+    async def cancellation_observer(self, row):
+        # The inner observer runs before aiohttp releases the response context;
+        # the outer observer covers cancellation while awaiting response headers.
+        try:
+            yield
+        except asyncio.CancelledError:
+            if row.get("cancellation_delivered_elapsed_seconds") is None:
+                row["cancellation_delivered_elapsed_seconds"] = self.client_event(row, "cancellation_delivered")
+            raise
 
     async def sample(self, session):
         import aiohttp
@@ -316,12 +349,18 @@ class Run:
                    dispatch_lag_seconds=max(0, start - scheduled), status=0,
                    client_ttft_seconds=None, first_answer_seconds=None, first_sse_seconds=None,
                    done_seen=False, finish_reason=None, complete=False, timed_out=False,
-                   cancelled=False, error=None, usage={})
+                   cancelled=False, error=None, usage={},
+                   cancellation_delivered_elapsed_seconds=None,
+                   cancellation_reason=None, engine_cancellation_acknowledged=None,
+                   upstream_response_request_id=None, upstream_sse_response_id=None)
         ttft_only = self.profile.get("measurement_target") == "ttft"
         horizon = self.profile.get("observation_horizon_seconds", self.profile["deadline_seconds"])
         if ttft_only:
             row.update(measurement_target="ttft", observation_horizon_seconds=horizon, intentional_stream_abort=False,
                        ttft_stream_policy=self.profile.get("ttft_stream_policy", "abort_after_first_text"))
+        row["ttft_deadline_elapsed_seconds"] = start - self.started + self.profile["deadline_seconds"]
+        row["observation_deadline_elapsed_seconds"] = start - self.started + horizon
+        self.client_event(row, "request_started")
         capture = self.profile.get("capture_content_chars", 0)
         if capture:
             row.update(content_preview="", content_characters=0)
@@ -332,6 +371,8 @@ class Run:
                 row["done_seen"] = True
                 return
             obj = json.loads(data)
+            if row["upstream_sse_response_id"] is None and isinstance(obj.get("id"), str):
+                row["upstream_sse_response_id"] = obj["id"][:256]
             if "error" in obj:
                 raise RuntimeError("SSE error: " + json.dumps(obj["error"])[:300])
             if row["first_sse_seconds"] is None:
@@ -344,6 +385,7 @@ class Run:
                 reasoning = delta.get("reasoning") or delta.get("reasoning_content")
                 if row["client_ttft_seconds"] is None and any(isinstance(v, str) and v for v in [answer, reasoning]):
                     row["client_ttft_seconds"] = elapsed
+                    self.client_event(row, "first_text")
                 if row["first_answer_seconds"] is None and isinstance(answer, str) and answer:
                     row["first_answer_seconds"] = elapsed
                 if capture and isinstance(answer, str):
@@ -353,41 +395,50 @@ class Run:
                     row["finish_reason"] = choice["finish_reason"]
         payload = dict(model=self.args.model, messages=prompt, max_tokens=item["max_output_tokens"],
                        stream=True, temperature=0, stream_options=dict(include_usage=True))
-        headers = {"opc-request-id": rid}
+        headers = {"opc-request-id": rid, "x-request-id": rid}
         if self.serving_key:
             headers["Authorization"] = "Bearer " + self.serving_key
         try:
             # One wall-clock deadline includes headers, first text and generation.
-            async with asyncio.timeout(horizon):
+            async with asyncio.timeout(horizon), self.cancellation_observer(row):
                 async with session.post(self.args.url.rstrip("/") + "/v1/chat/completions", json=payload,
                                         headers=headers, timeout=aiohttp.ClientTimeout(total=None)) as response:
                     row["status"] = response.status
-                    if response.status != 200:
-                        # Preserve error headers even if reading their body
-                        # reaches the deadline. That is not model-wait truth.
-                        row["error"] = "HTTP " + str(response.status)
-                        row["error"] += ": " + (await response.text())[:1000]
-                    else:
-                        async for chunk in response.content.iter_any():
-                            for data in frames.feed(chunk):
-                                consume(data)
-                            if (ttft_only and row["ttft_stream_policy"] == "abort_after_first_text"
-                                    and row["client_ttft_seconds"] is not None):
-                                row["intentional_stream_abort"] = not (row["done_seen"] and row["finish_reason"] is not None)
-                                break
-                        if not row.get("intentional_stream_abort"):
-                            for data in frames.feed(b"", final=True):
-                                consume(data)
-                        row["complete"] = bool(row["done_seen"] and row["finish_reason"] is not None and row["client_ttft_seconds"] is not None)
-                        if not row["complete"] and not row.get("intentional_stream_abort"):
-                            row["error"] = "Incomplete SSE response"
+                    row["upstream_response_request_id"] = (response.headers.get("x-request-id") or response.headers.get("opc-request-id") or "")[:256] or None
+                    self.client_event(row, "response_headers_received")
+                    async with self.cancellation_observer(row):
+                        if response.status != 200:
+                            # Preserve error headers even if reading their body
+                            # reaches the deadline. That is not model-wait truth.
+                            row["error"] = "HTTP " + str(response.status)
+                            row["error"] += ": " + (await response.text())[:1000]
+                        else:
+                            async for chunk in response.content.iter_any():
+                                for data in frames.feed(chunk):
+                                    consume(data)
+                                if (ttft_only and row["ttft_stream_policy"] == "abort_after_first_text"
+                                        and row["client_ttft_seconds"] is not None):
+                                    row["intentional_stream_abort"] = not (row["done_seen"] and row["finish_reason"] is not None)
+                                    if row["intentional_stream_abort"]:
+                                        row["cancellation_reason"] = "intentional_first_text_abort"
+                                        row["cancellation_delivered_elapsed_seconds"] = self.client_event(row, "intentional_response_release")
+                                    break
+                            if not row.get("intentional_stream_abort"):
+                                for data in frames.feed(b"", final=True):
+                                    consume(data)
+                            row["complete"] = bool(row["done_seen"] and row["finish_reason"] is not None and row["client_ttft_seconds"] is not None)
+                            if not row["complete"] and not row.get("intentional_stream_abort"):
+                                row["error"] = "Incomplete SSE response"
         except TimeoutError:
             row["timed_out"] = True
+            row["cancellation_reason"] = "observation_horizon"
         except asyncio.CancelledError:
             row["cancelled"] = True
+            row["cancellation_reason"] = "workload_interrupted"
             row["error"] = "Workload interrupted before its own deadline"
         except Exception as error:
             row["error"] = type(error).__name__ + ": " + str(error)
+        row["response_context_exited_elapsed_seconds"] = self.client_event(row, "request_context_exited")
         row["completed_elapsed_seconds"] = time.monotonic() - self.started
         row["e2e_seconds"] = time.monotonic() - start
         row["controlled_rejection"] = row["status"] == 503 and "estimated wait budgets" in (row["error"] or "")
@@ -599,6 +650,7 @@ async def run(args):
             await sampler
             workload.stream.close()
             workload.metrics_stream.close()
+            workload.client_events.close()
             save(args.output / "stages.json", workload.stages)
             save(args.output / "execution.json", dict(error=error, requests_recorded=len(workload.rows),
                  planned_requests=len(rows), native_drained=drained,

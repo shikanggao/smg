@@ -896,9 +896,20 @@ impl Router {
                         .and_then(|value| value.to_str().ok()),
                 )
         });
+        if let Some(observer) = &ttft_observer {
+            observer.transport_event("upstream_send_started");
+        }
         let res = match send_with_stale_conn_retry(request_builder).await {
-            Ok(res) => res,
+            Ok(res) => {
+                if let Some(observer) = &ttft_observer {
+                    observer.transport_event("upstream_headers_received");
+                }
+                res
+            }
             Err(e) => {
+                if let Some(observer) = &ttft_observer {
+                    observer.transport_event("upstream_send_failed");
+                }
                 error!(
                     "Failed to send multipart transcription request worker_url={} route={} error={}",
                     worker.url(),
@@ -996,27 +1007,34 @@ impl Router {
                                 if tx.capacity() == 0 { ttft_observer.cancel(); }
                                 if stream_header_status.is_success() { ttft_observer.push(&bytes); }
                                 if tx.send(Ok(bytes)).await.is_err() {
+                                    ttft_observer.transport_event("downstream_receiver_closed");
                                     client_disconnected = true;
                                     break;
                                 }
                             }
                             Some(Err(e)) => {
+                                ttft_observer.transport_event("upstream_stream_error");
                                 stream_failed = true;
                                 let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                 break;
                             }
-                            None => break,
+                            None => {
+                                ttft_observer.transport_event("upstream_eof");
+                                break;
+                            },
                         },
                         // Client gone with no chunk in flight (long prefill,
-                        // stalled upstream): break so the reqwest stream drops,
-                        // closing the upstream connection and letting the
-                        // engine abort generation.
+                        // stalled upstream): release the reqwest response stream.
+                        // This does not acknowledge native scheduler cancellation.
                         () = tx.closed() => {
+                            ttft_observer.transport_event("downstream_receiver_closed");
                             client_disconnected = true;
                             break;
                         }
                     }
                 }
+                drop(stream);
+                ttft_observer.transport_event("upstream_stream_released");
                 // Effective status = BAD_GATEWAY if the relay failed, else the
                 // worker's header status. Covers both "5xx header returned
                 // while stream=true" and "200 header then mid-stream break".
@@ -1192,9 +1210,20 @@ impl Router {
                         .and_then(|value| value.to_str().ok()),
                 )
         });
+        if let Some(observer) = &ttft_observer {
+            observer.transport_event("upstream_send_started");
+        }
         let res = match send_with_stale_conn_retry(request_builder).await {
-            Ok(res) => res,
+            Ok(res) => {
+                if let Some(observer) = &ttft_observer {
+                    observer.transport_event("upstream_headers_received");
+                }
+                res
+            }
             Err(e) => {
+                if let Some(observer) = &ttft_observer {
+                    observer.transport_event("upstream_send_failed");
+                }
                 error!(
                     "Failed to send typed request worker_url={} route={} error={}",
                     worker.url(),
@@ -1266,22 +1295,31 @@ impl Router {
                                 if tx.capacity() == 0 { ttft_observer.cancel(); }
                                 if status.is_success() { ttft_observer.push(&bytes); }
                                 if tx.send(Ok(bytes)).await.is_err() {
+                                    ttft_observer.transport_event("downstream_receiver_closed");
                                     break;
                                 }
                             }
                             Some(Err(e)) => {
+                                ttft_observer.transport_event("upstream_stream_error");
                                 let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                 break;
                             }
-                            None => break,
+                            None => {
+                                ttft_observer.transport_event("upstream_eof");
+                                break;
+                            },
                         },
                         // Client gone with no chunk in flight (long prefill,
-                        // stalled upstream): break so the reqwest stream drops,
-                        // closing the upstream connection and letting the
-                        // engine abort generation.
-                        () = tx.closed() => break,
+                        // stalled upstream): release the reqwest response stream.
+                        // This does not acknowledge native scheduler cancellation.
+                        () = tx.closed() => {
+                            ttft_observer.transport_event("downstream_receiver_closed");
+                            break;
+                        },
                     }
                 }
+                drop(stream);
+                ttft_observer.transport_event("upstream_stream_released");
             });
 
             let stream = ReceiverStream::new(rx);
