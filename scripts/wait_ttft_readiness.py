@@ -9,7 +9,8 @@ from collections import Counter
 
 
 METHOD = "mse_poll_two_wave_queue_v2"
-ISOLATION_REQUEST_EVENTS = frozenset({"forecast", "calibration_forecast", "calibration_feedback", "first_text", "request_transport"})
+RECOVERY_REQUEST_EVENTS = frozenset({"recovery_forecast", "recovery_probe_attempt", "recovery_probe_reserved", "recovery_probe_response", "recovery_probe_released"})
+ISOLATION_REQUEST_EVENTS = frozenset({"forecast", "calibration_forecast", "calibration_feedback", "first_text", "request_transport"}) | RECOVERY_REQUEST_EVENTS
 
 
 def native_completion_stats_proof(initial_text, current_text, backend):
@@ -115,6 +116,7 @@ def audit_isolation(events, owned_request_ids):
         raise ValueError("Expected nonempty, exact owned request IDs")
     kinds, foreign, unattributed = Counter(), {}, []
     owned_events, total, forecasts = 0, 0, set()
+    forecast_workers, recovery_bindings = {}, []
     for index, event in enumerate(events, 1):
         total += 1
         fields = event.get("fields", {})
@@ -133,9 +135,15 @@ def audit_isolation(events, owned_request_ids):
             owned_events += 1
             if kind == "forecast":
                 forecasts.add(rid)
+                forecast_workers[rid] = value.get("worker")
+            if kind in RECOVERY_REQUEST_EVENTS:
+                recovery_bindings.append((rid, value.get("worker"), occurrence))
         else:
             foreign.setdefault(rid, []).append(occurrence)
     missing = sorted(owned - forecasts)
+    mismatched_workers = [dict(request_id=rid, worker=worker, **occurrence)
+        for rid, worker, occurrence in recovery_bindings
+        if not isinstance(worker, str) or not worker or forecast_workers.get(rid) != worker]
     reasons = []
     if foreign:
         reasons.append("Request events from outside the exact owned request ID set")
@@ -143,11 +151,14 @@ def audit_isolation(events, owned_request_ids):
         reasons.append("Request events without an attributable request ID")
     if missing:
         reasons.append("Owned requests missing raw admission forecasts; capture is absent or incomplete")
+    if mismatched_workers:
+        reasons.append("Recovery request events do not match the exact owned raw-forecast worker")
     return dict(ok=not reasons, scope="whole_router_capture", owned_request_id_count=len(owned),
                 capture_event_count=total, checked_event_count=sum(kinds.values()),
                 ignored_event_count=total-sum(kinds.values()), event_kind_counts=dict(sorted(kinds.items())),
                 owned_event_count=owned_events, owned_forecast_request_count=len(forecasts),
                 missing_owned_forecasts=missing,
+                recovery_worker_mismatch_count=len(mismatched_workers), recovery_worker_mismatches=mismatched_workers,
                 foreign_event_count=sum(len(rows) for rows in foreign.values()), foreign_request_count=len(foreign),
                 foreign_requests=[dict(request_id=rid, event_count=len(rows),
                                        event_kind_counts=dict(sorted(Counter(row["event_kind"] for row in rows).items())),

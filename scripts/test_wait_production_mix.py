@@ -127,6 +127,19 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(sg["native_prompt_tokens"], 123)
         self.assertIsNone(sg["native_generation_tokens"])
 
+    def test_live_progress_and_abort_counts_are_aggregate_and_missing_unknown(self):
+        vllm = p.native_metrics('vllm:iteration_tokens_total_sum 321\n', "vllm")
+        self.assertEqual(vllm["native_iteration_tokens"], 321)
+        self.assertIsNone(vllm["native_aborted"])
+        sg = p.native_metrics('sglang:num_aborted_requests_total 4\n'
+                              'sglang_num_aborted_requests_total 40\n'
+                              'sglang:gen_throughput 12\n', "sglang")
+        self.assertEqual(sg["native_aborted"], 4)
+        self.assertEqual(sg["native_generation_throughput"], 12)
+        self.assertIsNone(sg["native_iteration_tokens"])
+        missing = p.native_metrics('sglang:gen_throughput NaN\n', "sglang")
+        self.assertIsNone(missing["native_generation_throughput"])
+
     def test_unknown_outcomes_do_not_become_false_positives(self):
         rows = [dict(pred=True, truth=None), dict(pred=True, truth=False, controlled_rejection=True),
                 dict(pred=False, truth=True), dict(pred=True, truth=False)]

@@ -60,6 +60,8 @@ def validate(profile, smoke=False):
     assert smoke or profile["deadline_seconds"] == 300, "Production coverage requires a 300-second deadline"
     if "serving_auth_env" in profile:
         assert profile["serving_auth_env"] == "SMG_EXPERIMENT_INGRESS_KEY", "Unexpected serving credential environment name"
+    if "recovery_candidate_required" in profile:
+        assert type(profile["recovery_candidate_required"]) is bool
     target = profile.get("measurement_target", "completion")
     assert target in {"completion", "ttft"}
     if target == "ttft":
@@ -233,6 +235,10 @@ def native_metrics(text, engine):
         "native_generation_tokens": ["vllm:generation_tokens_total"] if engine == "vllm" else ["sglang:generation_tokens_total", "sglang_generation_tokens_total"],
         "native_first_tokens": ["vllm:time_to_first_token_seconds_count"] if engine == "vllm" else ["sglang:time_to_first_token_seconds_count", "sglang_time_to_first_token_seconds_count"],
         "native_preemptions": ["vllm:num_preemptions_total"] if engine == "vllm" else ["sglang:num_retracted_reqs_total", "sglang_num_retracted_reqs_total"],
+        # Live aggregate progress/context, never request-specific cancellation ACKs.
+        "native_iteration_tokens": ["vllm:iteration_tokens_total_sum"] if engine == "vllm" else [],
+        "native_aborted": [] if engine == "vllm" else ["sglang:num_aborted_requests_total", "sglang_num_aborted_requests_total"],
+        "native_generation_throughput": [] if engine == "vllm" else ["sglang:gen_throughput", "sglang_gen_throughput"],
     }
     result.update({name: metric(text, aliases) for name, aliases in counters.items()})
     return result
@@ -679,7 +685,7 @@ def analyze(path, events_path=None):
     execution = json.loads((path / "execution.json").read_text())
     rows = [json.loads(line) for line in (path / "requests.jsonl").read_text().splitlines()]
     samples = [json.loads(line) for line in (path / "metrics.jsonl").read_text().splitlines()]
-    forecasts, first_text, gates = {}, {}, {}
+    forecasts, first_text, gates, recovery_forecasts = {}, {}, {}, {}
     isolation_events = []
     if events_path:
         for line in events_path.read_text().splitlines():
@@ -693,7 +699,8 @@ def analyze(path, events_path=None):
             rid = event.get("request_id", "")
             if not rid.startswith("prod-" + config["run_id"] + "-"):
                 continue
-            destination = {"calibration_forecast": forecasts, "first_text": first_text, "forecast": gates}.get(event.get("event"))
+            destination = {"calibration_forecast": forecasts, "first_text": first_text, "forecast": gates,
+                           "recovery_forecast": recovery_forecasts}.get(event.get("event"))
             if destination is not None:
                 assert rid not in destination, "Duplicate exact request event: " + rid
                 destination[rid] = event
@@ -718,6 +725,9 @@ def analyze(path, events_path=None):
             row[label + "_total_ttft_over_deadline"] = value >= deadline if value is not None else None
         row["raw_gate_would_reject"] = gate.get("would_reject") if gate else None
         row["calibrated_gate_would_reject"] = f.get("calibrated_would_reject") if f else None
+        row["pre_admission_recorded_extra_flags"] = {
+            "raw": gate.get("would_reject") if gate else None,
+            "calibrated": gate.get("calibrated_would_reject") if gate else None}
         row["smg_first_text_late"] = row["smg_ttft_seconds"] >= deadline if row["smg_ttft_seconds"] is not None else None
         row["pre_admission_total_ttft_predictions"] = {}
         if gate:
@@ -738,6 +748,23 @@ def analyze(path, events_path=None):
                 value = None
             row["pre_admission_total_ttft_predictions"][label] = value
             row[label + "_pre_admission_total_ttft_over_deadline"] = value >= deadline if value is not None else None
+        candidate = recovery_forecasts.get(row["opc_request_id"])
+        if candidate:
+            if not gate or candidate.get("worker") != gate.get("worker"):
+                raise ValueError("Recovery candidate lacks the exact original worker snapshot")
+            for candidate_key, original_key in [("original_queue_excess_seconds", "calibration_input_excess_seconds"),
+                                                 ("legacy_calibration_scale", "calibration_scale")]:
+                original = gate.get(original_key)
+                current = candidate.get(candidate_key)
+                if original is None or current is None or not math.isclose(original, current, rel_tol=1e-8, abs_tol=1e-8):
+                    raise ValueError("Recovery candidate does not match exact original admission components")
+            try:
+                from .wait_recovery_candidate import pair as pair_recovery
+            except ImportError:
+                from wait_recovery_candidate import pair as pair_recovery
+            row["recovery_candidate"] = pair_recovery(candidate,
+                row["pre_admission_total_ttft_predictions"], profile["router_extra_ttft_budget_seconds"],
+                {"calibrated": row["pre_admission_recorded_extra_flags"]["calibrated"]}, gate.get("native_ready"))
     isolation = None
     if ttft_only:
         try:
@@ -792,6 +819,12 @@ def analyze(path, events_path=None):
             healthy_ttft_controls_every_cohort=all(healthy[c["name"]] >= coverage["minimum_healthy_controls_per_cohort"] for c in profile["cohorts"]),
             pressure_ttft_misses=sum(r.get("first_text_late") is True for r in pressure) >= coverage["minimum_pressure_ttft_misses"],
             actual_observed_late_ttft=sum(r.get("client_ttft_seconds") is not None and r["client_ttft_seconds"] >= deadline for r in pressure) >= coverage["minimum_observed_late_ttft"])
+    if profile.get("recovery_candidate_required"):
+        checks["exact_recovery_forecasts"] = all(r["opc_request_id"] in recovery_forecasts
+            for r in rows if not r.get("local_drop") and not r.get("controlled_rejection"))
+        checks["no_actual_recovery_probe_in_shadow_round"] = not any(
+            e.get("event") in {"recovery_probe_reserved", "recovery_probe_response", "recovery_probe_released"}
+            for e in isolation_events)
     scores = {}
     for group, subset in [("controls", controls), ("pressure", pressure)]:
         scores[group] = {}
@@ -836,10 +869,21 @@ def analyze(path, events_path=None):
                   censored_late_first_text=sum(r.get("client_ttft_seconds") is None and r.get("first_text_late") is True for r in rows),
                   unknown_first_text_truth=sum(r.get("first_text_late") is None for r in rows),
                   intentional_first_text_aborts=sum(r.get("intentional_stream_abort", False) for r in rows))
+    if recovery_forecasts or profile.get("recovery_candidate_required"):
+        try:
+            from .wait_recovery_candidate import scores as recovery_scores
+        except ImportError:
+            from wait_recovery_candidate import scores as recovery_scores
+        result["recovery_candidate"] = {name: recovery_scores(subset, deadline)
+            for name, subset in [("all_offered", rows), ("pressure", pressure)]
+            + [("phase:" + phase, [r for r in rows if r["phase"] == phase])
+               for phase in sorted({r["phase"] for r in rows})]}
     if ttft_only:
         result["runtime_isolation"] = isolation
         result["notes"] += ["Primary scores compare exact pre-admission total TTFT with the300s first-text threshold. Production extra-delay flags are distinct.",
-            "TTFT mode closes the stream after first text; this is intentional measurement, not a full completion or answer-quality result.",
+            ("TTFT scoring allows capped responses to complete normally; horizon cancellation is distinct from first-text timing and answer quality."
+             if profile.get("ttft_stream_policy") == "complete_bounded_response" else
+             "TTFT mode intentionally closes the stream after first text; this does not establish full completion or answer quality."),
             "Missing first text after the longer observation horizon is a known late binary label with numeric TTFT unavailable. Short cancellations/errors remain unknown."]
     save(path / "summary.json", result)
     with (path / "paired-production.jsonl").open("w") as stream:

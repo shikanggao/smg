@@ -141,6 +141,7 @@
     }
   ],
   "measurement_target": "ttft",
+  "recovery_candidate_required": true,
   "startup_scenario": "isolated",
   "observation_horizon_seconds": 420,
   "readiness": {

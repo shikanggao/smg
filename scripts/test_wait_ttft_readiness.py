@@ -200,12 +200,23 @@ class WholeCaptureIsolationTests(unittest.TestCase):
         self.assertEqual(result["foreign_requests"][0]["request_id"], "owned-999")
 
     def test_each_request_event_kind_detects_foreign_without_worker_or_method(self):
-        for kind in ["forecast", "calibration_forecast", "calibration_feedback", "first_text", "request_transport"]:
+        for kind in ["forecast", "calibration_forecast", "calibration_feedback", "first_text", "request_transport",
+                     "recovery_forecast", "recovery_probe_attempt", "recovery_probe_reserved", "recovery_probe_response", "recovery_probe_released"]:
             with self.subTest(kind=kind):
                 result = audit_isolation([dict(event="forecast", request_id="owned"),
                                           dict(event=kind, request_id="foreign")], {"owned"})
                 self.assertFalse(result["ok"])
                 self.assertEqual(result["foreign_requests"][0]["event_kind_counts"], {kind: 1})
+
+    def test_owned_recovery_event_requires_matching_original_worker(self):
+        for worker in [None, "", "other"]:
+            result = audit_isolation([dict(event="forecast", request_id="owned", worker="engine"),
+                dict(event="recovery_forecast", request_id="owned", worker=worker)], {"owned"})
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["recovery_worker_mismatch_count"], 1)
+        result = audit_isolation([dict(event="recovery_probe_attempt", request_id="owned", worker="engine"),
+            dict(event="forecast", request_id="owned", worker="engine")], {"owned"})
+        self.assertTrue(result["ok"])
 
     def test_unknown_request_kind_and_lifecycle_span_are_not_false_positives(self):
         result = audit_isolation([dict(event="forecast", request_id="owned"),
