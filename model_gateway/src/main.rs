@@ -312,6 +312,10 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     estimated_wait_calibration_shadow: bool,
 
+    /// Experimental recovery exception: one HTTP SSE request per ten seconds, one in flight.
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    estimated_wait_recovery_probes: bool,
+
     /// Same-model representative TTFT baseline for diagnostic calibration startup.
     /// Omit when unknown; measured low-load baseline takes precedence.
     #[arg(long, help_heading = "Routing Policy")]
@@ -1916,6 +1920,7 @@ impl CliArgs {
                 max_estimated_wait_secs: self.max_estimated_wait_secs,
                 estimated_wait_shadow: self.estimated_wait_shadow,
                 estimated_wait_calibration_shadow: self.estimated_wait_calibration_shadow,
+                estimated_wait_recovery_probes: self.estimated_wait_recovery_probes,
                 estimated_wait_provisional_baseline_secs: self
                     .estimated_wait_provisional_baseline_secs,
                 estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
@@ -2660,6 +2665,7 @@ mod tests {
             "12",
             "--estimated-wait-shadow",
             "--estimated-wait-calibration-shadow",
+            "--estimated-wait-recovery-probes",
             "--estimated-wait-provisional-baseline-secs",
             "0.25",
             "--estimated-wait-queue-tokens-per-request",
@@ -2683,12 +2689,14 @@ mod tests {
         assert_eq!(config.max_estimated_wait_secs, Some(12.0));
         assert!(config.estimated_wait_shadow);
         assert!(config.estimated_wait_calibration_shadow);
+        assert!(config.estimated_wait_recovery_probes);
         assert_eq!(config.estimated_wait_provisional_baseline_secs, Some(0.25));
         assert_eq!(
             cli_args_from(&[]).estimated_wait_provisional_baseline_secs,
             None
         );
         assert!(!cli_args_from(&[]).estimated_wait_calibration_shadow);
+        assert!(!cli_args_from(&[]).estimated_wait_recovery_probes);
         assert!(!cli_args_from(&[]).estimated_wait_shadow);
         assert_eq!(config.estimated_wait_queue_tokens_per_request, 2048);
         assert_eq!(config.estimated_wait_fallback_prefill_throughput, 500.0);

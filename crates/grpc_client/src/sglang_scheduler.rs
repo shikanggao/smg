@@ -787,6 +787,8 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             dp_rank: load.dp_rank,
             num_running_reqs: load.num_running_reqs,
             num_waiting_reqs: load.num_waiting_reqs,
+            native_request_counts_available: None,
+            native_request_counts_profile: None,
             num_waiting_uncached_tokens: load.num_waiting_uncached_tokens,
             num_waiting_uncached_tokens_available: Some(true),
             num_total_reqs: load.num_total_reqs,

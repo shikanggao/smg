@@ -1301,6 +1301,13 @@ pub struct SchedulerLoadSnapshot {
     pub dp_rank: i32,
     pub num_running_reqs: i32,
     pub num_waiting_reqs: i32,
+    /// Explicit native gauge provenance for experimental recovery tracking.
+    /// Missing is unknown, never an inferred empty queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_request_counts_available: Option<bool>,
+    /// Opaque signature of native count series; changes invalidate recovery history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_request_counts_profile: Option<u64>,
     /// Queued uncached token-work. Kept required for wire compatibility with
     /// existing generated clients; use the companion flag to distinguish an
     /// unavailable signal from an exact empty queue.

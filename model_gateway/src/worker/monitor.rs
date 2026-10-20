@@ -85,6 +85,7 @@ struct PromScrape {
     samples: HashMap<String, Vec<f64>>,
     histogram_buckets: HashMap<String, Vec<(f64, f64)>>,
     local_compute_tokens: Option<f64>,
+    request_count_series: Vec<String>,
 }
 
 fn local_compute_source(head: &str) -> bool {
@@ -113,10 +114,50 @@ fn histogram_bound(head: &str) -> Option<f64> {
 }
 
 impl PromScrape {
+    fn request_counts_profile(&self, epoch: u64) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut series = self.request_count_series.clone();
+        series.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        series.hash(&mut hasher);
+        epoch.hash(&mut hasher);
+        hasher.finish()
+    }
+    fn valid_request_counts(&self, names: &[&str]) -> bool {
+        let mut expected_labels = None;
+        for name in names {
+            let Some(values) = self.samples.get(*name) else {
+                return false;
+            };
+            let mut labels: Vec<_> = self
+                .request_count_series
+                .iter()
+                .filter(|head| head.split('{').next() == Some(*name))
+                .map(|head| &head[name.len()..])
+                .collect();
+            labels.sort_unstable();
+            if labels.is_empty()
+                || labels.len() != values.len()
+                || labels.windows(2).any(|pair| pair[0] == pair[1])
+                || values
+                    .iter()
+                    .any(|value| !value.is_finite() || *value < 0.0 || value.fract() != 0.0)
+                || self.sum(name) > f64::from(i32::MAX)
+                || expected_labels
+                    .as_ref()
+                    .is_some_and(|expected| expected != &labels)
+            {
+                return false;
+            }
+            expected_labels = Some(labels);
+        }
+        true
+    }
     fn parse(text: &str) -> Self {
         let mut samples: HashMap<String, Vec<f64>> = HashMap::new();
         let mut histogram_buckets: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
         let mut local_compute_tokens = None;
+        let mut request_count_series = Vec::new();
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -135,10 +176,22 @@ impl PromScrape {
                     None => continue,
                 },
             };
-            let Some(value) = tail.split_whitespace().next() else {
-                continue;
-            };
             let name = head.split('{').next().unwrap_or(head).trim();
+            // Preserve malformed native-count presence, even a head with no
+            // numeric token. Otherwise one missing rank silently lowers P.
+            let value = tail.split_whitespace().next().unwrap_or("");
+            if [
+                "vllm:num_requests_waiting",
+                "vllm:num_requests_running",
+                "sglang:num_queue_reqs",
+                "sglang:num_running_reqs",
+                "sglang_num_queue_reqs",
+                "sglang_num_running_reqs",
+            ]
+            .contains(&name)
+            {
+                request_count_series.push(head.to_owned());
+            }
             if name == "vllm:prompt_tokens_by_source_total" && local_compute_source(head) {
                 // Retain invalid presence: it must not silently select cached
                 // prompt totals or completion-time counters as capacity.
@@ -150,6 +203,12 @@ impl PromScrape {
                 local_compute_tokens = Some(local_compute_tokens.unwrap_or(0.0) + computed);
             }
             let Ok(value) = value.parse::<f64>() else {
+                if request_count_series
+                    .last()
+                    .is_some_and(|series| series == head)
+                {
+                    samples.entry(name.to_owned()).or_default().push(f64::NAN);
+                }
                 continue;
             };
             samples.entry(name.to_string()).or_default().push(value);
@@ -172,6 +231,7 @@ impl PromScrape {
             samples,
             histogram_buckets,
             local_compute_tokens,
+            request_count_series,
         }
     }
 
@@ -270,6 +330,7 @@ impl EngineCounterSample {
 
 #[derive(Clone, Debug, Default)]
 struct EngineMetricsHistory {
+    recovery_counter_epoch: u64,
     sample: EngineCounterSample,
     avg_request_prefill_kv_computed_tokens: Option<f64>,
     cache_hit_rate: Option<f64>,
@@ -281,6 +342,7 @@ struct EngineMetricsHistory {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct EngineDerivedMetrics {
+    recovery_counter_epoch: u64,
     prefill_throughput: Option<f64>,
     gen_throughput: f64,
     avg_request_prefill_kv_computed_tokens: Option<f64>,
@@ -474,6 +536,19 @@ fn derive_engine_metrics(
             || counter_reset(current.prefill_kv_count, history.sample.prefill_kv_count)
             || counter_reset(current.prompt_tokens, history.sample.prompt_tokens)
     });
+    // Keep recovery count history separate from a native restart/counter reset,
+    // including when capacity learning has not accumulated any samples yet.
+    let recovery_reset = capacity_counter_changed
+        || prefill_counter_reset
+        || previous.as_ref().is_some_and(|history| {
+            counter_reset(current.generation_tokens, history.sample.generation_tokens)
+                || counter_reset(current.ttft_count, history.sample.ttft_count)
+                || counter_reset(current.queue_delay_count, history.sample.queue_delay_count)
+        });
+    let recovery_counter_epoch = previous
+        .as_ref()
+        .map_or(0, |h| h.recovery_counter_epoch)
+        .wrapping_add(u64::from(recovery_reset));
     let prefill_throughput = previous.as_ref().and_then(|history| {
         if capacity_counter_changed {
             return None;
@@ -690,6 +765,7 @@ fn derive_engine_metrics(
     });
 
     let derived = EngineDerivedMetrics {
+        recovery_counter_epoch,
         prefill_throughput,
         gen_throughput,
         avg_request_prefill_kv_computed_tokens,
@@ -704,6 +780,7 @@ fn derive_engine_metrics(
         recent_queue_delay_sample_count,
     };
     let history = EngineMetricsHistory {
+        recovery_counter_epoch,
         sample: current,
         avg_request_prefill_kv_computed_tokens,
         cache_hit_rate,
@@ -1347,6 +1424,19 @@ impl WorkerMonitor {
         {
             for load in loads {
                 if let Some(rank) = load.as_object_mut() {
+                    let counts_available = rank
+                        .get("native_request_counts_available")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(false)
+                        && ["num_waiting_reqs", "num_running_reqs"].iter().all(|key| {
+                            rank.get(*key)
+                                .and_then(serde_json::Value::as_i64)
+                                .is_some_and(|n| n >= 0 && n <= i64::from(i32::MAX))
+                        });
+                    rank.insert(
+                        "native_request_counts_available".to_owned(),
+                        counts_available.into(),
+                    );
                     if !rank.contains_key("num_waiting_uncached_tokens") {
                         rank.insert(
                             "num_waiting_uncached_tokens_available".to_owned(),
@@ -1392,6 +1482,12 @@ impl WorkerMonitor {
         Some(Self::single_rank(SchedulerLoadSnapshot {
             num_running_reqs: m.sum("vllm:num_requests_running") as i32,
             num_waiting_reqs: m.sum("vllm:num_requests_waiting") as i32,
+            native_request_counts_available: Some(
+                m.valid_request_counts(&["vllm:num_requests_waiting", "vllm:num_requests_running"]),
+            ),
+            native_request_counts_profile: Some(
+                m.request_counts_profile(derived.recovery_counter_epoch),
+            ),
             num_waiting_uncached_tokens_available: Some(false),
             token_usage: m.max(kv_usage),
             prefill_throughput: derived.prefill_throughput,
@@ -1483,6 +1579,13 @@ impl WorkerMonitor {
             SchedulerLoadSnapshot {
                 num_running_reqs: m.sum(&format!("{prefix}num_running_reqs")) as i32,
                 num_waiting_reqs: m.sum(&format!("{prefix}num_queue_reqs")) as i32,
+                native_request_counts_available: Some(m.valid_request_counts(&[
+                    &format!("{prefix}num_queue_reqs"),
+                    &format!("{prefix}num_running_reqs"),
+                ])),
+                native_request_counts_profile: Some(
+                    m.request_counts_profile(derived.recovery_counter_epoch),
+                ),
                 num_waiting_uncached_tokens_available: Some(false),
                 token_usage: m.mean(&format!("{prefix}token_usage")),
                 // Preserve the reported generation rate; estimated-wait admission
@@ -1934,6 +2037,45 @@ async fn group_monitor_loop(
 #[cfg(test)]
 mod estimated_wait_metrics_tests {
     use super::PromScrape;
+
+    #[test]
+    fn recovery_counts_reject_missing_malformed_mixed_rank_gauges_and_change_profile() {
+        let valid="vllm:num_requests_waiting{rank=\"0\"} 10\nvllm:num_requests_running{rank=\"0\"} 2\nvllm:num_requests_waiting{rank=\"1\"} 5\nvllm:num_requests_running{rank=\"1\"} 2";
+        let names = ["vllm:num_requests_waiting", "vllm:num_requests_running"];
+        let good = PromScrape::parse(valid);
+        assert!(good.valid_request_counts(&names));
+        for bad in ["bad", "NaN", "+Inf", "-1", "0.5"] {
+            let mixed = PromScrape::parse(&valid.replace(
+                "running{rank=\"1\"} 2",
+                &format!("running{{rank=\"1\"}} {bad}"),
+            ));
+            assert!(!mixed.valid_request_counts(&names), "{bad}");
+            assert_eq!(
+                good.request_counts_profile(0),
+                mixed.request_counts_profile(0)
+            );
+        }
+        let missing_rank =
+            PromScrape::parse(&valid.replace("vllm:num_requests_waiting{rank=\"1\"} 5\n", ""));
+        assert!(!missing_rank.valid_request_counts(&names));
+        let missing_token =
+            PromScrape::parse(&valid.replace("waiting{rank=\"1\"} 5", "waiting{rank=\"1\"}"));
+        assert!(!missing_token.valid_request_counts(&names));
+        let duplicate = PromScrape::parse(&format!(
+            "{valid}\nvllm:num_requests_waiting{{rank=\"1\"}} 5"
+        ));
+        assert!(!duplicate.valid_request_counts(&names));
+        let missing = PromScrape::parse("vllm:num_requests_waiting 10");
+        assert!(!missing.valid_request_counts(&names));
+        assert_ne!(
+            good.request_counts_profile(0),
+            good.request_counts_profile(1)
+        );
+        assert_ne!(
+            good.request_counts_profile(0),
+            PromScrape::parse(&valid.replace("rank=\"1\"", "rank=\"2\"")).request_counts_profile(0)
+        );
+    }
 
     #[test]
     fn maximum_kv_sample_preserves_saturation_and_invalid_data() {

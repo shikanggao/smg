@@ -548,6 +548,7 @@ struct Router {
     estimated_wait_fallback_prefill_throughput: Option<f64>,
     estimated_wait_calibration_shadow: bool,
     estimated_wait_provisional_baseline_secs: Option<f64>,
+    estimated_wait_recovery_probes: bool,
 }
 
 impl Router {
@@ -869,6 +870,7 @@ impl Router {
                 max_estimated_wait_secs: self.max_estimated_wait_secs,
                 estimated_wait_shadow: self.estimated_wait_shadow,
                 estimated_wait_calibration_shadow: self.estimated_wait_calibration_shadow,
+                estimated_wait_recovery_probes: self.estimated_wait_recovery_probes,
                 estimated_wait_provisional_baseline_secs: self
                     .estimated_wait_provisional_baseline_secs,
                 estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
@@ -1164,6 +1166,7 @@ impl Router {
         estimated_wait_fallback_prefill_throughput = None,
         estimated_wait_calibration_shadow = false,
         estimated_wait_provisional_baseline_secs = None,
+        estimated_wait_recovery_probes = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1336,6 +1339,7 @@ impl Router {
         estimated_wait_fallback_prefill_throughput: Option<f64>,
         estimated_wait_calibration_shadow: bool,
         estimated_wait_provisional_baseline_secs: Option<f64>,
+        estimated_wait_recovery_probes: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1520,6 +1524,7 @@ impl Router {
             estimated_wait_fallback_prefill_throughput,
             estimated_wait_calibration_shadow,
             estimated_wait_provisional_baseline_secs,
+            estimated_wait_recovery_probes,
         })
     }
 

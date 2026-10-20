@@ -26,8 +26,9 @@ use crate::{
     },
     routers::common::overload,
     worker::{
-        estimated_wait::CalibrationForecast, ConnectionMode, ConnectionModeExt, PdPairIndex,
-        RoutingPool, RuntimeType, Worker, WorkerRegistry,
+        estimated_wait::{CalibrationForecast, RecoveryProbePermit},
+        ConnectionMode, ConnectionModeExt, PdPairIndex, RoutingPool, RuntimeType, Worker,
+        WorkerRegistry,
     },
 };
 
@@ -55,6 +56,8 @@ pub(crate) struct PlacementInputs<'a> {
     pub cache_namespace: Option<CacheNamespace>,
     /// Optional HTTP SSE observer handoff, captured atomically before credit.
     pub calibration: Option<&'a Mutex<Option<CalibrationForecast>>>,
+    /// Supported HTTP streaming paths transfer this permit to the response body.
+    pub recovery_probe: Option<&'a Mutex<Option<RecoveryProbePermit>>>,
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -163,6 +166,7 @@ pub(crate) fn select_from(
     inputs: PlacementInputs<'_>,
 ) -> Result<Option<Arc<dyn Worker>>, Response> {
     let mut admission = registry.estimated_wait().begin();
+    let mut recovery_probe_needed = false;
     if let Some(guard) = &mut admission {
         guard.record_forecast(
             candidates,
@@ -171,7 +175,14 @@ pub(crate) fn select_from(
                 .and_then(|headers| headers.get("opc-request-id"))
                 .and_then(|value| value.to_str().ok()),
         );
-        guard.check(candidates, model_id)?;
+        if guard.check_cohort(candidates, model_id) {
+            if inputs.recovery_probe.is_none() {
+                return Err(crate::worker::estimated_wait::AdmissionGuard::shed(
+                    model_id,
+                ));
+            }
+            recovery_probe_needed = true;
+        }
     }
     let policy = policies.get_policy_or_default(model_id);
 
@@ -216,6 +227,42 @@ pub(crate) fn select_from(
         return Ok(None);
     };
     let selected = available[idx].clone();
+    // Selection and reservation share the admission lock. A declined policy
+    // never consumes a permit or starts its cooldown.
+    if recovery_probe_needed {
+        let Some(capture) = inputs.recovery_probe else {
+            return Err(crate::worker::estimated_wait::AdmissionGuard::shed(
+                model_id,
+            ));
+        };
+        let mut captured = capture.lock();
+        if captured.is_some() {
+            return Err(crate::worker::estimated_wait::AdmissionGuard::shed(
+                model_id,
+            ));
+        }
+        let permit = selected
+            .is_available()
+            .then(|| {
+                admission.as_mut().and_then(|guard| {
+                    guard.reserve_recovery_probe(
+                        candidates,
+                        &selected,
+                        inputs
+                            .headers
+                            .and_then(|headers| headers.get("opc-request-id"))
+                            .and_then(|value| value.to_str().ok()),
+                    )
+                })
+            })
+            .flatten();
+        let Some(permit) = permit else {
+            return Err(crate::worker::estimated_wait::AdmissionGuard::shed(
+                model_id,
+            ));
+        };
+        *captured = Some(permit);
+    }
 
     Metrics::record_worker_selection(
         metrics_labels::WORKER_REGULAR,
