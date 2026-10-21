@@ -99,6 +99,26 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(profile["ttft_stream_policy"], "complete_bounded_response")
         self.assertEqual(profile["bounded_continuation"]["rejected_outcome"], "unknown")
 
+    def test_deadline_pair_has_matched_continuous_pressure_and_separate_response_limit(self):
+        plans = []
+        for name, policy, numeric_late_min in [("deadline300", "cancel_if_no_first_text", 0),
+                                                ("observe420", "observe", 1)]:
+            profile = json.loads((HERE / ("wait-ttft-" + name + ".json")).read_text())
+            p.validate(profile)
+            self.assertEqual(profile["ttft_deadline_policy"], policy)
+            self.assertEqual(profile["deadline_seconds"], 300)
+            self.assertEqual(profile["observation_horizon_seconds"], 420)
+            self.assertEqual(profile["coverage"]["minimum_observed_late_ttft"], numeric_late_min)
+            self.assertEqual(profile["readiness"]["before_phase"], "pressure")
+            self.assertTrue(profile["readiness"]["require_entry_epoch_continuity"])
+            self.assertEqual([(x["name"], x["seconds"], x["rps"]) for x in profile["phases"]],
+                             [("readiness-learn", 60, 4), ("pressure", 420, 2),
+                              ("pressure-high", 180, 4), ("recovery", 720, .1)])
+            rows = p.make_plan(profile)
+            self.assertEqual(len(rows), 1868)
+            plans.append([{k: v for k, v in r.items() if k != "prompt_sha256"} for r in rows])
+        self.assertEqual(plans[0], plans[1])
+
     def test_smoke_never_claims_300_seconds(self):
         with self.assertRaisesRegex(AssertionError, "300-second"):
             p.validate(smoke_profile())
@@ -301,6 +321,8 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         body = await request.json()
         self.payloads.append(body)
         self.posts += 1
+        if self.mode == "stalled-headers":
+            await asyncio.sleep(.2)
         if self.mode == "stalled-http-error":
             response = self.web.StreamResponse(status=500)
             await response.prepare(request)
@@ -314,11 +336,11 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.active += 1
         self.peak = max(self.peak, self.active)
         response = self.web.StreamResponse(headers={"Content-Type": "text/event-stream", "x-request-id": "native-header-id"})
-        await response.prepare(request)
         async def event(value):
             value["id"] = "native-sse-id"
             await response.write(("data: " + json.dumps(value) + "\n\n").encode())
         try:
+            await response.prepare(request)
             await event({"choices": [{"delta": {"role": "assistant"}}]})
             if mode == 1:
                 await asyncio.sleep(.2)
@@ -406,10 +428,10 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row["content_preview"], "ans")
             self.assertEqual(row["content_characters"], len("answer"))
 
-    async def ttft_request(self, horizon=.3, stream_policy="abort_after_first_text"):
+    async def ttft_request(self, horizon=.3, stream_policy="abort_after_first_text", deadline_policy="observe"):
         import aiohttp
         profile = dict(smoke_profile(), measurement_target="ttft", observation_horizon_seconds=horizon,
-                       ttft_stream_policy=stream_policy,
+                       ttft_stream_policy=stream_policy, ttft_deadline_policy=deadline_policy,
                        readiness=dict(before_phase="pressure", timeout_seconds=.05))
         output = self.root / "ttft-request"
         output.mkdir()
@@ -472,6 +494,65 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(row["intentional_stream_abort"])
         self.assertFalse(row["complete"])
         self.assertIsNone(row["completion_late"])
+
+    async def test_pending_first_text_deadline_censors_without_inventing_numeric_ttft(self):
+        self.mode = "late-first-text"
+        row = await self.ttft_request(horizon=.4, stream_policy="complete_bounded_response",
+                                      deadline_policy="cancel_if_no_first_text")
+        self.assertTrue(row["timed_out"])
+        self.assertTrue(row["first_text_late"])
+        self.assertIsNone(row["client_ttft_seconds"])
+        self.assertEqual(row["cancellation_reason"], "ttft_deadline")
+        self.assertEqual(row["first_text_observation_horizon_seconds"], .07)
+        self.assertEqual(row["response_completion_horizon_seconds"], .4)
+        self.assertGreaterEqual(row["e2e_seconds"], .07)
+        self.assertLess(row["e2e_seconds"], .4)
+        events = [json.loads(line) for line in (self.root / "ttft-request/client-events.jsonl").read_text().splitlines()]
+        cancelled = [e for e in events if e["phase"] == "cancellation_delivered"]
+        self.assertEqual(len(cancelled), 1)
+        self.assertEqual(cancelled[0]["cancellation_reason"], "ttft_deadline")
+        self.assertLessEqual(row["cancellation_delivered_elapsed_seconds"], row["response_context_exited_elapsed_seconds"])
+
+    async def test_pending_text_timer_is_disarmed_and_response_can_finish_after_deadline(self):
+        self.mode = "early-text-stalled-generation"
+        row = await self.ttft_request(horizon=.4, stream_policy="complete_bounded_response",
+                                      deadline_policy="cancel_if_no_first_text")
+        self.assertTrue(row["complete"])
+        self.assertFalse(row["timed_out"])
+        self.assertFalse(row["first_text_late"])
+        self.assertLess(row["client_ttft_seconds"], .07)
+        self.assertGreater(row["e2e_seconds"], .07)
+        self.assertIsNone(row["cancellation_reason"])
+
+    async def test_response_horizon_after_timely_text_is_not_a_ttft_deadline_cancel(self):
+        self.mode = "early-text-stalled-generation"
+        row = await self.ttft_request(horizon=.1, stream_policy="complete_bounded_response",
+                                      deadline_policy="cancel_if_no_first_text")
+        self.assertTrue(row["timed_out"])
+        self.assertFalse(row["first_text_late"])
+        self.assertEqual(row["cancellation_reason"], "response_completion_horizon")
+        self.assertIsNotNone(row["client_ttft_seconds"])
+        self.assertGreaterEqual(row["e2e_seconds"], .1)
+
+    async def test_pending_text_deadline_includes_time_waiting_for_headers(self):
+        self.mode = "stalled-headers"
+        row = await self.ttft_request(horizon=.4, stream_policy="complete_bounded_response",
+                                      deadline_policy="cancel_if_no_first_text")
+        self.assertEqual(row["status"], 0)
+        self.assertTrue(row["timed_out"])
+        self.assertIsNone(row["client_ttft_seconds"])
+        self.assertEqual(row["cancellation_reason"], "ttft_deadline")
+
+    async def test_delayed_timer_callback_never_turns_observed_late_text_into_timely_text(self):
+        timer = mock.Mock()
+        timer.expired.return_value = False
+        row = {}
+        p.observe_first_text(row, 300.25, 300, timer)
+        self.assertEqual(row["client_ttft_seconds"], 300.25)
+        self.assertGreaterEqual(row["client_ttft_seconds"], 300)
+        self.assertEqual(row["ttft_deadline_observation_lag_seconds"], .25)
+        self.assertEqual(row["ttft_deadline_policy_deviation"], "first_text_observed_after_planned_deadline")
+        timer.reschedule.assert_called_once_with(None)
 
     async def test_ttft_horizon_observes_numeric_late_first_text(self):
         self.mode = "late-first-text"

@@ -11,7 +11,8 @@ from collections import Counter
 METHOD = "mse_poll_two_wave_queue_v2"
 RECOVERY_REQUEST_EVENTS = frozenset({"recovery_forecast", "recovery_probe_attempt", "recovery_probe_reserved", "recovery_probe_response", "recovery_probe_released"})
 FEATURE_REQUEST_EVENTS = frozenset({"feature_context_forecast", "feature_context_feedback",
-    "feature_outcome", "feature_outcome_ignored", "feature_admission_decision"})
+    "feature_outcome", "feature_outcome_ignored", "feature_admission_decision",
+    "feature_deadline_started", "feature_deadline_resolution", "feature_deadline_ignored"})
 ISOLATION_REQUEST_EVENTS = frozenset({"forecast", "calibration_forecast", "calibration_feedback", "first_text", "request_transport"}) | RECOVERY_REQUEST_EVENTS | FEATURE_REQUEST_EVENTS
 
 
@@ -191,6 +192,38 @@ def audit_isolation(events, owned_request_ids):
                                        event_kind_counts=dict(sorted(Counter(row["event_kind"] for row in rows).items())),
                                        events=rows) for rid, rows in sorted(foreign.items())],
                 unattributed_event_count=len(unattributed), unattributed_events=unattributed, reasons=reasons)
+
+
+def audit_entry_continuity(events, rows, readiness, measurement_phase):
+    """Bind the first measured admission to the epoch that actually passed readiness."""
+    measured = [r for r in rows if r.get("phase") == measurement_phase and not r.get("local_drop")]
+    errors = []
+    first = min(measured, key=lambda r: r["index"]) if measured else None
+    candidates = []
+    if first:
+        for event in events:
+            value = (event.get("fields", {}) or {}) | event
+            if value.get("event") == "forecast" and value.get("request_id") == first["opc_request_id"]:
+                candidates.append(value)
+    if readiness.get("ready") is not True or len(candidates) != 1:
+        errors.append("Missing successful readiness or exact first measured admission")
+    gate = candidates[0] if len(candidates) == 1 else {}
+    expected = next((w for w in readiness.get("workers", []) if w["worker"] == gate.get("worker")), {})
+    checks = dict(same_trained_worker=bool(expected),
+        known_scalar_method=gate.get("calibration_method") == METHOD,
+        same_trained_epoch=bool(expected) and gate.get("calibration_epoch") == expected.get("epoch"),
+        native_capacity_fresh=gate.get("native_ready") is True,
+        current_samples_retained=gate.get("calibration_sample_count", 0) >= 4,
+        current_fit_retained=bool(expected) and gate.get("calibration_fitted_revision", 0) >= expected.get("fitted_revision", 0) > 0,
+        baseline_retained=gate.get("calibration_baseline_available") is True)
+    if not all(checks.values()):
+        errors.append("Training epoch or usable fitted history was lost before measurement entry")
+    return dict(ok=not errors, errors=errors, measurement_phase=measurement_phase,
+                first_measured_request_id=first["opc_request_id"] if first else None,
+                readiness_worker=expected, checks=checks,
+                admission={key: gate.get(key) for key in ["worker", "calibration_epoch", "calibration_sample_count",
+                    "calibration_fitted_revision", "native_ready", "calibration_baseline_available"]},
+                scope="Readiness to first measured admission only; later genuine lifecycle or recovery resets remain observable.")
 
 
 class Readiness:

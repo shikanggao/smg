@@ -7,11 +7,17 @@ from collections import Counter
 
 
 METHOD = "feature_context_ridge_v1"
+CURRENT_METHOD = "feature_context_deadline_ridge_v2"
+METHODS = frozenset({METHOD, CURRENT_METHOD})
 FEATURES = ("kv_usage", "pretext_cutoff_rate", "actual_rejection_rate")
+CURRENT_FEATURES = ("kv_usage", "deadline_or_cutoff_rate", "actual_rejection_rate")
 COUNTS = ("first_text", "upstream_timeout", "pretext_downstream_disconnect",
           "unknown_pretext_end", "admitted", "actual_rejected", "untracked_admitted")
+DEADLINE_COUNTS = ("deadline_timely_first_text", "deadline_breach",
+                   "deadline_or_cutoff_adverse", "deadline_or_cutoff_unknown")
 REQUEST_EVENTS = frozenset({"feature_context_forecast", "feature_context_feedback",
-                            "feature_outcome", "feature_outcome_ignored", "feature_admission_decision"})
+                            "feature_outcome", "feature_outcome_ignored", "feature_admission_decision",
+                            "feature_deadline_started", "feature_deadline_resolution", "feature_deadline_ignored"})
 
 
 def number(value, name, *, nullable=False, maximum=None):
@@ -61,7 +67,7 @@ def close(value, expected, name):
 
 
 def payload(event):
-    if event.get("feature_method") != METHOD:
+    if event.get("feature_method") not in METHODS:
         raise ValueError("Unknown feature telemetry method")
     value = event.get("feature_json")
     if not isinstance(value, str):
@@ -75,18 +81,35 @@ def payload(event):
     return value
 
 
-def validate_context(context):
+def validate_context(context, method=None):
     integer(context["bucket_second"], "context.bucket_second")
     clock(context["activity_origin_time_seconds"], "activity origin")
     values = vector(context["values"], "context.values",
                     lambda v, n: number(v, n, nullable=True, maximum=1))
-    counts = {name: integer(context["counts"][name], name) for name in COUNTS}
-    cutoff = counts["upstream_timeout"] + counts["pretext_downstream_disconnect"]
-    known = counts["first_text"] + cutoff
-    resolved = known + counts["unknown_pretext_end"]
+    if method is None:
+        method = CURRENT_METHOD if "deadline_untracked_pending" in context or any(k in context["counts"] for k in DEADLINE_COUNTS) else METHOD
+    if method not in METHODS:
+        raise ValueError("Unknown feature context method")
+    names = COUNTS + DEADLINE_COUNTS if method == CURRENT_METHOD else COUNTS
+    if set(context["counts"]) != set(names):
+        raise ValueError("Unexpected feature counter schema")
+    counts = {name: integer(context["counts"][name], name) for name in names}
+    if method == CURRENT_METHOD:
+        pending_unknown = integer(context["deadline_untracked_pending"], "deadline_untracked_pending")
+        cutoff = counts["deadline_or_cutoff_adverse"]
+        known = counts["deadline_timely_first_text"] + cutoff
+        unknown = counts["deadline_or_cutoff_unknown"]
+    else:
+        if "deadline_untracked_pending" in context:
+            raise ValueError("Legacy context cannot contain deadline-v2 state")
+        pending_unknown = 0
+        cutoff = counts["upstream_timeout"] + counts["pretext_downstream_disconnect"]
+        known = counts["first_text"] + cutoff
+        unknown = counts["unknown_pretext_end"]
+    resolved = known + unknown
     attempts = counts["admitted"] + counts["actual_rejected"]
     expected_cutoff = (cutoff / known if known >= 16 and not counts["untracked_admitted"]
-                       and counts["unknown_pretext_end"] < .1 * resolved else None)
+                       and not pending_unknown and unknown < .1 * resolved else None)
     expected_rejection = counts["actual_rejected"] / attempts if attempts >= 16 else None
     for actual, expected, name in [(values[1], expected_cutoff, "cutoff rate/outcome coverage"),
                                    (values[2], expected_rejection, "actual rejection rate/admission coverage")]:
@@ -98,14 +121,26 @@ def validate_context(context):
     return values, counts
 
 
+def audit_method(events, expected):
+    """Historical parsing support must not relax a fresh run's frozen method."""
+    if expected not in METHODS:
+        raise ValueError("Unknown expected feature method")
+    captured = [(i, e) for i, e in enumerate(events) if str(e.get("event", "")).startswith("feature_")]
+    errors = [dict(event_index=i, event_kind=e.get("event"), request_id=e.get("request_id"),
+                   captured_method=e.get("feature_method"), expected_method=expected)
+              for i, e in captured if e.get("feature_method") != expected]
+    return dict(ok=bool(captured) and not errors, expected_method=expected,
+                event_count=len(captured), errors=errors)
+
+
 def forecast(event, *, gate=None, ttft_deadline_seconds=300):
     """Keep TOTAL-TTFT comparisons separate from the recorded EXTRA flags."""
     if event.get("event") != "feature_context_forecast":
         raise ValueError("Expected feature admission forecast")
     value = payload(event)
-    if value.get("method") != METHOD:
+    if value.get("method") != event.get("feature_method"):
         raise ValueError("Unknown feature payload method")
-    context, counts = validate_context(value["context"])
+    context, counts = validate_context(value["context"], event["feature_method"])
     fit, prediction = value["fit"], value["prediction"]
     support = vector(fit["support"], "fit.support", boolean)
     active = vector(prediction["active"], "prediction.active", boolean)
@@ -203,7 +238,7 @@ def forecast(event, *, gate=None, ttft_deadline_seconds=300):
                 raise ValueError("Feature baseline availability differs from admission")
         else:
             close(baseline, original_b, "original admission baseline")
-    return dict(method=METHOD, total_ttft_seconds=total, extra_seconds=extra,
+    return dict(method=event["feature_method"], total_ttft_seconds=total, extra_seconds=extra,
                 total_ttft_over_deadline=None if total is None else total >= ttft_deadline_seconds,
                 recorded_extra_would_reject=value["extra_would_reject"],
                 recorded_total_would_reject=value["total_would_reject"],
@@ -228,10 +263,10 @@ def audit_activity(events, rows):
         if kind != "feature_outcome_ignored":
             value = payload(event)
             context = value["activity"]
-            _, counts = validate_context(context)
+            _, counts = validate_context(context, event["feature_method"])
             if value["counts"] != counts:
                 errors.append("Activity counts differ from the captured bucket context")
-        elif (event.get("feature_method") != METHOD
+        elif (event.get("feature_method") not in METHODS
               or event.get("reason") not in {"generation_changed", "worker_missing"}):
             errors.append("Unknown ignored-outcome provenance")
         if kind == "feature_admission_decision":
@@ -310,11 +345,13 @@ def audit_windows(events):
             generations[worker] = dict(epoch=epoch, origin=None)
             continue
         if kind not in {"feature_context_forecast", "feature_context_poll",
-                        "feature_admission_decision", "feature_outcome"}:
+                        "feature_admission_decision", "feature_outcome",
+                        "feature_deadline_started", "feature_deadline_resolution"}:
             continue
         value = payload(event)
         context = value["context"] if kind.startswith("feature_context_") else value["activity"]
-        _, captured = validate_context(context)
+        _, captured = validate_context(context, event["feature_method"])
+        names = tuple(captured)
         second = context["bucket_second"]
         origin = context["activity_origin_time_seconds"]
         elapsed = clock(event["diagnostic_time_seconds"], "diagnostic time") - origin
@@ -339,11 +376,20 @@ def audit_windows(events):
             if kind == "feature_admission_decision" and category == "admitted" and not event["outcome_tracking_supported"]:
                 past.append((second, "untracked_admitted"))
             activity_events += 1
+        if kind == "feature_deadline_resolution":
+            categories = {"timely_first_text": ["deadline_timely_first_text"],
+                          "deadline_breach": ["deadline_breach", "deadline_or_cutoff_adverse"],
+                          "actual_cutoff": ["deadline_or_cutoff_adverse"],
+                          "unknown_pretext_end": ["deadline_or_cutoff_unknown"]}.get(event.get("resolution"))
+            if categories is None or event["feature_method"] != CURRENT_METHOD:
+                raise ValueError("Unknown deadline resolution category")
+            past.extend((second, name) for name in categories)
+            activity_events += 1
         expected = Counter(category for bucket, category in past if second - 60 < bucket <= second)
-        if any(captured[name] != expected[name] for name in COUNTS):
+        if any(captured[name] != expected[name] for name in names):
             errors.append(dict(event_index=index, event_kind=kind,
                                request_id=event.get("request_id"), reason="Activity window counts differ",
-                               expected={name: expected[name] for name in COUNTS}, captured=captured))
+                               expected={name: expected[name] for name in names}, captured=captured))
         snapshots += 1
     return dict(ok=not errors, errors=errors, snapshots=snapshots,
                 activity_events=activity_events, worker_generations=len(history),

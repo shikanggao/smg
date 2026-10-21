@@ -164,6 +164,54 @@ class FeatureForecastTests(unittest.TestCase):
                 f.forecast(event(changed))
 
 
+class DeadlineContextTests(unittest.TestCase):
+    def value(self):
+        value, gate = fixture()
+        value["method"] = f.CURRENT_METHOD
+        value["context"].update(deadline_untracked_pending=0)
+        value["context"]["counts"].update(deadline_timely_first_text=12, deadline_breach=4,
+            deadline_or_cutoff_adverse=4, deadline_or_cutoff_unknown=0)
+        value["context"]["values"][1] = .25
+        return value, gate
+
+    def test_deadline_union_feature_is_distinct_from_actual_terminal_rate(self):
+        value, gate = self.value()
+        captured = event(value, gate); captured["feature_method"] = f.CURRENT_METHOD
+        result = f.forecast(captured, gate=gate)
+        self.assertEqual(result["feature_values"][1], .25)
+        self.assertEqual(value["context"]["counts"]["upstream_timeout"], 0)
+        self.assertEqual(value["context"]["counts"]["pretext_downstream_disconnect"], 0)
+
+    def test_pending_untracked_or_unknown_outcomes_suppress_union_rate(self):
+        for field in ("pending", "unknown", "untracked"):
+            value, _ = self.value()
+            if field == "pending": value["context"]["deadline_untracked_pending"] = 1
+            elif field == "unknown": value["context"]["counts"]["deadline_or_cutoff_unknown"] = 2
+            else: value["context"]["counts"]["untracked_admitted"] = 1
+            with self.assertRaisesRegex(ValueError, "availability mismatch"):
+                f.validate_context(value["context"], f.CURRENT_METHOD)
+            value["context"]["values"][1] = None
+            self.assertIsNone(f.validate_context(value["context"], f.CURRENT_METHOD)[0][1])
+
+    def test_new_method_requires_exact_counter_schema(self):
+        value, _ = self.value()
+        for name in f.DEADLINE_COUNTS:
+            changed = copy.deepcopy(value["context"]); del changed["counts"][name]
+            with self.assertRaisesRegex(ValueError, "counter schema"):
+                f.validate_context(changed, f.CURRENT_METHOD)
+        with self.assertRaisesRegex(ValueError, "counter schema"):
+            f.validate_context(value["context"], f.METHOD)
+
+    def test_fresh_capture_cannot_mix_historical_methods(self):
+        current = dict(event="feature_deadline_started", feature_method=f.CURRENT_METHOD)
+        self.assertTrue(f.audit_method([current], f.CURRENT_METHOD)["ok"])
+        legacy = dict(event="feature_context_feedback", feature_method=f.METHOD)
+        result = f.audit_method([current, legacy], f.CURRENT_METHOD)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["errors"][0]["captured_method"], f.METHOD)
+        self.assertFalse(f.audit_method([], f.CURRENT_METHOD)["ok"])
+
+
 def activity_event(rid, category, counts, second=0, worker="http://worker", tracking=True):
     context = dict(values=[None, None, None], bucket_second=second,
                    activity_origin_time_seconds=-.001, counts={key: counts.get(key, 0) for key in f.COUNTS})

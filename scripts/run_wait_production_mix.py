@@ -52,6 +52,17 @@ def quantile(values, q):
     return values[min(len(values) - 1, math.ceil(q * len(values)) - 1)] if values else None
 
 
+def observe_first_text(row, elapsed, deadline_seconds, pending_timeout=None):
+    """Preserve the actual observation even if the event loop ran a timer late."""
+    row["client_ttft_seconds"] = elapsed
+    if pending_timeout is not None:
+        if elapsed >= deadline_seconds:
+            row["ttft_deadline_policy_deviation"] = "first_text_observed_after_planned_deadline"
+            row["ttft_deadline_observation_lag_seconds"] = elapsed - deadline_seconds
+        if not pending_timeout.expired():
+            pending_timeout.reschedule(None)
+
+
 def validate(profile, smoke=False):
     assert profile["schema_version"] == 1
     assert profile["deadline_seconds"] > 0
@@ -74,7 +85,12 @@ def validate(profile, smoke=False):
         horizon = profile["observation_horizon_seconds"]
         assert math.isfinite(horizon) and profile["deadline_seconds"] < horizon <= (1 if smoke else 600)
         assert profile.get("ttft_stream_policy", "abort_after_first_text") in {"abort_after_first_text", "complete_bounded_response"}
+        assert profile.get("ttft_deadline_policy", "observe") in {"observe", "cancel_if_no_first_text"}
+        if profile.get("ttft_deadline_policy") == "cancel_if_no_first_text":
+            assert profile.get("ttft_stream_policy") == "complete_bounded_response", "Pending-text deadlines must preserve bounded normal completion"
         readiness = profile["readiness"]
+        if "require_entry_epoch_continuity" in readiness:
+            assert type(readiness["require_entry_epoch_continuity"]) is bool
         assert readiness["timeout_seconds"] > 0 and readiness["timeout_seconds"] <= 300
         assert readiness["before_phase"] in {p["name"] for p in profile["phases"]}
         assert profile["phases"][0]["name"] != readiness["before_phase"], "Readiness needs a bounded learning phase"
@@ -289,20 +305,34 @@ class Run:
         event = dict(event="client_transport", phase=phase, opc_request_id=row["opc_request_id"],
                      elapsed_seconds=time.monotonic() - self.started,
                      request_elapsed_seconds=time.monotonic() - self.started - row["started_elapsed_seconds"],
+                     cancellation_reason=row.get("cancellation_reason"),
                      engine_cancellation_acknowledged=None)
         self.client_events.write(encoded(event).decode() + "\n")
         self.client_events.flush()
         return event["elapsed_seconds"]
 
     @asynccontextmanager
-    async def cancellation_observer(self, row):
+    async def cancellation_observer(self, row, pending_deadline=None, response_deadline=None):
         # The inner observer runs before aiohttp releases the response context;
         # the outer observer covers cancellation while awaiting response headers.
         try:
             yield
         except asyncio.CancelledError:
             if row.get("cancellation_delivered_elapsed_seconds") is None:
+                if pending_deadline is not None and pending_deadline.expired():
+                    row["cancellation_reason"] = "ttft_deadline"
+                elif response_deadline is not None and response_deadline.expired():
+                    row["cancellation_reason"] = ("response_completion_horizon" if
+                        row.get("ttft_deadline_policy") == "cancel_if_no_first_text"
+                        and row.get("client_ttft_seconds") is not None else "observation_horizon")
+                else:
+                    row["cancellation_reason"] = "workload_interrupted"
                 row["cancellation_delivered_elapsed_seconds"] = self.client_event(row, "cancellation_delivered")
+                planned = (row["ttft_deadline_elapsed_seconds"] if row["cancellation_reason"] == "ttft_deadline"
+                           else row["observation_deadline_elapsed_seconds"] if row["cancellation_reason"] in
+                           {"observation_horizon", "response_completion_horizon"} else None)
+                if planned is not None:
+                    row["cancellation_deadline_lag_seconds"] = row["cancellation_delivered_elapsed_seconds"] - planned
             raise
 
     async def sample(self, session):
@@ -364,9 +394,15 @@ class Run:
                    upstream_response_request_id=None, upstream_sse_response_id=None)
         ttft_only = self.profile.get("measurement_target") == "ttft"
         horizon = self.profile.get("observation_horizon_seconds", self.profile["deadline_seconds"])
+        pending_only_deadline = (ttft_only and self.profile.get("ttft_deadline_policy") == "cancel_if_no_first_text")
+        response_timeout = asyncio.timeout_at(start + horizon)
+        pending_timeout = asyncio.timeout_at(start + self.profile["deadline_seconds"] if pending_only_deadline else None)
         if ttft_only:
             row.update(measurement_target="ttft", observation_horizon_seconds=horizon, intentional_stream_abort=False,
-                       ttft_stream_policy=self.profile.get("ttft_stream_policy", "abort_after_first_text"))
+                       ttft_stream_policy=self.profile.get("ttft_stream_policy", "abort_after_first_text"),
+                       ttft_deadline_policy=self.profile.get("ttft_deadline_policy", "observe"),
+                       first_text_observation_horizon_seconds=self.profile["deadline_seconds"] if pending_only_deadline else horizon,
+                       response_completion_horizon_seconds=horizon)
         row["ttft_deadline_elapsed_seconds"] = start - self.started + self.profile["deadline_seconds"]
         row["observation_deadline_elapsed_seconds"] = start - self.started + horizon
         self.client_event(row, "request_started")
@@ -393,7 +429,8 @@ class Run:
                 answer = delta.get("content")
                 reasoning = delta.get("reasoning") or delta.get("reasoning_content")
                 if row["client_ttft_seconds"] is None and any(isinstance(v, str) and v for v in [answer, reasoning]):
-                    row["client_ttft_seconds"] = elapsed
+                    observe_first_text(row, elapsed, self.profile["deadline_seconds"],
+                                       pending_timeout if pending_only_deadline else None)
                     self.client_event(row, "first_text")
                 if row["first_answer_seconds"] is None and isinstance(answer, str) and answer:
                     row["first_answer_seconds"] = elapsed
@@ -408,14 +445,15 @@ class Run:
         if self.serving_key:
             headers["Authorization"] = "Bearer " + self.serving_key
         try:
-            # One wall-clock deadline includes headers, first text and generation.
-            async with asyncio.timeout(horizon), self.cancellation_observer(row):
+            # The pending-text timer is disarmed by first text. The independent
+            # response horizon still bounds headers, streaming and generation.
+            async with response_timeout, pending_timeout, self.cancellation_observer(row, pending_timeout, response_timeout):
                 async with session.post(self.args.url.rstrip("/") + "/v1/chat/completions", json=payload,
                                         headers=headers, timeout=aiohttp.ClientTimeout(total=None)) as response:
                     row["status"] = response.status
                     row["upstream_response_request_id"] = (response.headers.get("x-request-id") or response.headers.get("opc-request-id") or "")[:256] or None
                     self.client_event(row, "response_headers_received")
-                    async with self.cancellation_observer(row):
+                    async with self.cancellation_observer(row, pending_timeout, response_timeout):
                         if response.status != 200:
                             # Preserve error headers even if reading their body
                             # reaches the deadline. That is not model-wait truth.
@@ -448,7 +486,8 @@ class Run:
                                 row["error"] = "Incomplete SSE response"
         except TimeoutError:
             row["timed_out"] = True
-            row["cancellation_reason"] = "observation_horizon"
+            row["cancellation_reason"] = ("ttft_deadline" if pending_timeout.expired() else
+                "response_completion_horizon" if pending_only_deadline and row["client_ttft_seconds"] is not None else "observation_horizon")
         except asyncio.CancelledError:
             row["cancelled"] = True
             row["cancellation_reason"] = "workload_interrupted"
@@ -804,7 +843,8 @@ def analyze(path, events_path=None):
     def valid_ttft_measurement(row):
         return ttft_only and row.get("error") is None and not row.get("cancelled") and (
             row.get("intentional_stream_abort") and row.get("client_ttft_seconds") is not None
-            or row.get("timed_out") and row.get("first_text_late") is True)
+            or row.get("timed_out") and (row.get("first_text_late") is True
+                or row.get("status") == 200 and row.get("client_ttft_seconds") is not None))
     errors = [r for r in rows if not r.get("local_drop") and not (r.get("complete") or valid_ttft_measurement(r)
               or (r.get("timed_out") and r.get("completion_late") is True) or r.get("controlled_rejection"))]
     lag = quantile([r.get("dispatch_lag_seconds") for r in rows], .99)
@@ -819,14 +859,30 @@ def analyze(path, events_path=None):
     feature_activity, feature_windows = None, None
     if feature_forecasts or profile.get("feature_context_required"):
         try:
-            from .wait_feature_context import audit_activity, audit_windows
+            from .wait_feature_context import audit_activity, audit_windows, audit_method
         except ImportError:
             try:
-                from wait_feature_context import audit_activity, audit_windows
+                from wait_feature_context import audit_activity, audit_windows, audit_method
             except ImportError:
-                from scripts.wait_feature_context import audit_activity, audit_windows
+                from scripts.wait_feature_context import audit_activity, audit_windows, audit_method
         feature_activity = audit_activity(isolation_events, rows)
         feature_windows = audit_windows(isolation_events)
+        if profile.get("expected_feature_method"):
+            method_audit = audit_method(isolation_events, profile["expected_feature_method"])
+            save(path / "feature-method-audit.json", method_audit)
+            checks["frozen_feature_method"] = method_audit["ok"]
+        if profile.get("expected_feature_deadline_seconds") is not None:
+            try:
+                from .wait_feature_deadline import audit_deadlines
+            except ImportError:
+                try:
+                    from wait_feature_deadline import audit_deadlines
+                except ImportError:
+                    from scripts.wait_feature_deadline import audit_deadlines
+            deadline_audit = audit_deadlines(isolation_events, rows)
+            save(path / "feature-deadline-audit.json", deadline_audit)
+            checks["once_only_router_deadline_ledger"] = (profile["expected_feature_deadline_seconds"] == 300
+                and deadline_audit["ok"] and deadline_audit["applicable"])
         checks["feature_actual_decisions_and_terminal_accounting"] = feature_activity["ok"]
         checks["feature_causal_rate_windows"] = feature_windows["ok"]
         checks["exact_feature_forecasts"] = all(r["opc_request_id"] in feature_forecasts for r in rows
@@ -859,6 +915,26 @@ def analyze(path, events_path=None):
         covered = {k: covered[k] for k in ["actual_300_second_deadline", "exact_request_forecasts", "controlled_rejections_audited", "exact_first_text_events"]}
         covered.update(observation_beyond_ttft_threshold=profile["observation_horizon_seconds"] > deadline,
                        readiness_verified_before_pressure=readiness.get("ready") is True)
+        if profile.get("ttft_deadline_policy") == "cancel_if_no_first_text":
+            covered.pop("observation_beyond_ttft_threshold")
+            covered["pending_first_text_deadline_contract"] = all(
+                r.get("cancellation_reason") == "ttft_deadline" and r.get("e2e_seconds", 0) >= deadline
+                and r.get("cancellation_delivered_elapsed_seconds", -1) >= r["ttft_deadline_elapsed_seconds"]
+                for r in rows if r.get("timed_out") and r.get("client_ttft_seconds") is None and r.get("error") is None)
+            covered["post_first_text_completion_is_separate"] = all(
+                r.get("cancellation_reason") != "ttft_deadline" for r in rows
+                if r.get("client_ttft_seconds") is not None and r["client_ttft_seconds"] < deadline)
+        if profile.get("readiness", {}).get("require_entry_epoch_continuity"):
+            try:
+                from .wait_ttft_readiness import audit_entry_continuity
+            except ImportError:
+                try:
+                    from wait_ttft_readiness import audit_entry_continuity
+                except ImportError:
+                    from scripts.wait_ttft_readiness import audit_entry_continuity
+            entry = audit_entry_continuity(isolation_events, rows, readiness, profile["readiness"]["before_phase"])
+            save(path / "measurement-entry-continuity.json", entry)
+            checks["measurement_training_epoch_continuity"] = entry["ok"]
         if coverage.get("kind") == "raw_hard_continuation":
             covered.update(actual_rejection_exposure=feature_activity is not None and feature_activity["actual_rejected"] >= coverage["minimum_actual_admission_rejections"],
                 actual_admission_decision_exposure=feature_activity is not None and feature_activity["actual_decisions"] >= coverage["minimum_actual_admission_decisions"],
@@ -952,7 +1028,7 @@ def analyze(path, events_path=None):
             ("TTFT scoring allows capped responses to complete normally; horizon cancellation is distinct from first-text timing and answer quality."
              if profile.get("ttft_stream_policy") == "complete_bounded_response" else
              "TTFT mode intentionally closes the stream after first text; this does not establish full completion or answer quality."),
-            "Missing first text after the longer observation horizon is a known late binary label with numeric TTFT unavailable. Short cancellations/errors remain unknown."]
+            "Missing first text after its configured waiting deadline is a censored late binary label only with full-bound observation and valid owned dispatch; numeric TTFT remains unavailable. Short cancellations/errors remain unknown."]
     save(path / "summary.json", result)
     with (path / "paired-production.jsonl").open("w") as stream:
         for row in rows:

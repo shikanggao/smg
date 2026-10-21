@@ -4,9 +4,9 @@ import json
 import unittest
 
 try:
-    from scripts.wait_ttft_readiness import METHOD, Readiness, audit_isolation, native_completion_stats_proof
+    from scripts.wait_ttft_readiness import METHOD, Readiness, audit_isolation, audit_entry_continuity, native_completion_stats_proof
 except ModuleNotFoundError:
-    from wait_ttft_readiness import METHOD, Readiness, audit_isolation, native_completion_stats_proof
+    from wait_ttft_readiness import METHOD, Readiness, audit_isolation, audit_entry_continuity, native_completion_stats_proof
 
 
 class NativeCompletionStatsTests(unittest.TestCase):
@@ -263,6 +263,37 @@ class WholeCaptureIsolationTests(unittest.TestCase):
         for invalid in ["owned-prefix-", set(), {""}, {None}]:
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 audit_isolation([], invalid)
+
+
+class MeasurementEntryTests(unittest.TestCase):
+    def fixture(self):
+        rows = [dict(index=0, phase="readiness-learn", opc_request_id="learn"),
+                dict(index=1, phase="pressure", opc_request_id="measured")]
+        proof = dict(ready=True, workers=[dict(worker="worker", epoch=1, fitted_revision=4)])
+        gate = dict(event="forecast", request_id="measured", worker="worker", calibration_method=METHOD,
+                    calibration_epoch=1, calibration_sample_count=4, calibration_fitted_revision=5,
+                    native_ready=True, calibration_baseline_available=True)
+        return rows, proof, gate
+
+    def test_first_measured_admission_retains_current_training_epoch_and_fit(self):
+        rows, proof, gate = self.fixture()
+        result = audit_entry_continuity([gate], rows, proof, "pressure")
+        self.assertTrue(result["ok"], result)
+
+    def test_a_successful_historical_readiness_cannot_hide_drain_before_measurement(self):
+        rows, proof, gate = self.fixture()
+        gate.update(calibration_epoch=2, calibration_sample_count=0, calibration_fitted_revision=0)
+        result = audit_entry_continuity([gate], rows, proof, "pressure")
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["checks"]["same_trained_epoch"])
+        self.assertFalse(result["checks"]["current_fit_retained"])
+
+    def test_missing_duplicate_or_stale_first_admission_fails_closed(self):
+        rows, proof, gate = self.fixture()
+        for events in [[], [gate, gate], [dict(gate, native_ready=False)],
+                       [dict(gate, calibration_method="unknown")]]:
+            with self.subTest(events=events):
+                self.assertFalse(audit_entry_continuity(events, rows, proof, "pressure")["ok"])
 
 
 if __name__ == "__main__":
