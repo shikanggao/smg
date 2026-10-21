@@ -62,6 +62,8 @@ def validate(profile, smoke=False):
         assert profile["serving_auth_env"] == "SMG_EXPERIMENT_INGRESS_KEY", "Unexpected serving credential environment name"
     if "recovery_candidate_required" in profile:
         assert type(profile["recovery_candidate_required"]) is bool
+    if "feature_context_required" in profile:
+        assert type(profile["feature_context_required"]) is bool
     target = profile.get("measurement_target", "completion")
     assert target in {"completion", "ttft"}
     if target == "ttft":
@@ -358,6 +360,7 @@ class Run:
                    cancelled=False, error=None, usage={},
                    cancellation_delivered_elapsed_seconds=None,
                    cancellation_reason=None, engine_cancellation_acknowledged=None,
+                   response_error_code=None,
                    upstream_response_request_id=None, upstream_sse_response_id=None)
         ttft_only = self.profile.get("measurement_target") == "ttft"
         horizon = self.profile.get("observation_horizon_seconds", self.profile["deadline_seconds"])
@@ -417,7 +420,15 @@ class Run:
                             # Preserve error headers even if reading their body
                             # reaches the deadline. That is not model-wait truth.
                             row["error"] = "HTTP " + str(response.status)
-                            row["error"] += ": " + (await response.text())[:1000]
+                            body = await response.text()
+                            row["error"] += ": " + body[:1000]
+                            try:
+                                error_body = json.loads(body)
+                                error_body = error_body.get("error") if isinstance(error_body, dict) else None
+                                code = error_body.get("code") if isinstance(error_body, dict) else None
+                                row["response_error_code"] = code if isinstance(code, str) else None
+                            except ValueError:
+                                pass
                         else:
                             async for chunk in response.content.iter_any():
                                 for data in frames.feed(chunk):
@@ -447,7 +458,9 @@ class Run:
         row["response_context_exited_elapsed_seconds"] = self.client_event(row, "request_context_exited")
         row["completed_elapsed_seconds"] = time.monotonic() - self.started
         row["e2e_seconds"] = time.monotonic() - start
-        row["controlled_rejection"] = row["status"] == 503 and "estimated wait budgets" in (row["error"] or "")
+        row["controlled_rejection"] = (row["status"] == 503
+            and row["response_error_code"] == "worker_overload_protection_shed"
+            and "estimated wait budgets" in (row["error"] or ""))
         valid_timeout = row["timed_out"] and row["status"] in (0, 200) and row["error"] is None
         row["completion_late"] = (True if valid_timeout and not ttft_only else row["e2e_seconds"] >= self.profile["deadline_seconds"] if row["complete"] else None)
         row["first_text_late"] = (row["client_ttft_seconds"] >= self.profile["deadline_seconds"] if row["client_ttft_seconds"] is not None else True if valid_timeout and horizon >= self.profile["deadline_seconds"] else None)
@@ -685,7 +698,7 @@ def analyze(path, events_path=None):
     execution = json.loads((path / "execution.json").read_text())
     rows = [json.loads(line) for line in (path / "requests.jsonl").read_text().splitlines()]
     samples = [json.loads(line) for line in (path / "metrics.jsonl").read_text().splitlines()]
-    forecasts, first_text, gates, recovery_forecasts = {}, {}, {}, {}
+    forecasts, first_text, gates, recovery_forecasts, feature_forecasts = {}, {}, {}, {}, {}
     isolation_events = []
     if events_path:
         for line in events_path.read_text().splitlines():
@@ -700,7 +713,8 @@ def analyze(path, events_path=None):
             if not rid.startswith("prod-" + config["run_id"] + "-"):
                 continue
             destination = {"calibration_forecast": forecasts, "first_text": first_text, "forecast": gates,
-                           "recovery_forecast": recovery_forecasts}.get(event.get("event"))
+                           "recovery_forecast": recovery_forecasts,
+                           "feature_context_forecast": feature_forecasts}.get(event.get("event"))
             if destination is not None:
                 assert rid not in destination, "Duplicate exact request event: " + rid
                 destination[rid] = event
@@ -765,6 +779,16 @@ def analyze(path, events_path=None):
             row["recovery_candidate"] = pair_recovery(candidate,
                 row["pre_admission_total_ttft_predictions"], profile["router_extra_ttft_budget_seconds"],
                 {"calibrated": row["pre_admission_recorded_extra_flags"]["calibrated"]}, gate.get("native_ready"))
+        feature = feature_forecasts.get(row["opc_request_id"])
+        if feature is not None:
+            try:
+                from .wait_feature_context import forecast as pair_feature
+            except ImportError:
+                from wait_feature_context import forecast as pair_feature
+            if gate is None:
+                raise ValueError("Feature candidate lacks its exact original admission forecast")
+            row["feature_context_candidate"] = pair_feature(feature, gate=gate,
+                                                            ttft_deadline_seconds=deadline)
     isolation = None
     if ttft_only:
         try:
@@ -790,6 +814,18 @@ def analyze(path, events_path=None):
                   native_drained=execution["native_drained"])
     if ttft_only:
         checks["exclusive_workload_isolation"] = isolation["ok"]
+    feature_activity, feature_windows = None, None
+    if feature_forecasts or profile.get("feature_context_required"):
+        try:
+            from .wait_feature_context import audit_activity, audit_windows
+        except ImportError:
+            from wait_feature_context import audit_activity, audit_windows
+        feature_activity = audit_activity(isolation_events, rows)
+        feature_windows = audit_windows(isolation_events)
+        checks["feature_actual_decisions_and_terminal_accounting"] = feature_activity["ok"]
+        checks["feature_causal_rate_windows"] = feature_windows["ok"]
+        checks["exact_feature_forecasts"] = all(r["opc_request_id"] in feature_forecasts for r in rows
+            if not r.get("local_drop"))
     controls = [r for r in rows if r["control"]]
     pressure = [r for r in rows if not r["control"]]
     high_seconds = 0
@@ -799,26 +835,35 @@ def analyze(path, events_path=None):
             high_seconds += interval
     coverage = profile["coverage"]
     healthy = Counter(r["cohort"] for r in controls if r.get("complete") and not r["completion_late"])
-    long_outputs = sum(r.get("complete", False) and (r.get("usage", {}).get("completion_tokens") or 0) >= coverage["long_output_tokens"] for r in rows)
+    long_outputs = (sum(r.get("complete", False) and (r.get("usage", {}).get("completion_tokens") or 0) >= coverage["long_output_tokens"] for r in rows)
+                    if not ttft_only else None)
     covered = dict(actual_300_second_deadline=deadline == 300 and not config["smoke"],
-                   pressure_deadline_misses=sum(r.get("timed_out", False) and r.get("completion_late") is True for r in pressure) >= coverage["minimum_pressure_timeouts"],
-                   healthy_controls_every_cohort=all(healthy[c["name"]] >= coverage["minimum_healthy_controls_per_cohort"] for c in profile["cohorts"]),
-                   sustained_native_kv_pressure=high_seconds >= coverage["minimum_kv_90_observed_seconds"],
-                   actual_long_outputs=long_outputs >= coverage["minimum_completed_long_outputs"],
-                   healthy_boundary_completions=sum(r.get("complete", False) and .8 * deadline <= r["e2e_seconds"] < deadline for r in pressure) >= coverage["minimum_healthy_boundary_completions"],
                    exact_request_forecasts=bool(forecasts) and all(r["opc_request_id"] in forecasts and r["opc_request_id"] in gates for r in rows if not r.get("local_drop") and not r.get("controlled_rejection")),
                    controlled_rejections_audited=all(gates.get(r["opc_request_id"], {}).get("would_reject") is True and gates[r["opc_request_id"]].get("ready") is True for r in rows if r.get("controlled_rejection")),
                    exact_first_text_events=bool(first_text) and all(r["opc_request_id"] in first_text for r in rows if r.get("client_ttft_seconds") is not None))
+    if not ttft_only:
+        covered.update(pressure_deadline_misses=sum(r.get("timed_out", False) and r.get("completion_late") is True for r in pressure) >= coverage["minimum_pressure_timeouts"],
+            healthy_controls_every_cohort=all(healthy[c["name"]] >= coverage["minimum_healthy_controls_per_cohort"] for c in profile["cohorts"]),
+            sustained_native_kv_pressure=high_seconds >= coverage["minimum_kv_90_observed_seconds"],
+            actual_long_outputs=long_outputs >= coverage["minimum_completed_long_outputs"],
+            healthy_boundary_completions=sum(r.get("complete", False) and .8 * deadline <= r["e2e_seconds"] < deadline for r in pressure) >= coverage["minimum_healthy_boundary_completions"])
     if ttft_only:
         readiness_path = path / "readiness.json"
         readiness = json.loads(readiness_path.read_text()) if readiness_path.exists() else {}
         healthy = Counter(r["cohort"] for r in controls if r.get("first_text_late") is False)
         covered = {k: covered[k] for k in ["actual_300_second_deadline", "exact_request_forecasts", "controlled_rejections_audited", "exact_first_text_events"]}
         covered.update(observation_beyond_ttft_threshold=profile["observation_horizon_seconds"] > deadline,
-            readiness_verified_before_pressure=readiness.get("ready") is True,
-            healthy_ttft_controls_every_cohort=all(healthy[c["name"]] >= coverage["minimum_healthy_controls_per_cohort"] for c in profile["cohorts"]),
-            pressure_ttft_misses=sum(r.get("first_text_late") is True for r in pressure) >= coverage["minimum_pressure_ttft_misses"],
-            actual_observed_late_ttft=sum(r.get("client_ttft_seconds") is not None and r["client_ttft_seconds"] >= deadline for r in pressure) >= coverage["minimum_observed_late_ttft"])
+                       readiness_verified_before_pressure=readiness.get("ready") is True)
+        if coverage.get("kind") == "raw_hard_continuation":
+            covered.update(actual_rejection_exposure=feature_activity is not None and feature_activity["actual_rejected"] >= coverage["minimum_actual_admission_rejections"],
+                actual_admission_decision_exposure=feature_activity is not None and feature_activity["actual_decisions"] >= coverage["minimum_actual_admission_decisions"],
+                resolved_feature_outcome_exposure=feature_activity is not None and feature_activity["known_terminal_outcomes"] >= coverage["minimum_resolved_feature_outcomes"])
+        else:
+            covered.update(healthy_ttft_controls_every_cohort=all(healthy[c["name"]] >= coverage["minimum_healthy_controls_per_cohort"] for c in profile["cohorts"]),
+                pressure_ttft_misses=sum(r.get("first_text_late") is True for r in pressure) >= coverage["minimum_pressure_ttft_misses"],
+                actual_observed_late_ttft=sum(r.get("client_ttft_seconds") is not None and r["client_ttft_seconds"] >= deadline for r in pressure) >= coverage["minimum_observed_late_ttft"])
+    if feature_activity is not None:
+        covered["controlled_rejections_audited"] &= feature_activity["ok"]
     if profile.get("recovery_candidate_required"):
         checks["exact_recovery_forecasts"] = all(r["opc_request_id"] in recovery_forecasts
             for r in rows if not r.get("local_drop") and not r.get("controlled_rejection"))
@@ -882,6 +927,16 @@ def analyze(path, events_path=None):
             for name, subset in [("all_offered", rows), ("pressure", pressure)]
             + [("phase:" + phase, [r for r in rows if r["phase"] == phase])
                for phase in sorted({r["phase"] for r in rows})]}
+    if feature_activity is not None:
+        try:
+            from .wait_feature_context import scores as feature_scores
+        except ImportError:
+            from wait_feature_context import scores as feature_scores
+        result["feature_context"] = dict(activity=feature_activity, causal_windows=feature_windows,
+            scorecards={name: feature_scores(subset, deadline)
+                for name, subset in [("all_offered", rows), ("pressure", pressure)]
+                + [("phase:" + phase, [r for r in rows if r["phase"] == phase])
+                   for phase in sorted({r["phase"] for r in rows})]})
     if ttft_only:
         result["runtime_isolation"] = isolation
         result["notes"] += ["Primary scores compare exact pre-admission total TTFT with the300s first-text threshold. Production extra-delay flags are distinct.",

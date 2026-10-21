@@ -1,0 +1,164 @@
+{
+  "schema_version": 1,
+  "description": "Bounded 5-second raw-extra rejection-accounting mechanics continuation; independent fresh epoch, not a300-second policy-benefit comparison.",
+  "seed": 20261019,
+  "deadline_seconds": 300,
+  "router_extra_ttft_budget_seconds": 5,
+  "max_requests": 120,
+  "max_inflight": 128,
+  "sample_interval_seconds": 1,
+  "drain_timeout_seconds": 660,
+  "shared_prefix_fraction": 0.35,
+  "prefix_sessions": 16,
+  "maximum_p99_dispatch_lag_seconds": 0.25,
+  "coverage": {
+    "kind": "raw_hard_continuation",
+    "minimum_actual_admission_rejections": 1,
+    "minimum_actual_admission_decisions": 16,
+    "minimum_resolved_feature_outcomes": 16,
+    "require_fresh_readiness": true,
+    "require_exact_actual_decision_audit": true,
+    "require_all_offered_denominator_reconciliation": true
+  },
+  "cohorts": [
+    {
+      "name": "short-chat",
+      "weight": 40,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "rag",
+      "weight": 25,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "summarization",
+      "weight": 10,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "long-generation",
+      "weight": 10,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "code",
+      "weight": 10,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "long-context-generation",
+      "weight": 5,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    }
+  ],
+  "phases": [
+    {
+      "name": "readiness-learn",
+      "seconds": 16,
+      "rps": 4,
+      "arrivals": "periodic",
+      "balanced_controls": true,
+      "input_words": [
+        8192,
+        16384
+      ]
+    },
+    {
+      "name": "readiness-refresh",
+      "seconds": 31,
+      "rps": 0.2,
+      "arrivals": "periodic",
+      "balanced_controls": true,
+      "input_words": [
+        8192,
+        16384
+      ]
+    },
+    {
+      "name": "hard-observe",
+      "seconds": 52,
+      "rps": 1,
+      "arrivals": "periodic",
+      "balanced_controls": true,
+      "drain_before": false
+    }
+  ],
+  "measurement_target": "ttft",
+  "recovery_candidate_required": false,
+  "startup_scenario": "isolated",
+  "observation_horizon_seconds": 420,
+  "readiness": {
+    "before_phase": "hard-observe",
+    "timeout_seconds": 5,
+    "require_native_completion_stats": true
+  },
+  "capture_content_chars": 0,
+  "cache_namespace": "queuecomplete-focused-20261019",
+  "interpretation": {
+    "primary_target": "Observed or truthfully censored TTFT>=300s; no full-completion FP/FN substitution.",
+    "stream": "Allow capped32-token responses to finish normally; scoreTTFTonly, bounded420s wallclockobservation. Cancellation occurs only atobservationhorizon or genuineinterrupt.",
+    "history": "New owned router plus initial nativeidle and emptycalibrationhistory, thenmandatorycurrentepochfouraccepted+actualfit readiness.",
+    "workload": "Long-prefill ramp; changed from previous longdecode tests. No historical causal comparison.",
+    "baseline_seed": "Reuse the frozen representative12-request seed baseline from this model\u2019s shadow segment with exact runtime/engine provenance. No additional uncounted seed inference for this continuation.",
+    "template_labels": "Cohort names are prompttemplate keys. All main inputs are standardized longprefill16\u201332kwords with32outputtokens; labels do not imply actualshortchat/longdecode or representativeproductionmix. No answerquality claim.",
+    "recovery": "This short independent continuation measures actual raw admission decisions; it does not reproduce the main shadow overload/recovery trajectory.",
+    "isolation": "Ownedephemeralservingkeyauth beforeadmission, no rawkeyinPodspec/config/logs. Missing/wrongkey401+correctinvalidbody400controls beforeSTART; finalwhole-captureexactrequest-IDaudit. Engine/directbypass notcovered.",
+    "admission": "Raw EXTRA-delay gate at5seconds solely tests real rejection accounting/online-feature mechanics; first-text outcome threshold stays300seconds with420secondhorizon. Calibration, feature-conditioned gain and recovery candidates remain diagnostic. Every rejected TTFT outcome is unknown; no300second-policy counterfactual is imputed.",
+    "features": "Record feature/recovery availability, fallback and observed terminal counts; actual rejection/cutoff feature exposure may be insufficient. No minimum candidate eligibility or late TTFT count is asserted for the short fresh continuation."
+  },
+  "ttft_stream_policy": "complete_bounded_response",
+  "serving_auth_env": "SMG_EXPERIMENT_INGRESS_KEY",
+  "raw_policy_mode": "hard",
+  "bounded_continuation": {
+    "maximum_offered_requests": 120,
+    "maximum_arrival_wall_seconds": 103,
+    "rejected_outcome": "unknown",
+    "insufficient_exposure": "Report lack of actual rejection or current-feature support; no extension or repeated measured attempt.",
+    "scope": "Rejection-accounting mechanics only; no300-second FP/FN or recovery-policy benefit claim."
+  },
+  "feature_context_required": true,
+  "expected_feature_method": "feature_context_ridge_v1"
+}

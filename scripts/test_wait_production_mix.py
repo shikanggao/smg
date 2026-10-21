@@ -80,6 +80,25 @@ class PlannerTests(unittest.TestCase):
             if phase["name"].startswith("pressure"):
                 self.assertGreater(phase["seconds"], DEFAULT["deadline_seconds"])
 
+    def test_raw_hard_continuation_keeps_the_approved_fixed_bound(self):
+        profile = json.loads((HERE / "wait-ttft-raw-hard.json").read_text())
+        p.validate(profile)
+        rows = p.make_plan(profile)
+        self.assertEqual(p.Counter(r["phase"] for r in rows),
+                         {"readiness-learn": 63, "readiness-refresh": 6, "hard-observe": 51})
+        self.assertEqual(len(rows), profile["bounded_continuation"]["maximum_offered_requests"])
+        last_arrival = max(r["scheduled_phase_seconds"] for r in rows if r["phase"] == "hard-observe")
+        maximum_to_last_offer = (sum(phase["seconds"] for phase in profile["phases"][:-1])
+                                + profile["readiness"]["timeout_seconds"] + last_arrival)
+        self.assertLessEqual(maximum_to_last_offer,
+                             profile["bounded_continuation"]["maximum_arrival_wall_seconds"])
+        self.assertEqual(profile["raw_policy_mode"], "hard")
+        self.assertEqual(profile["router_extra_ttft_budget_seconds"], 5)
+        self.assertEqual(profile["deadline_seconds"], 300)
+        self.assertEqual(profile["observation_horizon_seconds"], 420)
+        self.assertEqual(profile["ttft_stream_policy"], "complete_bounded_response")
+        self.assertEqual(profile["bounded_continuation"]["rejected_outcome"], "unknown")
+
     def test_smoke_never_claims_300_seconds(self):
         with self.assertRaisesRegex(AssertionError, "300-second"):
             p.validate(smoke_profile())
@@ -247,7 +266,8 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         index = int(request.headers["opc-request-id"].rsplit("-", 1)[1])
         mode = index % 4 if self.mode == "mixed" else 1 if self.mode in {"slow", "late-first-text"} else 2 if self.mode == "early-text-stalled-generation" else 0
         if mode == 3:
-            return self.web.Response(status=503, text="estimated wait budgets exceeded")
+            return self.web.json_response({"error": {"code": "worker_overload_protection_shed",
+                "message": "estimated wait budgets exceeded"}}, status=503)
         self.active += 1
         self.peak = max(self.peak, self.active)
         response = self.web.StreamResponse(headers={"Content-Type": "text/event-stream", "x-request-id": "native-header-id"})

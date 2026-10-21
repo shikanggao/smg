@@ -10,7 +10,9 @@ from collections import Counter
 
 METHOD = "mse_poll_two_wave_queue_v2"
 RECOVERY_REQUEST_EVENTS = frozenset({"recovery_forecast", "recovery_probe_attempt", "recovery_probe_reserved", "recovery_probe_response", "recovery_probe_released"})
-ISOLATION_REQUEST_EVENTS = frozenset({"forecast", "calibration_forecast", "calibration_feedback", "first_text", "request_transport"}) | RECOVERY_REQUEST_EVENTS
+FEATURE_REQUEST_EVENTS = frozenset({"feature_context_forecast", "feature_context_feedback",
+    "feature_outcome", "feature_outcome_ignored", "feature_admission_decision"})
+ISOLATION_REQUEST_EVENTS = frozenset({"forecast", "calibration_forecast", "calibration_feedback", "first_text", "request_transport"}) | RECOVERY_REQUEST_EVENTS | FEATURE_REQUEST_EVENTS
 
 
 def native_completion_stats_proof(initial_text, current_text, backend):
@@ -103,7 +105,8 @@ def audit_isolation(events, owned_request_ids):
 
     Raw ``forecast`` is the admission record for streaming and nonstreaming
     requests. It must be checked even when no calibration feedback follows.
-    Every owned ID must have a raw forecast; absent/incomplete captures fail.
+    Every owned ID needs a raw forecast, including rejected requests because
+    the raw/feature snapshot is recorded before the cohort admission check.
     Flat and tracing ``fields`` event dictionaries are accepted. Capture
     continuity and parsing of raw log lines remain the caller's responsibility.
     Only IDs, event kinds, timestamps and capture indices enter this receipt;
@@ -116,7 +119,8 @@ def audit_isolation(events, owned_request_ids):
         raise ValueError("Expected nonempty, exact owned request IDs")
     kinds, foreign, unattributed = Counter(), {}, []
     owned_events, total, forecasts = 0, 0, set()
-    forecast_workers, recovery_bindings = {}, []
+    forecast_workers, recovery_bindings, feature_bindings = {}, [], []
+    verified_rejections = set()
     for index, event in enumerate(events, 1):
         total += 1
         fields = event.get("fields", {})
@@ -138,11 +142,29 @@ def audit_isolation(events, owned_request_ids):
                 forecast_workers[rid] = value.get("worker")
             if kind in RECOVERY_REQUEST_EVENTS:
                 recovery_bindings.append((rid, value.get("worker"), occurrence))
+            if kind in FEATURE_REQUEST_EVENTS:
+                feature_bindings.append((rid, value.get("worker"), occurrence))
+                if kind == "feature_admission_decision" and value.get("decision") == "actual_rejected":
+                    try:
+                        try:
+                            from .wait_feature_context import payload, validate_context
+                        except ImportError:
+                            from wait_feature_context import payload, validate_context
+                        snapshot = payload(value)
+                        _, counts = validate_context(snapshot["activity"])
+                        if snapshot["counts"] != counts or value.get("outcome_tracking_supported") is not False:
+                            raise ValueError("Invalid actual rejection snapshot")
+                        verified_rejections.add(rid)
+                    except (ValueError, KeyError, TypeError):
+                        unattributed.append(dict(occurrence, reason="Unverified actual rejection event"))
         else:
             foreign.setdefault(rid, []).append(occurrence)
     missing = sorted(owned - forecasts)
     mismatched_workers = [dict(request_id=rid, worker=worker, **occurrence)
         for rid, worker, occurrence in recovery_bindings
+        if not isinstance(worker, str) or not worker or forecast_workers.get(rid) != worker]
+    feature_mismatches = [dict(request_id=rid, worker=worker, **occurrence)
+        for rid, worker, occurrence in feature_bindings
         if not isinstance(worker, str) or not worker or forecast_workers.get(rid) != worker]
     reasons = []
     if foreign:
@@ -153,12 +175,17 @@ def audit_isolation(events, owned_request_ids):
         reasons.append("Owned requests missing raw admission forecasts; capture is absent or incomplete")
     if mismatched_workers:
         reasons.append("Recovery request events do not match the exact owned raw-forecast worker")
+    if feature_mismatches:
+        reasons.append("Feature request events do not match the exact owned raw-forecast worker")
     return dict(ok=not reasons, scope="whole_router_capture", owned_request_id_count=len(owned),
                 capture_event_count=total, checked_event_count=sum(kinds.values()),
                 ignored_event_count=total-sum(kinds.values()), event_kind_counts=dict(sorted(kinds.items())),
                 owned_event_count=owned_events, owned_forecast_request_count=len(forecasts),
+                owned_actual_rejected_request_count=len(verified_rejections),
+                verified_preselection_rejections_without_forecasts=sorted(verified_rejections - forecasts),
                 missing_owned_forecasts=missing,
                 recovery_worker_mismatch_count=len(mismatched_workers), recovery_worker_mismatches=mismatched_workers,
+                feature_worker_mismatch_count=len(feature_mismatches), feature_worker_mismatches=feature_mismatches,
                 foreign_event_count=sum(len(rows) for rows in foreign.values()), foreign_request_count=len(foreign),
                 foreign_requests=[dict(request_id=rid, event_count=len(rows),
                                        event_kind_counts=dict(sorted(Counter(row["event_kind"] for row in rows).items())),
