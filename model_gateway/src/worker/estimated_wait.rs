@@ -62,7 +62,8 @@ use crate::{
 mod feature;
 mod recovery;
 use feature::{
-    Activity, Context as FeatureContext, Model as FeatureModel, Outcome as FeatureOutcome,
+    Activity, Context as FeatureContext, DeadlineHandle, DeadlineResolution, Deadlines,
+    Model as FeatureModel, Outcome as FeatureOutcome,
 };
 use recovery::{RecoveryForecast, RecoveryTracker};
 
@@ -923,6 +924,7 @@ pub(crate) struct StreamTtftObserver {
     request_id: Option<String>,
     feature_identity: Option<CalibrationForecast>,
     feature_resolved: bool,
+    feature_deadline: Option<DeadlineHandle>,
 }
 
 impl StreamTtftObserver {
@@ -961,6 +963,7 @@ impl StreamTtftObserver {
             request_id: None,
             feature_identity: None,
             feature_resolved: false,
+            feature_deadline: None,
         }
     }
 
@@ -977,6 +980,16 @@ impl StreamTtftObserver {
             .as_ref()
             .filter(|f| f.feature_context.is_some())
             .cloned();
+        if let (Some(registry), Some(identity)) =
+            (self.registry.upgrade(), self.feature_identity.as_ref())
+        {
+            self.feature_deadline = registry.estimated_wait().register_feature_deadline(
+                &self.worker_url,
+                self.request_id.as_deref(),
+                identity,
+                self.started,
+            );
+        }
         if let Some(probe) = &mut self.probe {
             probe.calibration = forecast;
         }
@@ -987,8 +1000,13 @@ impl StreamTtftObserver {
         if self.probe.is_none() && (self.feature_identity.is_none() || self.feature_resolved) {
             return;
         }
-        if let Some((ttft, visibility)) = self.scan(bytes, Instant::now()) {
-            self.feature_outcome(FeatureOutcome::FirstText);
+        let _observation_claim = self
+            .feature_deadline
+            .as_ref()
+            .and_then(DeadlineHandle::observing);
+        let observed_at = Instant::now();
+        if let Some((ttft, visibility)) = self.scan(bytes, observed_at) {
+            self.feature_outcome_at(FeatureOutcome::FirstText, observed_at);
             tracing::debug!(
                 target: "smg::estimated_wait::observation",
                 event = "first_text",
@@ -1005,10 +1023,19 @@ impl StreamTtftObserver {
     }
 
     fn feature_outcome(&mut self, outcome: FeatureOutcome) {
+        if let Some(deadline) = &self.feature_deadline {
+            deadline.claim_terminal();
+        }
+        self.feature_outcome_at(outcome, Instant::now());
+    }
+    fn feature_outcome_at(&mut self, outcome: FeatureOutcome, observed_at: Instant) {
         if self.feature_resolved {
             return;
         }
         self.feature_resolved = true;
+        if let Some(deadline) = &self.feature_deadline {
+            deadline.claim_terminal();
+        }
         if let (Some(registry), Some(identity)) =
             (self.registry.upgrade(), self.feature_identity.as_ref())
         {
@@ -1017,6 +1044,9 @@ impl StreamTtftObserver {
                 self.request_id.as_deref(),
                 identity,
                 outcome,
+                self.feature_deadline.take(),
+                self.started,
+                observed_at,
             );
         }
     }
@@ -1131,6 +1161,7 @@ struct Entry {
     recovery: RecoveryTracker,
     feature_activity: Activity,
     feature_profile: Option<u64>,
+    feature_deadlines: Deadlines,
 }
 
 impl Entry {
@@ -1160,6 +1191,7 @@ impl Entry {
             recovery: RecoveryTracker::default(),
             feature_activity: Activity::new(Instant::now()),
             feature_profile: None,
+            feature_deadlines: Deadlines::default(),
         }
     }
 
@@ -1186,6 +1218,7 @@ impl Entry {
         self.recovery.reset(reason);
         self.calibration = ExcessCalibration::new(now);
         self.feature_activity = Activity::new(now);
+        self.feature_deadlines = Deadlines::default();
         self.feature_profile = None;
         self.calibration_baseline = (None, BaselineSource::Unknown);
         self.calibration_generation = Arc::new(());
@@ -1197,8 +1230,42 @@ impl Entry {
         }
     }
 
+    fn feature_activity_context(&self, now: Instant, kv: Option<f64>) -> FeatureContext {
+        let mut context = self.feature_activity.context(now, kv);
+        context.deadline_untracked_pending = self.feature_deadlines.untracked;
+        if context.deadline_untracked_pending > 0 {
+            context.values[1] = None;
+        }
+        context
+    }
+
+    fn record_deadline_resolution(
+        &mut self,
+        worker: &str,
+        resolved: DeadlineResolution,
+        observed_at: Instant,
+        now: Instant,
+        source: &str,
+    ) {
+        self.feature_activity.record(now, resolved.outcome);
+        tracing::debug!(target:"smg::estimated_wait::observation", event="feature_deadline_resolution", feature_method=feature::METHOD,
+            worker, request_id=resolved.request_id.as_deref().unwrap_or(""), calibration_epoch=self.calibration_epoch,
+            resolution=resolved.outcome.name(), resolution_source=source, diagnostic_time_seconds=diagnostic_time(now),
+            observed_time_seconds=diagnostic_time(observed_at), request_started_time_seconds=diagnostic_time(resolved.started),
+            deadline_time_seconds=diagnostic_time(resolved.started+feature::TTFT_DEADLINE), deadline_seconds=feature::TTFT_DEADLINE.as_secs(),
+            elapsed_seconds=observed_at.saturating_duration_since(resolved.started).as_secs_f64(),
+            native_cancellation_acknowledgement="unavailable",
+            feature_json=%serde_json::json!({"activity":self.feature_activity_context(now,None),"counts":self.feature_activity_context(now,None).counts}));
+    }
+
+    fn advance_feature_deadlines(&mut self, worker: &str, now: Instant) {
+        for resolved in self.feature_deadlines.advance(now) {
+            self.record_deadline_resolution(worker, resolved, now, now, "poll");
+        }
+    }
+
     fn feature_context(&self, now: Instant, fresh: bool) -> FeatureContext {
-        self.feature_activity.context(
+        self.feature_activity_context(
             now,
             self.sample
                 .as_ref()
@@ -1571,12 +1638,53 @@ impl EstimatedWaitAdmission {
         Some(probe)
     }
 
+    fn register_feature_deadline(
+        &self,
+        worker: &str,
+        request_id: Option<&str>,
+        identity: &CalibrationForecast,
+        started: Instant,
+    ) -> Option<DeadlineHandle> {
+        if !self.config().estimated_wait_feature_shadow {
+            return None;
+        }
+        let mut entries = self.entries.lock();
+        let entry = entries.get_mut(worker);
+        let valid = entry.as_ref().is_some_and(|entry| {
+            Arc::ptr_eq(&entry.generation, &identity.generation)
+                && Arc::ptr_eq(
+                    &entry.calibration_generation,
+                    &identity.calibration_generation,
+                )
+        });
+        if !valid {
+            tracing::debug!(target:"smg::estimated_wait::observation", event="feature_deadline_ignored", feature_method=feature::METHOD,
+                worker,request_id=request_id.unwrap_or(""),admission_epoch=identity.epoch,
+                calibration_epoch=entry.as_ref().map(|e|e.calibration_epoch), reason="generation_changed_or_worker_missing",
+                diagnostic_time_seconds=diagnostic_time(Instant::now()));
+            return None;
+        }
+        let entry = entry.unwrap();
+        let handle = entry.feature_deadlines.register(started, request_id);
+        let now = Instant::now();
+        tracing::debug!(target:"smg::estimated_wait::observation", event="feature_deadline_started", feature_method=feature::METHOD,
+            worker,request_id=request_id.unwrap_or(""),calibration_epoch=entry.calibration_epoch,
+            diagnostic_time_seconds=diagnostic_time(now), request_started_time_seconds=diagnostic_time(started),
+            deadline_time_seconds=diagnostic_time(started+feature::TTFT_DEADLINE), deadline_seconds=feature::TTFT_DEADLINE.as_secs(),
+            deadline_tracking_supported=matches!(handle,DeadlineHandle::Tracked(_, _)), pending_deadline_count=entry.feature_deadlines.pending_count(),
+            feature_json=%serde_json::json!({"activity":entry.feature_activity_context(now,None),"counts":entry.feature_activity_context(now,None).counts}));
+        Some(handle)
+    }
+
     fn record_feature_outcome(
         &self,
         worker: &str,
         request_id: Option<&str>,
         identity: &CalibrationForecast,
         outcome: FeatureOutcome,
+        deadline: Option<DeadlineHandle>,
+        started: Instant,
+        observed_at: Instant,
     ) {
         if !self.config().estimated_wait_feature_shadow {
             return;
@@ -1596,11 +1704,18 @@ impl EstimatedWaitAdmission {
             return;
         }
         let now = Instant::now();
+        if let Some(resolved) = deadline.and_then(|handle| {
+            entry
+                .feature_deadlines
+                .resolve(handle, started, request_id, observed_at, outcome)
+        }) {
+            entry.record_deadline_resolution(worker, resolved, observed_at, now, outcome.name());
+        }
         entry.feature_activity.record(now, outcome);
         tracing::debug!(target:"smg::estimated_wait::observation",event="feature_outcome",feature_method=feature::METHOD,
             worker,request_id=request_id.unwrap_or(""),outcome=outcome.name(),calibration_epoch=entry.calibration_epoch,
             diagnostic_time_seconds=diagnostic_time(now),native_cancellation_acknowledgement="unavailable",
-            feature_json=%serde_json::json!({"activity":entry.feature_activity.context(now,None),"counts":entry.feature_activity.context(now,None).counts}));
+            feature_json=%serde_json::json!({"activity":entry.feature_activity_context(now,None),"counts":entry.feature_activity_context(now,None).counts}));
     }
 
     fn finish_ttft_probe(&self, probe: &TtftProbe) {
@@ -1974,6 +2089,9 @@ impl EstimatedWaitAdmission {
             return;
         }
         let new_poll = entry.last_published.is_none_or(|last| started > last);
+        if config.estimated_wait_feature_shadow {
+            entry.advance_feature_deadlines(worker.url(), Instant::now());
+        }
         entry.last_published = Some(started);
         // Native capacity samples only shrink when the monitor resets its
         // counter/profile history. Do not let pre-reset responses train the
@@ -2282,7 +2400,7 @@ impl AdmissionGuard<'_> {
         entry.feature_activity.record(now, outcome);
         tracing::debug!(target:"smg::estimated_wait::observation", event="feature_admission_decision", feature_method=feature::METHOD,
             worker=worker.url(),request_id=request_id.unwrap_or(""),decision=outcome.name(),outcome_tracking_supported,calibration_epoch=entry.calibration_epoch,
-            diagnostic_time_seconds=diagnostic_time(now),feature_json=%serde_json::json!({"activity":entry.feature_activity.context(now,None),"counts":entry.feature_activity.context(now,None).counts}));
+            diagnostic_time_seconds=diagnostic_time(now),feature_json=%serde_json::json!({"activity":entry.feature_activity_context(now,None),"counts":entry.feature_activity_context(now,None).counts}));
     }
 
     pub(crate) fn capture_calibration(
@@ -2950,7 +3068,88 @@ mod tests {
         assert_eq!(c.unknown_pretext_end, 1);
         assert_eq!(c.pretext_downstream_disconnect, 1);
         assert_eq!(c.upstream_timeout, 1);
+        assert_eq!(c.deadline_timely_first_text, 1);
+        assert_eq!(c.deadline_or_cutoff_adverse, 2);
+        assert_eq!(c.deadline_breach, 0);
+        assert_eq!(c.deadline_or_cutoff_unknown, 1);
     }
+    #[test]
+    fn feature_deadline_poll_and_real_terminal_are_separate_epoch_safe_observations() {
+        let (registry, worker) = feature_registry();
+        let mut guard = registry.estimated_wait().begin().unwrap();
+        let mut forecast = guard.capture_calibration(&worker, Some("deadline-test"));
+        guard.attach_feature_context(&worker, &mut forecast);
+        drop(guard);
+        let start = Instant::now() - Duration::from_secs(301);
+        let mut observer = StreamTtftObserver::new(&registry, worker.url(), start)
+            .with_request_id(Some("deadline-test"))
+            .with_calibration(forecast);
+        observer.push(b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n");
+        // A failed native fetch still advances local deadlines, with no fabricated text.
+        let poll_started = Instant::now();
+        let watermark = registry.estimated_wait().poll_started(&worker);
+        registry
+            .estimated_wait()
+            .publish(&worker, None, watermark, poll_started);
+        {
+            let mut entries = registry.estimated_wait().entries.lock();
+            let entry = entries.get_mut(worker.url()).unwrap();
+            let c = entry.feature_activity_context(Instant::now(), None).counts;
+            assert_eq!(c.deadline_breach, 1);
+            assert_eq!(c.deadline_or_cutoff_adverse, 1);
+            assert_eq!(c.first_text, 0);
+            assert_eq!(c.upstream_timeout, 0);
+        }
+        observer.cancel();
+        observer.downstream_disconnected();
+        {
+            let mut entries = registry.estimated_wait().entries.lock();
+            let entry = entries.get_mut(worker.url()).unwrap();
+            let c = entry.feature_activity_context(Instant::now(), None).counts;
+            assert_eq!(c.unknown_pretext_end, 1);
+            assert_eq!(c.deadline_or_cutoff_unknown, 0);
+            assert_eq!(c.deadline_or_cutoff_adverse, 1);
+            entry.reset_calibration(Instant::now(), "test");
+            assert_eq!(entry.feature_deadlines.pending_count(), 0);
+            assert_eq!(
+                entry
+                    .feature_activity_context(Instant::now(), None)
+                    .counts
+                    .deadline_breach,
+                0
+            );
+        }
+    }
+    #[test]
+    fn feature_deadline_pending_overflow_suppresses_union_until_resolved() {
+        let (registry, worker) = feature_registry();
+        let mut entries = registry.estimated_wait().entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        let now = Instant::now();
+        for _ in 0..16 {
+            entry
+                .feature_activity
+                .record(now, FeatureOutcome::DeadlineTimely);
+        }
+        assert_eq!(
+            entry.feature_activity_context(now, None).values[1],
+            Some(0.)
+        );
+        entry.feature_deadlines.untracked = 1;
+        assert_eq!(entry.feature_activity_context(now, None).values[1], None);
+        entry.feature_deadlines.resolve(
+            DeadlineHandle::Untracked,
+            now,
+            None,
+            now,
+            FeatureOutcome::Unknown,
+        );
+        assert_eq!(
+            entry.feature_activity_context(now, None).values[1],
+            Some(0.)
+        );
+    }
+
     #[test]
     fn feature_old_outcomes_and_wrong_worker_identity_cannot_mutate_replacement() {
         let (registry, worker) = feature_registry();
@@ -5041,6 +5240,7 @@ mod tests {
             request_id: None,
             feature_identity: None,
             feature_resolved: false,
+            feature_deadline: None,
         };
         assert_eq!(
             observer.scan(
@@ -5083,6 +5283,7 @@ mod tests {
             request_id: None,
             feature_identity: None,
             feature_resolved: false,
+            feature_deadline: None,
         };
         observer.cancel();
         assert_eq!(

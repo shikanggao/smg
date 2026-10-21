@@ -2,9 +2,16 @@
 //! Rates describe resolved local observations, not native cancellation acknowledgements.
 use super::ScaleTrajectory;
 use serde::Serialize;
-use std::{collections::VecDeque, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
-pub(super) const METHOD: &str = "feature_context_ridge_v1";
+pub(super) const METHOD: &str = "feature_context_deadline_ridge_v2";
 pub(super) const RIDGE: f64 = 0.1;
 const MAX_SHIFT: f64 = 0.5;
 const MAX_BETA: f64 = 2.0;
@@ -16,6 +23,7 @@ pub(super) struct Context {
     pub counts: Counts,
     pub bucket_second: u64,
     pub activity_origin_time_seconds: f64,
+    pub deadline_untracked_pending: u64,
 }
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub(super) struct Counts {
@@ -26,6 +34,10 @@ pub(super) struct Counts {
     pub admitted: u64,
     pub actual_rejected: u64,
     pub untracked_admitted: u64,
+    pub deadline_timely_first_text: u64,
+    pub deadline_breach: u64,
+    pub deadline_or_cutoff_adverse: u64,
+    pub deadline_or_cutoff_unknown: u64,
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Outcome {
@@ -36,6 +48,10 @@ pub(super) enum Outcome {
     Admitted,
     Rejected,
     UntrackedAdmitted,
+    DeadlineTimely,
+    DeadlineBreach,
+    ActualCutoff,
+    DeadlineUnknown,
 }
 impl Outcome {
     pub fn name(self) -> &'static str {
@@ -46,6 +62,10 @@ impl Outcome {
             Self::Unknown => "unknown_pretext_end",
             Self::Admitted | Self::UntrackedAdmitted => "admitted",
             Self::Rejected => "actual_rejected",
+            Self::DeadlineTimely => "timely_first_text",
+            Self::DeadlineBreach => "deadline_breach",
+            Self::ActualCutoff => "actual_cutoff",
+            Self::DeadlineUnknown => "unknown_pretext_end",
         }
     }
 }
@@ -59,6 +79,16 @@ impl Counts {
         self.unknown_pretext_end = self
             .unknown_pretext_end
             .saturating_add(other.unknown_pretext_end);
+        self.deadline_timely_first_text = self
+            .deadline_timely_first_text
+            .saturating_add(other.deadline_timely_first_text);
+        self.deadline_breach = self.deadline_breach.saturating_add(other.deadline_breach);
+        self.deadline_or_cutoff_adverse = self
+            .deadline_or_cutoff_adverse
+            .saturating_add(other.deadline_or_cutoff_adverse);
+        self.deadline_or_cutoff_unknown = self
+            .deadline_or_cutoff_unknown
+            .saturating_add(other.deadline_or_cutoff_unknown);
         self.admitted = self.admitted.saturating_add(other.admitted);
         self.actual_rejected = self.actual_rejected.saturating_add(other.actual_rejected);
         self.untracked_admitted = self
@@ -69,6 +99,9 @@ impl Counts {
         if matches!(outcome, Outcome::UntrackedAdmitted) {
             self.untracked_admitted = self.untracked_admitted.saturating_add(1);
         }
+        if matches!(outcome, Outcome::DeadlineBreach) {
+            self.deadline_breach = self.deadline_breach.saturating_add(1);
+        }
         let value = match outcome {
             Outcome::FirstText => &mut self.first_text,
             Outcome::Timeout => &mut self.upstream_timeout,
@@ -76,6 +109,9 @@ impl Counts {
             Outcome::Unknown => &mut self.unknown_pretext_end,
             Outcome::Admitted | Outcome::UntrackedAdmitted => &mut self.admitted,
             Outcome::Rejected => &mut self.actual_rejected,
+            Outcome::DeadlineTimely => &mut self.deadline_timely_first_text,
+            Outcome::DeadlineBreach | Outcome::ActualCutoff => &mut self.deadline_or_cutoff_adverse,
+            Outcome::DeadlineUnknown => &mut self.deadline_or_cutoff_unknown,
         };
         *value = value.saturating_add(1);
     }
@@ -118,25 +154,146 @@ impl Activity {
                 counts.add(*bucket);
             }
         }
-        let cutoff = counts
-            .upstream_timeout
-            .saturating_add(counts.pretext_downstream_disconnect);
-        let known = counts.first_text.saturating_add(cutoff);
-        let resolved = known.saturating_add(counts.unknown_pretext_end);
+        let adverse = counts.deadline_or_cutoff_adverse;
+        let known = counts.deadline_timely_first_text.saturating_add(adverse);
+        let resolved = known.saturating_add(counts.deadline_or_cutoff_unknown);
         let attempts = counts.admitted.saturating_add(counts.actual_rejected);
         Context {
             bucket_second: second,
+            deadline_untracked_pending: 0,
             activity_origin_time_seconds: super::diagnostic_time(self.origin),
             values: [
                 kv.filter(|v| v.is_finite() && (0.0..=1.0).contains(v)),
                 (known >= 16
                     && counts.untracked_admitted == 0
-                    && (counts.unknown_pretext_end as f64) < 0.1 * resolved as f64)
-                    .then(|| cutoff as f64 / known as f64),
+                    && (counts.deadline_or_cutoff_unknown as f64) < 0.1 * resolved as f64)
+                    .then(|| adverse as f64 / known as f64),
                 (attempts >= 16).then(|| counts.actual_rejected as f64 / attempts as f64),
             ],
             counts,
         }
+    }
+}
+
+/// A bounded local first-text observation, independent of upstream cancellation.
+pub(super) const TTFT_DEADLINE: Duration = Duration::from_secs(300);
+const MAX_PENDING_DEADLINES: usize = 8192;
+#[derive(Clone, Debug)]
+pub(super) enum DeadlineHandle {
+    Tracked(u64, Arc<AtomicU8>),
+    Untracked,
+}
+// 0 idle, 1 scanning a received chunk, 2 terminal claimed, 3 poll breach.
+// Claim before the observation timestamp so a poll cannot overtake timely text
+// while its callback waits for the ledger lock. Polling never blocks on scans.
+pub(super) struct ObservationClaim(Arc<AtomicU8>);
+impl Drop for ObservationClaim {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+impl DeadlineHandle {
+    pub fn observing(&self) -> Option<ObservationClaim> {
+        if let Self::Tracked(_, state) = self {
+            state
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .ok()
+                .map(|_| ObservationClaim(Arc::clone(state)))
+        } else {
+            None
+        }
+    }
+    pub fn claim_terminal(&self) {
+        if let Self::Tracked(_, state) = self {
+            let _ =
+                state.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| (s < 2).then_some(2));
+        }
+    }
+}
+#[derive(Debug)]
+pub(super) struct DeadlineResolution {
+    pub started: Instant,
+    pub request_id: Option<String>,
+    pub outcome: Outcome,
+}
+#[derive(Debug, Default)]
+pub(super) struct Deadlines {
+    next: u64,
+    pending: HashMap<u64, (Instant, Option<String>, Arc<AtomicU8>)>,
+    pub untracked: u64,
+}
+impl Deadlines {
+    pub fn register(&mut self, started: Instant, request_id: Option<&str>) -> DeadlineHandle {
+        if self.pending.len() >= MAX_PENDING_DEADLINES || self.next == u64::MAX {
+            self.untracked = self.untracked.saturating_add(1);
+            return DeadlineHandle::Untracked;
+        }
+        self.next += 1;
+        let state = Arc::new(AtomicU8::new(0));
+        self.pending.insert(
+            self.next,
+            (started, request_id.map(str::to_owned), Arc::clone(&state)),
+        );
+        DeadlineHandle::Tracked(self.next, state)
+    }
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+    pub fn advance(&mut self, now: Instant) -> Vec<DeadlineResolution> {
+        let mut resolved = Vec::new();
+        self.pending.retain(|_, (started, request_id, state)| {
+            if now.saturating_duration_since(*started) < TTFT_DEADLINE {
+                return true;
+            }
+            if state
+                .compare_exchange(0, 3, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return true;
+            }
+            resolved.push(DeadlineResolution {
+                started: *started,
+                request_id: request_id.clone(),
+                outcome: Outcome::DeadlineBreach,
+            });
+            false
+        });
+        resolved
+    }
+    pub fn resolve(
+        &mut self,
+        handle: DeadlineHandle,
+        started: Instant,
+        request_id: Option<&str>,
+        now: Instant,
+        terminal: Outcome,
+    ) -> Option<DeadlineResolution> {
+        let (started, request_id) = match handle {
+            DeadlineHandle::Tracked(id, _) => {
+                let (started, request_id, _) = self.pending.remove(&id)?;
+                (started, request_id)
+            }
+            DeadlineHandle::Untracked => {
+                self.untracked = self.untracked.saturating_sub(1);
+                (started, request_id.map(str::to_owned))
+            }
+        };
+        let outcome = if now.saturating_duration_since(started) >= TTFT_DEADLINE {
+            Outcome::DeadlineBreach
+        } else {
+            match terminal {
+                Outcome::FirstText => Outcome::DeadlineTimely,
+                Outcome::Timeout | Outcome::Disconnect => Outcome::ActualCutoff,
+                _ => Outcome::DeadlineUnknown,
+            }
+        };
+        Some(DeadlineResolution {
+            started,
+            request_id,
+            outcome,
+        })
     }
 }
 
@@ -166,7 +323,7 @@ impl Fit {
         if samples.len() != contexts.len() {
             return empty;
         }
-        // Largest supported subset first; deterministic KV, cutoff, rejection priority.
+        // Largest supported subset first; deterministic KV, deadline-or-cutoff, rejection priority.
         for mask in [7u8, 3, 5, 6, 1, 2, 4] {
             let rows: Vec<_> = samples
                 .iter()
@@ -386,6 +543,140 @@ mod tests {
             .unzip()
     }
     #[test]
+    fn deadline_poll_is_once_and_late_terminals_do_not_reclassify() {
+        let start = Instant::now();
+        for terminal in [
+            Outcome::FirstText,
+            Outcome::Timeout,
+            Outcome::Disconnect,
+            Outcome::Unknown,
+        ] {
+            let mut d = Deadlines::default();
+            let h = d.register(start, Some("request"));
+            assert!(d.advance(start + Duration::from_millis(299_999)).is_empty());
+            let resolved = d.advance(start + TTFT_DEADLINE);
+            assert_eq!(resolved.len(), 1);
+            assert!(matches!(resolved[0].outcome, Outcome::DeadlineBreach));
+            assert!(d.advance(start + Duration::from_secs(420)).is_empty());
+            assert!(d
+                .resolve(
+                    h,
+                    start,
+                    Some("request"),
+                    start + Duration::from_secs(420),
+                    terminal
+                )
+                .is_none());
+        }
+    }
+    #[test]
+    fn terminal_resolves_deadline_without_a_poll_and_early_cutoff_is_not_breach() {
+        let start = Instant::now();
+        for (elapsed, terminal, expected) in [
+            (299.99, Outcome::Disconnect, "actual_cutoff"),
+            (299.99, Outcome::Timeout, "actual_cutoff"),
+            (299.99, Outcome::Unknown, "unknown_pretext_end"),
+            (299.99, Outcome::FirstText, "timely_first_text"),
+            (300.0, Outcome::FirstText, "deadline_breach"),
+        ] {
+            let mut d = Deadlines::default();
+            let h = d.register(start, None);
+            h.claim_terminal();
+            let r = d
+                .resolve(
+                    h,
+                    start,
+                    None,
+                    start + Duration::from_secs_f64(elapsed),
+                    terminal,
+                )
+                .unwrap();
+            assert_eq!(r.outcome.name(), expected);
+            assert!(d.advance(start + Duration::from_secs(420)).is_empty());
+        }
+    }
+    #[test]
+    fn timely_scan_claim_cannot_be_overtaken_by_poll_waiting_on_ledger() {
+        let start = Instant::now();
+        let mut d = Deadlines::default();
+        let h = d.register(start, None);
+        let scan = h.observing().unwrap();
+        // The bytes were observed at299.99; the ledger callback arrives after300.
+        let observed = start + Duration::from_millis(299_990);
+        assert!(d.advance(start + TTFT_DEADLINE).is_empty());
+        h.claim_terminal();
+        drop(scan);
+        assert!(d.advance(start + Duration::from_secs(301)).is_empty());
+        assert!(matches!(
+            d.resolve(h, start, None, observed, Outcome::FirstText)
+                .unwrap()
+                .outcome,
+            Outcome::DeadlineTimely
+        ));
+        let h = d.register(start, None);
+        let scan = h.observing().unwrap();
+        drop(scan);
+        // Metadata/malformed/no-text scans release the claim; next poll can resolve.
+        assert_eq!(d.advance(start + TTFT_DEADLINE).len(), 1);
+        assert!(h.observing().is_none());
+    }
+    #[test]
+    fn deadline_tracking_is_bounded_and_overflow_drains() {
+        let start = Instant::now();
+        let mut d = Deadlines::default();
+        for _ in 0..MAX_PENDING_DEADLINES {
+            assert!(matches!(
+                d.register(start, None),
+                DeadlineHandle::Tracked(_, _)
+            ));
+        }
+        let h = d.register(start, None);
+        assert!(matches!(h, DeadlineHandle::Untracked));
+        assert_eq!(d.pending_count(), MAX_PENDING_DEADLINES);
+        assert_eq!(d.untracked, 1);
+        assert!(matches!(
+            d.resolve(
+                h,
+                start,
+                None,
+                start + Duration::from_secs(1),
+                Outcome::Unknown
+            )
+            .unwrap()
+            .outcome,
+            Outcome::DeadlineUnknown
+        ));
+        assert_eq!(d.untracked, 0);
+        assert_eq!(
+            d.advance(start + TTFT_DEADLINE).len(),
+            MAX_PENDING_DEADLINES
+        );
+        assert_eq!(d.pending_count(), 0);
+        d.next = u64::MAX;
+        assert!(matches!(d.register(start, None), DeadlineHandle::Untracked));
+    }
+    #[test]
+    fn deadline_union_keeps_actual_cutoff_diagnostics_separate() {
+        let start = Instant::now();
+        let mut a = Activity::new(start);
+        for _ in 0..15 {
+            a.record(start, Outcome::DeadlineTimely);
+        }
+        a.record(start, Outcome::DeadlineBreach);
+        a.record(start, Outcome::Timeout); // Later terminal is diagnostic only.
+        a.record(start, Outcome::Unknown); // Already-breached unknown isn't union unknown.
+        let c = a.context(start, None);
+        assert_eq!(c.values[1], Some(1. / 16.));
+        assert_eq!(c.counts.deadline_breach, 1);
+        assert_eq!(c.counts.upstream_timeout, 1);
+        assert_eq!(c.counts.deadline_or_cutoff_unknown, 0);
+        assert_eq!(
+            a.context(start + Duration::from_secs(60), None).values[1],
+            None
+        );
+    }
+
+    #[test]
     fn joint_ridge_matches_orthogonal_closed_form_and_collinear_remains_finite() {
         let (samples, contexts): (VecDeque<_>, VecDeque<_>) = (0..32)
             .map(|i| {
@@ -492,9 +783,11 @@ mod tests {
         let mut a = Activity::new(now);
         for _ in 0..16 {
             a.record(now, Outcome::FirstText);
+            a.record(now, Outcome::DeadlineTimely);
             a.record(now, Outcome::Admitted);
         }
         a.record(now + Duration::from_secs(1), Outcome::Timeout);
+        a.record(now + Duration::from_secs(1), Outcome::ActualCutoff);
         assert_eq!(
             a.context(now, Some(0.2)).values,
             [Some(0.2), Some(0.0), Some(0.0)]
@@ -505,6 +798,7 @@ mod tests {
         );
         for _ in 0..3 {
             a.record(now + Duration::from_secs(1), Outcome::Unknown);
+            a.record(now + Duration::from_secs(1), Outcome::DeadlineUnknown);
         }
         assert_eq!(
             a.context(now + Duration::from_secs(1), None).values[1],
@@ -517,6 +811,7 @@ mod tests {
         let mut activity = Activity::new(now);
         for _ in 0..16 {
             activity.record(now, Outcome::FirstText);
+            activity.record(now, Outcome::DeadlineTimely);
             activity.record(now, Outcome::Admitted);
         }
         activity.record(now, Outcome::UntrackedAdmitted);

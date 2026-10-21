@@ -36,7 +36,7 @@ builder's `estimated_wait(EstimatedWaitConfig)` method.
 | `--max-estimated-wait-secs` | unset | Gateway wait budget; disabled unless a worker sets its own |
 | `--estimated-wait-shadow` | false | Record would-reject decisions and continue routing |
 | `--estimated-wait-calibration-shadow` | false | Experimental multiplicative TTFT diagnostics only; never affects admission |
-| `--estimated-wait-feature-shadow` | false | Learn KV/cutoff/rejection context adjustments in shadow; requires calibration shadow |
+| `--estimated-wait-feature-shadow` | false | Learn KV/deadline-or-cutoff/rejection context adjustments in shadow; requires calibration shadow |
 | `--estimated-wait-provisional-baseline-secs` | unset | Positive, finite same-model representative baseline for calibration startup only; measured baseline takes precedence |
 | `--estimated-wait-queue-tokens-per-request` | 0 | Explicit waiting-request proxy; 0 disables it |
 | `--estimated-wait-fallback-prefill-throughput` | 2000 | Cold-start prefill capacity until a qualified value is learned; `--estimated-wait-min-prefill-throughput` and `--estimated-wait-default-throughput` remain aliases |
@@ -114,11 +114,12 @@ frequency; retargeting starts from the current applied value without idle credit
 ### Experimental context gain
 
 `--estimated-wait-feature-shadow` adds a separate prediction alongside the scalar
-calibration and recovery diagnostics. It never replaces the admission score.
+calibration and recovery diagnostics. Method `feature_context_deadline_ridge_v2`
+never replaces the admission score; its second input differs from v1.
 With queue-only extra delay `N`, its prediction is `B_cal + g_context * N`:
 
 ```
-z = [native_KV_usage, observed_pretext_cutoff_rate, actual_rejection_rate]
+z = [native_KV_usage, deadline_or_cutoff_rate, actual_rejection_rate]
 gain_target = max(0, scalar_gain_target + clip(beta · (z - weighted_mean), -0.5, 0.5))
 ```
 
@@ -138,17 +139,25 @@ constants are experimental starting values, not optimized model profiles.
 
 Rates use bounded one-second buckets over the preceding 60 seconds:
 
-- Cutoff rate is `(known upstream timeouts + observed pre-text downstream
-  disconnects) / (first-text observations + those cutoffs)`. It requires at least
-  16 known resolved observations and less than 10% unknown outcomes among all
-  resolved observations. It describes recent resolved outcomes, not a matched
-  arrival cohort. A disconnect does not prove a client timeout or native engine
-  cancellation. Backpressure-disabled observation and unclassified endings
-  count as unknown; a disconnect after first text is not a pre-text cutoff.
-  Admissions without an outcome-observation identity are counted separately,
-  and suppress this feature while present in the 60-second admission window.
-  The resolved-outcome coverage check describes the tracked cohort; it is not
-  proof of complete engine-wide observation.
+- Deadline-or-cutoff rate is `adverse / (timely_first_text + adverse)`.
+  A request is adverse once when no first text has been observed by 300 seconds,
+  or when an actual upstream timeout/pre-text downstream disconnect occurs.
+  The existing worker poll resolves a pending deadline at its first observation
+  at or after 300 seconds; terminal callbacks also check the deadline. This does
+  not wait for a 420-second test observation horizon. The clock starts at the
+  existing server TTFT start before upstream send, not at response headers.
+  Client/server clock offsets can make a client 300-second cancellation arrive
+  before server age 300: that is an actual cutoff, not an invented deadline breach.
+  Late first text or later cancellation cannot reverse or double-count a breach.
+  Actual first-text, timeout and disconnect diagnostics remain separate.
+  The rate requires at least 16 resolved observations and less than 10% unknown
+  outcomes. Early backpressure-disabled observation/unclassified endings are
+  unknown; an unknown ending after a breach does not change its resolved class.
+  It describes recent resolved observations, not a matched arrival cohort.
+  Unsupported admissions suppress the feature for their 60-second window.
+  Pending deadline storage is capped at 8192 per worker; overflow is explicit
+  and suppresses this feature until all untracked pending observations resolve.
+  Resetting an epoch clears pending deadlines and invalidates older callbacks.
 - Rejection rate is `actual estimated-wait rejections / (selected admission attempts +
   actual estimated-wait rejections)`, with at least 16 decisions. Shadow
   would-reject checks and upstream errors are not actual gateway rejections.

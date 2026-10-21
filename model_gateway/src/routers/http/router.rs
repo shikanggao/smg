@@ -892,12 +892,12 @@ impl Router {
 
         let mut ttft_observer = is_stream.then(|| {
             StreamTtftObserver::new(&self.worker_registry, worker.url(), start)
-                .with_calibration(calibration.into_inner())
                 .with_request_id(
                     headers
                         .and_then(|headers| headers.get("opc-request-id"))
                         .and_then(|value| value.to_str().ok()),
                 )
+                .with_calibration(calibration.into_inner())
         });
         if let Some(observer) = &ttft_observer {
             observer.transport_event("upstream_send_started");
@@ -1212,12 +1212,12 @@ impl Router {
 
         let mut ttft_observer = is_stream.then(|| {
             StreamTtftObserver::new(&self.worker_registry, worker.url(), started)
-                .with_calibration(calibration)
                 .with_request_id(
                     headers
                         .and_then(|headers| headers.get("opc-request-id"))
                         .and_then(|value| value.to_str().ok()),
                 )
+                .with_calibration(calibration)
         });
         if let Some(observer) = &ttft_observer {
             observer.transport_event("upstream_send_started");
@@ -1478,12 +1478,12 @@ impl Router {
             .is_some_and(|ct| ct.starts_with("text/event-stream"));
         let observer = is_stream.then(|| {
             StreamTtftObserver::new(&self.worker_registry, worker.url(), started)
-                .with_calibration(calibration)
                 .with_request_id(
                     headers
                         .get("opc-request-id")
                         .and_then(|value| value.to_str().ok()),
                 )
+                .with_calibration(calibration)
         });
         self.forward_worker_response(res, is_stream, worker.url(), load_guard, started, observer)
             .await
