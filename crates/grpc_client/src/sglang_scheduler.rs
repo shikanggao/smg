@@ -795,6 +795,10 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             num_used_tokens: load.num_used_tokens,
             max_total_num_tokens: load.max_total_num_tokens,
             token_usage: load.token_usage,
+            // The protobuf scalar has no presence bit, so its default zero
+            // cannot establish native KV measurement availability.
+            native_kv_usage_available: None,
+            native_kv_usage_profile: None,
             prefill_throughput: None,
             gen_throughput: load.gen_throughput,
             avg_request_prefill_kv_computed_tokens: None,

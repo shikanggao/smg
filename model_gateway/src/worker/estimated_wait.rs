@@ -59,7 +59,11 @@ use crate::{
     routers::common::overload,
 };
 
+mod feature;
 mod recovery;
+use feature::{
+    Activity, Context as FeatureContext, Model as FeatureModel, Outcome as FeatureOutcome,
+};
 use recovery::{RecoveryForecast, RecoveryTracker};
 
 /// All defaults are starting points for calibration, not capacity guarantees.
@@ -86,6 +90,8 @@ pub struct EstimatedWaitConfig {
     pub estimated_wait_shadow: bool,
     /// Learn excess-TTFT correction for diagnostics only; never changes admission.
     pub estimated_wait_calibration_shadow: bool,
+    /// Experimental online context gain; diagnostic only, requires calibration shadow.
+    pub estimated_wait_feature_shadow: bool,
     /// Same-model deployment baseline for diagnostic calibration until measured.
     pub estimated_wait_provisional_baseline_secs: Option<f64>,
 }
@@ -103,6 +109,7 @@ impl Default for EstimatedWaitConfig {
             estimated_wait_max_snapshot_age_secs: 30.0,
             estimated_wait_shadow: false,
             estimated_wait_calibration_shadow: false,
+            estimated_wait_feature_shadow: false,
             estimated_wait_provisional_baseline_secs: None,
         }
     }
@@ -110,6 +117,13 @@ impl Default for EstimatedWaitConfig {
 
 impl EstimatedWaitConfig {
     pub fn validate(&self) -> ConfigResult<()> {
+        if self.estimated_wait_feature_shadow && !self.estimated_wait_calibration_shadow {
+            return Err(ConfigError::InvalidValue {
+                field: "estimated_wait_feature_shadow".into(),
+                value: "true".into(),
+                reason: "Requires estimated_wait_calibration_shadow".into(),
+            });
+        }
         if self.estimated_wait_kv_pressure_weight != 0.0 {
             return Err(ConfigError::InvalidValue {
                 field: "estimated_wait_kv_pressure_weight".to_string(),
@@ -317,6 +331,36 @@ impl EstimatedWaitConfig {
                 .iter()
                 .map(|rank| f64::from(rank.num_running_reqs.max(0)))
                 .sum(),
+            kv_usage: (!load.loads.is_empty()
+                && load.dp_rank_count as usize == load.loads.len()
+                && load
+                    .loads
+                    .iter()
+                    .map(|r| r.dp_rank)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    == load.loads.len()
+                && load.loads.iter().all(|rank| {
+                    rank.native_kv_usage_available == Some(true)
+                        && rank.token_usage.is_finite()
+                        && (0.0..=1.0).contains(&rank.token_usage)
+                }))
+            .then(|| {
+                load.loads.iter().map(|rank| rank.token_usage).sum::<f64>()
+                    / load.loads.len() as f64
+            }),
+            kv_profile: {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                let mut ranks: Vec<_> = load
+                    .loads
+                    .iter()
+                    .map(|r| (r.dp_rank, r.native_kv_usage_profile))
+                    .collect();
+                ranks.sort_unstable();
+                ranks.hash(&mut hasher);
+                hasher.finish()
+            },
             pending_engine: 0.0,
             proxy,
             fallback,
@@ -381,6 +425,8 @@ struct PreparedWait {
     native_estimate: ExpectedWait,
     native_waiting: f64,
     native_running: f64,
+    kv_usage: Option<f64>,
+    kv_profile: u64,
     pending_engine: f64,
     proxy: bool,
     fallback: bool,
@@ -573,6 +619,8 @@ pub(crate) struct CalibrationForecast {
     history_revision: u64,
     fitted_revision: u64,
     threshold: f64,
+    feature_context: Option<FeatureContext>,
+    feature_profile: u64,
 }
 
 impl CalibrationForecast {
@@ -646,6 +694,8 @@ struct ExcessCalibration {
     // Separate histories across native capacity warm-up, even when F promotes
     // the independent raw admission-readiness gate.
     samples: [VecDeque<(f64, f64)>; 2],
+    feature_contexts: [VecDeque<Option<FeatureContext>>; 2],
+    feature_models: [FeatureModel; 2],
     accepted: [u64; 2],
     fitted: [u64; 2],
     trajectories: [ScaleTrajectory; 2],
@@ -670,6 +720,8 @@ impl ExcessCalibration {
     fn new(now: Instant) -> Self {
         Self {
             samples: Default::default(),
+            feature_contexts: Default::default(),
+            feature_models: Default::default(),
             accepted: [0; 2],
             fitted: [0; 2],
             trajectories: [ScaleTrajectory::new(now), ScaleTrajectory::new(now)],
@@ -720,6 +772,12 @@ impl ExcessCalibration {
                 self.previous_count[index]
             };
             self.samples[index].drain(..remove);
+            let context_remove = remove.min(self.feature_contexts[index].len());
+            self.feature_contexts[index].drain(..context_remove);
+            if remove > 0 {
+                self.feature_models[index].invalidate();
+            }
+
             self.previous_count[index] = self.samples[index].len();
             if remove > 0 {
                 self.history_revision[index] += 1;
@@ -796,11 +854,13 @@ impl ExcessCalibration {
         let index = usize::from(forecast.native_capacity_ready);
         let samples = &mut self.samples[index];
         samples.push_back((ratio, forecast.queue_extra));
+        self.feature_contexts[index].push_back(forecast.feature_context);
         self.last_feedback[index] = Some((now, forecast.captured_at));
         self.accepted[index] += 1;
         self.history_revision[index] += 1;
         if samples.len() - self.previous_count[index] > TTFT_WINDOW_SAMPLES {
             samples.remove(self.previous_count[index]);
+            self.feature_contexts[index].remove(self.previous_count[index]);
         }
         "accepted"
     }
@@ -861,6 +921,8 @@ pub(crate) struct StreamTtftObserver {
     done: bool,
     worker_url: String,
     request_id: Option<String>,
+    feature_identity: Option<CalibrationForecast>,
+    feature_resolved: bool,
 }
 
 impl StreamTtftObserver {
@@ -875,6 +937,8 @@ impl StreamTtftObserver {
     }
 
     pub(crate) fn cancel(&mut self) {
+        // Observation stopped by backpressure is unknown, not proof of cutoff.
+        self.feature_outcome(FeatureOutcome::Unknown);
         self.finish_probe();
         self.pending.clear();
         self.done = true;
@@ -895,6 +959,8 @@ impl StreamTtftObserver {
             done: false,
             worker_url: worker_url.to_owned(),
             request_id: None,
+            feature_identity: None,
+            feature_resolved: false,
         }
     }
 
@@ -907,6 +973,10 @@ impl StreamTtftObserver {
     }
 
     pub(crate) fn with_calibration(mut self, forecast: Option<CalibrationForecast>) -> Self {
+        self.feature_identity = forecast
+            .as_ref()
+            .filter(|f| f.feature_context.is_some())
+            .cloned();
         if let Some(probe) = &mut self.probe {
             probe.calibration = forecast;
         }
@@ -914,10 +984,11 @@ impl StreamTtftObserver {
     }
 
     pub(crate) fn push(&mut self, bytes: &[u8]) {
-        if self.probe.is_none() {
+        if self.probe.is_none() && (self.feature_identity.is_none() || self.feature_resolved) {
             return;
         }
         if let Some((ttft, visibility)) = self.scan(bytes, Instant::now()) {
+            self.feature_outcome(FeatureOutcome::FirstText);
             tracing::debug!(
                 target: "smg::estimated_wait::observation",
                 event = "first_text",
@@ -933,11 +1004,35 @@ impl StreamTtftObserver {
         }
     }
 
+    fn feature_outcome(&mut self, outcome: FeatureOutcome) {
+        if self.feature_resolved {
+            return;
+        }
+        self.feature_resolved = true;
+        if let (Some(registry), Some(identity)) =
+            (self.registry.upgrade(), self.feature_identity.as_ref())
+        {
+            registry.estimated_wait().record_feature_outcome(
+                &self.worker_url,
+                self.request_id.as_deref(),
+                identity,
+                outcome,
+            );
+        }
+    }
+    pub(crate) fn upstream_timeout(&mut self) {
+        self.feature_outcome(FeatureOutcome::Timeout);
+    }
+    pub(crate) fn downstream_disconnected(&mut self) {
+        self.feature_outcome(FeatureOutcome::Disconnect);
+    }
+
     fn scan(&mut self, bytes: &[u8], now: Instant) -> Option<(f64, f64)> {
         if self.done {
             return None;
         }
         if self.pending.len().saturating_add(bytes.len()) > MAX_TTFT_EVENT_BYTES {
+            self.feature_outcome(FeatureOutcome::Unknown);
             self.done = true;
             self.pending.clear();
             return None;
@@ -993,6 +1088,7 @@ impl StreamTtftObserver {
 impl Drop for StreamTtftObserver {
     fn drop(&mut self) {
         self.transport_event("observer_dropped");
+        self.feature_outcome(FeatureOutcome::Unknown);
         self.finish_probe();
     }
 }
@@ -1033,6 +1129,8 @@ struct Entry {
     calibration_empty_polls: u8,
     calibration_baseline: (Option<f64>, BaselineSource),
     recovery: RecoveryTracker,
+    feature_activity: Activity,
+    feature_profile: Option<u64>,
 }
 
 impl Entry {
@@ -1060,6 +1158,8 @@ impl Entry {
             calibration_empty_polls: 0,
             calibration_baseline: (None, BaselineSource::Unknown),
             recovery: RecoveryTracker::default(),
+            feature_activity: Activity::new(Instant::now()),
+            feature_profile: None,
         }
     }
 
@@ -1085,6 +1185,8 @@ impl Entry {
     fn reset_calibration(&mut self, now: Instant, reason: &'static str) {
         self.recovery.reset(reason);
         self.calibration = ExcessCalibration::new(now);
+        self.feature_activity = Activity::new(now);
+        self.feature_profile = None;
         self.calibration_baseline = (None, BaselineSource::Unknown);
         self.calibration_generation = Arc::new(());
         self.calibration_epoch = self.calibration_epoch.wrapping_add(1);
@@ -1093,6 +1195,104 @@ impl Entry {
                 event = "calibration_reset", worker = worker.url(), reason,
                 calibration_epoch = self.calibration_epoch);
         }
+    }
+
+    fn feature_context(&self, now: Instant, fresh: bool) -> FeatureContext {
+        self.feature_activity.context(
+            now,
+            self.sample
+                .as_ref()
+                .filter(|_| fresh)
+                .and_then(|s| s.prepared.kv_usage),
+        )
+    }
+
+    fn update_feature_on_poll(&mut self, config: &EstimatedWaitConfig, now: Instant) {
+        if !config.estimated_wait_feature_shadow {
+            return;
+        }
+        let Some(sample) = self.sample.as_ref() else {
+            for model in &mut self.calibration.feature_models {
+                *model = FeatureModel::default();
+            }
+            return;
+        };
+        let profile = sample.prepared.kv_profile;
+        if self.feature_profile != Some(profile) {
+            for contexts in &mut self.calibration.feature_contexts {
+                for ctx in contexts {
+                    *ctx = None;
+                }
+            }
+            self.calibration.feature_models = Default::default();
+            self.feature_profile = Some(profile);
+        }
+        let ready = sample.prepared.capacity_learned_ready;
+        let index = usize::from(ready);
+        let context = self.feature_context(now, true);
+        let scalar_target = self.calibration.target(ready);
+        let scalar_applied = self.calibration.stats(ready, now).0;
+        let revision = self.calibration.history_revision[index];
+        let model = &mut self.calibration.feature_models[index];
+        if model.fit.revision != revision {
+            model.fit = feature::Fit::learn(
+                &self.calibration.samples[index],
+                &self.calibration.feature_contexts[index],
+                revision,
+                scalar_target,
+            );
+        }
+        model.update(&context, scalar_target, scalar_applied, now);
+    }
+
+    fn log_feature(
+        &self,
+        config: &EstimatedWaitConfig,
+        now: Instant,
+        event: &'static str,
+        worker: &str,
+        request_id: &str,
+        scoped: bool,
+    ) {
+        if !config.estimated_wait_feature_shadow
+            || !tracing::enabled!(target:"smg::estimated_wait::observation",tracing::Level::DEBUG)
+        {
+            return;
+        }
+        let Some(sample) = self.sample.as_ref() else {
+            return;
+        };
+        let fresh = now.saturating_duration_since(sample.started).as_secs_f64()
+            <= config.estimated_wait_max_snapshot_age_secs;
+        let context = self.feature_context(now, fresh);
+        let ready = sample.prepared.capacity_learned_ready;
+        let index = usize::from(ready);
+        let scalar = self.calibration.stats(ready, now).0;
+        let model = &self.calibration.feature_models[index];
+        let prediction = model.prediction(&context, scalar, now, fresh && ready && scoped);
+        let n = sample
+            .prepared
+            .queue_excess_seconds(self.total_dispatched.saturating_sub(sample.watermark));
+        let extra = (n * prediction.gain)
+            .is_finite()
+            .then_some(n * prediction.gain);
+        let total = self
+            .calibration_baseline
+            .0
+            .zip(extra)
+            .map(|(b, e)| b + e)
+            .filter(|t| t.is_finite());
+        let usable = fresh && ready && scoped && total.is_some() && extra.is_some();
+        tracing::debug!(target:"smg::estimated_wait::observation", event, feature_method=feature::METHOD,
+            worker, request_id, diagnostic_time_seconds=diagnostic_time(now), calibration_epoch=self.calibration_epoch,
+            feature_json=%serde_json::json!({"method":feature::METHOD,"context":context,"fit":model.fit,"prediction":prediction,
+                "profile":self.feature_profile,"original_queue_excess_seconds":n,"baseline_seconds":self.calibration_baseline.0,
+                "legacy_gain":scalar,"legacy_target_gain":self.calibration.target(ready),"total_ttft_seconds":total,"extra_seconds":extra,
+                "extra_would_reject":extra.filter(|_|usable).map(|v|v>=sample.threshold),"total_would_reject":total.filter(|_|usable).map(|v|v>=sample.threshold),
+                "prediction_available":usable,
+                "native_ready":ready,"fresh":fresh,"supported_path":scoped,"threshold_seconds":sample.threshold,
+                "poll_started_time_seconds":diagnostic_time(sample.started),"history_revision":self.calibration.history_revision[index],
+                "scalar_fit_sequence":self.calibration.fitted[index],"ridge":feature::RIDGE,"max_delta":0.5,"max_abs_coefficient":2.0}));
     }
 
     fn recovery_forecast(
@@ -1253,6 +1453,8 @@ impl Entry {
             fitted_revision: self.calibration.fitted_revision
                 [usize::from(sample.prepared.capacity_learned_ready)],
             threshold: sample.threshold,
+            feature_context: None,
+            feature_profile: sample.prepared.kv_profile,
         })
     }
 
@@ -1369,6 +1571,38 @@ impl EstimatedWaitAdmission {
         Some(probe)
     }
 
+    fn record_feature_outcome(
+        &self,
+        worker: &str,
+        request_id: Option<&str>,
+        identity: &CalibrationForecast,
+        outcome: FeatureOutcome,
+    ) {
+        if !self.config().estimated_wait_feature_shadow {
+            return;
+        }
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.get_mut(worker) else {
+            tracing::debug!(target:"smg::estimated_wait::observation",event="feature_outcome_ignored",feature_method=feature::METHOD, worker,request_id=request_id.unwrap_or(""),outcome=outcome.name(),admission_epoch=identity.epoch,reason="worker_missing",diagnostic_time_seconds=diagnostic_time(Instant::now()));
+            return;
+        };
+        if !Arc::ptr_eq(&entry.generation, &identity.generation)
+            || !Arc::ptr_eq(
+                &entry.calibration_generation,
+                &identity.calibration_generation,
+            )
+        {
+            tracing::debug!(target:"smg::estimated_wait::observation",event="feature_outcome_ignored",feature_method=feature::METHOD,worker,request_id=request_id.unwrap_or(""),outcome=outcome.name(),admission_epoch=identity.epoch,calibration_epoch=entry.calibration_epoch,reason="generation_changed",diagnostic_time_seconds=diagnostic_time(Instant::now()));
+            return;
+        }
+        let now = Instant::now();
+        entry.feature_activity.record(now, outcome);
+        tracing::debug!(target:"smg::estimated_wait::observation",event="feature_outcome",feature_method=feature::METHOD,
+            worker,request_id=request_id.unwrap_or(""),outcome=outcome.name(),calibration_epoch=entry.calibration_epoch,
+            diagnostic_time_seconds=diagnostic_time(now),native_cancellation_acknowledgement="unavailable",
+            feature_json=%serde_json::json!({"activity":entry.feature_activity.context(now,None),"counts":entry.feature_activity.context(now,None).counts}));
+    }
+
     fn finish_ttft_probe(&self, probe: &TtftProbe) {
         let mut entries = self.entries.lock();
         let Some(entry) = entries.get_mut(&probe.worker_url) else {
@@ -1421,10 +1655,17 @@ impl EstimatedWaitAdmission {
                     &entry.calibration_generation,
                     &forecast.calibration_generation,
                 ) {
-                entry.calibration.observe(forecast, ttft, now)
+                let mut eligible = forecast.clone();
+                if entry.feature_profile != Some(forecast.feature_profile) {
+                    eligible.feature_context = None;
+                }
+                entry.calibration.observe(&eligible, ttft, now)
             } else {
                 "calibration_generation_changed"
             };
+            if self.config().estimated_wait_feature_shadow {
+                tracing::debug!(target: "smg::estimated_wait::observation", event="feature_context_feedback", feature_method=feature::METHOD, worker=probe.worker_url, request_id=probe.request_id.as_deref().unwrap_or(""), diagnostic_time_seconds=diagnostic_time(now), calibration_epoch=entry.calibration_epoch, feature_json=%serde_json::json!({"saved_context":forecast.feature_context,"admission_profile":forecast.feature_profile,"current_profile":entry.feature_profile,"admission_epoch":forecast.epoch,"admission_time_seconds":diagnostic_time(forecast.captured_at),"queue_excess_seconds":forecast.queue_extra,"baseline_seconds":forecast.baseline,"ttft_seconds":ttft,"ratio":forecast.baseline.map(|b|(ttft-b).max(0.0)/forecast.queue_extra),"reason":reason,"feature_context_accepted":reason=="accepted" && forecast.feature_context.is_some() && entry.feature_profile==Some(forecast.feature_profile),"history_revision":entry.calibration.history_revision[usize::from(forecast.native_capacity_ready)]}));
+            }
             let after = entry.calibration.stats(forecast.native_capacity_ready, now);
             let sequence_after =
                 entry.calibration.accepted[usize::from(forecast.native_capacity_ready)];
@@ -1886,6 +2127,21 @@ impl EstimatedWaitAdmission {
                 .set(entry.observed_delays.len() as f64);
         }
         entry.refresh(worker, config);
+        if outcome == "success" {
+            entry.update_feature_on_poll(config, Instant::now());
+        } else {
+            for model in &mut entry.calibration.feature_models {
+                model.invalidate();
+            }
+        }
+        entry.log_feature(
+            config,
+            Instant::now(),
+            "feature_context_poll",
+            worker.url(),
+            "",
+            true,
+        );
         if config.estimated_wait_calibration_shadow {
             let now = Instant::now();
             let candidate = entry.recovery_forecast(config, now);
@@ -1964,6 +2220,71 @@ pub(crate) struct AdmissionGuard<'a> {
 }
 
 impl AdmissionGuard<'_> {
+    pub(crate) fn feature_scope(
+        candidates: &[Arc<dyn Worker>],
+        enabled_path: bool,
+    ) -> Option<&Arc<dyn Worker>> {
+        // Scope is a single-worker pool, not a transient availability snapshot:
+        // health changes must not attribute a cohort rejection to one worker.
+        if !enabled_path || candidates.len() != 1 {
+            return None;
+        }
+        candidates[0].is_available().then_some(&candidates[0])
+    }
+
+    pub(crate) fn attach_feature_context(
+        &self,
+        worker: &Arc<dyn Worker>,
+        forecast: &mut Option<CalibrationForecast>,
+    ) -> bool {
+        if !self.config.estimated_wait_feature_shadow {
+            return false;
+        }
+        if let (Some(entry), Some(forecast)) = (
+            self.entries
+                .get(worker.url())
+                .filter(|e| e.source.ptr_eq(&Arc::downgrade(worker))),
+            forecast.as_mut(),
+        ) {
+            forecast.feature_context =
+                Some(entry.feature_context(forecast.captured_at, forecast.fresh));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn record_feature_decision(
+        &mut self,
+        worker: &Arc<dyn Worker>,
+        request_id: Option<&str>,
+        rejected: bool,
+        outcome_tracking_supported: bool,
+    ) {
+        if !self.config.estimated_wait_feature_shadow {
+            return;
+        }
+        let Some(entry) = self
+            .entries
+            .get_mut(worker.url())
+            .filter(|e| e.source.ptr_eq(&Arc::downgrade(worker)))
+        else {
+            return;
+        };
+        let now = Instant::now();
+        let outcome = if rejected {
+            FeatureOutcome::Rejected
+        } else if outcome_tracking_supported {
+            FeatureOutcome::Admitted
+        } else {
+            FeatureOutcome::UntrackedAdmitted
+        };
+        entry.feature_activity.record(now, outcome);
+        tracing::debug!(target:"smg::estimated_wait::observation", event="feature_admission_decision", feature_method=feature::METHOD,
+            worker=worker.url(),request_id=request_id.unwrap_or(""),decision=outcome.name(),outcome_tracking_supported,calibration_epoch=entry.calibration_epoch,
+            diagnostic_time_seconds=diagnostic_time(now),feature_json=%serde_json::json!({"activity":entry.feature_activity.context(now,None),"counts":entry.feature_activity.context(now,None).counts}));
+    }
+
     pub(crate) fn capture_calibration(
         &mut self,
         worker: &Arc<dyn Worker>,
@@ -1971,7 +2292,8 @@ impl AdmissionGuard<'_> {
     ) -> Option<CalibrationForecast> {
         let forecast = self
             .entries
-            .get_mut(worker.url())?
+            .get_mut(worker.url())
+            .filter(|e| e.source.ptr_eq(&Arc::downgrade(worker)))?
             .calibration_forecast(self.config, Instant::now())?;
         tracing::debug!(
             target: "smg::estimated_wait::observation", event = "calibration_forecast",
@@ -2011,6 +2333,7 @@ impl AdmissionGuard<'_> {
         &mut self,
         candidates: &[Arc<dyn Worker>],
         request_id: Option<&str>,
+        feature_worker: Option<&Arc<dyn Worker>>,
     ) {
         let Some(request_id) = request_id else {
             return;
@@ -2020,10 +2343,22 @@ impl AdmissionGuard<'_> {
         }
         for worker in candidates.iter().filter(|worker| worker.is_available()) {
             let now = Instant::now();
-            let Some(entry) = self.entries.get_mut(worker.url()) else {
+            let Some(entry) = self
+                .entries
+                .get_mut(worker.url())
+                .filter(|e| e.source.ptr_eq(&Arc::downgrade(worker)))
+            else {
                 continue;
             };
             let calibration = entry.calibration_forecast(self.config, now);
+            entry.log_feature(
+                self.config,
+                now,
+                "feature_context_forecast",
+                worker.url(),
+                request_id,
+                feature_worker.is_some_and(|w| Arc::ptr_eq(w, worker)),
+            );
             let recovery = entry.recovery_forecast(self.config, now);
             if let Some(candidate) = recovery {
                 tracing::debug!(target: "smg::estimated_wait::observation",
@@ -2551,6 +2886,298 @@ mod tests {
     ) {
         let stamp = admission.poll_started(worker);
         admission.publish(worker, Some(report), stamp, Instant::now());
+    }
+
+    fn feature_registry() -> (Arc<WorkerRegistry>, Arc<dyn Worker>) {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.estimated_wait().configure(EstimatedWaitConfig {
+            estimated_wait_calibration_shadow: true,
+            estimated_wait_feature_shadow: true,
+            ..config()
+        });
+        let worker = worker("http://feature:1");
+        registry.register(worker.clone()).unwrap();
+        let mut report = load(Some(1000), 2, 100.0, 0.4);
+        report.dp_rank_count = 1;
+        report.loads[0].low_load_ttft_seconds = Some(0.2);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        report.loads[0].native_kv_usage_available = Some(true);
+        report.loads[0].native_kv_usage_profile = Some(1);
+        publish_load(registry.estimated_wait(), &worker, &report);
+        (registry, worker)
+    }
+    fn feature_observer(
+        registry: &Arc<WorkerRegistry>,
+        worker: &Arc<dyn Worker>,
+    ) -> StreamTtftObserver {
+        let mut guard = registry.estimated_wait().begin().unwrap();
+        let mut forecast = guard.capture_calibration(worker, None);
+        guard.attach_feature_context(worker, &mut forecast);
+        drop(guard);
+        StreamTtftObserver::new(registry, worker.url(), Instant::now()).with_calibration(forecast)
+    }
+    #[test]
+    fn feature_outcomes_are_once_pretext_only_and_backpressure_is_unknown() {
+        let (registry, worker) = feature_registry();
+        {
+            let mut observer = feature_observer(&registry, &worker);
+            observer.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n");
+            observer.downstream_disconnected();
+            observer.upstream_timeout();
+        }
+        {
+            let mut observer = feature_observer(&registry, &worker);
+            observer.cancel();
+            observer.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n");
+            observer.downstream_disconnected();
+        }
+        {
+            let mut observer = feature_observer(&registry, &worker);
+            observer.downstream_disconnected();
+            observer.downstream_disconnected();
+        }
+        {
+            let mut observer = feature_observer(&registry, &worker);
+            observer.upstream_timeout();
+        }
+        let entries = registry.estimated_wait().entries.lock();
+        let c = entries[worker.url()]
+            .feature_activity
+            .context(Instant::now(), None)
+            .counts;
+        assert_eq!(c.first_text, 1);
+        assert_eq!(c.unknown_pretext_end, 1);
+        assert_eq!(c.pretext_downstream_disconnect, 1);
+        assert_eq!(c.upstream_timeout, 1);
+    }
+    #[test]
+    fn feature_old_outcomes_and_wrong_worker_identity_cannot_mutate_replacement() {
+        let (registry, worker) = feature_registry();
+        let mut observer = feature_observer(&registry, &worker);
+        registry
+            .estimated_wait()
+            .entries
+            .lock()
+            .get_mut(worker.url())
+            .unwrap()
+            .reset_calibration(Instant::now(), "test");
+        observer.downstream_disconnected();
+        let mut guard = registry.estimated_wait().begin().unwrap();
+        let other = self::worker(worker.url());
+        guard.record_feature_decision(&other, None, true, false);
+        assert_eq!(
+            guard.entries[worker.url()]
+                .feature_activity
+                .context(Instant::now(), None)
+                .counts
+                .actual_rejected,
+            0
+        );
+        assert_eq!(
+            guard.entries[worker.url()]
+                .feature_activity
+                .context(Instant::now(), None)
+                .counts
+                .pretext_downstream_disconnect,
+            0
+        );
+        assert!(AdmissionGuard::feature_scope(std::slice::from_ref(&worker), false).is_none());
+        assert!(AdmissionGuard::feature_scope(&[worker.clone(), other], true).is_none());
+    }
+    #[test]
+    fn feature_context_is_saved_before_own_decision_and_never_changes_scalar_fit() {
+        let (registry, worker) = feature_registry();
+        let mut guard = registry.estimated_wait().begin().unwrap();
+        for _ in 0..16 {
+            guard.record_feature_decision(&worker, None, false, true);
+        }
+        let mut forecast = guard.capture_calibration(&worker, None);
+        guard.attach_feature_context(&worker, &mut forecast);
+        let forecast = forecast.unwrap();
+        assert_eq!(
+            forecast.feature_context.unwrap().values,
+            [Some(0.4), None, Some(0.0)]
+        );
+        guard.record_feature_decision(&worker, None, true, false);
+        assert_eq!(forecast.feature_context.unwrap().counts.actual_rejected, 0);
+        let config = guard.config;
+        let entry = guard.entries.get_mut(worker.url()).unwrap();
+        let now = Instant::now();
+        for i in 0..40 {
+            let mut f = forecast.clone();
+            f.feature_context.as_mut().unwrap().values[0] = Some(i as f64 / 40.0);
+            assert_eq!(entry.calibration.observe(&f, 20.2, now), "accepted");
+        }
+        entry.calibration.fit_on_poll(true, now);
+        assert_eq!(entry.calibration.target(true), 2.0);
+        assert_eq!(entry.calibration.samples[1].len(), 32);
+        assert_eq!(entry.calibration.feature_contexts[1].len(), 32);
+        assert_eq!(
+            entry.calibration.feature_contexts[1][0].unwrap().values[0],
+            Some(0.2)
+        );
+        entry.update_feature_on_poll(config, now);
+        assert!(entry.calibration.feature_models[1].fit.support[0]);
+        assert!(entry.calibration.feature_models[1].fit.beta[0].abs() < 1e-10);
+        entry.calibration.rotate(now + Duration::from_secs(600));
+        assert!(entry.calibration.feature_contexts[1].is_empty());
+    }
+    #[test]
+    fn feature_kv_missing_duplicate_ranks_and_profile_order() {
+        let mut report = load(Some(1000), 2, 100.0, 0.4);
+        report.dp_rank_count = 1;
+        assert!(config().prepare(&report).unwrap().kv_usage.is_none());
+        report.loads[0].native_kv_usage_available = Some(true);
+        assert_eq!(config().prepare(&report).unwrap().kv_usage, Some(0.4));
+        let mut second = report.loads[0].clone();
+        second.dp_rank = 1;
+        second.token_usage = 0.6;
+        report.loads.push(second);
+        report.dp_rank_count = 2;
+        let p = config().prepare(&report).unwrap();
+        report.loads.reverse();
+        assert_eq!(config().prepare(&report).unwrap().kv_profile, p.kv_profile);
+        assert_eq!(p.kv_usage, Some(0.5));
+        report.loads[0].dp_rank = 0;
+        assert!(config().prepare(&report).unwrap().kv_usage.is_none());
+    }
+
+    #[test]
+    fn feature_actual_hard_rejection_is_counted_but_shadow_would_reject_is_not() {
+        for shadow in [false, true] {
+            let registry = Arc::new(WorkerRegistry::new());
+            registry.estimated_wait().configure(EstimatedWaitConfig {
+                estimated_wait_calibration_shadow: true,
+                estimated_wait_feature_shadow: true,
+                estimated_wait_shadow: shadow,
+                ..config()
+            });
+            let worker = worker("http://feature-decision:1");
+            registry.register(worker.clone()).unwrap();
+            let mut report = load(Some(100_000), 20, 100.0, 0.5);
+            report.loads[0].prefill_capacity_learning_active = Some(false);
+            report.loads[0].prefill_capacity_sample_count = Some(8);
+            publish_load(registry.estimated_wait(), &worker, &report);
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            let capture = Mutex::new(None);
+            let result = placement::select_from(
+                &registry,
+                &policies,
+                "m",
+                std::slice::from_ref(&worker),
+                PlacementInputs {
+                    calibration: Some(&capture),
+                    feature_context_supported: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(result.is_err(), !shadow);
+            let entries = registry.estimated_wait().entries.lock();
+            let counts = entries[worker.url()]
+                .feature_activity
+                .context(Instant::now(), None)
+                .counts;
+            assert_eq!(counts.actual_rejected, u64::from(!shadow));
+            assert_eq!(counts.admitted, u64::from(shadow));
+        }
+    }
+    #[test]
+    fn feature_kv_profile_reset_preserves_scalar_but_excludes_old_saved_context() {
+        let (registry, worker) = feature_registry();
+        let admission = registry.estimated_wait();
+        let mut guard = admission.begin().unwrap();
+        let mut forecast = guard.capture_calibration(&worker, None);
+        guard.attach_feature_context(&worker, &mut forecast);
+        let saved = forecast.unwrap();
+        drop(guard);
+        let mut old_probe = admission.ttft_probe(worker.url()).unwrap();
+        old_probe.calibration = Some(saved.clone());
+        {
+            let mut entries = admission.entries.lock();
+            let entry = entries.get_mut(worker.url()).unwrap();
+            for _ in 0..12 {
+                assert_eq!(
+                    entry.calibration.observe(&saved, 20.2, Instant::now()),
+                    "accepted"
+                );
+            }
+            entry.calibration.fit_on_poll(true, Instant::now());
+        }
+        let mut report = load(Some(1000), 2, 100.0, 0.6);
+        report.dp_rank_count = 1;
+        report.loads[0].low_load_ttft_seconds = Some(0.2);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        report.loads[0].native_kv_usage_available = Some(true);
+        report.loads[0].native_kv_usage_profile = Some(2);
+        publish_load(admission, &worker, &report);
+        {
+            let entries = admission.entries.lock();
+            let entry = &entries[worker.url()];
+            assert_eq!(entry.calibration.samples[1].len(), 12);
+            assert_eq!(entry.calibration.target(true), 2.0);
+            assert!(entry.calibration.feature_contexts[1]
+                .iter()
+                .all(Option::is_none));
+        }
+        admission.observe_ttft(old_probe, 20.2, 0.0);
+        let entries = admission.entries.lock();
+        let entry = &entries[worker.url()];
+        assert_eq!(entry.calibration.samples[1].len(), 13);
+        assert!(entry.calibration.feature_contexts[1]
+            .back()
+            .unwrap()
+            .is_none());
+    }
+    #[test]
+    fn feature_forecast_json_unknown_baseline_and_nonfinite_prediction_are_unavailable() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = DiagnosticWriter(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let (registry, worker) = feature_registry();
+            bytes.lock().clear();
+            let mut entries = registry.estimated_wait().entries.lock();
+            let entry = entries.get_mut(worker.url()).unwrap();
+            entry.calibration_baseline.0 = None;
+            entry.log_feature(
+                registry.estimated_wait().config(),
+                Instant::now(),
+                "feature_context_forecast",
+                worker.url(),
+                "no-baseline",
+                true,
+            );
+            entry.calibration_baseline.0 = Some(0.2);
+            entry.calibration.trajectories[1].anchor_scale = f64::MAX;
+            entry.calibration.trajectories[1].target_scale = f64::MAX;
+            entry.log_feature(
+                registry.estimated_wait().config(),
+                Instant::now(),
+                "feature_context_forecast",
+                worker.url(),
+                "overflow",
+                true,
+            );
+        });
+        let events: Vec<serde_json::Value> = String::from_utf8(bytes.lock().clone())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        for event in events {
+            let value: serde_json::Value =
+                serde_json::from_str(event["fields"]["feature_json"].as_str().unwrap()).unwrap();
+            assert_eq!(value["prediction_available"], false);
+            assert!(value["extra_would_reject"].is_null());
+            assert!(value["total_would_reject"].is_null());
+        }
     }
 
     fn calibration_registry(native_ready: bool) -> (Arc<WorkerRegistry>, Arc<dyn Worker>) {
@@ -4412,6 +5039,8 @@ mod tests {
             done: false,
             worker_url: "http://observer-test".to_owned(),
             request_id: None,
+            feature_identity: None,
+            feature_resolved: false,
         };
         assert_eq!(
             observer.scan(
@@ -4452,6 +5081,8 @@ mod tests {
             done: false,
             worker_url: "http://observer-test".to_owned(),
             request_id: None,
+            feature_identity: None,
+            feature_resolved: false,
         };
         observer.cancel();
         assert_eq!(

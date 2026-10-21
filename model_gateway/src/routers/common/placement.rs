@@ -55,6 +55,8 @@ pub(crate) struct PlacementInputs<'a> {
     pub cache_namespace: Option<CacheNamespace>,
     /// Optional HTTP SSE observer handoff, captured atomically before credit.
     pub calibration: Option<&'a Mutex<Option<CalibrationForecast>>>,
+    /// Only typed regular HTTP streaming TTFT paths have observable outcomes.
+    pub feature_context_supported: bool,
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -162,6 +164,14 @@ pub(crate) fn select_from(
     candidates: &[Arc<dyn Worker>],
     inputs: PlacementInputs<'_>,
 ) -> Result<Option<Arc<dyn Worker>>, Response> {
+    let request_id = inputs
+        .headers
+        .and_then(|h| h.get("opc-request-id"))
+        .and_then(|v| v.to_str().ok());
+    let feature_worker = crate::worker::estimated_wait::AdmissionGuard::feature_scope(
+        candidates,
+        inputs.feature_context_supported,
+    );
     let mut admission = registry.estimated_wait().begin();
     if let Some(guard) = &mut admission {
         guard.record_forecast(
@@ -170,8 +180,14 @@ pub(crate) fn select_from(
                 .headers
                 .and_then(|headers| headers.get("opc-request-id"))
                 .and_then(|value| value.to_str().ok()),
+            feature_worker,
         );
-        guard.check(candidates, model_id)?;
+        if let Err(response) = guard.check(candidates, model_id) {
+            if let Some(worker) = feature_worker {
+                guard.record_feature_decision(worker, request_id, true, false);
+            }
+            return Err(response);
+        }
     }
     let policy = policies.get_policy_or_default(model_id);
 
@@ -233,6 +249,12 @@ pub(crate) fn select_from(
                     .and_then(|headers| headers.get("opc-request-id"))
                     .and_then(|value| value.to_str().ok()),
             );
+        }
+        if feature_worker.is_some_and(|worker| Arc::ptr_eq(worker, &selected)) {
+            let tracked = inputs.calibration.is_some_and(|capture| {
+                guard.attach_feature_context(&selected, &mut capture.lock())
+            });
+            guard.record_feature_decision(&selected, request_id, false, tracked);
         }
         guard.credit(&selected, inputs.tokens);
     }

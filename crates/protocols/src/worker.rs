@@ -1322,6 +1322,13 @@ pub struct SchedulerLoadSnapshot {
     pub max_total_num_tokens: i32,
     /// Token usage ratio (0.0–1.0).
     pub token_usage: f64,
+    /// Explicit presence and validity of the native KV gauge for experimental
+    /// calibration. Missing is unknown; a default numeric zero is not evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_kv_usage_available: Option<bool>,
+    /// Opaque KV source/series signature. Changes invalidate feature-fit history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_kv_usage_profile: Option<u64>,
     /// Recent aggregate uncached-prefill throughput in tokens/s when the
     /// backend can derive it. `None` keeps older producers and counter cold
     /// starts on the existing generation-throughput/configured fallback path.

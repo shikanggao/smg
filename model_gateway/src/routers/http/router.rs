@@ -494,6 +494,8 @@ impl Router {
                     rid_key: view.rid_key,
                     cache_namespace: view.cache_namespace,
                     calibration: is_stream.then_some(&calibration),
+                    feature_context_supported: is_stream
+                        && matches!(route, "/v1/chat/completions" | "/v1/completions"),
                 },
             )
         }) {
@@ -813,6 +815,7 @@ impl Router {
                 rid_key: None,
                 cache_namespace: None,
                 calibration: is_stream.then_some(&calibration),
+                feature_context_supported: false,
             },
         );
         let worker = match selection {
@@ -887,7 +890,7 @@ impl Router {
             worker.api_key(),
         );
 
-        let ttft_observer = is_stream.then(|| {
+        let mut ttft_observer = is_stream.then(|| {
             StreamTtftObserver::new(&self.worker_registry, worker.url(), start)
                 .with_calibration(calibration.into_inner())
                 .with_request_id(
@@ -907,7 +910,10 @@ impl Router {
                 res
             }
             Err(e) => {
-                if let Some(observer) = &ttft_observer {
+                if let Some(observer) = &mut ttft_observer {
+                    if e.is_timeout() {
+                        observer.upstream_timeout();
+                    }
                     observer.transport_event("upstream_send_failed");
                 }
                 error!(
@@ -1007,12 +1013,14 @@ impl Router {
                                 if tx.capacity() == 0 { ttft_observer.cancel(); }
                                 if stream_header_status.is_success() { ttft_observer.push(&bytes); }
                                 if tx.send(Ok(bytes)).await.is_err() {
+                                    ttft_observer.downstream_disconnected();
                                     ttft_observer.transport_event("downstream_receiver_closed");
                                     client_disconnected = true;
                                     break;
                                 }
                             }
                             Some(Err(e)) => {
+                                if e.is_timeout() { ttft_observer.upstream_timeout(); }
                                 ttft_observer.transport_event("upstream_stream_error");
                                 stream_failed = true;
                                 let _ = tx.send(Err(format!("Stream error: {e}"))).await;
@@ -1027,7 +1035,8 @@ impl Router {
                         // stalled upstream): release the reqwest response stream.
                         // This does not acknowledge native scheduler cancellation.
                         () = tx.closed() => {
-                            ttft_observer.transport_event("downstream_receiver_closed");
+                            ttft_observer.downstream_disconnected();
+                                    ttft_observer.transport_event("downstream_receiver_closed");
                             client_disconnected = true;
                             break;
                         }
@@ -1201,7 +1210,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        let ttft_observer = is_stream.then(|| {
+        let mut ttft_observer = is_stream.then(|| {
             StreamTtftObserver::new(&self.worker_registry, worker.url(), started)
                 .with_calibration(calibration)
                 .with_request_id(
@@ -1221,7 +1230,10 @@ impl Router {
                 res
             }
             Err(e) => {
-                if let Some(observer) = &ttft_observer {
+                if let Some(observer) = &mut ttft_observer {
+                    if e.is_timeout() {
+                        observer.upstream_timeout();
+                    }
                     observer.transport_event("upstream_send_failed");
                 }
                 error!(
@@ -1278,6 +1290,11 @@ impl Router {
                 StreamTtftObserver::new(&self.worker_registry, worker_url, started)
             });
 
+            // An HTTP error body is not a successful streaming TTFT attempt.
+            if !status.is_success() {
+                ttft_observer.cancel();
+            }
+
             // Spawn task to forward stream
             #[expect(
                 clippy::disallowed_methods,
@@ -1295,11 +1312,13 @@ impl Router {
                                 if tx.capacity() == 0 { ttft_observer.cancel(); }
                                 if status.is_success() { ttft_observer.push(&bytes); }
                                 if tx.send(Ok(bytes)).await.is_err() {
+                                    ttft_observer.downstream_disconnected();
                                     ttft_observer.transport_event("downstream_receiver_closed");
                                     break;
                                 }
                             }
                             Some(Err(e)) => {
+                                if e.is_timeout() { ttft_observer.upstream_timeout(); }
                                 ttft_observer.transport_event("upstream_stream_error");
                                 let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                 break;
@@ -1313,7 +1332,8 @@ impl Router {
                         // stalled upstream): release the reqwest response stream.
                         // This does not acknowledge native scheduler cancellation.
                         () = tx.closed() => {
-                            ttft_observer.transport_event("downstream_receiver_closed");
+                            ttft_observer.downstream_disconnected();
+                                    ttft_observer.transport_event("downstream_receiver_closed");
                             break;
                         },
                     }
@@ -1753,6 +1773,7 @@ impl Router {
                 tokens: hinted_tokens.as_deref(),
                 headers: Some(req.headers()),
                 calibration: Some(&calibration),
+                feature_context_supported: false,
                 ..Default::default()
             },
         );

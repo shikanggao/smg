@@ -86,6 +86,7 @@ struct PromScrape {
     histogram_buckets: HashMap<String, Vec<(f64, f64)>>,
     local_compute_tokens: Option<f64>,
     request_count_series: Vec<String>,
+    kv_usage_series: Vec<String>,
 }
 
 fn local_compute_source(head: &str) -> bool {
@@ -114,6 +115,39 @@ fn histogram_bound(head: &str) -> Option<f64> {
 }
 
 impl PromScrape {
+    fn kv_usage_profile(&self, name: &str, aggregation: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut series: Vec<_> = self
+            .kv_usage_series
+            .iter()
+            .filter(|head| head.split('{').next() == Some(name))
+            .collect();
+        series.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut hasher);
+        aggregation.hash(&mut hasher);
+        series.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn valid_kv_usage(&self, name: &str) -> bool {
+        let Some(values) = self.samples.get(name) else {
+            return false;
+        };
+        let mut series: Vec<_> = self
+            .kv_usage_series
+            .iter()
+            .filter(|head| head.split('{').next() == Some(name))
+            .collect();
+        series.sort_unstable();
+        !series.is_empty()
+            && series.len() == values.len()
+            && !series.windows(2).any(|pair| pair[0] == pair[1])
+            && values
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+    }
+
     fn request_counts_profile(&self, epoch: u64) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut series = self.request_count_series.clone();
@@ -158,6 +192,7 @@ impl PromScrape {
         let mut histogram_buckets: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
         let mut local_compute_tokens = None;
         let mut request_count_series = Vec::new();
+        let mut kv_usage_series = Vec::new();
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -173,13 +208,25 @@ impl PromScrape {
                 Some(close) => (&line[..=close], &line[close + 1..]),
                 None => match line.split_once(char::is_whitespace) {
                     Some(split) => split,
-                    None => continue,
+                    None => (line, ""),
                 },
             };
             let name = head.split('{').next().unwrap_or(head).trim();
             // Preserve malformed native-count presence, even a head with no
             // numeric token. Otherwise one missing rank silently lowers P.
             let value = tail.split_whitespace().next().unwrap_or("");
+            if [
+                "vllm:gpu_cache_usage_perc",
+                "vllm:kv_cache_usage_perc",
+                "sglang:token_usage",
+                "sglang_token_usage",
+            ]
+            .contains(&name)
+            {
+                // Keep malformed series presence separately without changing
+                // the legacy policy's numeric aggregation behavior.
+                kv_usage_series.push(head.to_owned());
+            }
             if [
                 "vllm:num_requests_waiting",
                 "vllm:num_requests_running",
@@ -232,6 +279,7 @@ impl PromScrape {
             histogram_buckets,
             local_compute_tokens,
             request_count_series,
+            kv_usage_series,
         }
     }
 
@@ -1424,6 +1472,14 @@ impl WorkerMonitor {
         {
             for load in loads {
                 if let Some(rank) = load.as_object_mut() {
+                    let kv_available = rank
+                        .get("native_kv_usage_available")
+                        .is_none_or(|flag| flag.as_bool() == Some(true))
+                        && rank
+                            .get("token_usage")
+                            .and_then(serde_json::Value::as_f64)
+                            .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value));
+                    rank.insert("native_kv_usage_available".to_owned(), kv_available.into());
                     let counts_available = rank
                         .get("native_request_counts_available")
                         .and_then(serde_json::Value::as_bool)
@@ -1490,6 +1546,8 @@ impl WorkerMonitor {
             ),
             num_waiting_uncached_tokens_available: Some(false),
             token_usage: m.max(kv_usage),
+            native_kv_usage_available: Some(m.valid_kv_usage(kv_usage)),
+            native_kv_usage_profile: Some(m.kv_usage_profile(kv_usage, "max")),
             prefill_throughput: derived.prefill_throughput,
             gen_throughput: derived.gen_throughput,
             avg_request_prefill_kv_computed_tokens: derived.avg_request_prefill_kv_computed_tokens,
@@ -1588,6 +1646,10 @@ impl WorkerMonitor {
                 ),
                 num_waiting_uncached_tokens_available: Some(false),
                 token_usage: m.mean(&format!("{prefix}token_usage")),
+                native_kv_usage_available: Some(m.valid_kv_usage(&format!("{prefix}token_usage"))),
+                native_kv_usage_profile: Some(
+                    m.kv_usage_profile(&format!("{prefix}token_usage"), "mean"),
+                ),
                 // Preserve the reported generation rate; estimated-wait admission
                 // applies its configured floor to demand-starved samples.
                 gen_throughput: m
@@ -2037,6 +2099,103 @@ async fn group_monitor_loop(
 #[cfg(test)]
 mod estimated_wait_metrics_tests {
     use super::PromScrape;
+
+    #[test]
+    fn feature_kv_requires_every_reported_series_to_be_valid() {
+        for name in [
+            "vllm:gpu_cache_usage_perc",
+            "vllm:kv_cache_usage_perc",
+            "sglang:token_usage",
+            "sglang_token_usage",
+        ] {
+            let good = format!("{name}{{rank=\"0\"}} 0\n{name}{{rank=\"1\"}} 1");
+            assert!(PromScrape::parse(&good).valid_kv_usage(name));
+            assert!(!PromScrape::parse("").valid_kv_usage(name));
+            for bad in ["bad", "NaN", "+Inf", "-0.01", "1.01", ""] {
+                let body = format!("{name}{{rank=\"0\"}} 0.5\n{name}{{rank=\"1\"}} {bad}");
+                assert!(!PromScrape::parse(&body).valid_kv_usage(name), "{body}");
+                assert!(!PromScrape::parse(&format!("{name} {bad}")).valid_kv_usage(name));
+            }
+            let duplicate = format!("{name}{{rank=\"0\"}} 0.1\n{name}{{rank=\"0\"}} 0.2");
+            assert!(!PromScrape::parse(&duplicate).valid_kv_usage(name));
+        }
+    }
+
+    #[test]
+    fn feature_kv_profile_tracks_source_not_value_or_series_order() {
+        let name = "vllm:kv_cache_usage_perc";
+        let first = PromScrape::parse(&format!(
+            "{name}{{rank=\"0\"}} 0.1\n{name}{{rank=\"1\"}} 0.2"
+        ));
+        let reordered = PromScrape::parse(&format!(
+            "{name}{{rank=\"1\"}} 0.9\n{name}{{rank=\"0\"}} 0.8"
+        ));
+        assert_eq!(
+            first.kv_usage_profile(name, "max"),
+            reordered.kv_usage_profile(name, "max")
+        );
+        let fewer = PromScrape::parse(&format!("{name}{{rank=\"0\"}} 0.1"));
+        assert_ne!(
+            first.kv_usage_profile(name, "max"),
+            fewer.kv_usage_profile(name, "max")
+        );
+        assert_ne!(
+            first.kv_usage_profile(name, "max"),
+            first.kv_usage_profile(name, "mean")
+        );
+    }
+
+    #[test]
+    fn feature_kv_native_json_distinguishes_measured_zero_from_missing() {
+        use serde_json::json;
+        for (rank, expected) in [
+            (json!({}), false),
+            (json!({"token_usage": 0.0}), true),
+            (json!({"token_usage": 1.0}), true),
+            (json!({"token_usage": -0.01}), false),
+            (json!({"token_usage": 1.01}), false),
+            (json!({"native_kv_usage_available": true}), false),
+            (
+                json!({"token_usage": 0.2, "native_kv_usage_available": false}),
+                false,
+            ),
+            (
+                json!({"token_usage": 0.2, "native_kv_usage_available": "true"}),
+                false,
+            ),
+            (
+                json!({"token_usage": 0.2, "native_kv_usage_available": null}),
+                false,
+            ),
+        ] {
+            let response = super::WorkerMonitor::decode_native_loads(json!({"loads": [rank]}))
+                .expect("valid native load envelope");
+            assert_eq!(response.loads[0].native_kv_usage_available, Some(expected));
+        }
+        let legacy: openai_protocol::worker::SchedulerLoadSnapshot =
+            serde_json::from_value(json!({"token_usage": 0.0})).unwrap();
+        assert_eq!(legacy.native_kv_usage_available, None);
+    }
+
+    #[test]
+    fn feature_kv_sglang_metadata_does_not_change_legacy_aggregation() {
+        for prefix in ["sglang:", "sglang_"] {
+            let base = format!("{prefix}num_queue_reqs 1\n{prefix}num_running_reqs 2\n");
+            let valid = format!("{base}{prefix}token_usage{{rank=\"0\"}} 0.2\n{prefix}token_usage{{rank=\"1\"}} 0.8");
+            let snapshot = super::WorkerMonitor::decode_sglang_metrics(&valid).unwrap();
+            assert_eq!(snapshot.token_usage, 0.5);
+            assert_eq!(snapshot.native_kv_usage_available, Some(true));
+            let malformed = valid.replace(" 0.8", " bad");
+            let invalid = super::WorkerMonitor::decode_sglang_metrics(&malformed).unwrap();
+            assert_eq!(invalid.token_usage, 0.2); // Existing aggregation is unchanged.
+            assert_eq!(invalid.native_kv_usage_available, Some(false));
+            assert_eq!(
+                snapshot.native_kv_usage_profile,
+                invalid.native_kv_usage_profile
+            );
+            assert!(snapshot.native_kv_usage_profile.is_some());
+        }
+    }
 
     #[test]
     fn recovery_counts_reject_missing_malformed_mixed_rank_gauges_and_change_profile() {
@@ -3617,6 +3776,8 @@ mod native_loads_tests {
                 .expect("metrics fallback");
             assert_eq!(resp.loads[0].num_running_reqs, 7);
             assert_eq!(resp.loads[0].num_waiting_reqs, 11);
+            assert_eq!(resp.loads[0].native_kv_usage_available, Some(true));
+            assert!(resp.loads[0].native_kv_usage_profile.is_some());
         }
 
         let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");

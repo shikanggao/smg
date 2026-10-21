@@ -36,6 +36,7 @@ builder's `estimated_wait(EstimatedWaitConfig)` method.
 | `--max-estimated-wait-secs` | unset | Gateway wait budget; disabled unless a worker sets its own |
 | `--estimated-wait-shadow` | false | Record would-reject decisions and continue routing |
 | `--estimated-wait-calibration-shadow` | false | Experimental multiplicative TTFT diagnostics only; never affects admission |
+| `--estimated-wait-feature-shadow` | false | Learn KV/cutoff/rejection context adjustments in shadow; requires calibration shadow |
 | `--estimated-wait-provisional-baseline-secs` | unset | Positive, finite same-model representative baseline for calibration startup only; measured baseline takes precedence |
 | `--estimated-wait-queue-tokens-per-request` | 0 | Explicit waiting-request proxy; 0 disables it |
 | `--estimated-wait-fallback-prefill-throughput` | 2000 | Cold-start prefill capacity until a qualified value is learned; `--estimated-wait-min-prefill-throughput` and `--estimated-wait-default-throughput` remain aliases |
@@ -109,6 +110,77 @@ prediction. The raw floor-inclusive path remains the admission comparator.
 Failed/stale/duplicate polls do not fit. The applied scale approaches
 the target at at most **0.5 absolute units per second**, independent of polling
 frequency; retargeting starts from the current applied value without idle credit.
+
+### Experimental context gain
+
+`--estimated-wait-feature-shadow` adds a separate prediction alongside the scalar
+calibration and recovery diagnostics. It never replaces the admission score.
+With queue-only extra delay `N`, its prediction is `B_cal + g_context * N`:
+
+```
+z = [native_KV_usage, observed_pretext_cutoff_rate, actual_rejection_rate]
+gain_target = max(0, scalar_gain_target + clip(beta · (z - weighted_mean), -0.5, 0.5))
+```
+
+Each fresh load poll updates the target using current context. The applied
+context gain approaches it at at most 0.5 absolute units per second. Positive
+and negative feature coefficients can raise or lower the prediction; they do
+not add delay when `N` is zero. The raw observed-delay floor is excluded.
+
+The learner retains the same accepted first-text samples and two 300-second
+banks as scalar calibration, with each request's immutable admission context.
+It fits three weighted-centered residual slopes using normalized `N²` weights
+and ridge regularization of 0.1 toward initial coefficients `[0, 0, 0]`. The
+residual is `max(TTFT - saved_baseline, 0) / saved_N - scalar_gain_target`.
+Coefficients are clipped to `[-2, 2]`, making this a bounded approximation to
+unconstrained ridge. The scalar fit remains unchanged. These fixed versioned
+constants are experimental starting values, not optimized model profiles.
+
+Rates use bounded one-second buckets over the preceding 60 seconds:
+
+- Cutoff rate is `(known upstream timeouts + observed pre-text downstream
+  disconnects) / (first-text observations + those cutoffs)`. It requires at least
+  16 known resolved observations and less than 10% unknown outcomes among all
+  resolved observations. It describes recent resolved outcomes, not a matched
+  arrival cohort. A disconnect does not prove a client timeout or native engine
+  cancellation. Backpressure-disabled observation and unclassified endings
+  count as unknown; a disconnect after first text is not a pre-text cutoff.
+  Admissions without an outcome-observation identity are counted separately,
+  and suppress this feature while present in the 60-second admission window.
+  The resolved-outcome coverage check describes the tracked cohort; it is not
+  proof of complete engine-wide observation.
+- Rejection rate is `actual estimated-wait rejections / (selected admission attempts +
+  actual estimated-wait rejections)`, with at least 16 decisions. Shadow
+  would-reject checks and upstream errors are not actual gateway rejections.
+  These are local placement decisions; retried upstream attempts are not
+  deduplicated into a customer-level request rate.
+
+The initial supported path is typed streaming HTTP chat/completions with a
+single-worker pool whose worker is available. Other paths and multiworker pools
+are unsupported, even when only one member is currently healthy.
+KV input requires explicitly present, finite native measurements in `[0, 1]`;
+missing metrics and default numeric zeros cannot establish availability. A KV
+source/rank-profile change invalidates feature contexts while preserving the
+independent scalar fit.
+
+A fit needs at least 12 complete observations, weighted effective sample size
+of 8, and variation in each fitted feature (weighted variance at least `1e-4`
+and range at least `0.05`). The largest supported subset is fitted using common
+observations; missing dimensions are not imputed. An unsupported or currently
+out-of-range dimension contributes zero. With no currently supported dimensions,
+the candidate falls back explicitly to scalar calibration. This availability
+transition is distinct from the movement cap on an active context trajectory.
+Worker/baseline lifecycle, stale-data and history-expiry protections still apply.
+
+Debug observation events `feature_context_poll`, `feature_context_forecast`,
+`feature_context_feedback`, `feature_admission_decision`, and `feature_outcome`
+include context, counts, coefficients, support and prediction provenance for
+replay. Rejected requests have no TTFT label. No-text timeouts do not supply an
+invented numeric training label. Surviving first-text labels and policy-dependent
+activity rates can be biased; evaluate decision errors and coverage by phase
+before considering enforcement.
+
+### Baseline and history
 
 For startup under an already busy workload, explicitly supply a representative
 same-model, same-deployment baseline using `--estimated-wait-provisional-baseline-secs`.
