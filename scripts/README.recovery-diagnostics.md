@@ -1,9 +1,8 @@
 # Recovery diagnostic capture
 
-With recovery probes disabled (the default), this instrumentation observes the
-current admission policy without changing enforcement. Calibration fitting,
-history expiry, readiness, and the 0.5/second gain movement cap are unchanged.
-The separate opt-in recovery probe exception is described below. Enable the existing `smg::estimated_wait::observation=debug`
+This instrumentation observes the current admission policy without changing
+enforcement. Calibration fitting, history expiry, readiness, and the 0.5/second
+gain movement cap are unchanged. Enable the existing `smg::estimated_wait::observation=debug`
 tracing target for a bounded experiment. No prompt, response text, credential,
 per-token event, or per-request metric label is added by the router diagnostics.
 
@@ -100,14 +99,24 @@ that layer, not scheduler completion. If no acknowledgement is exposed, record
 that limitation and use queue/token progress only as aggregate evidence.
 
 
-## Live recovery candidate (`live_net_depletion_v1`)
+## Live recovery candidate (`live_arrival_bounded_depletion_v2`)
 
 Calibration shadow also computes a separate, untrained recovery comparator from
 fresh native waiting (`W`) and running (`R`) gauges. Let `P=W+R`. Over both a
 10-second and a 30-second window, require a strict decline in **both** `W` and `P`,
-at least five polls, and no intermediate rebound. Flat individual polls are
+at least five polls, and no unsupported intermediate rebound. Flat individual polls are
 allowed because request counts are discrete, but a flat short window is not.
-Use the smaller of the two net population-depletion rates `r`:
+A positive per-poll change in either `W` or `P` is tolerated only when each
+increase is at most `min(1, new_request_credits)`. Credits count router admissions,
+not prompt tokens, and are captured atomically at poll start. Each interval uses
+only its watermark delta: old, duplicate, future or previously consumed credits
+cannot fund another bump. Counter rollback clears history; saturation supplies
+no new allowance. This bounded continuity rule does not prove native acceptance
+or attribute a native arrival to an owned request. External arrivals and delayed
+native acceptance can still reset history. It is deliberately conservative.
+
+Use the smaller of the two **unadjusted** net population-depletion rates `r`;
+never add arrivals to this rate or subtract them from native work:
 
 ```
 Nlive = min(Nqueue_without_dispatch_debt, P/r) + dispatch_debt
@@ -131,7 +140,7 @@ History is bounded to 121 polls / 120 seconds. Missing, malformed, negative,
 fractional or overflowing count gauges invalidate the aggregate, including one
 bad series among otherwise valid ranks. Source-series/rank profile changes,
 detected native counter resets, capacity-profile resets, fresh failed/stale polls,
-poll gaps beyond the configured snapshot age, rebounds and zero population clear
+poll gaps beyond the configured snapshot age, unsupported rebounds and zero population clear
 history. Worker invalidation clears evidence. Duplicate and older publications
 cannot replace or invalidate newer evidence. Unobservable native restarts or
 model changes cannot be detected magically; the observed signals bound this claim.
@@ -153,34 +162,14 @@ TTFT** against that numeric threshold for analysis and requires a known baseline
 These are distinct scorecards. `recovery_poll` adds the once-per-publication
 state, exact poll times and opaque profile needed to reconstruct eligibility;
 original `calibration_poll` events remain available for failed/stale/ignored polls.
+Both recovery events expose `poll_request_watermark`, current
+`total_dispatched_requests`, optional `requests_since_previous_poll`,
+`rebound_allowance_requests` and `rebound_retained`. The existing
+`total_dispatched` counts tokens and must never be used as an arrival count.
+Request counters are worker-generation scoped, reset on invalidation/replacement,
+and saturate without wrapping. Diagnostic comparisons may replay strict v1 on
+the same polls; v1 is not a second runtime policy.
 
-## Experimental recovery admission probes
 
-`--estimated-wait-recovery-probes` defaults to **off** and requires calibration
-shadow. With hard raw enforcement enabled, it permits at most **one request per
-worker incarnation every ten seconds and one full response in flight**. Raw
-shadow mode never consumes an actual permit. There is no automatic allowance
-ramp in this first implementation.
-
-Only the typed regular HTTP streaming `/v1/chat/completions` and `/v1/completions`
-paths support the response-lifetime handoff. Non-streaming, raw-body passthrough,
-multipart, disaggregated and gRPC paths do not acquire exceptions. Exactly one
-available worker must remain in the candidate cohort, and the permit is bound
-to the actual selected worker. Health/circuit-breaker/static overload checks
-remain in place. The original raw sample must be fresh, ready and over budget;
-both `B+Nlive` and `B+g*Nlive` must be below the numeric budget. This deliberately
-conservative probe condition does not turn either predictor into a guarantee.
-
-Selection and reservation are atomic under the admission mutex; a policy that
-selects no worker consumes no permit or cooldown. The full response body owns the
-permit until EOF, stream error or client drop. First text does not release it.
-Pre-response failures/drop release through RAII. Invalidation clears evidence
-but retains occupied permits and cooldown within the same worker incarnation;
-replacement workers start independent state. Logs `recovery_probe_attempt`,
-`recovery_probe_reserved`, `recovery_probe_response` and `recovery_probe_released`
-include owned request correlation and the shared clock. Local release never
-claims that native engine work has stopped.
-
-The DEV comparison keeps probes **off** and evaluates the candidate in shadow.
-It cannot establish the performance of an enforced reopening policy. Local
-integration tests cover the bounded exception separately.
+Recovery estimates are shadow diagnostics only. No admission bypass or probe
+exception exists. Customer requests use the unchanged normal admission path.

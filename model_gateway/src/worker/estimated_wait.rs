@@ -22,9 +22,7 @@
 //! Regular HTTP OpenAI-compatible SSE carries the admission-time snapshot to
 //! its first nonempty reasoning/content text callback. Metadata, cancellation,
 //! completion, and nonstreaming responses never supply training observations.
-//! Calibration shadow alone never changes admission or promotes raw readiness.
-//! The separately enabled, bounded recovery-probe exception may consult the
-//! legacy-gain ablation; it does not replace the raw gate. Worker
+//! No calibrated field feeds admission or promotes raw readiness. Worker
 //! invalidation and detectable native-capacity profile resets clear learning;
 //! two fresh queue-empty polls without local pending work also reset learning.
 //! Banks rotate every 300 seconds from the first accepted observation. Keep
@@ -62,7 +60,6 @@ use crate::{
 };
 
 mod recovery;
-pub(crate) use recovery::RecoveryProbePermit;
 use recovery::{RecoveryForecast, RecoveryTracker};
 
 /// All defaults are starting points for calibration, not capacity guarantees.
@@ -89,8 +86,6 @@ pub struct EstimatedWaitConfig {
     pub estimated_wait_shadow: bool,
     /// Learn excess-TTFT correction for diagnostics only; never changes admission.
     pub estimated_wait_calibration_shadow: bool,
-    /// Experimental fixed one-inflight / ten-second recovery admission exception.
-    pub estimated_wait_recovery_probes: bool,
     /// Same-model deployment baseline for diagnostic calibration until measured.
     pub estimated_wait_provisional_baseline_secs: Option<f64>,
 }
@@ -108,7 +103,6 @@ impl Default for EstimatedWaitConfig {
             estimated_wait_max_snapshot_age_secs: 30.0,
             estimated_wait_shadow: false,
             estimated_wait_calibration_shadow: false,
-            estimated_wait_recovery_probes: false,
             estimated_wait_provisional_baseline_secs: None,
         }
     }
@@ -116,13 +110,6 @@ impl Default for EstimatedWaitConfig {
 
 impl EstimatedWaitConfig {
     pub fn validate(&self) -> ConfigResult<()> {
-        if self.estimated_wait_recovery_probes && !self.estimated_wait_calibration_shadow {
-            return Err(ConfigError::InvalidValue {
-                field: "estimated_wait_recovery_probes".into(),
-                value: "true".into(),
-                reason: "Requires estimated_wait_calibration_shadow for recovery evidence".into(),
-            });
-        }
         if self.estimated_wait_kv_pressure_weight != 0.0 {
             return Err(ConfigError::InvalidValue {
                 field: "estimated_wait_kv_pressure_weight".to_string(),
@@ -1026,6 +1013,7 @@ struct Entry {
     source: Weak<dyn Worker>,
     generation: Arc<()>,
     total_dispatched: u64,
+    total_dispatched_requests: u64,
     // Keep ordering even for failed polls, which must supersede older successes.
     last_published: Option<Instant>,
     sample: Option<Sample>,
@@ -1045,8 +1033,6 @@ struct Entry {
     calibration_empty_polls: u8,
     calibration_baseline: (Option<f64>, BaselineSource),
     recovery: RecoveryTracker,
-    probe_inflight: Arc<AtomicUsize>,
-    last_probe: Option<Instant>,
 }
 
 impl Entry {
@@ -1055,6 +1041,7 @@ impl Entry {
             source: Arc::downgrade(worker),
             generation: Arc::new(()),
             total_dispatched: 0,
+            total_dispatched_requests: 0,
             last_published: None,
             sample: None,
             low_load_ttfts: VecDeque::new(),
@@ -1073,14 +1060,13 @@ impl Entry {
             calibration_empty_polls: 0,
             calibration_baseline: (None, BaselineSource::Unknown),
             recovery: RecoveryTracker::default(),
-            probe_inflight: Arc::new(AtomicUsize::new(0)),
-            last_probe: None,
         }
     }
 
     fn invalidate(&mut self) {
         self.generation = Arc::new(());
         self.total_dispatched = 0;
+        self.total_dispatched_requests = 0;
         self.last_published = None;
         self.sample = None;
         self.low_load_ttfts.clear();
@@ -1573,14 +1559,6 @@ impl EstimatedWaitAdmission {
         prepared.capacity_ready |= floor.is_some_and(|delay| delay >= sample.threshold);
     }
 
-    #[cfg(test)]
-    pub(crate) fn recovery_probe_inflight(&self, worker: &Arc<dyn Worker>) -> usize {
-        self.entries
-            .lock()
-            .get(worker.url())
-            .map_or(0, |entry| entry.probe_inflight.load(Ordering::Acquire))
-    }
-
     pub(crate) fn configure(&self, config: EstimatedWaitConfig) {
         let _ = self.config.set(config);
     }
@@ -1655,6 +1633,7 @@ impl EstimatedWaitAdmission {
         Some(PollWatermark {
             generation: Arc::clone(&entry.generation),
             dispatched: entry.total_dispatched,
+            dispatched_requests: entry.total_dispatched_requests,
         })
     }
 
@@ -1786,6 +1765,7 @@ impl EstimatedWaitAdmission {
                         load,
                         started,
                         config.estimated_wait_max_snapshot_age_secs,
+                        watermark.dispatched_requests,
                     );
                 }
             } else {
@@ -1913,6 +1893,11 @@ impl EstimatedWaitAdmission {
                 worker = worker.url(), diagnostic_time_seconds = diagnostic_time(now),
                 poll_started_time_seconds = diagnostic_time(started), outcome,
                 recovery_method = recovery::METHOD,
+                poll_request_watermark = watermark.dispatched_requests,
+                total_dispatched_requests = entry.total_dispatched_requests,
+                requests_since_previous_poll = candidate.and_then(|c| c.requests_since_previous_poll),
+                rebound_allowance_requests = candidate.map(|c| c.rebound_allowance),
+                rebound_retained = candidate.is_some_and(|c| c.rebound_retained),
                 calibration_epoch = entry.calibration_epoch,
                 native_counts_profile = candidate.and_then(|c| c.profile),
                 window_started_time_seconds = candidate.and_then(|c| c.window_started).map(diagnostic_time),
@@ -1970,6 +1955,7 @@ impl EstimatedWaitAdmission {
 pub(crate) struct PollWatermark {
     generation: Arc<()>,
     dispatched: u64,
+    dispatched_requests: u64,
 }
 
 pub(crate) struct AdmissionGuard<'a> {
@@ -2043,6 +2029,11 @@ impl AdmissionGuard<'_> {
                 tracing::debug!(target: "smg::estimated_wait::observation",
                     event = "recovery_forecast", request_id, worker = worker.url(),
                     recovery_method = recovery::METHOD, available = candidate.available,
+                    poll_request_watermark = candidate.poll_request_watermark,
+                    total_dispatched_requests = entry.total_dispatched_requests,
+                    requests_since_previous_poll = candidate.requests_since_previous_poll,
+                    rebound_allowance_requests = candidate.rebound_allowance,
+                    rebound_retained = candidate.rebound_retained,
                     diagnostic_time_seconds = diagnostic_time(now),
                     legacy_calibration_scale = candidate.gain,
                     calibration_epoch = entry.calibration_epoch,
@@ -2151,64 +2142,6 @@ impl AdmissionGuard<'_> {
         }
     }
 
-    /// Only the typed regular HTTP SSE path provides a response-lifetime handoff.
-    /// The original gate must already reject, so raw shadow never spends permits.
-    pub(crate) fn reserve_recovery_probe(
-        &mut self,
-        candidates: &[Arc<dyn Worker>],
-        selected: &Arc<dyn Worker>,
-        request_id: Option<&str>,
-    ) -> Option<RecoveryProbePermit> {
-        if !self.config.estimated_wait_recovery_probes
-            || self.config.estimated_wait_shadow
-            || !self.config.estimated_wait_calibration_shadow
-        {
-            return None;
-        }
-        let mut eligible = candidates.iter().filter(|w| w.is_available());
-        let worker = eligible.next()?;
-        if !Arc::ptr_eq(worker, selected) {
-            return None;
-        }
-        if eligible.next().is_some()
-            || !matches!(worker.connection_mode(), super::ConnectionMode::Http)
-        {
-            return None;
-        }
-        let entry = self.entries.get_mut(worker.url())?;
-        if !entry.source.ptr_eq(&Arc::downgrade(worker)) {
-            return None;
-        }
-        let now = Instant::now();
-        let sample = entry.sample.as_ref()?;
-        if sample.overloaded != Some(true)
-            || !sample.prepared.capacity_ready
-            || now.saturating_duration_since(sample.started).as_secs_f64()
-                > self.config.estimated_wait_max_snapshot_age_secs
-        {
-            return None;
-        }
-        let forecast = entry.recovery_forecast(self.config, now)?;
-        let threshold = entry.sample.as_ref()?.threshold;
-        let safe_candidate = forecast.available
-            && forecast
-                .total
-                .is_some_and(|t| t.is_finite() && t < threshold)
-            && forecast
-                .legacy_gain_total
-                .is_some_and(|t| t.is_finite() && t < threshold);
-        let interval_ready = entry
-            .last_probe
-            .is_none_or(|at| now.saturating_duration_since(at) >= recovery::PROBE_INTERVAL);
-        tracing::debug!(target: "smg::estimated_wait::observation", event = "recovery_probe_attempt", diagnostic_time_seconds = diagnostic_time(now), worker = worker.url(), request_id = request_id.unwrap_or(""), safe_candidate, interval_ready, inflight = entry.probe_inflight.load(Ordering::Acquire));
-        if !safe_candidate || !interval_ready {
-            return None;
-        }
-        let permit = RecoveryProbePermit::reserve(&entry.probe_inflight, worker.url(), request_id)?;
-        entry.last_probe = Some(now);
-        Some(permit)
-    }
-
     pub(crate) fn check(
         &self,
         candidates: &[Arc<dyn Worker>],
@@ -2292,6 +2225,7 @@ impl AdmissionGuard<'_> {
             return;
         };
         entry.total_dispatched = entry.total_dispatched.saturating_add(count);
+        entry.total_dispatched_requests = entry.total_dispatched_requests.saturating_add(1);
         entry.refresh(worker, self.config);
     }
 }
@@ -2338,7 +2272,6 @@ mod tests {
             max_estimated_wait_secs: Some(300.0),
             estimated_wait_max_snapshot_age_secs: 60.0,
             estimated_wait_calibration_shadow: true,
-            estimated_wait_recovery_probes: true,
             estimated_wait_shadow: shadow,
             ..config()
         });
@@ -2396,6 +2329,59 @@ mod tests {
     }
 
     #[test]
+    fn recovery_arrival_credit_is_one_request_and_frozen_at_poll_start() {
+        for credit_before_start in [false, true] {
+            let (registry, worker) = recovery_registry(false);
+            let admission = registry.estimated_wait();
+            if credit_before_start {
+                admission.begin().unwrap().credit(&worker, Some(&[0; 100]));
+            }
+            let stamp = admission.poll_started(&worker);
+            if !credit_before_start {
+                admission.begin().unwrap().credit(&worker, Some(&[0; 100]));
+            }
+            let mut report = load(Some(100_000), 41, 100.0, 0.0);
+            report.loads[0].num_running_reqs = 10;
+            report.loads[0].native_request_counts_available = Some(true);
+            report.loads[0].low_load_ttft_seconds = Some(2.0);
+            let at = admission.entries.lock()[worker.url()]
+                .last_published
+                .unwrap()
+                + Duration::from_secs(5);
+            admission.publish(&worker, Some(&report), stamp, at);
+            let entries = admission.entries.lock();
+            let entry = &entries[worker.url()];
+            assert_eq!(entry.total_dispatched_requests, 1);
+            assert_eq!(entry.total_dispatched, 100);
+            let f = entry.recovery_forecast(admission.config(), at).unwrap();
+            assert_eq!(f.available, credit_before_start);
+            assert_eq!(
+                f.poll_request_watermark,
+                Some(u64::from(credit_before_start))
+            );
+            assert_eq!(f.debt, if credit_before_start { 0.0 } else { 1.0 });
+        }
+    }
+
+    #[test]
+    fn recovery_request_counter_saturates_and_worker_invalidation_resets_it() {
+        let (registry, worker) = recovery_registry(false);
+        let admission = registry.estimated_wait();
+        admission
+            .entries
+            .lock()
+            .get_mut(worker.url())
+            .unwrap()
+            .total_dispatched_requests = u64::MAX;
+        admission.begin().unwrap().credit(&worker, Some(&[]));
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        assert_eq!(entry.total_dispatched_requests, u64::MAX);
+        entry.invalidate();
+        assert_eq!(entry.total_dispatched_requests, 0);
+    }
+
+    #[test]
     fn live_recovery_failed_poll_resets_but_duplicates_and_older_reports_do_not_mix_inputs() {
         let (registry, worker) = recovery_registry(false);
         let admission = registry.estimated_wait();
@@ -2429,140 +2415,6 @@ mod tests {
         let entry = &entries[worker.url()];
         assert!(entry.sample.is_none());
         assert_eq!(entry.recovery.reason, "failed");
-    }
-
-    #[test]
-    fn recovery_probe_selection_is_bound_rate_limited_and_not_available_on_unsupported_paths() {
-        let (registry, worker) = recovery_registry(false);
-        let admission = registry.estimated_wait();
-        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        // Non-streaming and unsupported transports provide no handoff.
-        assert!(placement::select_from(
-            &registry,
-            &policies,
-            "m",
-            std::slice::from_ref(&worker),
-            PlacementInputs::default()
-        )
-        .is_err());
-        let other = Arc::new(
-            BasicWorkerBuilder::new("http://other:1")
-                .status(WorkerStatus::Ready)
-                .worker_type(WorkerType::Regular)
-                .connection_mode(ConnectionMode::Http)
-                .build(),
-        ) as Arc<dyn Worker>;
-        {
-            let mut guard = admission.begin().unwrap();
-            assert!(guard
-                .reserve_recovery_probe(std::slice::from_ref(&worker), &other, None)
-                .is_none());
-            assert!(guard
-                .reserve_recovery_probe(&[worker.clone(), other.clone()], &worker, None)
-                .is_none());
-        }
-        let capture = Mutex::new(None);
-        let selected = placement::select_from(
-            &registry,
-            &policies,
-            "m",
-            std::slice::from_ref(&worker),
-            PlacementInputs {
-                recovery_probe: Some(&capture),
-                ..Default::default()
-            },
-        )
-        .unwrap()
-        .unwrap();
-        assert!(Arc::ptr_eq(&worker, &selected));
-        let permit = capture.into_inner().unwrap();
-        assert!(admission
-            .begin()
-            .unwrap()
-            .reserve_recovery_probe(std::slice::from_ref(&worker), &worker, None)
-            .is_none());
-        drop(permit);
-        // Release does not erase the ten-second admission-rate bound.
-        assert!(admission
-            .begin()
-            .unwrap()
-            .reserve_recovery_probe(std::slice::from_ref(&worker), &worker, None)
-            .is_none());
-        admission
-            .entries
-            .lock()
-            .get_mut(worker.url())
-            .unwrap()
-            .last_probe = Some(Instant::now() - Duration::from_secs(11));
-        assert!(admission
-            .begin()
-            .unwrap()
-            .reserve_recovery_probe(std::slice::from_ref(&worker), &worker, None)
-            .is_some());
-    }
-
-    #[test]
-    fn recovery_probes_never_spend_permits_in_raw_shadow_or_on_stale_unready_unblocked_state() {
-        let (registry, worker) = recovery_registry(true);
-        let admission = registry.estimated_wait();
-        assert!(admission
-            .begin()
-            .unwrap()
-            .reserve_recovery_probe(std::slice::from_ref(&worker), &worker, None)
-            .is_none());
-        let (registry, worker) = recovery_registry(false);
-        let admission = registry.estimated_wait();
-        for state in ["stale", "unready", "unblocked"] {
-            let mut guard = admission.begin().unwrap();
-            let sample = guard
-                .entries
-                .get_mut(worker.url())
-                .unwrap()
-                .sample
-                .as_mut()
-                .unwrap();
-            sample.started = Instant::now();
-            sample.prepared.capacity_ready = true;
-            sample.overloaded = Some(true);
-            match state {
-                "stale" => sample.started -= Duration::from_secs(61),
-                "unready" => sample.prepared.capacity_ready = false,
-                _ => sample.overloaded = Some(false),
-            }
-            assert!(guard
-                .reserve_recovery_probe(std::slice::from_ref(&worker), &worker, None)
-                .is_none());
-        }
-    }
-
-    #[test]
-    fn recovery_probe_inflight_survives_invalidation_without_reusing_old_evidence() {
-        let (registry, worker) = recovery_registry(false);
-        let admission = registry.estimated_wait();
-        let permit = admission
-            .begin()
-            .unwrap()
-            .reserve_recovery_probe(std::slice::from_ref(&worker), &worker, None)
-            .unwrap();
-        admission.evict(&worker);
-        {
-            let entries = admission.entries.lock();
-            let entry = &entries[worker.url()];
-            assert_eq!(entry.probe_inflight.load(Ordering::Acquire), 1);
-            assert_eq!(entry.recovery.reason, "worker_invalidated");
-        }
-        assert!(admission
-            .begin()
-            .unwrap()
-            .reserve_recovery_probe(std::slice::from_ref(&worker), &worker, None)
-            .is_none());
-        drop(permit);
-        assert_eq!(
-            admission.entries.lock()[worker.url()]
-                .probe_inflight
-                .load(Ordering::Acquire),
-            0
-        );
     }
 
     #[test]

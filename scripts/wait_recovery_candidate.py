@@ -11,6 +11,8 @@ import math
 
 
 METHOD = "live_net_depletion_v1"
+CURRENT_METHOD = "live_arrival_bounded_depletion_v2"
+SUPPORTED_METHODS = frozenset((METHOD, CURRENT_METHOD))
 TRAINING = "unchanged_original_queue_only"
 
 
@@ -22,8 +24,43 @@ def number(value, label, optional=False):
     return value
 
 
+def arrival_snapshot(event):
+    """Validate REQUEST-count diagnostics; they are not token/service counters.
+
+    These are the newest captured interval's fields. Checking every credited
+    W/P bump still requires replaying the complete poll history.
+    """
+    def counter(key, optional=False):
+        value = event.get(key)
+        if value is None and optional:
+            return None
+        if type(value) is not int or not 0 <= value <= (1 << 64) - 1:
+            raise ValueError("Invalid recovery REQUEST counter: " + key)
+        return value
+
+    total = counter("total_dispatched_requests")
+    watermark = counter("poll_request_watermark", optional=True)
+    delta = counter("requests_since_previous_poll", optional=True)
+    allowance = counter("rebound_allowance_requests")
+    retained = event.get("rebound_retained")
+    if type(retained) is not bool or allowance != min(delta or 0, 1):
+        raise ValueError("Recovery rebound allowance differs from captured REQUEST credit")
+    if watermark is None:
+        if delta is not None or allowance or retained or event["available"]:
+            raise ValueError("Recovery REQUEST interval lacks a poll-start watermark")
+    elif watermark > total or delta is not None and delta > watermark:
+        raise ValueError("Recovery REQUEST watermark is inconsistent with cumulative counts")
+    if retained and allowance != 1:
+        raise ValueError("Recovery retained rebound lacks fresh REQUEST credit")
+    if event["available"] and delta is None:
+        raise ValueError("Eligible recovery window lacks its newest REQUEST interval")
+    return {key: event.get(key) for key in ("poll_request_watermark", "total_dispatched_requests",
+        "requests_since_previous_poll", "rebound_allowance_requests", "rebound_retained")}
+
+
 def pair(event, original_totals, threshold, original_flags=None, original_native_ready=None):
-    if event.get("event") != "recovery_forecast" or event.get("recovery_method") != METHOD:
+    method = event.get("recovery_method")
+    if event.get("event") != "recovery_forecast" or method not in SUPPORTED_METHODS:
         raise ValueError("Unknown recovery forecast method")
     if any(not isinstance(event.get(k), str) or not event[k] for k in ("request_id", "worker")):
         raise ValueError("Recovery exact request and worker identity are required")
@@ -35,6 +72,7 @@ def pair(event, original_totals, threshold, original_flags=None, original_native
         raise ValueError("Recovery candidate training/acknowledgement contract changed")
     if type(event.get("available")) is not bool or not isinstance(event.get("reason"), str):
         raise ValueError("Recovery eligibility and reason are required")
+    arrivals = arrival_snapshot(event) if method == CURRENT_METHOD else {}
     if event.get("threshold_seconds") != threshold:
         raise ValueError("Recovery threshold differs from exact admission budget")
     for field in ("original_queue_excess_seconds", "queue_excess_seconds", "window_seconds", "dispatch_debt_seconds"):
@@ -91,7 +129,7 @@ def pair(event, original_totals, threshold, original_flags=None, original_native
     for value in fallback.values():
         number(value, "fallback total", optional=True)
     original_flags = original_flags or {}
-    return dict(method=METHOD, available=event["available"], reason=event["reason"],
+    return dict(method=method, available=event["available"], reason=event["reason"],
                 gain_training=TRAINING, candidate_is_calibrated=False,
                 eligible_total_ttft_predictions=eligible,
                 explicit_fallback_total_ttft_predictions=fallback,
@@ -110,7 +148,7 @@ def pair(event, original_totals, threshold, original_flags=None, original_native
                     "legacy_calibration_scale", "calibration_epoch", "calibration_history_revision", "calibration_fit_sequence",
                     "native_counts_profile", "window_started_time_seconds", "latest_poll_started_time_seconds",
                     "native_population", "native_waiting", "diagnostic_time_seconds", "worker",
-                    "net_population_depletion_per_second", "window_seconds", "window_poll_count", "dispatch_debt_seconds")})
+                    "net_population_depletion_per_second", "window_seconds", "window_poll_count", "dispatch_debt_seconds")} | arrivals)
 
 
 def scores(rows, threshold):

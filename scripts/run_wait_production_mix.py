@@ -822,6 +822,10 @@ def analyze(path, events_path=None):
     if profile.get("recovery_candidate_required"):
         checks["exact_recovery_forecasts"] = all(r["opc_request_id"] in recovery_forecasts
             for r in rows if not r.get("local_drop") and not r.get("controlled_rejection"))
+        methods = {event.get("recovery_method") for event in recovery_forecasts.values()}
+        expected_method = profile.get("expected_recovery_method")
+        checks["consistent_recovery_method"] = len(methods) == 1 and (
+            expected_method is None or methods == {expected_method})
         checks["no_actual_recovery_probe_in_shadow_round"] = not any(
             e.get("event") in {"recovery_probe_reserved", "recovery_probe_response", "recovery_probe_released"}
             for e in isolation_events)

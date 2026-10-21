@@ -1,20 +1,12 @@
 //! Experimental net-population drain extrapolation. This is not measured
 //! remaining token work, service throughput, or a native cancellation ACK.
-use axum::{body::Body, response::Response};
 use openai_protocol::worker::WorkerLoadResponse;
 use std::{
     collections::VecDeque,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
-pub(super) const METHOD: &str = "live_net_depletion_v1";
-pub(super) const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+pub(super) const METHOD: &str = "live_arrival_bounded_depletion_v2";
 const SHORT: Duration = Duration::from_secs(10);
 const LONG: Duration = Duration::from_secs(30);
 const HISTORY: Duration = Duration::from_secs(120);
@@ -25,6 +17,9 @@ struct Point {
     at: Instant,
     waiting: f64,
     population: f64,
+    request_watermark: u64,
+    new_requests: Option<u64>,
+    rebound_retained: bool,
 }
 
 #[derive(Debug)]
@@ -60,6 +55,10 @@ pub(super) struct RecoveryForecast {
     pub profile: Option<u64>,
     pub window_started: Option<Instant>,
     pub latest_poll: Option<Instant>,
+    pub poll_request_watermark: Option<u64>,
+    pub requests_since_previous_poll: Option<u64>,
+    pub rebound_allowance: u64,
+    pub rebound_retained: bool,
 }
 impl RecoveryTracker {
     pub(super) fn reset(&mut self, reason: &'static str) {
@@ -67,7 +66,13 @@ impl RecoveryTracker {
         self.ranks.clear();
         self.reason = reason;
     }
-    pub(super) fn observe(&mut self, load: &WorkerLoadResponse, at: Instant, max_gap: f64) {
+    pub(super) fn observe(
+        &mut self,
+        load: &WorkerLoadResponse,
+        at: Instant,
+        max_gap: f64,
+        request_watermark: u64,
+    ) {
         if self.points.back().is_some_and(|p| at <= p.at) {
             return;
         }
@@ -99,21 +104,41 @@ impl RecoveryTracker {
             .iter()
             .map(|r| f64::from(r.num_waiting_reqs) + f64::from(r.num_running_reqs))
             .sum();
+        if !self.ranks.is_empty() && self.ranks != ranks {
+            self.reset("rank_profile_changed");
+        }
+        let mut new_requests = None;
+        let mut rebound_retained = false;
+        if let Some(last) = self.points.back() {
+            if at.duration_since(last.at).as_secs_f64() > max_gap {
+                self.reset("poll_gap");
+            } else if let Some(arrivals) = request_watermark.checked_sub(last.request_watermark) {
+                new_requests = Some(arrivals);
+                if waiting > last.waiting || population > last.population {
+                    // Local admissions support continuity only. They are NOT
+                    // added to the measured net-depletion rate or subtracted
+                    // from native work; native acceptance is unobservable.
+                    let allowance = arrivals.min(1) as f64;
+                    if waiting - last.waiting > allowance
+                        || population - last.population > allowance
+                    {
+                        self.reset("population_rebound");
+                    } else {
+                        rebound_retained = true;
+                    }
+                }
+            } else {
+                self.reset("arrival_counter_reset");
+            }
+        }
         let point = Point {
             at,
             waiting,
             population,
+            request_watermark,
+            new_requests,
+            rebound_retained,
         };
-        if !self.ranks.is_empty() && self.ranks != ranks {
-            self.reset("rank_profile_changed");
-        }
-        if let Some(last) = self.points.back() {
-            if at.duration_since(last.at).as_secs_f64() > max_gap {
-                self.reset("poll_gap");
-            } else if waiting > last.waiting || population > last.population {
-                self.reset("population_rebound");
-            }
-        }
         // Zero may mean a genuine drain or a native process reset. Never use a
         // jump to zero to project the speed of a subsequent population.
         if population == 0.0 {
@@ -162,6 +187,15 @@ impl RecoveryTracker {
             profile,
             window_started: self.points.front().map(|p| p.at),
             latest_poll: self.points.back().map(|p| p.at),
+            poll_request_watermark: self.points.back().map(|p| p.request_watermark),
+            requests_since_previous_poll: self.points.back().and_then(|p| p.new_requests),
+            rebound_allowance: self
+                .points
+                .back()
+                .and_then(|p| p.new_requests)
+                .unwrap_or(0)
+                .min(1),
+            rebound_retained: self.points.back().is_some_and(|p| p.rebound_retained),
         };
         let Some(last) = self.points.back() else {
             return fallback(self.reason);
@@ -209,83 +243,17 @@ impl RecoveryTracker {
             profile,
             window_started: Some(long.at),
             latest_poll: Some(last.at),
+            poll_request_watermark: Some(last.request_watermark),
+            requests_since_previous_poll: last.new_requests,
+            rebound_allowance: last.new_requests.unwrap_or(0).min(1),
+            rebound_retained: last.rebound_retained,
         }
-    }
-}
-
-/// One actual admission exception. The counter survives worker generations so
-/// stale evidence resets cannot silently free an occupied probe slot within
-/// this worker incarnation. A replacement worker has independent state.
-#[derive(Debug)]
-pub(crate) struct RecoveryProbePermit {
-    inflight: Arc<AtomicUsize>,
-    worker: String,
-    request_id: String,
-}
-impl RecoveryProbePermit {
-    pub(super) fn reserve(
-        inflight: &Arc<AtomicUsize>,
-        worker: &str,
-        request_id: Option<&str>,
-    ) -> Option<Self> {
-        inflight
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .ok()?;
-        tracing::debug!(target: "smg::estimated_wait::observation", event = "recovery_probe_reserved", diagnostic_time_seconds = super::diagnostic_time(Instant::now()), worker, request_id = request_id.unwrap_or(""), max_inflight = 1, min_interval_seconds = PROBE_INTERVAL.as_secs());
-        Some(Self {
-            inflight: Arc::clone(inflight),
-            worker: worker.to_owned(),
-            request_id: request_id.unwrap_or("").to_owned(),
-        })
-    }
-    pub(crate) fn attach(self, response: Response) -> Response {
-        tracing::debug!(target: "smg::estimated_wait::observation", event = "recovery_probe_response", diagnostic_time_seconds = super::diagnostic_time(Instant::now()), worker = self.worker, request_id = self.request_id, status = response.status().as_u16());
-        let (parts, body) = response.into_parts();
-        Response::from_parts(
-            parts,
-            Body::new(ProbeBody {
-                body,
-                permit: Some(self),
-            }),
-        )
-    }
-}
-impl Drop for RecoveryProbePermit {
-    fn drop(&mut self) {
-        self.inflight.fetch_sub(1, Ordering::AcqRel);
-        tracing::debug!(target: "smg::estimated_wait::observation", event = "recovery_probe_released", diagnostic_time_seconds = super::diagnostic_time(Instant::now()), worker = self.worker, request_id = self.request_id, native_cancellation_acknowledgement = "unavailable");
-    }
-}
-struct ProbeBody {
-    body: Body,
-    permit: Option<RecoveryProbePermit>,
-}
-impl http_body::Body for ProbeBody {
-    type Data = bytes::Bytes;
-    type Error = axum::Error;
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        let polled = Pin::new(&mut this.body).poll_frame(cx);
-        if matches!(polled, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
-            this.permit.take();
-        }
-        polled
-    }
-    fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
-    }
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.body.size_hint()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::BodyExt;
     use openai_protocol::worker::SchedulerLoadSnapshot;
     fn load(waiting: i32, running: i32) -> WorkerLoadResponse {
         WorkerLoadResponse {
@@ -305,6 +273,7 @@ mod tests {
                 &load(100 - i * 10, 10),
                 start + Duration::from_secs(i as u64 * 5),
                 30.0,
+                0,
             );
         }
         history
@@ -341,13 +310,14 @@ mod tests {
                     &load(100 - i * 10, if transfer { i * 10 } else { 100 }),
                     start + Duration::from_secs(i as u64 * 5),
                     30.0,
+                    0,
                 );
             }
             assert_eq!(forecast(&history, start + LONG).available, !transfer);
         }
         let mut history = declining(start);
         for i in 7..=9 {
-            history.observe(&load(40, 10), start + Duration::from_secs(i * 5), 30.0);
+            history.observe(&load(40, 10), start + Duration::from_secs(i * 5), 30.0, 0);
         }
         assert!(!forecast(&history, start + Duration::from_secs(45)).available);
     }
@@ -355,9 +325,9 @@ mod tests {
     fn recovery_cancel_burst_does_not_establish_a_sustained_short_window() {
         let start = Instant::now();
         let mut history = RecoveryTracker::default();
-        history.observe(&load(1000, 10), start, 30.0);
+        history.observe(&load(1000, 10), start, 30.0, 0);
         for i in 1..=6 {
-            history.observe(&load(10, 10), start + Duration::from_secs(i * 5), 30.0);
+            history.observe(&load(10, 10), start + Duration::from_secs(i * 5), 30.0, 0);
         }
         assert!(!forecast(&history, start + LONG).available);
         // No assertion of completion: a sustained cancellation drain can qualify;
@@ -385,10 +355,10 @@ mod tests {
             (l, t)
         }) {
             let mut history = declining(start);
-            history.observe(&report, start + Duration::from_secs(time), 30.0);
+            history.observe(&report, start + Duration::from_secs(time), 30.0, 0);
             assert!(!forecast(&history, start + Duration::from_secs(time)).available);
             report.loads[0].num_running_reqs = -1;
-            history.observe(&report, start + Duration::from_secs(time + 1), 30.0);
+            history.observe(&report, start + Duration::from_secs(time + 1), 30.0, 0);
             assert_eq!(history.reason, "native_counts_unavailable");
         }
     }
@@ -396,8 +366,8 @@ mod tests {
     fn recovery_stale_and_duplicate_or_older_polls_do_not_resurrect_or_erase_evidence() {
         let start = Instant::now();
         let mut history = declining(start);
-        history.observe(&load(999, 999), start + LONG, 30.0);
-        history.observe(&load(999, 999), start, 30.0);
+        history.observe(&load(999, 999), start + LONG, 30.0, 0);
+        history.observe(&load(999, 999), start, 30.0, 0);
         assert!(forecast(&history, start + LONG).available);
         assert_eq!(
             forecast(&history, start + Duration::from_secs(61)).reason,
@@ -407,6 +377,79 @@ mod tests {
         assert_eq!(forecast(&history, start + LONG).reason, "failed");
     }
     #[test]
+    fn arrival_supported_single_bump_preserves_actual_net_rate_only() {
+        let start = Instant::now();
+        let mut history = declining(start);
+        history.observe(&load(41, 10), start + Duration::from_secs(35), 30.0, 1);
+        let f = forecast(&history, start + Duration::from_secs(35));
+        assert!(f.available && f.rebound_retained);
+        assert_eq!(f.requests_since_previous_poll, Some(1));
+        assert_eq!(f.rate, Some(0.9)); // (P25 - P35)/10; arrival NOT added.
+        assert_eq!(f.queue_extra, 51.0 / 0.9 + 7.0);
+        // A second bump cannot reuse the already consumed credit.
+        history.observe(&load(42, 10), start + Duration::from_secs(40), 30.0, 1);
+        assert_eq!(history.reason, "population_rebound");
+        assert_eq!(history.points.len(), 1);
+    }
+
+    #[test]
+    fn arrivals_do_not_allow_large_unaccounted_or_net_growing_population() {
+        let start = Instant::now();
+        for (waiting, running, arrivals) in [(41, 10, 0), (42, 10, 100), (41, 11, 100)] {
+            let mut history = declining(start);
+            history.observe(
+                &load(waiting, running),
+                start + Duration::from_secs(35),
+                30.0,
+                arrivals,
+            );
+            assert_eq!(history.reason, "population_rebound");
+            assert!(!forecast(&history, start + Duration::from_secs(35)).available);
+        }
+        let mut history = RecoveryTracker::default();
+        for i in 0..10 {
+            history.observe(
+                &load(10 + i, 10),
+                start + Duration::from_secs(i as u64 * 5),
+                30.0,
+                i as u64,
+            );
+        }
+        assert_eq!(
+            forecast(&history, start + Duration::from_secs(45)).reason,
+            "no_sustained_decline"
+        );
+    }
+
+    #[test]
+    fn arrival_watermarks_ignore_older_polls_and_fail_closed_on_reset_or_saturation() {
+        let start = Instant::now();
+        let mut history = declining(start);
+        history.observe(&load(999, 10), start + LONG, 30.0, 100);
+        history.observe(&load(999, 10), start, 30.0, 100);
+        history.observe(&load(41, 10), start + Duration::from_secs(35), 30.0, 1);
+        assert!(forecast(&history, start + Duration::from_secs(35)).available);
+        history.observe(&load(30, 10), start + Duration::from_secs(40), 30.0, 0);
+        assert_eq!(history.reason, "arrival_counter_reset");
+        assert_eq!(history.points.len(), 1);
+        history.reset("failed");
+        history.observe(
+            &load(20, 10),
+            start + Duration::from_secs(45),
+            30.0,
+            u64::MAX,
+        );
+        history.observe(
+            &load(21, 10),
+            start + Duration::from_secs(50),
+            30.0,
+            u64::MAX,
+        );
+        assert_eq!(history.reason, "population_rebound");
+        assert_eq!(history.points.len(), 1);
+    }
+
+    #[test]
     fn recovery_history_memory_is_bounded_and_unknown_baseline_stays_unknown() {
         let start = Instant::now();
         let mut history = RecoveryTracker::default();
@@ -415,6 +458,7 @@ mod tests {
                 &load(1000 - i, 1),
                 start + Duration::from_secs(i as u64),
                 30.0,
+                0,
             );
         }
         assert!(history.points.len() <= MAX_POLLS);
@@ -429,30 +473,5 @@ mod tests {
         assert!(f.available);
         assert!(f.total.is_none());
         assert!(f.legacy_gain_total.is_none());
-    }
-    #[tokio::test]
-    async fn recovery_probe_permit_is_atomic_and_released_on_eof_error_or_client_drop() {
-        let count = Arc::new(AtomicUsize::new(0));
-        let first = RecoveryProbePermit::reserve(&count, "w", Some("r")).unwrap();
-        assert!(RecoveryProbePermit::reserve(&count, "w", Some("other")).is_none());
-        let mut body = first
-            .attach(Response::new(Body::from("first text is not completion")))
-            .into_body();
-        assert!(body.frame().await.unwrap().is_ok());
-        assert_eq!(count.load(Ordering::Acquire), 1);
-        assert!(body.frame().await.is_none());
-        assert_eq!(count.load(Ordering::Acquire), 0);
-        let permit = RecoveryProbePermit::reserve(&count, "w", None).unwrap();
-        let stream = futures::stream::iter([Err::<bytes::Bytes, _>(std::io::Error::other(
-            "upstream failed",
-        ))]);
-        let mut body = permit
-            .attach(Response::new(Body::from_stream(stream)))
-            .into_body();
-        assert!(body.frame().await.unwrap().is_err());
-        assert_eq!(count.load(Ordering::Acquire), 0);
-        let permit = RecoveryProbePermit::reserve(&count, "w", None).unwrap();
-        drop(permit.attach(Response::new(Body::from("cancelled"))));
-        assert_eq!(count.load(Ordering::Acquire), 0);
     }
 }

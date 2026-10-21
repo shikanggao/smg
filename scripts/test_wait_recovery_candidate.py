@@ -5,9 +5,9 @@ import tempfile
 import unittest
 
 try:
-    from scripts.wait_recovery_candidate import METHOD, TRAINING, pair, scores
+    from scripts.wait_recovery_candidate import CURRENT_METHOD, METHOD, TRAINING, pair, scores
 except ModuleNotFoundError:
-    from wait_recovery_candidate import METHOD, TRAINING, pair, scores
+    from wait_recovery_candidate import CURRENT_METHOD, METHOD, TRAINING, pair, scores
 
 
 class CandidateTests(unittest.TestCase):
@@ -39,6 +39,47 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(result["eligible_total_ttft_predictions"]["legacy_gain_ablation"], 201.)
         self.assertFalse(result["candidate_is_calibrated"])
         self.assertEqual(result["gain_training"], TRAINING)
+
+    def v2(self, **changed):
+        return self.event(recovery_method=CURRENT_METHOD, poll_request_watermark=100,
+                          total_dispatched_requests=103, requests_since_previous_poll=2,
+                          rebound_allowance_requests=1, rebound_retained=True) | changed
+
+    def test_v2_preserves_gain_and_actual_net_rate_with_later_inflight_requests(self):
+        event = self.v2()
+        result = pair(event, {}, 300.)
+        self.assertEqual(result["method"], CURRENT_METHOD)
+        self.assertEqual(result["components"]["poll_request_watermark"], 100)
+        self.assertEqual(result["components"]["total_dispatched_requests"], 103)
+        self.assertEqual(result["eligible_total_ttft_predictions"]["legacy_gain_ablation"], 201.)
+        self.assertEqual(result["components"]["net_population_depletion_per_second"], 2.)
+        self.assertEqual(self.paired()["method"], METHOD)
+        self.assertNotIn("poll_request_watermark", self.paired()["components"])
+
+    def test_v2_missing_history_and_first_interval_are_explicit(self):
+        event = self.event(available=False, recovery_method=CURRENT_METHOD,
+            reason="native_empty", window_poll_count=0, window_seconds=0.,
+            total_dispatched_requests=103, rebound_allowance_requests=0, rebound_retained=False)
+        result = pair(event, {}, 300.)
+        self.assertIsNone(result["components"]["poll_request_watermark"])
+        event.update(poll_request_watermark=103, window_poll_count=1,
+                     requests_since_previous_poll=2, rebound_allowance_requests=1)
+        self.assertFalse(pair(event, {}, 300.)["available"])
+
+    def test_v2_arrival_diagnostics_fail_closed(self):
+        changes = [{"total_dispatched_requests": None}, {"total_dispatched_requests": 99},
+            {"poll_request_watermark": None}, {"poll_request_watermark": 100.},
+            {"total_dispatched_requests": True}, {"total_dispatched_requests": 1 << 64},
+            {"requests_since_previous_poll": -1}, {"requests_since_previous_poll": 101},
+            {"requests_since_previous_poll": None}, {"rebound_allowance_requests": 2},
+            {"rebound_retained": 1}, {"rebound_allowance_requests": 0},
+            {"requests_since_previous_poll": 0, "rebound_allowance_requests": 0}]
+        for changed in changes:
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                pair(self.v2(**changed), {}, 300.)
+        event = self.v2(requests_since_previous_poll=0, rebound_allowance_requests=0,
+                        rebound_retained=False)
+        self.assertEqual(pair(event, {}, 300.)["components"]["rebound_allowance_requests"], 0)
 
     def test_zero_legacy_gain_is_a_valid_ablation_not_missing_or_negative(self):
         result = self.paired(legacy_calibration_scale=0., legacy_gain_ablation_ttft_seconds=1.,
@@ -158,6 +199,24 @@ class CandidateJoinTests(unittest.TestCase):
                 self.assertEqual(result["execution_status"], "INVALID")
                 key = "exact_recovery_forecasts" if changed == "missing" else "no_actual_recovery_probe_in_shadow_round"
                 self.assertFalse(result["execution_checks"][key])
+
+    def test_profile_pins_fresh_v2_without_breaking_historical_v1(self):
+        for use_v2 in (False, True):
+            with self.subTest(use_v2=use_v2), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                driver, events = self.fixture(root)
+                profile = json.loads((root / "profile.json").read_text())
+                profile["expected_recovery_method"] = CURRENT_METHOD
+                (root / "profile.json").write_text(json.dumps(profile))
+                if use_v2:
+                    events[2].update(recovery_method=CURRENT_METHOD, poll_request_watermark=100,
+                        total_dispatched_requests=103, requests_since_previous_poll=2,
+                        rebound_allowance_requests=1, rebound_retained=True)
+                log = root / "capture.jsonl"
+                log.write_text("".join(json.dumps(e) + "\n" for e in events))
+                result = driver.analyze(root, log)
+                self.assertEqual(result["execution_checks"]["consistent_recovery_method"], use_v2)
+                self.assertEqual(result["execution_status"], "PASS" if use_v2 else "INVALID")
 
 
 if __name__ == "__main__":

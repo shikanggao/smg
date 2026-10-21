@@ -484,7 +484,6 @@ impl Router {
         is_stream: bool,
     ) -> Response {
         let calibration = Mutex::new(None);
-        let recovery_probe = Mutex::new(None);
         let worker = match lease.with_view(|view| {
             self.select_worker_for_model(
                 model_id,
@@ -495,9 +494,6 @@ impl Router {
                     rid_key: view.rid_key,
                     cache_namespace: view.cache_namespace,
                     calibration: is_stream.then_some(&calibration),
-                    recovery_probe: (is_stream
-                        && matches!(route, "/v1/chat/completions" | "/v1/completions"))
-                    .then_some(&recovery_probe),
                 },
             )
         }) {
@@ -593,10 +589,7 @@ impl Router {
             );
         }
 
-        match recovery_probe.into_inner() {
-            Some(permit) => permit.attach(response),
-            None => response,
-        }
+        response
     }
 
     // Generic simple routing for GET/POST without JSON body
@@ -820,7 +813,6 @@ impl Router {
                 rid_key: None,
                 cache_namespace: None,
                 calibration: is_stream.then_some(&calibration),
-                recovery_probe: None,
             },
         );
         let worker = match selection {
@@ -2439,107 +2431,6 @@ mod tests {
             .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, PlacementInputs::default(),)
             .unwrap()
             .is_none());
-    }
-
-    #[tokio::test]
-    async fn recovery_probe_http_stream_keeps_permit_after_first_text_and_releases_on_client_drop()
-    {
-        use crate::worker::estimated_wait::EstimatedWaitConfig;
-        use http_body_util::BodyExt;
-        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus};
-        let app = axum::Router::new().route(
-            "/v1/chat/completions",
-            axum::routing::post(|| async {
-                let first = futures::stream::once(async {
-                    Ok::<_, std::io::Error>(Bytes::from_static(
-                        b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
-                    ))
-                });
-                let stream = first.chain(futures::stream::pending());
-                (
-                    [(CONTENT_TYPE, "text/event-stream")],
-                    Body::from_stream(stream),
-                )
-                    .into_response()
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "bounded local integration server aborted at test end"
-        )]
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let mut router = streaming_router(
-            least_load_policy(),
-            1024 * 1024,
-            vec![plain_worker(&format!("http://{addr}"))],
-        );
-        router.retry_config.max_retries = 0;
-        let worker = router.worker_registry.get_all()[0].clone();
-        worker.set_status(WorkerStatus::Ready);
-        let admission = router.worker_registry.estimated_wait();
-        admission.configure(EstimatedWaitConfig {
-            max_estimated_wait_secs: Some(300.0),
-            estimated_wait_max_snapshot_age_secs: 60.0,
-            estimated_wait_calibration_shadow: true,
-            estimated_wait_recovery_probes: true,
-            estimated_wait_fallback_prefill_throughput: 100.0,
-            ..Default::default()
-        });
-        let started = Instant::now() - Duration::from_secs(30);
-        for i in 0..7 {
-            let load = WorkerLoadResponse {
-                loads: vec![SchedulerLoadSnapshot {
-                    num_waiting_reqs: 100 - i * 10,
-                    num_running_reqs: 10,
-                    native_request_counts_available: Some(true),
-                    num_waiting_uncached_tokens: 100_000,
-                    learned_prefill_capacity: Some(100.0),
-                    low_load_ttft_seconds: Some(2.0),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            };
-            let stamp = admission.poll_started(&worker);
-            admission.publish(
-                &worker,
-                Some(&load),
-                stamp,
-                started + Duration::from_secs(i as u64 * 5),
-            );
-        }
-        let request:ChatCompletionRequest=serde_json::from_value(serde_json::json!({"model":"m","messages":[{"role":"user","content":"test"}],"stream":true})).unwrap();
-        let response = tokio::time::timeout(
-            Duration::from_secs(3),
-            router.route_typed_request(
-                None,
-                request,
-                "/v1/chat/completions",
-                crate::worker::UNKNOWN_MODEL_ID,
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(admission.recovery_probe_inflight(&worker), 1);
-        let mut body = response.into_body();
-        let frame = tokio::time::timeout(Duration::from_secs(3), body.frame())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(std::str::from_utf8(frame.data_ref().unwrap())
-            .unwrap()
-            .contains("first"));
-        assert_eq!(
-            admission.recovery_probe_inflight(&worker),
-            1,
-            "first text must not release a full-request permit"
-        );
-        drop(body);
-        assert_eq!(admission.recovery_probe_inflight(&worker), 0);
-        server.abort();
     }
 
     #[tokio::test]

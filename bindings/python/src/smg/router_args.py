@@ -271,7 +271,6 @@ class RouterArgs:
     estimated_wait_fallback_prefill_throughput: float | None = None
     estimated_wait_calibration_shadow: bool = False
     estimated_wait_provisional_baseline_secs: float | None = None
-    estimated_wait_recovery_probes: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -663,12 +662,6 @@ class RouterArgs:
             type=float,
             default=RouterArgs.estimated_wait_provisional_baseline_secs,
             help="Same-model TTFT baseline for diagnostic calibration; measured baseline takes precedence",
-        )
-        routing_group.add_argument(
-            f"--{prefix}estimated-wait-recovery-probes",
-            action="store_true",
-            default=RouterArgs.estimated_wait_recovery_probes,
-            help="Experimental recovery admission exception: one HTTP SSE request per ten seconds, one in flight; requires calibration shadow",
         )
         routing_group.add_argument(
             f"--{prefix}estimated-wait-calibration-shadow",
