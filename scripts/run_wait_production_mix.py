@@ -707,8 +707,7 @@ def analyze(path, events_path=None):
             except (ValueError, TypeError):
                 continue
             event = obj.get("fields", {}) | obj
-            if ttft_only:
-                isolation_events.append(event)
+            isolation_events.append(event)
             rid = event.get("request_id", "")
             if not rid.startswith("prod-" + config["run_id"] + "-"):
                 continue
@@ -784,13 +783,16 @@ def analyze(path, events_path=None):
             try:
                 from .wait_feature_context import forecast as pair_feature
             except ImportError:
-                from wait_feature_context import forecast as pair_feature
+                try:
+                    from wait_feature_context import forecast as pair_feature
+                except ImportError:
+                    from scripts.wait_feature_context import forecast as pair_feature
             if gate is None:
                 raise ValueError("Feature candidate lacks its exact original admission forecast")
             row["feature_context_candidate"] = pair_feature(feature, gate=gate,
                                                             ttft_deadline_seconds=deadline)
     isolation = None
-    if ttft_only:
+    if ttft_only or feature_forecasts or profile.get("feature_context_required"):
         try:
             from .wait_ttft_readiness import audit_isolation
         except ImportError:
@@ -812,14 +814,17 @@ def analyze(path, events_path=None):
                   no_transport_or_protocol_errors=not errors,
                   producer_kept_up=lag is not None and lag <= profile["maximum_p99_dispatch_lag_seconds"],
                   native_drained=execution["native_drained"])
-    if ttft_only:
+    if isolation is not None:
         checks["exclusive_workload_isolation"] = isolation["ok"]
     feature_activity, feature_windows = None, None
     if feature_forecasts or profile.get("feature_context_required"):
         try:
             from .wait_feature_context import audit_activity, audit_windows
         except ImportError:
-            from wait_feature_context import audit_activity, audit_windows
+            try:
+                from wait_feature_context import audit_activity, audit_windows
+            except ImportError:
+                from scripts.wait_feature_context import audit_activity, audit_windows
         feature_activity = audit_activity(isolation_events, rows)
         feature_windows = audit_windows(isolation_events)
         checks["feature_actual_decisions_and_terminal_accounting"] = feature_activity["ok"]
@@ -931,14 +936,18 @@ def analyze(path, events_path=None):
         try:
             from .wait_feature_context import scores as feature_scores
         except ImportError:
-            from wait_feature_context import scores as feature_scores
+            try:
+                from wait_feature_context import scores as feature_scores
+            except ImportError:
+                from scripts.wait_feature_context import scores as feature_scores
         result["feature_context"] = dict(activity=feature_activity, causal_windows=feature_windows,
             scorecards={name: feature_scores(subset, deadline)
                 for name, subset in [("all_offered", rows), ("pressure", pressure)]
                 + [("phase:" + phase, [r for r in rows if r["phase"] == phase])
                    for phase in sorted({r["phase"] for r in rows})]})
-    if ttft_only:
+    if isolation is not None:
         result["runtime_isolation"] = isolation
+    if ttft_only:
         result["notes"] += ["Primary scores compare exact pre-admission total TTFT with the300s first-text threshold. Production extra-delay flags are distinct.",
             ("TTFT scoring allows capped responses to complete normally; horizon cancellation is distinct from first-text timing and answer quality."
              if profile.get("ttft_stream_policy") == "complete_bounded_response" else

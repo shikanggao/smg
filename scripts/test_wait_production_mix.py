@@ -203,6 +203,49 @@ class PlannerTests(unittest.TestCase):
             missing = p.analyze(root)
             self.assertFalse(missing["execution_checks"]["exclusive_workload_isolation"])
 
+    def test_completion_seed_keeps_feature_activity_and_whole_capture_isolation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile = dict(DEFAULT, feature_context_required=True)
+            rid = "prod-seed-0"
+            row = dict(self.rows[0], opc_request_id=rid, complete=True,
+                client_ttft_seconds=1, first_text_late=False, completion_late=False,
+                e2e_seconds=2, first_answer_seconds=1, dispatch_lag_seconds=0,
+                timed_out=False, controlled_rejection=False, cancelled=False, error=None, usage={})
+            for name, value in {"profile.json": profile,
+                "run-config.json": dict(run_id="seed", smoke=False),
+                "execution.json": dict(error=None, planned_requests=1, native_drained=True)}.items():
+                (root / name).write_text(json.dumps(value))
+            (root / "requests.jsonl").write_text(json.dumps(row) + "\n")
+            (root / "metrics.jsonl").write_text("")
+            gate = dict(event="forecast", request_id=rid, worker="http://worker",
+                threshold_seconds=300, predicted_ttft_seconds=1, calibrated_ttft_seconds=1,
+                would_reject=False, calibrated_would_reject=False, baseline_available=True,
+                calibration_baseline_available=True, calibration_baseline_seconds=1,
+                calibration_input_excess_seconds=0, calibration_method="mse_poll_two_wave_queue_v2")
+            counts = dict(first_text=0, upstream_timeout=0, pretext_downstream_disconnect=0,
+                          unknown_pretext_end=0, admitted=1, actual_rejected=0, untracked_admitted=0)
+            def activity(kind, time):
+                context = dict(values=[None, None, None], bucket_second=0,
+                               activity_origin_time_seconds=0, counts=dict(counts))
+                return dict(event=kind, feature_method="feature_context_ridge_v1", request_id=rid,
+                    worker="http://worker", calibration_epoch=0, diagnostic_time_seconds=time,
+                    feature_json=json.dumps(dict(activity=context, counts=context["counts"])))
+            admitted = activity("feature_admission_decision", .1)
+            admitted.update(decision="admitted", outcome_tracking_supported=True)
+            counts["first_text"] = 1
+            first = activity("feature_outcome", .2);first["outcome"] = "first_text"
+            events = [gate, dict(gate, event="calibration_forecast"), admitted, first,
+                      dict(event="first_text", request_id=rid, ttft_seconds=1),
+                      dict(gate, request_id="foreign-nonstream")]
+            log = root / "captured.jsonl";log.write_text("".join(json.dumps(e) + "\n" for e in events))
+            summary = p.analyze(root, log)
+            self.assertEqual(summary["feature_context"]["activity"]["selected_admissions"], 1)
+            self.assertEqual(summary["feature_context"]["activity"]["known_terminal_outcomes"], 1)
+            self.assertTrue(summary["feature_context"]["causal_windows"]["ok"])
+            self.assertEqual(summary["runtime_isolation"]["foreign_request_count"], 1)
+            self.assertFalse(summary["execution_checks"]["exclusive_workload_isolation"])
+
     def test_versioned_ttft_profiles_validate_and_busy_start_is_focused_skip(self):
         for name in ["wait-ttft-focused.json", "wait-ttft-busy-start.json", "wait-ttft-seed.json"]:
             profile = json.loads((HERE / name).read_text())
