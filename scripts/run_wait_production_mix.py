@@ -294,7 +294,10 @@ class Run:
                 except ModuleNotFoundError:
                     from scripts.wait_ttft_readiness import Readiness
             assert args.router_events is not None, "TTFT readiness requires the live owned-router event stream"
-            self.readiness = Readiness(f"prod-{args.run_id}-", profile.get("startup_scenario", "isolated"))
+            if profile.get("decision_calibration_required"):
+                assert profile.get("expected_decision_method"), "Required decision method missing from profile"
+            self.readiness = Readiness(f"prod-{args.run_id}-", profile.get("startup_scenario", "isolated"),
+                expected_decision_method=profile.get("expected_decision_method") if profile.get("decision_calibration_required") else None)
 
     def record(self, row):
         self.rows.append(row)
@@ -856,6 +859,14 @@ def analyze(path, events_path=None):
                   native_drained=execution["native_drained"])
     if isolation is not None:
         checks["exclusive_workload_isolation"] = isolation["ok"]
+    if profile.get("decision_calibration_required"):
+        try:
+            from .replay_wait_decision import audit_schema
+        except ImportError:
+            from replay_wait_decision import audit_schema
+        decision_audit = audit_schema(isolation_events, profile.get("expected_decision_method"))
+        save(path / "decision-method-audit.json", decision_audit)
+        checks["frozen_decision_method"] = decision_audit["ok"]
     feature_activity, feature_windows = None, None
     if feature_forecasts or profile.get("feature_context_required"):
         try:

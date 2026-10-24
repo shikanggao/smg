@@ -416,9 +416,23 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_incomplete_stream_is_not_success(self):
         self.mode = "incomplete"
+        # Exercise protocol EOF, independently of the short deadline/load test.
+        # One immediate response has ample time to reach EOF without racing a
+        # valid timeout (whose completion_late=True has different semantics).
+        self.router_budget = 10
+        profile = dict(smoke_profile(), deadline_seconds=10,
+                       router_extra_ttft_budget_seconds=10, max_inflight=1,
+                       phases=[dict(name="pressure", seconds=.1, rps=20, arrivals="periodic")])
         with self.assertRaisesRegex(RuntimeError, "invalid"):
-            await self.exercise()
-        self.assertTrue(all(not r["complete"] and r["completion_late"] is None for r in self.rows()))
+            await self.exercise(profile)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["error"], "Incomplete SSE response")
+        self.assertFalse(row["timed_out"])
+        self.assertFalse(row["complete"])
+        self.assertFalse(row["done_seen"])
+        self.assertIsNone(row["completion_late"])
 
     async def test_opt_in_content_preview_is_bounded_and_excludes_reasoning(self):
         self.mode = "normal"

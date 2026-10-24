@@ -227,16 +227,28 @@ def audit_entry_continuity(events, rows, readiness, measurement_phase):
 
 
 class Readiness:
-    def __init__(self, request_prefix, scenario="isolated"):
+    def __init__(self, request_prefix, scenario="isolated", expected_decision_method=None):
         assert scenario in {"isolated", "busy_start"}
         self.prefix = request_prefix
         self.scenario = scenario
         self.epochs, self.forecasts, self.fits, self.initial = {}, {}, set(), {}
         self.errors = []
         self.accepted = {}
+        self.expected_decision_method = expected_decision_method
+        self.decision_methods = {}
 
     def observe(self, event):
         kind, worker = event.get("event"), event.get("worker")
+        if self.expected_decision_method is not None and kind == "decision_poll" and worker:
+            try:
+                from .replay_wait_decision import audit_schema
+            except ImportError:
+                from replay_wait_decision import audit_schema
+            proof = audit_schema([event], self.expected_decision_method)
+            self.decision_methods[worker] = (event.get("calibration_epoch"), proof["ok"])
+            if not proof["ok"]:
+                self.errors.extend(proof["errors"])
+            return
         if not worker or kind not in {"forecast", "calibration_forecast", "calibration_feedback", "calibration_update", "calibration_reset"}:
             return
         if kind == "forecast" and not event.get("calibration_enabled"):
@@ -282,6 +294,8 @@ class Readiness:
                 current_samples_at_least_four=f.get("calibration_sample_count", 0) >= 4,
                 accepted_in_current_epoch=self.accepted.get((worker, epoch), 0) >= 4,
                 actual_current_epoch_fit=(worker, epoch, revision) in self.fits)
+            if self.expected_decision_method is not None:
+                checks["decision_method_current_epoch"] = self.decision_methods.get(worker) == (epoch, True)
             workers.append(dict(worker=worker, epoch=epoch, checks=checks,
                 baseline_seconds=baseline, baseline_source=f.get("calibration_baseline_source"),
                 samples=f.get("calibration_sample_count"), fitted_revision=revision))
