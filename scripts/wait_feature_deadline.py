@@ -10,6 +10,8 @@ import math
 
 LEGACY_METHOD = "feature_context_ridge_v1"
 METHOD = "feature_context_deadline_ridge_v2"
+JOINT_METHOD = "feature_joint_gains_deadline_ridge_v3"
+DEADLINE_METHODS = {METHOD, JOINT_METHOD}
 DEADLINE_COUNTS = ("deadline_timely_first_text", "deadline_breach",
                    "deadline_or_cutoff_adverse", "deadline_or_cutoff_unknown")
 RESOLUTIONS = {"timely_first_text": ("deadline_timely_first_text",),
@@ -60,10 +62,10 @@ def audit_deadlines(events, rows):
     """Return a fail-closed receipt for one complete ordered feature capture."""
     counts, errors, poll_lags, publication_lags = Counter(), [], [], []
     methods = {e.get("feature_method") for e in events if str(e.get("event", "")).startswith("feature_")}
-    unknown = methods - {LEGACY_METHOD, METHOD}
+    unknown = methods - {LEGACY_METHOD, *DEADLINE_METHODS}
     if unknown or len(methods) > 1:
         return dict(ok=False, applicable=True, errors=[dict(reason="Unknown or mixed feature method")], counts={})
-    if METHOD not in methods:
+    if not methods & DEADLINE_METHODS:
         bad = any(str(e.get("event", "")).startswith("feature_deadline_") for e in events)
         return dict(ok=not bad, applicable=False, status="not_applicable",
                     errors=[dict(reason="Deadline events require deadline-v2 method")] if bad else [], counts={})
@@ -276,7 +278,7 @@ def audit_deadlines(events, rows):
                     require(rid in ignored or rid in resolved or started[rid]["cleared"], "Unresolved deadline at complete capture: " + rid)
         except (ValueError, KeyError) as error:
             errors.append(dict(reason=str(error)))
-    return dict(ok=not errors, applicable=True, method=METHOD, errors=errors, counts=dict(counts),
+    return dict(ok=not errors, applicable=True, method=next(iter(methods)), errors=errors, counts=dict(counts),
                 poll_resolution_lag_seconds=distribution(poll_lags), publication_lag_seconds=distribution(publication_lags),
                 pending_at_end=sum(len(s["tracked"])+len(s["untracked"]) for s in states.values()),
                 limits="Router observations only; no client future labels or native cancellation ACK. Atomic scan/terminal claims are unlogged; due pending observations without a terminal claim remain unverified diagnostics rather than failures. Eventual once-only resolution and completeness remain required. Poll-start time is a conservative advance bound. Union counts enter the diagnostic-publication bucket, never the earlier observation bucket.")

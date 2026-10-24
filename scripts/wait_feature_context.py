@@ -8,7 +8,9 @@ from collections import Counter
 
 METHOD = "feature_context_ridge_v1"
 CURRENT_METHOD = "feature_context_deadline_ridge_v2"
-METHODS = frozenset({METHOD, CURRENT_METHOD})
+JOINT_METHOD = "feature_joint_gains_deadline_ridge_v3"
+DEADLINE_METHODS = frozenset({CURRENT_METHOD, JOINT_METHOD})
+METHODS = frozenset({METHOD, *DEADLINE_METHODS})
 FEATURES = ("kv_usage", "pretext_cutoff_rate", "actual_rejection_rate")
 CURRENT_FEATURES = ("kv_usage", "deadline_or_cutoff_rate", "actual_rejection_rate")
 COUNTS = ("first_text", "upstream_timeout", "pretext_downstream_disconnect",
@@ -90,11 +92,11 @@ def validate_context(context, method=None):
         method = CURRENT_METHOD if "deadline_untracked_pending" in context or any(k in context["counts"] for k in DEADLINE_COUNTS) else METHOD
     if method not in METHODS:
         raise ValueError("Unknown feature context method")
-    names = COUNTS + DEADLINE_COUNTS if method == CURRENT_METHOD else COUNTS
+    names = COUNTS + DEADLINE_COUNTS if method in DEADLINE_METHODS else COUNTS
     if set(context["counts"]) != set(names):
         raise ValueError("Unexpected feature counter schema")
     counts = {name: integer(context["counts"][name], name) for name in names}
-    if method == CURRENT_METHOD:
+    if method in DEADLINE_METHODS:
         pending_unknown = integer(context["deadline_untracked_pending"], "deadline_untracked_pending")
         cutoff = counts["deadline_or_cutoff_adverse"]
         known = counts["deadline_timely_first_text"] + cutoff
@@ -173,7 +175,22 @@ def forecast(event, *, gate=None, ttft_deadline_seconds=300):
     fresh = boolean(value["fresh"], "fresh")
     ready = boolean(value["native_ready"], "native_ready")
     scoped = boolean(value["supported_path"], "supported_path")
-    if contextual:
+    joint = event["feature_method"] == JOINT_METHOD
+    if joint:
+        if value.get("coefficient_order") != ["queue", "kv", "deadline_or_cutoff", "rejection"]:
+            raise ValueError("Unknown joint coefficient order")
+        if value.get("neutral_prior") != [1, 0, 0, 0]:
+            raise ValueError("Unknown joint neutral prior")
+        close(number(value.get("coefficient_movement_l1_per_second"), "joint movement rate"), .5, "joint movement rate")
+        try:
+            from .wait_feature_joint import validate_prediction
+        except ImportError:
+            from wait_feature_joint import validate_prediction
+        validate_prediction(prediction, fit, context, legacy,
+                            clock(event["diagnostic_time_seconds"], "admission time"),
+                            fresh and ready and scoped,
+                            number(value["original_queue_excess_seconds"], "original N"))
+    elif contextual:
         if not (fresh and ready and scoped and any(active)):
             raise ValueError("Context trajectory active without usable support")
         anchor = number(prediction["trajectory_anchor_gain"], "trajectory anchor gain")
@@ -381,7 +398,7 @@ def audit_windows(events):
                           "deadline_breach": ["deadline_breach", "deadline_or_cutoff_adverse"],
                           "actual_cutoff": ["deadline_or_cutoff_adverse"],
                           "unknown_pretext_end": ["deadline_or_cutoff_unknown"]}.get(event.get("resolution"))
-            if categories is None or event["feature_method"] != CURRENT_METHOD:
+            if categories is None or event["feature_method"] not in DEADLINE_METHODS:
                 raise ValueError("Unknown deadline resolution category")
             past.extend((second, name) for name in categories)
             activity_events += 1
