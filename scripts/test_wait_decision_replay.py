@@ -1,7 +1,7 @@
 import unittest
 from copy import deepcopy
 from wait_decision_calibration import State, METHOD
-from replay_wait_decision import audit_schema, verify_snapshot, verify_native, replay
+from replay_wait_decision import audit_schema, verify_snapshot, verify_native, replay, bind_native_profile
 from wait_ttft_readiness import Readiness
 import json
 
@@ -76,15 +76,19 @@ def event_fixture():
     feedback=event('decision_label',5.2,dict(label=label));feedback['reason']='first_text'
     terminal=event('decision_terminal',5.2,dict(id=1,observed_at=5.1,outcome='first_text'))
     outcome=dict(event='feature_outcome',worker='w',request_id='r',calibration_epoch=0,diagnostic_time_seconds=5.2,outcome='first_text')
-    return [n,poll,selected,admission,feedback,terminal,outcome,dict(event='first_text',request_id='r',ttft_seconds=4.)]
+    recovery=dict(event='recovery_poll',worker='w',calibration_epoch=0,diagnostic_time_seconds=.01,
+        available=True,original_queue_excess_seconds=100.,dispatch_debt_seconds=0.,queue_excess_seconds=100.,
+        net_population_depletion_per_second=2.,native_population=200.,latest_poll_started_time_seconds=0.,
+        window_seconds=30.,window_poll_count=5)
+    return [n,poll,recovery,selected,admission,feedback,terminal,outcome,dict(event='first_text',request_id='r',ttft_seconds=4.)]
 
 
 class ReplayTests(unittest.TestCase):
     def test_independent_causal_admission_and_terminal(self):
         result=replay(event_fixture());self.assertTrue(result['ok']);self.assertEqual(len(result['labels']),1)
     def test_saved_prediction_corruption(self):
-        events=event_fixture();value=json.loads(events[3]['decision_json']);value['predictions'][0]['total']+=1
-        events[3]['decision_json']=json.dumps(value)
+        events=event_fixture();value=json.loads(events[4]['decision_json']);value['predictions'][0]['total']+=1
+        events[4]['decision_json']=json.dumps(value)
         with self.assertRaises(ValueError):replay(events)
     def test_exact_label_requires_terminal_provenance(self):
         events=event_fixture();events[-1]['ttft_seconds']=300.
@@ -95,14 +99,14 @@ class ReplayTests(unittest.TestCase):
             events[0]['decision_json']=json.dumps(native)
             with self.assertRaises(ValueError):replay(events)
     def test_missing_eligible_label_fails(self):
-        events=event_fixture();del events[4]
+        events=event_fixture();del events[5]
         with self.assertRaises(ValueError):replay(events)
 
 
 class ScoringTests(unittest.TestCase):
     def data(self):
         from replay_wait_decision import score_admissions
-        admission=json.loads(event_fixture()[3]['decision_json'])
+        admission=json.loads(event_fixture()[4]['decision_json'])
         admission.update(request_id='r',worker='w',epoch=0)
         paired=dict(opc_request_id='r',phase='pressure',first_text_late=False,started_elapsed_seconds=1.,
             feature_context_candidate=dict(snapshot=dict(threshold_seconds=300.)),
@@ -120,3 +124,52 @@ class ScoringTests(unittest.TestCase):
         fn,a,p=self.data();p['controlled_rejection']=True
         rows,report=fn([],[p],'capture','model')
         self.assertEqual(len(rows),1);self.assertIsNone(rows[0]['truth']);self.assertEqual(report['actual_rejected'],1)
+
+
+class ProvenanceTests(unittest.TestCase):
+    def test_profile_signature_is_order_invariant(self):
+        evidence=json.loads(event_fixture()[0]['decision_json']);second=deepcopy(evidence['ranks'][0]);second['dp_rank']=1
+        evidence['ranks'].append(second);bindings={}
+        bind_native_profile(bindings,'w',7,evidence);evidence['ranks'].reverse();bind_native_profile(bindings,'w',7,evidence)
+        evidence['ranks'][0]['native_request_counts_profile']=2
+        with self.assertRaisesRegex(ValueError,'signature changed'):bind_native_profile(bindings,'w',7,evidence)
+    def test_second_poll_source_or_counter_change_cannot_keep_profile_and_history(self):
+        for field,value in [('timely_prefill_progress_source','prefill_started_requests'),('native_request_counts_profile',2)]:
+            events=event_fixture();native=deepcopy(events[0]);native['diagnostic_time_seconds']=6.;native['poll_started_time_seconds']=6.
+            ranks=json.loads(native['decision_json']);ranks['ranks'][0][field]=value;native['decision_json']=json.dumps(ranks)
+            s=State();s.poll(0.,7,True,5.);original=json.loads(events[4]['decision_json']);s.register(1,1.1,original['snapshot']);s.label(1,5.1,5.2,True,True);s.poll(6.,7,True,5.)
+            snap=snapshot(6.);snap['context']=s.context(6.,0.,100.,True)
+            poll=deepcopy(events[1]);poll['diagnostic_time_seconds']=6.;poll['decision_json']=json.dumps(dict(snapshot=snap,predictions=s.predictions(snap,6.,True),state=s.diagnostics(),profile=7,fresh=True,max_gap=5.,available=True))
+            with self.assertRaisesRegex(ValueError,'signature changed'):replay(events+[native,poll])
+    def test_selected_profile_must_match_initialized_state(self):
+        events=event_fixture();value=json.loads(events[4]['decision_json']);value['snapshot']['profile']=8;events[4]['decision_json']=json.dumps(value)
+        with self.assertRaisesRegex(ValueError,'profile differs'):replay(events)
+    def test_neutral_reset_allows_retained_sample_profile(self):
+        state=State();verify_snapshot(snapshot(),state,5.)
+    def test_live_queue_and_predictions_cannot_be_changed_together(self):
+        events=event_fixture();value=json.loads(events[4]['decision_json']);value['snapshot']['live_queue_extra']=90.;value['snapshot']['x']=90.
+        state=State();state.poll(0.,7,True,5.);value['predictions']=state.predictions(value['snapshot'],1.,True);events[4]['decision_json']=json.dumps(value)
+        with self.assertRaisesRegex(ValueError,'Live-N source binding'):replay(events)
+
+    def test_reset_before_selected_admission_keeps_neutral_prediction(self):
+        events=event_fixture();events.insert(3,dict(event='calibration_reset',worker='w',calibration_epoch=1))
+        for e in events[4:]:
+            if 'calibration_epoch' in e:e['calibration_epoch']=1
+        events=[e for e in events if e.get('event')!='decision_label']
+        admission=next(e for e in events if e.get('event')=='decision_admission');value=json.loads(admission['decision_json'])
+        value['snapshot']['live_queue_extra']=None;value['snapshot']['source']='original_n_scalar_fallback';admission['decision_json']=json.dumps(value)
+        result=replay(events);self.assertTrue(result['ok']);self.assertEqual(result['labels'],[])
+
+    def test_consumed_files_must_be_explicitly_hash_bound(self):
+        import hashlib,subprocess,sys,tempfile
+        from pathlib import Path
+        for missing in ('router-events.jsonl','paired-production.jsonl'):
+            with tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);files={}
+                for name in ('router-events.jsonl','paired-production.jsonl'):
+                    (root/name).write_text('')
+                    if name!=missing:files[name]=hashlib.sha256(b'').hexdigest()
+                (root/'state.json').write_text(json.dumps(dict(results_valid=True,result_path=str(root),result_files=files)))
+                result=subprocess.run([sys.executable,str(Path(__file__).with_name('replay_wait_decision.py')),
+                    '--router',str(root/'router-events.jsonl'),'--state',str(root/'state.json'),'--out',str(root/'out')],capture_output=True,text=True)
+                self.assertNotEqual(result.returncode,0);self.assertIn('Consumed canonical sources missing',result.stderr)

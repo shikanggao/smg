@@ -47,6 +47,10 @@ def audit_schema(events, expected=d.METHOD):
 
 
 def verify_snapshot(s, state, max_gap, selected=None):
+    if state.profile is not None:
+        require(s['profile']==state.profile,'Snapshot profile differs from initialized state')
+    else:
+        require(not state.rows and all(m.anchor==d.PRIOR and m.target==d.PRIOR for m in state.models),'Nonneutral state lacks a profile')
     require(s['source'] in ('live_n_scalar','original_n_scalar_fallback'),'Unknown base source')
     live=s['live_queue_extra']
     close(s['x'],s['scalar_gain']*(live if live is not None else s['original_queue_extra']),'original X')
@@ -85,8 +89,43 @@ def verify_native(snapshot, event, evidence, max_gap):
     close(c['values'][2],deficit,'native progress deficit')
 
 
+def bind_native_profile(bindings, worker, profile, evidence):
+    if profile is None:return
+    require(type(profile) is int and profile>=0,'Invalid decision profile')
+    require(isinstance(evidence['ranks'],list),'Profile lacks native rank evidence')
+    signature=tuple(sorted(((r['dp_rank'],r['native_request_counts_profile'],r['timely_prefill_progress_source'])
+                           for r in evidence['ranks']),key=lambda r:(r[0],json.dumps(r[1:]))))
+    by_profile,by_signature=bindings.setdefault(worker,({},{}))
+    require(profile not in by_profile or by_profile[profile]==signature,'Native signature changed without decision profile reset')
+    require(signature not in by_signature or by_signature[signature]==profile,'Unchanged native signature changed opaque profile')
+    by_profile[profile]=signature;by_signature[signature]=profile
+
+
+def verify_recovery_input(snapshot, proof, max_gap, source_poll):
+    require(proof is not None,'Missing causal live-N source')
+    close(snapshot['poll_started'],source_poll,'Live-N native sample source')
+    original=proof['original_queue_excess_seconds'];debt=proof['dispatch_debt_seconds']
+    require(type(original) in (int,float) and type(debt) in (int,float) and original>=0 and 0<=debt<=original+1e-7,'Invalid queue/debt evidence')
+    queue=max(original-debt,0.)
+    require(snapshot['original_queue_extra']>=queue-1e-7,'Selected original queue is below same-poll base queue')
+    selected_debt=max(snapshot['original_queue_extra']-queue,0.)
+    live=None
+    if proof['available']:
+        rate=proof['net_population_depletion_per_second'];population=proof['native_population'];latest=proof['latest_poll_started_time_seconds']
+        require(type(rate) in (int,float) and math.isfinite(rate) and rate>0 and type(population) in (int,float) and population>=0,'Missing recovery depletion evidence')
+        require(proof['window_seconds']>=30 and proof['window_poll_count']>=5,'Insufficient recovery support')
+        close(proof['queue_excess_seconds'],min(queue,population/rate)+debt,'Independent recovery arithmetic')
+        if max(0.,snapshot['at']-latest)<=max_gap:live=min(queue,population/rate)+selected_debt
+    else:
+        close(proof['queue_excess_seconds'],original,'Recovery fallback queue')
+        require(not (proof.get('reason')=='stale' and proof.get('latest_poll_started_time_seconds') is not None
+                     and max(0.,snapshot['at']-proof['latest_poll_started_time_seconds'])<=max_gap),
+                'Later stale diagnostic cannot prove earlier recovery availability')
+    close(snapshot['live_queue_extra'],live,'Live-N source binding')
+
+
 def replay(events):
-    states={};epochs={};selected={};gaps={};native={};counts=Counter();rows=[];labels=[];pending_labels={};admissions={}
+    states={};epochs={};selected={};gaps={};native={};profiles={};recovery={};pending_recovery={};counts=Counter();rows=[];labels=[];pending_labels={};admissions={}
     def state(e):
         worker=e['worker'];epoch=e['calibration_epoch']
         if worker not in states:states[worker]=d.State();epochs[worker]=epoch
@@ -97,11 +136,23 @@ def replay(events):
         if kind=='calibration_reset':
             states[worker]=d.State();epochs[worker]=e['calibration_epoch'];counts['resets']+=1
             for key in [key for key in selected if key[0]==worker]:selected.pop(key)
+            profiles.pop(worker,None);recovery.pop(worker,None)
             continue
         if kind=='calibration_forecast':
-            s=state(e);selected[(worker,e['request_id'])]=(deepcopy(s),e,deepcopy(native.get(worker)))
+            s=state(e);selected[(worker,e['request_id'])]=(deepcopy(s),e,deepcopy(native.get(worker)),deepcopy(recovery.get(worker)))
         if kind=='feature_admission_decision' and e.get('decision')=='admitted' and e.get('outcome_tracking_supported') is False:
             state(e).mark_incomplete()
+        if kind in ('recovery_forecast','recovery_poll'):
+            transaction='decision_forecast' if kind=='recovery_forecast' else 'decision_poll'
+            key=(worker,transaction,e.get('request_id',''))
+            item=pending_recovery.pop(key,None)
+            if item:
+                snapshot,max_gap,source_poll=item
+                if transaction=='decision_forecast':close(snapshot['at'],e['diagnostic_time_seconds'],'Same-clock recovery forecast')
+                require(e['calibration_epoch']==epochs[worker],'Recovery epoch mismatch')
+                verify_recovery_input(snapshot,e,max_gap,source_poll)
+            if worker in native:
+                recovery[worker]=(e,native[worker][0]['poll_started_time_seconds'])
         if kind not in EVENTS:continue
         p=payload(e);s=state(e);now=e['diagnostic_time_seconds'];counts[kind]+=1
         if kind=='decision_native_poll':native[worker]=(e,p)
@@ -110,11 +161,14 @@ def replay(events):
             native_event,native_payload=native[worker]
             close(native_event['diagnostic_time_seconds'],now,'native publication clock')
             require(native_event['calibration_epoch']==e['calibration_epoch'],'Native epoch mismatch')
+            bind_native_profile(profiles,worker,p['profile'],native_payload)
             if p['snapshot'] is not None:verify_native(p['snapshot'],native_event,native_payload,p['max_gap'])
             gaps[worker]=p['max_gap'];s.poll(now,p['profile'],p['fresh'],p['max_gap'])
             close(s.diagnostics(),p['state'],'poll state')
         if kind in ('decision_poll','decision_forecast') and p['snapshot'] is not None:
             verify_snapshot(p['snapshot'],s,p['max_gap'])
+            bind_native_profile(profiles,worker,p['snapshot']['profile'],native[worker][1])
+            pending_recovery[(worker,kind,e.get('request_id',''))]=(p['snapshot'],p['max_gap'],native[worker][0]['poll_started_time_seconds'])
             if kind=='decision_forecast':
                 require(worker in native,'Missing native provenance')
                 verify_native(p['snapshot'],*native[worker],p['max_gap'])
@@ -123,10 +177,17 @@ def replay(events):
             key=(worker,e['request_id']);require(key not in admissions,'Duplicate admission')
             require(key in selected or p['snapshot'] is None,'No selected calibration snapshot')
             if p['snapshot'] is not None:
-                saved,source,source_native=selected.pop(key)
+                saved,source,source_native,source_recovery=selected.pop(key)
                 verify_snapshot(p['snapshot'],saved,gaps[worker],source)
                 require(source_native is not None,'Missing selected native provenance')
                 verify_native(p['snapshot'],*source_native,gaps[worker])
+                bind_native_profile(profiles,worker,p['snapshot']['profile'],source_native[1])
+                if source_recovery is None:
+                    require(saved.profile is None and p['snapshot']['live_queue_extra'] is None,'Missing selected recovery source outside neutral reset')
+                else:
+                    proof,source_poll=source_recovery
+                    require(proof['calibration_epoch']==e['calibration_epoch'],'Selected recovery epoch mismatch')
+                    verify_recovery_input(p['snapshot'],proof,gaps[worker],source_poll)
                 available=p['snapshot']['fresh'] and p['snapshot']['native_ready']
                 close(saved.predictions(p['snapshot'],p['snapshot']['at'],available),p['predictions'],'frozen admission prediction')
             selected.pop(key,None)
@@ -150,6 +211,7 @@ def replay(events):
                 if p['outcome'] in ('first_text','upstream_timeout','pretext_downstream_disconnect'):
                     require(s.label(p['id'],p['observed_at'],now,p['outcome']=='first_text',True) is None,'Missing eligible terminal label')
                 else:s.terminal_unknown(p['id'])
+    require(not pending_recovery,'Decision snapshot lacks paired recovery transaction')
     require(not pending_labels,'Labels without terminal provenance')
     identity={(r['worker'],r['epoch'],r['id']):r for r in rows if r['id'] is not None}
     first={e['request_id']:e for e in events if e.get('event')=='first_text'}
@@ -228,6 +290,7 @@ def main():
     require(not args.out.exists(),'Output directory already exists')
     state_digest=sha(args.state);capture=json.loads(args.state.read_text());require(capture.get('results_valid') is True,'Capture invalid')
     root=Path(capture['result_path']).resolve();require(args.router.resolve()==root/'router-events.jsonl','Noncanonical router source')
+    require({'router-events.jsonl','paired-production.jsonl'}<=capture['result_files'].keys(),'Consumed canonical sources missing from hash manifest')
     bindings={}
     for name,digest in capture['result_files'].items():
         path=(root/name).resolve();require(path.is_relative_to(root),'Result path escaped root');require(sha(path)==digest,'Source hash mismatch: '+name);bindings[name]=digest
@@ -248,7 +311,9 @@ def main():
         (args.out/(key+'.jsonl')).write_text(''.join(json.dumps(r,sort_keys=True)+'\n' for r in result.pop(key)))
     result.update(schema=schema,deterministic_repeat_equal=True,source_state=str(args.state),source_state_sha256=state_digest,source_files=bindings,
                   source_router=str(args.router),helper_sha256=sha(__file__),math_sha256=sha(d.__file__),
-                  limitations=['Native per-rank rate provenance, completeness, interval and normalization are audited; monitor counter derivatives are separately unit-tested.','Capture closure and restoration are host-owner gates in addition to hash/results_valid checks.'])
+                  limitations=['Native per-rank rate provenance, completeness, interval and normalization are audited; monitor counter derivatives are separately unit-tested.','Opaque native profile hashes are checked for signature consistency, not reimplemented with Python hashing.',
+                                'Recovery rate/window eligibility is a separately recorded prerequisite; selected live-N arithmetic, same-poll debt and clock freshness are independently bound.',
+                                'Capture closure and restoration are host-owner gates in addition to hash/results_valid checks.'])
     (args.out/'decision-replay.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result['counts']))
 
 if __name__=='__main__':main()
