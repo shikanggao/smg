@@ -59,6 +59,7 @@ use crate::{
     routers::common::overload,
 };
 
+mod decision;
 mod feature;
 mod recovery;
 use feature::{
@@ -92,6 +93,8 @@ pub struct EstimatedWaitConfig {
     /// Learn excess-TTFT correction for diagnostics only; never changes admission.
     pub estimated_wait_calibration_shadow: bool,
     /// Experimental online context gain; diagnostic only, requires calibration shadow.
+    // Also enables isolated decision-focused live-N/early-signal/censored-loss
+    // ablations. These never replace raw admission or the existing comparators.
     pub estimated_wait_feature_shadow: bool,
     /// Same-model deployment baseline for diagnostic calibration until measured.
     pub estimated_wait_provisional_baseline_secs: Option<f64>,
@@ -362,6 +365,59 @@ impl EstimatedWaitConfig {
                 ranks.hash(&mut hasher);
                 hasher.finish()
             },
+            decision_profile: {
+                use std::{
+                    collections::hash_map::DefaultHasher,
+                    hash::{Hash, Hasher},
+                };
+                let mut h = DefaultHasher::new();
+                let mut ranks: Vec<_> = load
+                    .loads
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.dp_rank,
+                            r.native_request_counts_profile,
+                            r.timely_prefill_progress_source.as_deref(),
+                        )
+                    })
+                    .collect();
+                ranks.sort_unstable();
+                ranks.hash(&mut h);
+                h.finish()
+            },
+            progress_capacity: learned.filter(|v| v.is_finite() && *v > 0.0),
+            timely_progress: (!load.loads.is_empty()
+                && load.dp_rank_count as usize == load.loads.len()
+                && load
+                    .loads
+                    .iter()
+                    .map(|r| r.dp_rank)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    == load.loads.len())
+            .then(|| {
+                load.loads.iter().try_fold(0.0, |sum, r| {
+                    if r.native_request_counts_available != Some(true)
+                        || r.native_request_counts_profile.is_none()
+                        || !matches!(
+                            r.timely_prefill_progress_source.as_deref(),
+                            Some("local_compute_tokens" | "prefill_started_requests")
+                        )
+                        || !r.timely_prefill_progress_interval.is_some_and(|s| {
+                            s.is_finite()
+                                && s > 0.0
+                                && s <= self.estimated_wait_max_snapshot_age_secs
+                        })
+                    {
+                        return None;
+                    }
+                    r.timely_prefill_progress
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .map(|v| sum + v)
+                })
+            })
+            .flatten(),
             pending_engine: 0.0,
             proxy,
             fallback,
@@ -428,6 +484,9 @@ struct PreparedWait {
     native_running: f64,
     kv_usage: Option<f64>,
     kv_profile: u64,
+    decision_profile: u64,
+    timely_progress: Option<f64>,
+    progress_capacity: Option<f64>,
     pending_engine: f64,
     proxy: bool,
     fallback: bool,
@@ -622,6 +681,7 @@ pub(crate) struct CalibrationForecast {
     threshold: f64,
     feature_context: Option<FeatureContext>,
     feature_profile: u64,
+    decision_admission: Option<Box<decision::Admission>>,
 }
 
 impl CalibrationForecast {
@@ -1162,6 +1222,7 @@ struct Entry {
     feature_activity: Activity,
     feature_profile: Option<u64>,
     feature_deadlines: Deadlines,
+    decision: decision::State,
 }
 
 impl Entry {
@@ -1192,6 +1253,7 @@ impl Entry {
             feature_activity: Activity::new(Instant::now()),
             feature_profile: None,
             feature_deadlines: Deadlines::default(),
+            decision: decision::State::default(),
         }
     }
 
@@ -1219,6 +1281,7 @@ impl Entry {
         self.calibration = ExcessCalibration::new(now);
         self.feature_activity = Activity::new(now);
         self.feature_deadlines = Deadlines::default();
+        self.decision = decision::State::default();
         self.feature_profile = None;
         self.calibration_baseline = (None, BaselineSource::Unknown);
         self.calibration_generation = Arc::new(());
@@ -1247,6 +1310,20 @@ impl Entry {
         now: Instant,
         source: &str,
     ) {
+        if source == "poll" {
+            if let Some(label) = resolved.tracking_id.and_then(|id| {
+                self.decision.label(
+                    id,
+                    diagnostic_time(observed_at),
+                    diagnostic_time(now),
+                    false,
+                    false,
+                    Some(300.0),
+                )
+            }) {
+                self.log_decision_label(worker, &label, "poll_deadline");
+            }
+        }
         self.feature_activity.record(now, resolved.outcome);
         tracing::debug!(target:"smg::estimated_wait::observation", event="feature_deadline_resolution", feature_method=feature::METHOD,
             worker, request_id=resolved.request_id.as_deref().unwrap_or(""), calibration_epoch=self.calibration_epoch,
@@ -1358,6 +1435,104 @@ impl Entry {
                 "native_ready":ready,"fresh":fresh,"supported_path":scoped,"threshold_seconds":sample.threshold,
                 "poll_started_time_seconds":diagnostic_time(sample.started),"history_revision":self.calibration.history_revision[index],
                 "scalar_fit_sequence":self.calibration.fitted[index],"ridge":feature::RIDGE,"max_delta":0.5,"max_abs_coefficient":2.0,"coefficient_order":["queue","kv","deadline_or_cutoff","rejection"],"neutral_prior":[1.0,0.0,0.0,0.0],"coefficient_movement_l1_per_second":0.5}));
+    }
+
+    fn decision_snapshot(
+        &self,
+        config: &EstimatedWaitConfig,
+        now: Instant,
+    ) -> Option<decision::Snapshot> {
+        let sample = self.sample.as_ref()?;
+        let fresh = now.saturating_duration_since(sample.started).as_secs_f64()
+            <= config.estimated_wait_max_snapshot_age_secs;
+        let baseline = self.calibration_baseline.0?;
+        let scalar = self
+            .calibration
+            .stats(sample.prepared.capacity_learned_ready, now)
+            .0;
+        let original = sample
+            .prepared
+            .queue_excess_seconds(self.total_dispatched.saturating_sub(sample.watermark))
+            * scalar;
+        let live = self
+            .recovery_forecast(config, now)
+            .filter(|r| r.available)
+            .map(|r| r.queue_extra);
+        let x = live.map(|n| n * scalar).unwrap_or(original);
+        let context = self.decision.context(
+            diagnostic_time(now),
+            sample.prepared.timely_progress.filter(|_| fresh),
+            sample
+                .prepared
+                .capacity_learned_ready
+                .then_some(sample.prepared.progress_capacity)
+                .flatten(),
+            sample.prepared.has_backlog,
+        );
+        Some(decision::Snapshot {
+            at: diagnostic_time(now),
+            profile: sample.prepared.decision_profile,
+            baseline,
+            x,
+            source: if live.is_some() {
+                "live_n_scalar"
+            } else {
+                "original_n_scalar_fallback"
+            },
+            context,
+            original_queue_extra: sample
+                .prepared
+                .queue_excess_seconds(self.total_dispatched.saturating_sub(sample.watermark)),
+            live_queue_extra: live,
+            scalar_gain: scalar,
+            fresh,
+            native_ready: sample.prepared.capacity_learned_ready,
+            native_waiting: sample.prepared.native_waiting,
+            poll_started: diagnostic_time(sample.started),
+            eligible: fresh
+                && sample.prepared.capacity_learned_ready
+                && sample.prepared.native_waiting > 0.0
+                && baseline.is_finite()
+                && x.is_finite()
+                && x >= 0.001,
+        })
+    }
+
+    fn log_decision_label(&self, worker: &str, label: &decision::Label, reason: &str) {
+        tracing::debug!(target:"smg::estimated_wait::observation",event="decision_label",decision_method=decision::METHOD,
+            worker,calibration_epoch=self.calibration_epoch,diagnostic_time_seconds=label.at,reason,decision_json=%serde_json::json!({"label":label}));
+    }
+
+    fn log_decision(
+        &self,
+        config: &EstimatedWaitConfig,
+        now: Instant,
+        event: &str,
+        worker: &str,
+        request_id: &str,
+        scoped: bool,
+    ) {
+        if !config.estimated_wait_feature_shadow {
+            return;
+        }
+        let snapshot = self.decision_snapshot(config, now);
+        let fresh = self.sample.as_ref().is_some_and(|s| {
+            now.saturating_duration_since(s.started).as_secs_f64()
+                <= config.estimated_wait_max_snapshot_age_secs
+        });
+        let available = scoped
+            && fresh
+            && self
+                .sample
+                .as_ref()
+                .is_some_and(|s| s.prepared.capacity_learned_ready)
+            && snapshot.is_some();
+        tracing::debug!(target:"smg::estimated_wait::observation",event,decision_method=decision::METHOD,worker,request_id,
+            calibration_epoch=self.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+            decision_json=%serde_json::json!({"snapshot":snapshot,"predictions":snapshot.map(|s|self.decision.predictions(s,diagnostic_time(now),available)),
+                "fresh":fresh,"profile":self.sample.as_ref().map(|s|s.prepared.decision_profile),
+                "max_gap":config.estimated_wait_max_snapshot_age_secs,
+                "available":available,"threshold":self.sample.as_ref().map(|s|s.threshold),"state":if event=="decision_poll"{Some(self.decision.diagnostics())}else{None}}));
     }
 
     fn recovery_forecast(
@@ -1518,6 +1693,7 @@ impl Entry {
             fitted_revision: self.calibration.fitted_revision
                 [usize::from(sample.prepared.capacity_learned_ready)],
             threshold: sample.threshold,
+            decision_admission: None,
             feature_context: None,
             feature_profile: sample.prepared.kv_profile,
         })
@@ -1665,6 +1841,18 @@ impl EstimatedWaitAdmission {
         let entry = entry.unwrap();
         let handle = entry.feature_deadlines.register(started, request_id);
         let now = Instant::now();
+        let tracking_id = match &handle {
+            DeadlineHandle::Tracked(id, _) => Some(*id),
+            DeadlineHandle::Untracked => None,
+        };
+        let tracked = entry.decision.register(
+            tracking_id,
+            diagnostic_time(started),
+            identity.decision_admission.as_ref().map(|a| a.snapshot),
+        );
+        tracing::debug!(target:"smg::estimated_wait::observation",event="decision_admission",decision_method=decision::METHOD,
+            worker,request_id=request_id.unwrap_or(""),calibration_epoch=entry.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+            decision_json=%serde_json::json!({"id":tracking_id,"tracked":tracked,"started":diagnostic_time(started),"snapshot":identity.decision_admission.as_ref().map(|a|a.snapshot),"predictions":identity.decision_admission.as_ref().map(|a|&a.predictions)}));
         tracing::debug!(target:"smg::estimated_wait::observation", event="feature_deadline_started", feature_method=feature::METHOD,
             worker,request_id=request_id.unwrap_or(""),calibration_epoch=entry.calibration_epoch,
             diagnostic_time_seconds=diagnostic_time(now), request_started_time_seconds=diagnostic_time(started),
@@ -1702,6 +1890,33 @@ impl EstimatedWaitAdmission {
             return;
         }
         let now = Instant::now();
+        let id = deadline.as_ref().and_then(|h| match h {
+            DeadlineHandle::Tracked(id, _) => Some(*id),
+            DeadlineHandle::Untracked => None,
+        });
+        let label = match outcome {
+            FeatureOutcome::FirstText | FeatureOutcome::Timeout | FeatureOutcome::Disconnect => id
+                .and_then(|id| {
+                    entry.decision.label(
+                        id,
+                        diagnostic_time(observed_at),
+                        diagnostic_time(now),
+                        matches!(outcome, FeatureOutcome::FirstText),
+                        true,
+                        None,
+                    )
+                }),
+            _ => {
+                entry.decision.terminal_unknown(id);
+                None
+            }
+        };
+        if let Some(label) = label {
+            entry.log_decision_label(worker, &label, outcome.name());
+        }
+        tracing::debug!(target:"smg::estimated_wait::observation",event="decision_terminal",decision_method=decision::METHOD,worker,
+            calibration_epoch=entry.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+            decision_json=%serde_json::json!({"id":id,"observed_at":diagnostic_time(observed_at),"outcome":outcome.name()}));
         if let Some(resolved) = deadline.and_then(|handle| {
             entry
                 .feature_deadlines
@@ -2250,6 +2465,39 @@ impl EstimatedWaitAdmission {
                 model.invalidate();
             }
         }
+        if config.estimated_wait_feature_shadow {
+            let now = Instant::now();
+            let profile = entry.sample.as_ref().map(|s| s.prepared.decision_profile);
+            let fresh = outcome == "success"
+                && entry.sample.as_ref().is_some_and(|s| {
+                    now.saturating_duration_since(s.started).as_secs_f64()
+                        <= config.estimated_wait_max_snapshot_age_secs
+                });
+            tracing::debug!(target:"smg::estimated_wait::observation",event="decision_native_poll",decision_method=decision::METHOD,
+                worker=worker.url(),calibration_epoch=entry.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+                poll_started_time_seconds=diagnostic_time(started),outcome,
+                decision_json=%serde_json::json!({"expected_rank_count":load.map(|l|l.dp_rank_count),
+                    "ranks":load.map(|l|l.loads.iter().map(|r|serde_json::json!({
+                        "dp_rank":r.dp_rank,"native_request_counts_available":r.native_request_counts_available,
+                        "native_request_counts_profile":r.native_request_counts_profile,
+                        "timely_prefill_progress":r.timely_prefill_progress,
+                        "timely_prefill_progress_source":r.timely_prefill_progress_source,
+                        "timely_prefill_progress_interval":r.timely_prefill_progress_interval,
+                        "learned_prefill_capacity":r.learned_prefill_capacity,
+                        "prefill_capacity_sample_count":r.prefill_capacity_sample_count,
+                        "num_waiting_reqs":r.num_waiting_reqs,"num_running_reqs":r.num_running_reqs,
+                        "num_waiting_uncached_tokens":r.num_waiting_uncached_tokens,
+                        "num_waiting_uncached_tokens_available":r.num_waiting_uncached_tokens_available,
+                        "prefill_capacity_learning_active":r.prefill_capacity_learning_active
+                    })).collect::<Vec<_>>())}));
+            entry.decision.poll(
+                diagnostic_time(now),
+                profile,
+                fresh,
+                config.estimated_wait_max_snapshot_age_secs,
+            );
+            entry.log_decision(config, now, "decision_poll", worker.url(), "", true);
+        }
         entry.log_feature(
             config,
             Instant::now(),
@@ -2362,6 +2610,18 @@ impl AdmissionGuard<'_> {
                 .filter(|e| e.source.ptr_eq(&Arc::downgrade(worker))),
             forecast.as_mut(),
         ) {
+            forecast.decision_admission = entry
+                .decision_snapshot(self.config, forecast.captured_at)
+                .map(|snapshot| {
+                    Box::new(decision::Admission {
+                        snapshot,
+                        predictions: entry.decision.predictions(
+                            snapshot,
+                            diagnostic_time(forecast.captured_at),
+                            forecast.fresh && forecast.native_capacity_ready,
+                        ),
+                    })
+                });
             forecast.feature_context =
                 Some(entry.feature_context(forecast.captured_at, forecast.fresh));
             true
@@ -2395,6 +2655,9 @@ impl AdmissionGuard<'_> {
         } else {
             FeatureOutcome::UntrackedAdmitted
         };
+        if matches!(outcome, FeatureOutcome::UntrackedAdmitted) {
+            entry.decision.mark_incomplete();
+        }
         entry.feature_activity.record(now, outcome);
         tracing::debug!(target:"smg::estimated_wait::observation", event="feature_admission_decision", feature_method=feature::METHOD,
             worker=worker.url(),request_id=request_id.unwrap_or(""),decision=outcome.name(),outcome_tracking_supported,calibration_epoch=entry.calibration_epoch,
@@ -2471,6 +2734,14 @@ impl AdmissionGuard<'_> {
                 self.config,
                 now,
                 "feature_context_forecast",
+                worker.url(),
+                request_id,
+                feature_worker.is_some_and(|w| Arc::ptr_eq(w, worker)),
+            );
+            entry.log_decision(
+                self.config,
+                now,
+                "decision_forecast",
                 worker.url(),
                 request_id,
                 feature_worker.is_some_and(|w| Arc::ptr_eq(w, worker)),
@@ -3237,6 +3508,62 @@ mod tests {
                 .contextual
         );
     }
+    #[test]
+    fn decision_progress_requires_complete_timely_rank_evidence() {
+        let cfg = config();
+        let mut report = load(Some(1000), 2, 100.0, 0.4);
+        report.dp_rank_count = 1;
+        let rank = &mut report.loads[0];
+        rank.native_request_counts_available = Some(true);
+        rank.native_request_counts_profile = Some(7);
+        rank.timely_prefill_progress = Some(0.0);
+        rank.timely_prefill_progress_source = Some("local_compute_tokens".to_owned());
+        rank.timely_prefill_progress_interval = Some(1.0);
+        assert_eq!(cfg.prepare(&report).unwrap().timely_progress, Some(0.0));
+        report.loads[0].timely_prefill_progress_interval = Some(1000.0);
+        assert_eq!(cfg.prepare(&report).unwrap().timely_progress, None);
+        report.loads[0].timely_prefill_progress_interval = Some(1.0);
+        report.loads[0].timely_prefill_progress_source = Some("completed_uncached".to_owned());
+        assert_eq!(cfg.prepare(&report).unwrap().timely_progress, None);
+        report.loads[0].timely_prefill_progress_source = Some("local_compute_tokens".to_owned());
+        report.dp_rank_count = 2;
+        assert!(cfg.prepare(&report).is_none());
+        report.loads.push(report.loads[0].clone());
+        assert_eq!(cfg.prepare(&report).unwrap().timely_progress, None);
+    }
+
+    #[test]
+    fn decision_saved_prediction_is_immutable_and_never_changes_admission() {
+        let (registry, worker) = feature_registry();
+        let mut guard = registry.estimated_wait().begin().unwrap();
+        let before = guard
+            .entries
+            .get(worker.url())
+            .unwrap()
+            .sample
+            .as_ref()
+            .unwrap()
+            .overloaded;
+        let mut forecast = guard.capture_calibration(&worker, None);
+        guard.attach_feature_context(&worker, &mut forecast);
+        let saved = forecast.unwrap();
+        let frozen = serde_json::to_value(&saved.decision_admission).unwrap();
+        let entry = guard.entries.get_mut(worker.url()).unwrap();
+        entry.decision.mark_incomplete();
+        assert_eq!(
+            serde_json::to_value(&saved.decision_admission).unwrap(),
+            frozen
+        );
+        assert_eq!(entry.sample.as_ref().unwrap().overloaded, before);
+        assert!(saved.decision_admission.unwrap().snapshot.context.complete);
+        assert!(
+            !entry
+                .decision
+                .context(saved.time_seconds, None, None, false)
+                .complete
+        );
+    }
+
     #[test]
     fn feature_kv_missing_duplicate_ranks_and_profile_order() {
         let mut report = load(Some(1000), 2, 100.0, 0.4);

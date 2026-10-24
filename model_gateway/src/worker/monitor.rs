@@ -392,6 +392,9 @@ struct EngineMetricsHistory {
 struct EngineDerivedMetrics {
     recovery_counter_epoch: u64,
     prefill_throughput: Option<f64>,
+    timely_prefill_progress: Option<f64>,
+    timely_prefill_progress_source: Option<&'static str>,
+    timely_prefill_progress_interval: Option<f64>,
     gen_throughput: f64,
     avg_request_prefill_kv_computed_tokens: Option<f64>,
     median_request_prefill_kv_computed_tokens: Option<f64>,
@@ -616,6 +619,27 @@ fn derive_engine_metrics(
         };
         (rate.is_finite() && rate > 0.0).then_some(rate)
     });
+    // Keep zero as evidence, and exclude counters published at request completion.
+    // This is an independent shadow signal; capacity learning above is unchanged.
+    let timely_prefill_progress_source = match prefill_source {
+        PrefillCounter::LocalCompute => Some("local_compute_tokens"),
+        PrefillCounter::StartedRequests => Some("prefill_started_requests"),
+        _ => None,
+    };
+    let timely_prefill_progress = timely_prefill_progress_source.and_then(|_| {
+        let history = previous.as_ref()?;
+        if capacity_counter_changed || recovery_reset {
+            return None;
+        }
+        let rate = counter_rate(prefill_counter, history.sample.prefill_counter().1, elapsed)?;
+        let rate = if prefill_source == PrefillCounter::StartedRequests {
+            rate * history.avg_request_prefill_kv_computed_tokens?
+        } else {
+            rate
+        };
+        (rate.is_finite() && rate >= 0.0).then_some(rate)
+    });
+    let timely_prefill_progress_interval = timely_prefill_progress.map(|_| elapsed);
     let gen_throughput = previous
         .as_ref()
         .and_then(|history| {
@@ -815,6 +839,9 @@ fn derive_engine_metrics(
     let derived = EngineDerivedMetrics {
         recovery_counter_epoch,
         prefill_throughput,
+        timely_prefill_progress,
+        timely_prefill_progress_source,
+        timely_prefill_progress_interval,
         gen_throughput,
         avg_request_prefill_kv_computed_tokens,
         median_request_prefill_kv_computed_tokens,
@@ -1549,6 +1576,11 @@ impl WorkerMonitor {
             native_kv_usage_available: Some(m.valid_kv_usage(kv_usage)),
             native_kv_usage_profile: Some(m.kv_usage_profile(kv_usage, "max")),
             prefill_throughput: derived.prefill_throughput,
+            timely_prefill_progress: derived.timely_prefill_progress,
+            timely_prefill_progress_source: derived
+                .timely_prefill_progress_source
+                .map(str::to_owned),
+            timely_prefill_progress_interval: derived.timely_prefill_progress_interval,
             gen_throughput: derived.gen_throughput,
             avg_request_prefill_kv_computed_tokens: derived.avg_request_prefill_kv_computed_tokens,
             median_request_prefill_kv_computed_tokens: derived
@@ -1658,6 +1690,11 @@ impl WorkerMonitor {
                 cache_hit_rate: m.mean(&format!("{prefix}cache_hit_rate")),
                 utilization: m.mean(&format!("{prefix}utilization")),
                 prefill_throughput: derived.prefill_throughput,
+                timely_prefill_progress: derived.timely_prefill_progress,
+                timely_prefill_progress_source: derived
+                    .timely_prefill_progress_source
+                    .map(str::to_owned),
+                timely_prefill_progress_interval: derived.timely_prefill_progress_interval,
                 avg_request_prefill_kv_computed_tokens: derived
                     .avg_request_prefill_kv_computed_tokens,
                 prefill_size_sample_count: derived.prefill_size_sample_count,
@@ -2909,6 +2946,12 @@ sglang:utilization{model="llama"} 0.9
             Some(history),
         );
         assert_eq!(derived.prefill_throughput, None);
+        assert_eq!(derived.timely_prefill_progress, Some(0.0));
+        assert_eq!(
+            derived.timely_prefill_progress_source,
+            Some("local_compute_tokens")
+        );
+        assert_eq!(derived.timely_prefill_progress_interval, Some(1.0));
         assert_eq!(derived.prefill_capacity_sample_count, Some(0));
         assert_eq!(derived.learned_prefill_capacity, None);
     }
@@ -2934,6 +2977,7 @@ sglang:utilization{model="llama"} 0.9
                 Some(history.clone()),
             );
             assert_eq!(derived.prefill_throughput, None);
+            assert_eq!(derived.timely_prefill_progress, None);
             assert_eq!(derived.prefill_capacity_sample_count, Some(0));
             assert_eq!(derived.learned_prefill_capacity, None);
         }

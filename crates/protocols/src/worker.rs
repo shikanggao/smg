@@ -1334,6 +1334,16 @@ pub struct SchedulerLoadSnapshot {
     /// starts on the existing generation-throughput/configured fallback path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_throughput: Option<f64>,
+    /// Timely prefill progress only (local compute or started-prefill counter).
+    /// Zero is observed zero progress; None is unknown. Never uses completion counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timely_prefill_progress: Option<f64>,
+    /// Source identity, paired with native_request_counts_profile for reset provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timely_prefill_progress_source: Option<String>,
+    /// Counter interval in seconds. Long/cold/reset intervals are not live evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timely_prefill_progress_interval: Option<f64>,
     pub gen_throughput: f64,
     /// Recent mean uncached prefill tokens per completed request. Gauge-only
     /// backends use this to turn waiting-request counts into queued token-work.

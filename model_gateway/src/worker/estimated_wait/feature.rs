@@ -216,6 +216,7 @@ impl DeadlineHandle {
 }
 #[derive(Debug)]
 pub(super) struct DeadlineResolution {
+    pub tracking_id: Option<u64>,
     pub started: Instant,
     pub request_id: Option<String>,
     pub outcome: Outcome,
@@ -245,7 +246,7 @@ impl Deadlines {
     }
     pub fn advance(&mut self, now: Instant) -> Vec<DeadlineResolution> {
         let mut resolved = Vec::new();
-        self.pending.retain(|_, (started, request_id, state)| {
+        self.pending.retain(|id, (started, request_id, state)| {
             if now.saturating_duration_since(*started) < TTFT_DEADLINE {
                 return true;
             }
@@ -256,6 +257,7 @@ impl Deadlines {
                 return true;
             }
             resolved.push(DeadlineResolution {
+                tracking_id: Some(*id),
                 started: *started,
                 request_id: request_id.clone(),
                 outcome: Outcome::DeadlineBreach,
@@ -272,6 +274,10 @@ impl Deadlines {
         now: Instant,
         terminal: Outcome,
     ) -> Option<DeadlineResolution> {
+        let tracking_id = match &handle {
+            DeadlineHandle::Tracked(id, _) => Some(*id),
+            DeadlineHandle::Untracked => None,
+        };
         let (started, request_id) = match handle {
             DeadlineHandle::Tracked(id, _) => {
                 let (started, request_id, _) = self.pending.remove(&id)?;
@@ -292,6 +298,7 @@ impl Deadlines {
             }
         };
         Some(DeadlineResolution {
+            tracking_id,
             started,
             request_id,
             outcome,
