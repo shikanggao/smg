@@ -1,7 +1,5 @@
-//! Experimental context-conditioned queue gain. No field here affects admission.
+//! Experimental jointly fitted queue/feature gains. No field here affects admission.
 //! Rates describe resolved local observations, not native cancellation acknowledgements.
-use super::ScaleTrajectory;
-use serde::Serialize;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
@@ -11,7 +9,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(super) const METHOD: &str = "feature_context_deadline_ridge_v2";
+use serde::Serialize;
+
+use super::CALIBRATION_MAX_SCALE_CHANGE_PER_SECOND;
+
+pub(super) const METHOD: &str = "feature_joint_gains_deadline_ridge_v3";
 pub(super) const RIDGE: f64 = 0.1;
 const MAX_SHIFT: f64 = 0.5;
 const MAX_BETA: f64 = 2.0;
@@ -297,9 +299,11 @@ impl Deadlines {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(super) struct Fit {
+    /// Compatibility alias for the three uncentered contextual coefficients.
     pub beta: [f64; 3],
+    pub coefficients: [f64; 4],
     pub mean: [f64; 3],
     pub minimum: [f64; 3],
     pub maximum: [f64; 3],
@@ -308,13 +312,27 @@ pub(super) struct Fit {
     pub ess: f64,
     pub revision: u64,
 }
+impl Default for Fit {
+    fn default() -> Self {
+        Self {
+            beta: [0.0; 3],
+            coefficients: [1.0, 0.0, 0.0, 0.0],
+            mean: [0.0; 3],
+            minimum: [0.0; 3],
+            maximum: [0.0; 3],
+            support: [false; 3],
+            count: 0,
+            ess: 0.0,
+            revision: 0,
+        }
+    }
+}
 impl Fit {
     /// At most seven tiny common-row fits. Missing inputs are never imputed.
     pub fn learn(
         samples: &VecDeque<(f64, f64)>,
         contexts: &VecDeque<Option<Context>>,
         revision: u64,
-        scalar_target: f64,
     ) -> Self {
         let empty = Self {
             revision,
@@ -370,64 +388,75 @@ impl Fit {
             if fit.ess < 8.0 {
                 continue;
             }
-            let mut covariance = [[0.0; 3]; 3];
-            let mut rhs = [0.0; 3];
+            let mut covariance = [[0.0; 4]; 4];
+            let mut rhs = [0.0; 4];
+            let mut variance = [0.0; 3];
             for &(ratio, n, ctx) in &rows {
                 let w = (n / largest).powi(2) / sumw;
-                let z: [f64; 3] = std::array::from_fn(|j| {
-                    if mask & (1 << j) != 0 {
-                        ctx.values[j].unwrap() - fit.mean[j]
-                    } else {
-                        0.0
-                    }
-                });
+                let mut x = [1.0, 0.0, 0.0, 0.0];
                 for j in 0..3 {
-                    rhs[j] += w * z[j] * (ratio - scalar_target);
-                    for k in 0..3 {
-                        covariance[j][k] += w * z[j] * z[k];
+                    if mask & (1 << j) != 0 {
+                        // Common-row filtering above guarantees a present input.
+                        x[j + 1] = ctx.values[j].unwrap_or_default();
+                        variance[j] += w * (x[j + 1] - fit.mean[j]).powi(2);
+                    }
+                }
+                for j in 0..4 {
+                    rhs[j] += w * x[j] * ratio;
+                    for k in 0..4 {
+                        covariance[j][k] += w * x[j] * x[k];
                     }
                 }
             }
             if (0..3).any(|j| {
                 mask & (1 << j) != 0
-                    && (covariance[j][j] < 1e-4 || fit.maximum[j] - fit.minimum[j] < 0.05)
+                    && (variance[j] < 1e-4 || fit.maximum[j] - fit.minimum[j] < 0.05)
             }) {
                 continue;
             }
+            // Joint ridge on [N, N*KV, N*cutoff, N*reject], normalized by sum N².
+            // A neutral prior [1,0,0,0] is independent of the scalar comparator.
+            for (j, row) in covariance.iter_mut().enumerate() {
+                row[j] += RIDGE;
+            }
+            rhs[0] += RIDGE;
             for j in 0..3 {
                 fit.support[j] = mask & (1 << j) != 0;
-                covariance[j][j] += RIDGE;
                 if !fit.support[j] {
                     fit.minimum[j] = 0.0;
                     fit.maximum[j] = 0.0;
                 }
             }
-            if let Some(beta) = solve(covariance, rhs) {
-                // Neutral frozen prior; coefficient clipping is a bounded approximation
-                // to unconstrained ridge, not a constrained-ridge optimizer.
-                fit.beta = beta.map(|x| x.clamp(-MAX_BETA, MAX_BETA));
+            if let Some(mut coefficients) = solve(covariance, rhs) {
+                // Coefficient clipping is a bounded approximation to ridge,
+                // not a constrained-ridge optimizer.
+                coefficients[0] = coefficients[0].max(0.0);
+                for value in &mut coefficients[1..] {
+                    *value = value.clamp(-MAX_BETA, MAX_BETA);
+                }
+                fit.coefficients = coefficients;
+                fit.beta.copy_from_slice(&coefficients[1..]);
                 return fit;
             }
         }
         empty
     }
-    fn correction(&self, context: &Context) -> (f64, [bool; 3]) {
-        let active = std::array::from_fn(|j| {
+    fn active(&self, context: &Context) -> [bool; 3] {
+        std::array::from_fn(|j| {
             self.support[j]
                 && context.values[j]
                     .is_some_and(|x| x.is_finite() && x >= self.minimum[j] && x <= self.maximum[j])
-        });
-        let shift = (0..3)
-            .filter(|j| active[*j])
-            .map(|j| self.beta[j] * (context.values[j].unwrap() - self.mean[j]))
-            .sum::<f64>()
-            .clamp(-MAX_SHIFT, MAX_SHIFT);
-        (shift, active)
+        })
+    }
+    fn supported(&self, active: [bool; 3]) -> bool {
+        // A jointly fitted intercept must not be reused after silently dropping
+        // one of its fitted predictors. Fall back as a whole in that case.
+        active == self.support && active.iter().any(|x| *x)
     }
 }
-fn solve(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
-    let mut l = [[0.0; 3]; 3];
-    for i in 0..3 {
+fn solve(a: [[f64; 4]; 4], b: [f64; 4]) -> Option<[f64; 4]> {
+    let mut l = [[0.0; 4]; 4];
+    for i in 0..4 {
         for j in 0..=i {
             let v = a[i][j] - (0..j).map(|k| l[i][k] * l[j][k]).sum::<f64>();
             l[i][j] = if i == j {
@@ -440,20 +469,73 @@ fn solve(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
             };
         }
     }
-    let mut y = [0.0; 3];
-    for i in 0..3 {
+    let mut y = [0.0; 4];
+    for i in 0..4 {
         y[i] = (b[i] - (0..i).map(|j| l[i][j] * y[j]).sum::<f64>()) / l[i][i];
     }
-    let mut x = [0.0; 3];
-    for i in (0..3).rev() {
-        x[i] = (y[i] - ((i + 1)..3).map(|j| l[j][i] * x[j]).sum::<f64>()) / l[i][i];
+    let mut x = [0.0; 4];
+    for i in (0..4).rev() {
+        x[i] = (y[i] - ((i + 1)..4).map(|j| l[j][i] * x[j]).sum::<f64>()) / l[i][i];
     }
     x.iter().all(|v| v.is_finite()).then_some(x)
+}
+
+/// One shared interpolation fraction bounds the L1 coefficient movement.
+/// Thus each coefficient AND the gain at any fixed inputs in [0,1] move by
+/// at most 0.5/second. Input/queue changes themselves are never rate limited.
+#[derive(Debug)]
+struct Trajectory {
+    anchor: [f64; 4],
+    target: [f64; 4],
+    anchor_time: Instant,
+}
+impl Trajectory {
+    fn applied(&self, now: Instant) -> [f64; 4] {
+        let distance: f64 = (0..4)
+            .map(|j| (self.target[j] - self.anchor[j]).abs())
+            .sum();
+        let budget = CALIBRATION_MAX_SCALE_CHANGE_PER_SECOND
+            * now
+                .saturating_duration_since(self.anchor_time)
+                .as_secs_f64();
+        let fraction = if distance > 0.0 {
+            (budget / distance).min(1.0)
+        } else {
+            1.0
+        };
+        std::array::from_fn(|j| self.anchor[j] + fraction * (self.target[j] - self.anchor[j]))
+    }
+    fn retarget(&mut self, target: [f64; 4], now: Instant) {
+        self.anchor = self.applied(now);
+        self.target = target;
+        self.anchor_time = now;
+    }
+}
+
+/// Return the effective coefficients after the contextual +/-0.5 safety cap.
+/// Scale contextual terms together to preserve an exact signed decomposition.
+fn effective(coefficients: [f64; 4], inputs: [f64; 4]) -> [f64; 4] {
+    let shift: f64 = (1..4).map(|j| coefficients[j] * inputs[j]).sum();
+    let bounded = shift.clamp(-MAX_SHIFT, MAX_SHIFT).max(-coefficients[0]);
+    let factor = if shift == 0.0 { 1.0 } else { bounded / shift };
+    let mut result = coefficients;
+    for value in &mut result[1..] {
+        *value *= factor;
+    }
+    result
+}
+fn gain(coefficients: [f64; 4], inputs: [f64; 4]) -> f64 {
+    coefficients
+        .iter()
+        .zip(inputs)
+        .map(|(g, x)| g * x)
+        .sum::<f64>()
+        .max(0.0)
 }
 #[derive(Debug, Default)]
 pub(super) struct Model {
     pub fit: Fit,
-    trajectory: Option<ScaleTrajectory>,
+    trajectory: Option<Trajectory>,
     active: [bool; 3],
 }
 #[derive(Serialize)]
@@ -463,6 +545,12 @@ pub(super) struct Prediction {
     pub contextual: bool,
     pub reason: &'static str,
     pub active: [bool; 3],
+    pub applied_coefficients: [f64; 4],
+    pub target_coefficients: [f64; 4],
+    pub effective_coefficients: [f64; 4],
+    pub target_effective_coefficients: [f64; 4],
+    pub contribution_seconds: [f64; 4],
+    pub trajectory_anchor_coefficients: Option<[f64; 4]>,
     pub trajectory_anchor_gain: Option<f64>,
     pub trajectory_anchor_time_seconds: Option<f64>,
 }
@@ -471,26 +559,22 @@ impl Model {
         self.trajectory = None;
         self.active = [false; 3];
     }
-    pub fn update(
-        &mut self,
-        context: &Context,
-        scalar_target: f64,
-        scalar_applied: f64,
-        now: Instant,
-    ) {
-        let (shift, active) = self.fit.correction(context);
-        self.active = active;
-        if !active.iter().any(|x| *x) {
-            self.trajectory = None;
+    pub fn update(&mut self, context: &Context, scalar_applied: f64, now: Instant) {
+        let active = self.fit.active(context);
+        if !self.fit.supported(active) {
+            self.invalidate();
             return;
         }
-        let target = (scalar_target + shift).max(0.0);
-        let trajectory = self.trajectory.get_or_insert(ScaleTrajectory {
-            anchor_scale: scalar_applied,
-            target_scale: scalar_applied,
+        if self.active != active {
+            self.trajectory = None;
+        }
+        self.active = active;
+        let trajectory = self.trajectory.get_or_insert(Trajectory {
+            anchor: [scalar_applied, 0.0, 0.0, 0.0],
+            target: [scalar_applied, 0.0, 0.0, 0.0],
             anchor_time: now,
         });
-        trajectory.retarget(target, now);
+        trajectory.retarget(self.fit.coefficients, now);
     }
     pub fn prediction(
         &self,
@@ -498,16 +582,29 @@ impl Model {
         scalar: f64,
         now: Instant,
         usable: bool,
+        n: f64,
     ) -> Prediction {
-        let (_, active) = self.fit.correction(context);
-        // If current support changes between polls, avoid applying stale contributions.
+        let active = self.fit.active(context);
         let trajectory = self
             .trajectory
             .as_ref()
-            .filter(|_| usable && active == self.active && active.iter().any(|x| *x));
+            .filter(|_| usable && active == self.active && self.fit.supported(active));
+        let inputs = std::array::from_fn(|j| {
+            if j == 0 {
+                1.0
+            } else if active[j - 1] {
+                context.values[j - 1].unwrap_or_default()
+            } else {
+                0.0
+            }
+        });
+        let applied = trajectory.map_or([scalar, 0.0, 0.0, 0.0], |t| t.applied(now));
+        let target = trajectory.map_or(applied, |t| t.target);
+        let effective_coefficients = effective(applied, inputs);
+        let target_effective_coefficients = effective(target, inputs);
         Prediction {
-            gain: trajectory.map_or(scalar, |t| t.applied(now)),
-            target_gain: trajectory.map_or(scalar, |t| t.target_scale),
+            gain: gain(effective_coefficients, inputs),
+            target_gain: gain(target_effective_coefficients, inputs),
             contextual: trajectory.is_some(),
             reason: if !usable {
                 "snapshot_unavailable"
@@ -517,7 +614,15 @@ impl Model {
                 "legacy_fallback_no_current_support"
             },
             active,
-            trajectory_anchor_gain: trajectory.map(|t| t.anchor_scale),
+            applied_coefficients: applied,
+            target_coefficients: target,
+            effective_coefficients,
+            target_effective_coefficients,
+            contribution_seconds: std::array::from_fn(|j| {
+                n * effective_coefficients[j] * inputs[j]
+            }),
+            trajectory_anchor_coefficients: trajectory.map(|t| t.anchor),
+            trajectory_anchor_gain: trajectory.map(|t| gain(effective(t.anchor, inputs), inputs)),
             trajectory_anchor_time_seconds: trajectory
                 .map(|t| super::diagnostic_time(t.anchor_time)),
         }
@@ -526,8 +631,9 @@ impl Model {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
     fn data(sign: f64) -> (VecDeque<(f64, f64)>, VecDeque<Option<Context>>) {
         (0..32)
             .map(|i| {
@@ -677,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn joint_ridge_matches_orthogonal_closed_form_and_collinear_remains_finite() {
+    fn joint_ridge_satisfies_normal_equations_and_collinear_remains_finite() {
         let (samples, contexts): (VecDeque<_>, VecDeque<_>) = (0..32)
             .map(|i| {
                 let z = [
@@ -694,14 +800,27 @@ mod tests {
                 )
             })
             .unzip();
-        let f = Fit::learn(&samples, &contexts, 1, 3.25);
+        let f = Fit::learn(&samples, &contexts, 1);
         assert_eq!(f.support, [true; 3]);
-        for (actual, expected) in f
-            .beta
-            .into_iter()
-            .zip([0.25 / 0.35, -0.25 / 0.35, 0.125 / 0.35])
-        {
-            assert!((actual - expected).abs() < 1e-10);
+        // Verify all four joint normal equations, including intercept shrinkage
+        // toward one. The scalar comparator is deliberately not an input.
+        let mut residual = [0.0; 4];
+        for ((ratio, _), context) in samples.iter().zip(&contexts) {
+            let c = context.unwrap();
+            let x = [
+                1.0,
+                c.values[0].unwrap(),
+                c.values[1].unwrap(),
+                c.values[2].unwrap(),
+            ];
+            let error = gain(f.coefficients, x) - ratio;
+            for j in 0..4 {
+                residual[j] += x[j] * error / 32.0;
+            }
+        }
+        for (j, value) in residual.iter().enumerate() {
+            let prior = if j == 0 { 1.0 } else { 0.0 };
+            assert!((value + RIDGE * (f.coefficients[j] - prior)).abs() < 1e-10);
         }
         let collinear: VecDeque<_> = contexts
             .into_iter()
@@ -712,7 +831,7 @@ mod tests {
                 })
             })
             .collect();
-        let f = Fit::learn(&samples, &collinear, 2, 3.25);
+        let f = Fit::learn(&samples, &collinear, 2);
         assert_eq!(f.support, [true; 3]);
         assert!(f.beta.iter().all(|v| v.is_finite()));
         assert!((f.beta[0] - f.beta[1]).abs() < 1e-10);
@@ -722,7 +841,7 @@ mod tests {
     fn learned_signed_slopes_missing_rejection_does_not_block_kv() {
         for sign in [-1.0, 1.0] {
             let (s, c) = data(sign);
-            let f = Fit::learn(&s, &c, 1, 2.0);
+            let f = Fit::learn(&s, &c, 1);
             assert_eq!(f.support, [true, false, false]);
             assert!(f.beta[0] * sign > 0.0);
             assert_eq!(f.beta[1..], [0.0, 0.0]);
@@ -735,16 +854,15 @@ mod tests {
         for ctx in c.iter_mut().flatten() {
             ctx.values[0] = Some(0.5);
         }
-        assert!(!Fit::learn(&s, &c, 1, 1.0).support[0]);
+        assert!(!Fit::learn(&s, &c, 1).support[0]);
         let (_, c) = data(1.0);
         s[0].1 = 1e9;
-        assert!(!Fit::learn(&s, &c, 1, 1.0).support[0]);
+        assert!(!Fit::learn(&s, &c, 1).support[0]);
         assert!(
             !Fit::learn(
                 &s.into_iter().take(11).collect(),
                 &c.into_iter().take(11).collect(),
-                1,
-                1.0
+                1
             )
             .support[0]
         );
@@ -754,25 +872,25 @@ mod tests {
         let now = Instant::now();
         let (s, c) = data(1.0);
         let mut m = Model {
-            fit: Fit::learn(&s, &c, 1, 2.0),
+            fit: Fit::learn(&s, &c, 1),
             ..Model::default()
         };
         let ctx = c.back().unwrap().unwrap();
-        m.update(&ctx, 4.0, 1.0, now);
-        assert_eq!(m.prediction(&ctx, 1.0, now, true).gain, 1.0);
+        m.update(&ctx, 1.0, now);
+        assert_eq!(m.prediction(&ctx, 1.0, now, true, 100.0).gain, 1.0);
         assert!(
-            (m.prediction(&ctx, 1.0, now + Duration::from_millis(100), true)
+            (m.prediction(&ctx, 1.0, now + Duration::from_millis(100), true, 100.0)
                 .gain
                 - 1.05)
                 .abs()
                 < 1e-8
         );
         let missing = Context::default();
-        assert_eq!(m.prediction(&missing, 2.0, now, true).gain, 2.0);
-        m.update(&missing, 4.0, 2.0, now);
-        m.update(&ctx, 4.0, 2.0, now + Duration::from_secs(100));
+        assert_eq!(m.prediction(&missing, 2.0, now, true, 100.0).gain, 2.0);
+        m.update(&missing, 2.0, now);
+        m.update(&ctx, 2.0, now + Duration::from_secs(100));
         assert_eq!(
-            m.prediction(&ctx, 2.0, now + Duration::from_secs(100), true)
+            m.prediction(&ctx, 2.0, now + Duration::from_secs(100), true, 100.0)
                 .gain,
             2.0
         );
@@ -825,18 +943,199 @@ mod tests {
     }
 
     #[test]
-    fn correction_is_bounded_and_out_of_range_neutral() {
-        let (s, c) = data(100.0);
-        let f = Fit::learn(&s, &c, 1, 1.0);
-        assert_eq!(f.beta[0], 2.0);
-        assert_eq!(f.correction(&c.back().unwrap().unwrap()).0, 0.5);
-        assert_eq!(
-            f.correction(&Context {
-                values: [Some(1.1), None, None],
-                ..Context::default()
+    fn joint_gain_cross_language_fixture() {
+        let (samples, contexts): (VecDeque<_>, VecDeque<_>) = (0..32)
+            .map(|i| {
+                let x: [f64; 3] = std::array::from_fn(|j| u8::from(i & (1 << j) != 0) as f64);
+                (
+                    (
+                        1.4 + 0.7 * x[0] - 0.4 * x[1] + 0.2 * x[2],
+                        20.0 + 5.0 * i as f64,
+                    ),
+                    Some(Context {
+                        values: x.map(Some),
+                        ..Context::default()
+                    }),
+                )
             })
-            .0,
-            0.0
+            .unzip();
+        let now = Instant::now();
+        let mut model = Model {
+            fit: Fit::learn(&samples, &contexts, 1),
+            ..Model::default()
+        };
+        let context = Context {
+            values: [Some(0.2), Some(0.7), Some(0.4)],
+            ..Context::default()
+        };
+        model.update(&context, 1.0, now);
+        let predictions: Vec<_> = [0.0, 0.25, 2.0, 20.0]
+            .into_iter()
+            .map(|seconds| {
+                let p = model.prediction(
+                    &context,
+                    1.0,
+                    now + Duration::from_secs_f64(seconds),
+                    true,
+                    125.0,
+                );
+                serde_json::json!({"elapsed":seconds,"prediction":p})
+            })
+            .collect();
+        assert_eq!(model.fit.support, [true; 3]);
+        println!(
+            "JOINT_GAIN_FIXTURE {}",
+            serde_json::json!({"fit":model.fit,"predictions":predictions})
+        );
+    }
+
+    #[test]
+    fn neutral_prior_and_signed_independent_weights() {
+        let (mut samples, contexts) = data(0.0);
+        for sample in &mut samples {
+            sample.0 = 1.0;
+        }
+        let fit = Fit::learn(&samples, &contexts, 1);
+        for (actual, prior) in fit.coefficients.into_iter().zip([1.0, 0.0, 0.0, 0.0]) {
+            assert!((actual - prior).abs() < 1e-10);
+        }
+        assert_eq!(Fit::default().coefficients, [1.0, 0.0, 0.0, 0.0]);
+        let (samples, contexts) = data(100.0);
+        let fit = Fit::learn(&samples, &contexts, 1);
+        assert_eq!(fit.beta[0], 2.0);
+    }
+
+    fn supported_model(now: Instant, target: [f64; 4]) -> (Model, Context) {
+        let context = Context {
+            values: [Some(1.0); 3],
+            ..Context::default()
+        };
+        let mut model = Model {
+            fit: Fit {
+                coefficients: target,
+                support: [true; 3],
+                minimum: [0.0; 3],
+                maximum: [1.0; 3],
+                ..Fit::default()
+            },
+            ..Model::default()
+        };
+        model.update(&context, 1.0, now);
+        (model, context)
+    }
+
+    #[test]
+    fn coefficient_and_combined_motion_are_bounded_for_all_current_inputs() {
+        let now = Instant::now();
+        let (mut model, context) = supported_model(now, [3.0, 2.0, -2.0, 1.0]);
+        let later = now + Duration::from_millis(100);
+        let p = model.prediction(&context, 1.0, later, true, 100.0);
+        let distance: f64 = p
+            .applied_coefficients
+            .iter()
+            .zip([1.0, 0.0, 0.0, 0.0])
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!((distance - 0.05).abs() < 1e-10);
+        for mask in 0..8 {
+            let c = Context {
+                values: std::array::from_fn(|j| Some(f64::from(mask & (1 << j) != 0))),
+                ..context
+            };
+            let p = model.prediction(&c, 1.0, later, true, 100.0);
+            assert!((p.gain - 1.0).abs() <= 0.05 + 1e-10);
+        }
+        let before = p.applied_coefficients;
+        model.fit.coefficients = [0.1, -2.0, 2.0, -1.0];
+        model.update(&context, 1.0, later);
+        assert_eq!(
+            model
+                .prediction(&context, 1.0, later, true, 100.0)
+                .applied_coefficients,
+            before
+        );
+        let after = model.prediction(
+            &context,
+            1.0,
+            later + Duration::from_millis(100),
+            true,
+            100.0,
+        );
+        let distance: f64 = after
+            .applied_coefficients
+            .iter()
+            .zip(before)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(distance <= 0.05 + 1e-10);
+    }
+
+    #[test]
+    fn bounded_context_has_exact_signed_seconds_decomposition_and_responsive_queue() {
+        let now = Instant::now();
+        for target in [[2.0, 2.0, -0.25, 1.0], [0.1, -2.0, 0.25, -1.0]] {
+            let (model, context) = supported_model(now, target);
+            let p = model.prediction(&context, 1.0, now + Duration::from_secs(100), true, 100.0);
+            assert!((p.contribution_seconds.iter().sum::<f64>() - p.gain * 100.0).abs() < 1e-10);
+            let shift = p.gain - p.applied_coefficients[0];
+            assert!(shift.abs() <= MAX_SHIFT + 1e-10 && p.gain >= 0.0);
+            assert!(p.contribution_seconds[1] * target[1] > 0.0);
+            assert!(p.contribution_seconds[2] * target[2] > 0.0);
+            let doubled =
+                model.prediction(&context, 1.0, now + Duration::from_secs(100), true, 200.0);
+            for (a, b) in doubled
+                .contribution_seconds
+                .iter()
+                .zip(p.contribution_seconds)
+            {
+                assert!((a - 2.0 * b).abs() < 1e-10);
+            }
+            let empty = model.prediction(&context, 1.0, now + Duration::from_secs(100), true, 0.0);
+            assert_eq!(empty.contribution_seconds, [0.0; 4]);
+        }
+    }
+
+    #[test]
+    fn missing_out_of_range_stale_or_changed_subset_never_reuses_joint_intercept() {
+        let now = Instant::now();
+        let (mut model, context) = supported_model(now, [3.0, 1.0, -1.0, 0.5]);
+        let later = now + Duration::from_secs(100);
+        for missing in [None, Some(f64::NAN), Some(1.1), Some(-0.1)] {
+            let mut c = context;
+            c.values[1] = missing;
+            let p = model.prediction(&c, 1.2, later, true, 100.0);
+            assert_eq!(p.gain, 1.2);
+            assert!(!p.contextual);
+            assert_eq!(p.applied_coefficients, [1.2, 0.0, 0.0, 0.0]);
+        }
+        assert_eq!(
+            model.prediction(&context, 1.2, later, false, 100.0).gain,
+            1.2
+        );
+        let mut partial = context;
+        partial.values[1] = None;
+        model.update(&partial, 1.2, later);
+        model.update(&context, 1.2, later + Duration::from_secs(100));
+        assert_eq!(
+            model
+                .prediction(&context, 1.2, later + Duration::from_secs(100), true, 100.0)
+                .gain,
+            1.2
+        );
+        model.fit.support[1] = false;
+        model.fit.coefficients[2] = 0.0;
+        model.update(&context, 1.4, later + Duration::from_secs(200));
+        assert_eq!(
+            model
+                .prediction(&context, 1.4, later + Duration::from_secs(200), true, 100.0)
+                .gain,
+            1.4
+        );
+        model.invalidate();
+        assert!(
+            !model
+                .prediction(&context, 1.0, later, true, 100.0)
+                .contextual
         );
     }
 }

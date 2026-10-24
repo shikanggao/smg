@@ -1297,7 +1297,6 @@ impl Entry {
         let ready = sample.prepared.capacity_learned_ready;
         let index = usize::from(ready);
         let context = self.feature_context(now, true);
-        let scalar_target = self.calibration.target(ready);
         let scalar_applied = self.calibration.stats(ready, now).0;
         let revision = self.calibration.history_revision[index];
         let model = &mut self.calibration.feature_models[index];
@@ -1306,10 +1305,9 @@ impl Entry {
                 &self.calibration.samples[index],
                 &self.calibration.feature_contexts[index],
                 revision,
-                scalar_target,
             );
         }
-        model.update(&context, scalar_target, scalar_applied, now);
+        model.update(&context, scalar_applied, now);
     }
 
     fn log_feature(
@@ -1336,10 +1334,10 @@ impl Entry {
         let index = usize::from(ready);
         let scalar = self.calibration.stats(ready, now).0;
         let model = &self.calibration.feature_models[index];
-        let prediction = model.prediction(&context, scalar, now, fresh && ready && scoped);
         let n = sample
             .prepared
             .queue_excess_seconds(self.total_dispatched.saturating_sub(sample.watermark));
+        let prediction = model.prediction(&context, scalar, now, fresh && ready && scoped, n);
         let extra = (n * prediction.gain)
             .is_finite()
             .then_some(n * prediction.gain);
@@ -1359,7 +1357,7 @@ impl Entry {
                 "prediction_available":usable,
                 "native_ready":ready,"fresh":fresh,"supported_path":scoped,"threshold_seconds":sample.threshold,
                 "poll_started_time_seconds":diagnostic_time(sample.started),"history_revision":self.calibration.history_revision[index],
-                "scalar_fit_sequence":self.calibration.fitted[index],"ridge":feature::RIDGE,"max_delta":0.5,"max_abs_coefficient":2.0}));
+                "scalar_fit_sequence":self.calibration.fitted[index],"ridge":feature::RIDGE,"max_delta":0.5,"max_abs_coefficient":2.0,"coefficient_order":["queue","kv","deadline_or_cutoff","rejection"],"neutral_prior":[1.0,0.0,0.0,0.0],"coefficient_movement_l1_per_second":0.5}));
     }
 
     fn recovery_forecast(
@@ -3218,9 +3216,26 @@ mod tests {
         );
         entry.update_feature_on_poll(config, now);
         assert!(entry.calibration.feature_models[1].fit.support[0]);
-        assert!(entry.calibration.feature_models[1].fit.beta[0].abs() < 1e-10);
+        assert!(entry.calibration.feature_models[1]
+            .fit
+            .coefficients
+            .iter()
+            .all(|v| v.is_finite()));
+        // Joint ridge is independent; it cannot mutate the scalar comparator.
+        assert_eq!(entry.calibration.target(true), 2.0);
         entry.calibration.rotate(now + Duration::from_secs(600));
         assert!(entry.calibration.feature_contexts[1].is_empty());
+        assert!(
+            !entry.calibration.feature_models[1]
+                .prediction(
+                    &forecast.feature_context.unwrap(),
+                    1.0,
+                    now + Duration::from_secs(600),
+                    true,
+                    10.0
+                )
+                .contextual
+        );
     }
     #[test]
     fn feature_kv_missing_duplicate_ranks_and_profile_order() {
