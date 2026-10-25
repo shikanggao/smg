@@ -8,16 +8,25 @@ import math
 from pathlib import Path
 try:
     from . import wait_decision_calibration as d
+    from . import wait_decision_direct as direct
+    from . import wait_decision_direct_unpenalized as unpenalized
     from .replay_wait_joint_gains import close, read_events, require, sha
 except ImportError:
     import wait_decision_calibration as d
+    import wait_decision_direct as direct
+    import wait_decision_direct_unpenalized as unpenalized
     from replay_wait_joint_gains import close, read_events, require, sha
 
 EVENTS = {'decision_native_poll','decision_poll','decision_forecast','decision_admission','decision_label','decision_terminal'}
 
 
-def payload(e):
-    require(e.get('decision_method') == d.METHOD, 'Wrong or missing decision method')
+def implementation(method):
+    require(method in (d.METHOD, direct.METHOD, unpenalized.METHOD), 'Unsupported required decision method')
+    return unpenalized if method == unpenalized.METHOD else direct if method == direct.METHOD else d
+
+
+def payload(e, method=d.METHOD):
+    require(e.get('decision_method') == method, 'Wrong or missing decision method')
     p=json.loads(e['decision_json'])
     require(isinstance(p,dict),'Decision payload is not an object')
     return p
@@ -29,8 +38,8 @@ def audit_schema(events, expected=d.METHOD):
         if e.get('event') not in EVENTS:continue
         counts[e['event']]+=1
         try:
-            require(expected==d.METHOD,'Unsupported required decision method')
-            p=payload(e);kind=e['event']
+            implementation(expected)
+            p=payload(e,expected);kind=e['event']
             required={'decision_native_poll':('expected_rank_count','ranks'),'decision_poll':('snapshot','predictions','state','fresh','profile','max_gap','available'),
                       'decision_forecast':('snapshot','predictions','available'),
                       'decision_admission':('id','tracked','started','snapshot','predictions'),
@@ -38,23 +47,31 @@ def audit_schema(events, expected=d.METHOD):
             require(all(k in p for k in required),'Incomplete '+kind+' schema')
             if kind=='decision_poll':
                 require(isinstance(p['state'],dict) and all(k in p['state'] for k in d.State().diagnostics()),'Missing decision state')
+                if expected == unpenalized.METHOD:
+                    require(p['state'].get('coefficient_ridge') == unpenalized.COEFFICIENT_RIDGE, 'Missing or invalid slope-only ridge diagnostics')
             if 'predictions' in p and p['predictions'] is not None:
                 require([v['arm'] for v in p['predictions']]==list(d.ARMS),'Missing/reordered shadow arms')
                 require(all(type(v['available']) is bool for v in p['predictions']),'Invalid availability')
+                if expected in (direct.METHOD, unpenalized.METHOD):
+                    require(all(type(v.get('scalar_fallback')) is bool and v.get('source_arm') in (*d.ARMS,'live_n_scalar') for v in p['predictions']), 'Missing or invalid direct fallback diagnostics')
+                    require(all(v['scalar_fallback']==(v['source_arm']=='live_n_scalar') for v in p['predictions']), 'Inconsistent direct fallback source')
         except (ValueError,KeyError,TypeError) as exc:errors.append(str(exc))
     if not counts['decision_poll']:errors.append('No decision poll method proof')
     return dict(ok=not errors,method=expected,counts=dict(counts),errors=errors[:20])
 
 
-def verify_snapshot(s, state, max_gap, selected=None):
+def verify_snapshot(s, state, max_gap, selected=None, method=d.METHOD):
     if state.profile is not None:
         require(s['profile']==state.profile,'Snapshot profile differs from initialized state')
     else:
         require(not state.rows and all(m.anchor==d.PRIOR and m.target==d.PRIOR for m in state.models),'Nonneutral state lacks a profile')
-    require(s['source'] in ('live_n_scalar','original_n_scalar_fallback'),'Unknown base source')
-    live=s['live_queue_extra']
-    close(s['x'],s['scalar_gain']*(live if live is not None else s['original_queue_extra']),'original X')
-    require((live is not None)==(s['source']=='live_n_scalar'),'Incorrect fallback source')
+    implementation(method)
+    direct_basis = method in (direct.METHOD, unpenalized.METHOD)
+    sources = ('live_n','original_n_fallback') if direct_basis else ('live_n_scalar','original_n_scalar_fallback')
+    require(s['source'] in sources,'Unknown base source')
+    live=s['live_queue_extra'];base=live if live is not None else s['original_queue_extra']
+    close(s['x'],base if direct_basis else s['scalar_gain']*base,'original X')
+    require((live is not None)==(s['source']==sources[0]),'Incorrect fallback source')
     require(s['fresh']==(max(0.,s['at']-s['poll_started'])<=max_gap),'Freshness not clock-derived')
     eligible=s['fresh'] and s['native_ready'] and s['native_waiting']>0 and math.isfinite(s['baseline']) and math.isfinite(s['x']) and s['x']>=.001
     require(s['eligible']==eligible,'Eligibility mismatch')
@@ -124,17 +141,18 @@ def verify_recovery_input(snapshot, proof, max_gap, source_poll):
     close(snapshot['live_queue_extra'],live,'Live-N source binding')
 
 
-def replay(events):
+def replay(events, method=d.METHOD):
+    engine=implementation(method)
     states={};epochs={};selected={};gaps={};native={};profiles={};recovery={};pending_recovery={};counts=Counter();rows=[];labels=[];pending_labels={};admissions={}
     def state(e):
         worker=e['worker'];epoch=e['calibration_epoch']
-        if worker not in states:states[worker]=d.State();epochs[worker]=epoch
+        if worker not in states:states[worker]=engine.State();epochs[worker]=epoch
         require(epochs[worker]==epoch,'Decision epoch changed without reset')
         return states[worker]
     for index,e in enumerate(events):
         kind=e.get('event');worker=e.get('worker')
         if kind=='calibration_reset':
-            states[worker]=d.State();epochs[worker]=e['calibration_epoch'];counts['resets']+=1
+            states[worker]=engine.State();epochs[worker]=e['calibration_epoch'];counts['resets']+=1
             for key in [key for key in selected if key[0]==worker]:selected.pop(key)
             profiles.pop(worker,None);recovery.pop(worker,None)
             continue
@@ -154,7 +172,7 @@ def replay(events):
             if worker in native:
                 recovery[worker]=(e,native[worker][0]['poll_started_time_seconds'])
         if kind not in EVENTS:continue
-        p=payload(e);s=state(e);now=e['diagnostic_time_seconds'];counts[kind]+=1
+        p=payload(e,method);s=state(e);now=e['diagnostic_time_seconds'];counts[kind]+=1
         if kind=='decision_native_poll':native[worker]=(e,p)
         if kind=='decision_poll':
             require(worker in native,'Missing exact native evidence')
@@ -166,7 +184,7 @@ def replay(events):
             gaps[worker]=p['max_gap'];s.poll(now,p['profile'],p['fresh'],p['max_gap'])
             close(s.diagnostics(),p['state'],'poll state')
         if kind in ('decision_poll','decision_forecast') and p['snapshot'] is not None:
-            verify_snapshot(p['snapshot'],s,p['max_gap'])
+            verify_snapshot(p['snapshot'],s,p['max_gap'],method=method)
             bind_native_profile(profiles,worker,p['snapshot']['profile'],native[worker][1])
             pending_recovery[(worker,kind,e.get('request_id',''))]=(p['snapshot'],p['max_gap'],native[worker][0]['poll_started_time_seconds'])
             if kind=='decision_forecast':
@@ -178,7 +196,7 @@ def replay(events):
             require(key in selected or p['snapshot'] is None,'No selected calibration snapshot')
             if p['snapshot'] is not None:
                 saved,source,source_native,source_recovery=selected.pop(key)
-                verify_snapshot(p['snapshot'],saved,gaps[worker],source)
+                verify_snapshot(p['snapshot'],saved,gaps[worker],source,method=method)
                 require(source_native is not None,'Missing selected native provenance')
                 verify_native(p['snapshot'],*source_native,gaps[worker])
                 bind_native_profile(profiles,worker,p['snapshot']['profile'],source_native[1])
@@ -231,10 +249,11 @@ def replay(events):
             require(admission['request_id'] in first,'Exact label lacks first-text proof')
             close(first[admission['request_id']]['ttft_seconds'],label['elapsed'],'first text elapsed')
     require(counts['decision_poll'] and counts['decision_admission'],'Incomplete decision capture')
-    return dict(ok=True,method=d.METHOD,counts=dict(counts),admissions=rows,labels=labels)
+    return dict(ok=True,method=method,counts=dict(counts),admissions=rows,labels=labels)
 
 
-def score_admissions(admissions, paired, capture_name, model):
+def score_admissions(admissions, paired, capture_name, model, method=d.METHOD):
+    implementation(method)
     try:
         from .wait_decision_selection import compare,score
     except ImportError:
@@ -254,10 +273,11 @@ def score_admissions(admissions, paired, capture_name, model):
         require(type(threshold) in (int,float) and math.isfinite(threshold),'Missing recorded EXTRA threshold')
         fallback=p.get('pre_admission_recorded_extra_flags',{}).get('calibrated')
         require(type(fallback) in (bool,type(None)),'Invalid scalar fallback')
-        predictions={'live_n_scalar':snapshot['x']>=threshold if available else fallback}
+        baseline_extra=snapshot['x']*(snapshot['scalar_gain'] if method in (direct.METHOD, unpenalized.METHOD) else 1.) if snapshot else None
+        predictions={'live_n_scalar':baseline_extra>=threshold if available else fallback}
         predictions.update({v['arm']:v['extra']>=threshold if v['available'] else fallback for v in candidates})
         fallback_total=p.get('pre_admission_total_ttft_predictions',{}).get('calibrated')
-        totals={'live_n_scalar':snapshot['baseline']+snapshot['x'] if available else fallback_total}
+        totals={'live_n_scalar':snapshot['baseline']+baseline_extra if available else fallback_total}
         totals.update({v['arm']:v['total'] if v['available'] else fallback_total for v in candidates})
         for arm in d.ARMS:totals.setdefault(arm,fallback_total)
         for arm in d.ARMS:predictions.setdefault(arm,fallback)
@@ -294,8 +314,12 @@ def main():
     bindings={}
     for name,digest in capture['result_files'].items():
         path=(root/name).resolve();require(path.is_relative_to(root),'Result path escaped root');require(sha(path)==digest,'Source hash mismatch: '+name);bindings[name]=digest
-    events=read_events(args.router);schema=audit_schema(events);require(schema['ok'],str(schema))
-    result=replay(events);require(result==replay(events),'Replay nondeterministic')
+    events=read_events(args.router)
+    methods={e.get('decision_method') for e in events if e.get('event') in EVENTS}
+    require(len(methods)==1,'Mixed or missing decision methods')
+    method=methods.pop();engine=implementation(method)
+    schema=audit_schema(events,method);require(schema['ok'],str(schema))
+    result=replay(events,method);require(result==replay(events,method),'Replay nondeterministic')
     paired=[json.loads(line) for line in (root/'paired-production.jsonl').read_text().splitlines()]
     try:
         from . import wait_feature_context,wait_feature_deadline
@@ -303,14 +327,14 @@ def main():
         import wait_feature_context,wait_feature_deadline
     audits=dict(activity=wait_feature_context.audit_activity(events,paired),deadlines=wait_feature_deadline.audit_deadlines(events,paired))
     require(all(v['ok'] for v in audits.values()),'Independent terminal/deadline audit failed')
-    result['admissions'],evaluation=score_admissions(result['admissions'],paired,root.name,root.parent.name)
+    result['admissions'],evaluation=score_admissions(result['admissions'],paired,root.name,root.parent.name,method)
     result.update(evaluation=evaluation,audits=audits)
     require(sha(args.state)==state_digest and all(sha(root/name)==digest for name,digest in bindings.items()),'Source changed during audit')
     args.out.mkdir(parents=True)
     for key in ('admissions','labels'):
         (args.out/(key+'.jsonl')).write_text(''.join(json.dumps(r,sort_keys=True)+'\n' for r in result.pop(key)))
     result.update(schema=schema,deterministic_repeat_equal=True,source_state=str(args.state),source_state_sha256=state_digest,source_files=bindings,
-                  source_router=str(args.router),helper_sha256=sha(__file__),math_sha256=sha(d.__file__),
+                  source_router=str(args.router),helper_sha256=sha(__file__),math_sha256=sha(d.__file__),method_module_sha256=sha(engine.__file__),
                   limitations=['Native per-rank rate provenance, completeness, interval and normalization are audited; monitor counter derivatives are separately unit-tested.','Opaque native profile hashes are checked for signature consistency, not reimplemented with Python hashing.',
                                 'Recovery rate/window eligibility is a separately recorded prerequisite; selected live-N arithmetic, same-poll debt and clock freshness are independently bound.',
                                 'Capture closure and restoration are host-owner gates in addition to hash/results_valid checks.'])

@@ -154,5 +154,5 @@
   "expected_feature_method": "feature_joint_gains_deadline_ridge_v3",
   "expected_feature_deadline_seconds": 300,
   "decision_calibration_required": true,
-  "expected_decision_method": "decision_live_scalar_early_hinge_v1"
+  "expected_decision_method": "decision_live_queue_slope_ridge_hinge_v3"
 }

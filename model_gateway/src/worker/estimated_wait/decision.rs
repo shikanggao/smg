@@ -1,8 +1,13 @@
 //! Decision-focused shadow ablations. These predictions never affect admission.
-//! Exact labels and right-censored lower bounds share a regularized objective;
+//! Exact labels and right-censored lower bounds share a slope-regularized objective;
 //! a lower bound is never treated as a measured TTFT or rounded to a deadline.
 //!
-//! X = existing scalar gain * live N (original N fallback); T = B + X*(q+a·z).
+//! X = uncalibrated live N (original N fallback), independent of legacy scalar.
+//! The ideal single-layer expression is T = B + X*max(0, q+a·z); the deployed
+//! expression is B + X*max(0, q+clamp(a·z, -0.5, 0.5)). q is bounded to [0,4]
+//! and each feature coefficient to [-2,2], with the existing L1 trajectory cap.
+//! Only contextual slopes receive ridge regularization. Penalizing q toward1
+//! biases even an exact, noiseless queue-only fit away from its observed gain.
 //! z contains pending growth over30s, oldest pending age/300, and timely native
 //! progress deficit. The declared [0,1] domain permits bounded extrapolation;
 //! diagnostics distinguish predictions outside the observed training ranges.
@@ -12,11 +17,15 @@
 //! Fits run on poll only when labels/retention change. Fresh polls after a gap
 //! may reuse age-valid rows, but restart the trajectory and growth history.
 //! All history is shadow-only and independently reset with the worker epoch.
+//! Unsupported/unavailable models retain the legacy scalar*X fallback. Its
+//! exported coefficients are effective output weights, not learned weights;
+//! the scalar can exceed the fitted q cap and fallback transitions are not
+//! constrained by the learned trajectory. Learned vectors remain in diagnostics.
 use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
 
-pub(super) const METHOD: &str = "decision_live_scalar_early_hinge_v1";
+pub(super) const METHOD: &str = "decision_live_queue_slope_ridge_hinge_v3";
 const PRIOR: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
 const RIDGE: f64 = 0.1;
 const MIN_X: f64 = 0.001;
@@ -185,6 +194,8 @@ impl Fit {
             if !support {
                 continue;
             }
+            // RIDGE remains the largest diagonal penalty (on slopes), so this
+            // conservative Lipschitz bound is safe with an unpenalized intercept.
             let step = 1.0
                 / (RIDGE
                     + selected
@@ -194,7 +205,7 @@ impl Fit {
                         .sum::<f64>());
             let gradient = |theta: [f64; 4]| {
                 let mut grad = theta.map(|_| 0.0);
-                for j in 0..4 {
+                for j in 1..4 {
                     grad[j] = RIDGE * (theta[j] - PRIOR[j]);
                 }
                 for ((r, z), w) in selected.iter().zip(&weights) {
@@ -219,7 +230,7 @@ impl Fit {
                 .fold(0.0, f64::max);
             let objective = 0.5
                 * RIDGE
-                * (0..4)
+                * (1..4)
                     .map(|j| (coefficients[j] - PRIOR[j]).powi(2))
                     .sum::<f64>()
                 + 0.5
@@ -245,7 +256,7 @@ impl Fit {
                     .sum::<f64>()
                 + 0.5
                     * RIDGE
-                    * (0..4)
+                    * (1..4)
                         .map(|j| (coefficients[j] - PRIOR[j]).powi(2))
                         .sum::<f64>();
             let training_clipped_count = selected
@@ -319,6 +330,7 @@ impl Model {
 pub(super) struct Prediction {
     pub arm: &'static str,
     pub source_arm: &'static str,
+    pub scalar_fallback: bool,
     pub coefficients: [f64; 4],
     pub contributions: [f64; 4],
     pub extra: f64,
@@ -551,6 +563,24 @@ impl State {
                 i
             };
             let model = &self.models[index];
+            if !available || !model.fit.supported {
+                let unbounded_extra = snapshot.x * snapshot.scalar_gain;
+                let extra = unbounded_extra.max(0.0);
+                return Prediction {
+                    arm: ARMS[i],
+                    source_arm: "live_n_scalar",
+                    scalar_fallback: true,
+                    coefficients: [snapshot.scalar_gain, 0.0, 0.0, 0.0],
+                    contributions: [extra, 0.0, 0.0, 0.0],
+                    extra,
+                    total: snapshot.baseline + extra,
+                    supported: false,
+                    within_fitted_ranges: true,
+                    available: available && unbounded_extra.is_finite(),
+                    unbounded_extra,
+                    contextual_clip_applied: false,
+                };
+            }
             let z = vector(snapshot.context, model.fit.mask).unwrap_or(PRIOR);
             let coefficients = model.applied(now);
             let mut contributions = std::array::from_fn(|j| snapshot.x * coefficients[j] * z[j]);
@@ -569,6 +599,7 @@ impl State {
             Prediction {
                 arm: ARMS[i],
                 source_arm: ARMS[index],
+                scalar_fallback: false,
                 coefficients,
                 contributions,
                 extra,
@@ -584,6 +615,7 @@ impl State {
     pub fn diagnostics(&self) -> serde_json::Value {
         serde_json::json!({"models":self.models,"rows":self.rows.len(),"origin":self.origin,"profile":self.profile,
             "revision":self.revision,"fitted_revision":self.fitted_revision,"pending":self.pending.len(),"complete":!self.incomplete,"ridge":RIDGE,"min_x_seconds":MIN_X,
+            "coefficient_ridge":[0.0,RIDGE,RIDGE,RIDGE],
             "iterations":256,"coefficient_l1_per_second":0.5,"contextual_gain_cap":0.5,"domain":[0.0,1.0]})
     }
 }
@@ -597,7 +629,7 @@ mod tests {
             profile: 7,
             baseline: 2.0,
             x: 100.0,
-            source: "live_n_scalar",
+            source: "live_n",
             original_queue_extra: 100.0,
             live_queue_extra: Some(100.0),
             scalar_gain: 1.0,
@@ -665,6 +697,148 @@ mod tests {
         let fit = Fit::learn(&rows, false, true);
         assert!(fit.coefficients[0] > 1.8);
         assert_eq!(Fit::learn(&VecDeque::new(), true, true).coefficients, PRIOR);
+    }
+    #[test]
+    fn noiseless_queue_gain_has_no_shrinkage_above_or_below_one() {
+        let mut fixtures = Vec::new();
+        for gain in [0.5, 2.0] {
+            let mut rows = labels();
+            for row in &mut rows {
+                row.exact = true;
+                row.elapsed = row.snapshot.baseline + gain * row.snapshot.x;
+            }
+            let fit = Fit::learn(&rows, false, false);
+            assert!(fit.supported);
+            assert!((fit.coefficients[0] - gain).abs() < 1e-12);
+            assert_eq!(&fit.coefficients[1..], &[0.0; 3]);
+            assert!(fit.objective < 1e-20);
+            assert!(fit.projected_gradient < 1e-12);
+            fixtures.push(serde_json::json!({"name":"exact_queue","gain":gain,"rows":rows,"early":false,"censored":false,"fit":fit}));
+        }
+        println!(
+            "UNPENALIZED_QUEUE_FIXTURE={}",
+            serde_json::json!({"cases":fixtures})
+        );
+    }
+    #[test]
+    fn bound_only_queue_fit_respects_one_sided_identifiability_and_cap() {
+        let mut fixtures = Vec::new();
+        for (bound, expected_gain) in [(0.5, 1.0), (2.0, 2.0), (5.0, 4.0)] {
+            let mut rows = labels();
+            for row in &mut rows {
+                row.exact = false;
+                row.elapsed = row.snapshot.baseline + bound * row.snapshot.x;
+            }
+            let fit = Fit::learn(&rows, false, true);
+            assert!(fit.supported);
+            assert_eq!(fit.exact_count, 0);
+            assert_eq!(fit.bound_count, rows.len());
+            assert!((fit.coefficients[0] - expected_gain).abs() < 1e-12);
+            assert!(fit.projected_gradient < 1e-12);
+            assert!(!Fit::learn(&rows, false, false).supported);
+            if bound < 4.0 {
+                assert!(fit.objective < 1e-20);
+            } else {
+                assert!((fit.objective - 0.5).abs() < 1e-12);
+            }
+            // A lower bound below the prior does not identify a smaller point
+            // prediction. Feasible q>=bound has zero loss, so initialization1 stays.
+            fixtures.push(serde_json::json!({"name":"bound_queue","bound":bound,"rows":rows,"early":false,"censored":true,"fit":fit}));
+            rows.truncate(11);
+            assert!(!Fit::learn(&rows, false, true).supported);
+        }
+        println!(
+            "BOUND_QUEUE_FIXTURE={}",
+            serde_json::json!({"cases":fixtures})
+        );
+    }
+    #[test]
+    fn contextual_slopes_still_have_ridge_and_intercept_has_zero_mean_residual() {
+        for slope in [-0.3, 0.3] {
+            let mut rows = labels();
+            for (i, row) in rows.iter_mut().enumerate() {
+                let age = i as f64 / 31.0;
+                row.exact = true;
+                row.snapshot.context.values = [None, Some(age), None];
+                row.elapsed = row.snapshot.baseline + row.snapshot.x * (2.0 + slope * age);
+            }
+            let fit = Fit::learn(&rows, true, false);
+            let variance = (0..32)
+                .map(|i| (i as f64 / 31.0 - 0.5).powi(2))
+                .sum::<f64>()
+                / 32.0;
+            let expected_slope = slope * variance / (variance + RIDGE);
+            let expected_intercept = 2.0 + (slope - expected_slope) * 0.5;
+            assert_eq!(fit.mask, 2);
+            assert!((fit.coefficients[2] - expected_slope).abs() < 1e-10);
+            assert!((fit.coefficients[0] - expected_intercept).abs() < 1e-10);
+            assert!(fit.coefficients[2].abs() < slope.abs());
+            assert_eq!(fit.training_clipped_count, 0);
+            assert!((fit.objective - fit.bounded_training_objective).abs() < 1e-12);
+        }
+    }
+    #[test]
+    fn single_layer_fit_and_supported_predictions_ignore_legacy_scalar() {
+        let mut a = state();
+        a.rows = labels();
+        let mut b = state();
+        b.rows = a.rows.clone();
+        for (i, row) in b.rows.iter_mut().enumerate() {
+            row.snapshot.scalar_gain = if i % 2 == 0 { 0.2 } else { 6.0 };
+        }
+        for s in [&mut a, &mut b] {
+            s.revision += 1;
+            s.poll(1.0, Some(7), true, 5.0);
+        }
+        assert_eq!(a.diagnostics(), b.diagnostics());
+        let mut low = snapshot(1.0, [Some(0.5), Some(0.5), None]);
+        low.scalar_gain = 0.2;
+        let mut high = low;
+        high.scalar_gain = 6.0;
+        let before = a.predictions(low, 4.0, true);
+        let after = b.predictions(high, 4.0, true);
+        assert!(before.iter().all(|p| p.supported && !p.scalar_fallback));
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        for p in before {
+            let shift = p.coefficients[1] * 0.5 + p.coefficients[2] * 0.5;
+            let expected = low.x * (p.coefficients[0] + shift.clamp(-0.5, 0.5)).max(0.0);
+            assert!((p.extra - expected).abs() < 1e-10);
+        }
+    }
+    #[test]
+    fn unsupported_and_unavailable_outputs_explicitly_preserve_scalar_fallback() {
+        let mut s = state();
+        let mut snap = snapshot(1.0, [Some(0.5), Some(0.5), None]);
+        // Legacy fallback may exceed the learned intercept cap; it is not fitted.
+        snap.scalar_gain = 6.0;
+        for p in s.predictions(snap, 1.0, true) {
+            assert!(p.scalar_fallback && p.available && !p.supported);
+            assert_eq!(p.source_arm, "live_n_scalar");
+            assert_eq!(p.coefficients, [6.0, 0.0, 0.0, 0.0]);
+            assert_eq!(p.contributions, [600.0, 0.0, 0.0, 0.0]);
+            assert_eq!(p.total, 602.0);
+        }
+        s.rows = labels();
+        s.origin = Some(20.0);
+        s.revision += 1;
+        s.poll(21.0, Some(7), true, 30.0);
+        assert!(s
+            .predictions(snap, 24.0, true)
+            .iter()
+            .all(|p| !p.scalar_fallback));
+        for p in s.predictions(snap, 24.0, false) {
+            assert!(p.scalar_fallback && !p.available && !p.supported);
+            assert_eq!(p.extra, 600.0);
+            assert_eq!(p.extra, p.contributions.iter().sum::<f64>());
+        }
+        s.poll(600.0, Some(7), true, 5.0);
+        assert!(s
+            .predictions(snap, 600.0, true)
+            .iter()
+            .all(|p| p.scalar_fallback));
     }
     #[test]
     fn lower_bound_upgrade_preserves_age_position_and_weight() {
@@ -788,6 +962,7 @@ mod tests {
         let pred = s.predictions(snapshot(1.0, [None, Some(0.5), None]), 10.0, true);
         assert_eq!(pred[3].source_arm, "bound_queue");
         assert_eq!(pred[3].coefficients, pred[2].coefficients);
+        assert!(!pred[3].scalar_fallback);
         // Declared [0,1] domain permits bounded extrapolation, with explicit evidence.
         for r in &mut s.rows {
             r.snapshot.context.values[0] = r.snapshot.context.values[0].map(|x| x * 0.5);
@@ -820,7 +995,8 @@ mod tests {
         for i in 0..32 {
             let g = (i % 4) as f64 / 3.0;
             let a = (i / 4) as f64 / 7.0;
-            let snap = snapshot(0.0, [Some(g * 0.5), Some(a), None]);
+            let mut snap = snapshot(0.0, [Some(g * 0.5), Some(a), None]);
+            snap.scalar_gain = if i % 2 == 0 { 0.2 } else { 6.0 };
             s.register(Some(i), 0.0, Some(snap));
             actions.push(serde_json::json!({"op":"register","id":i,"started":0.0,"snapshot":snap}));
             outcomes.push((102.0 + 100.0 * (0.8 * g - 0.4 * a), i));
@@ -836,6 +1012,7 @@ mod tests {
                 s.poll(now, Some(7), true, 40.0);
             }
             let mut snap = snapshot(now, [Some(1.0), Some(0.5), None]);
+            snap.scalar_gain = 2.0;
             snap.context = s.context(now, Some(0.0), Some(100.0), true);
             actions.push(serde_json::json!({"op":if now==200.4{"predict"}else{"poll"},"now":now,"profile":7,"fresh":true,"max_gap":40.0,
                 "snapshot":snap,"predictions":s.predictions(snap,now,true),"state":s.diagnostics()}));
@@ -851,7 +1028,8 @@ mod tests {
             (601.0, 8, true),
         ] {
             s.poll(now, Some(profile), fresh, 40.0);
-            let snap = snapshot(now, [Some(1.0), Some(0.5), None]);
+            let mut snap = snapshot(now, [Some(1.0), Some(0.5), None]);
+            snap.scalar_gain = 6.0;
             actions.push(serde_json::json!({"op":"poll","now":now,"profile":profile,"fresh":fresh,"max_gap":40.0,"snapshot":snap,
                 "predictions":s.predictions(snap,now,fresh),"state":s.diagnostics()}));
         }

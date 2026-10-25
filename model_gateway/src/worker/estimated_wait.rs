@@ -1452,13 +1452,12 @@ impl Entry {
             .0;
         let original = sample
             .prepared
-            .queue_excess_seconds(self.total_dispatched.saturating_sub(sample.watermark))
-            * scalar;
+            .queue_excess_seconds(self.total_dispatched.saturating_sub(sample.watermark));
         let live = self
             .recovery_forecast(config, now)
             .filter(|r| r.available)
             .map(|r| r.queue_extra);
-        let x = live.map(|n| n * scalar).unwrap_or(original);
+        let x = live.unwrap_or(original);
         let context = self.decision.context(
             diagnostic_time(now),
             sample.prepared.timely_progress.filter(|_| fresh),
@@ -1475,14 +1474,12 @@ impl Entry {
             baseline,
             x,
             source: if live.is_some() {
-                "live_n_scalar"
+                "live_n"
             } else {
-                "original_n_scalar_fallback"
+                "original_n_fallback"
             },
             context,
-            original_queue_extra: sample
-                .prepared
-                .queue_excess_seconds(self.total_dispatched.saturating_sub(sample.watermark)),
+            original_queue_extra: original,
             live_queue_extra: live,
             scalar_gain: scalar,
             fresh,
@@ -3562,6 +3559,48 @@ mod tests {
                 .context(saved.time_seconds, None, None, false)
                 .complete
         );
+    }
+
+    #[test]
+    fn decision_snapshot_uses_uncalibrated_n_while_legacy_comparator_keeps_scalar() {
+        let (registry, worker) = recovery_registry(true);
+        let admission = registry.estimated_wait();
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        let now = Instant::now();
+        let ready = entry
+            .sample
+            .as_ref()
+            .unwrap()
+            .prepared
+            .capacity_learned_ready;
+        let overloaded = entry.sample.as_ref().unwrap().overloaded;
+        for scalar in [0.2, 2.0, 6.0] {
+            entry.calibration.trajectories[usize::from(ready)] = ScaleTrajectory {
+                anchor_scale: scalar,
+                target_scale: scalar,
+                anchor_time: now,
+            };
+            let snapshot = entry.decision_snapshot(admission.config(), now).unwrap();
+            let comparator = entry.recovery_forecast(admission.config(), now).unwrap();
+            assert!(comparator.available);
+            assert_eq!(snapshot.source, "live_n");
+            assert_eq!(snapshot.x, 25.0);
+            assert_eq!(snapshot.scalar_gain, scalar);
+            assert_eq!(comparator.gain, scalar);
+            assert_eq!(
+                comparator.legacy_gain_total,
+                Some(snapshot.baseline + scalar * snapshot.x)
+            );
+            assert_eq!(entry.sample.as_ref().unwrap().overloaded, overloaded);
+        }
+        entry.recovery.reset("test_original_queue_fallback");
+        let snapshot = entry.decision_snapshot(admission.config(), now).unwrap();
+        assert_eq!(snapshot.source, "original_n_fallback");
+        assert_eq!(snapshot.live_queue_extra, None);
+        assert_eq!(snapshot.x, snapshot.original_queue_extra);
+        assert_eq!(snapshot.x, 1000.0);
+        assert_eq!(snapshot.scalar_gain, 6.0);
     }
 
     #[test]
