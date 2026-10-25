@@ -1,10 +1,10 @@
 """Validate the experimental feature-gain telemetry without inventing labels."""
+
 from __future__ import annotations
 
 import json
 import math
 from collections import Counter
-
 
 METHOD = "feature_context_ridge_v1"
 CURRENT_METHOD = "feature_context_deadline_ridge_v2"
@@ -13,21 +13,46 @@ DEADLINE_METHODS = frozenset({CURRENT_METHOD, JOINT_METHOD})
 METHODS = frozenset({METHOD, *DEADLINE_METHODS})
 FEATURES = ("kv_usage", "pretext_cutoff_rate", "actual_rejection_rate")
 CURRENT_FEATURES = ("kv_usage", "deadline_or_cutoff_rate", "actual_rejection_rate")
-COUNTS = ("first_text", "upstream_timeout", "pretext_downstream_disconnect",
-          "unknown_pretext_end", "admitted", "actual_rejected", "untracked_admitted")
-DEADLINE_COUNTS = ("deadline_timely_first_text", "deadline_breach",
-                   "deadline_or_cutoff_adverse", "deadline_or_cutoff_unknown")
-REQUEST_EVENTS = frozenset({"feature_context_forecast", "feature_context_feedback",
-                            "feature_outcome", "feature_outcome_ignored", "feature_admission_decision",
-                            "feature_deadline_started", "feature_deadline_resolution", "feature_deadline_ignored"})
+COUNTS = (
+    "first_text",
+    "upstream_timeout",
+    "pretext_downstream_disconnect",
+    "unknown_pretext_end",
+    "admitted",
+    "actual_rejected",
+    "untracked_admitted",
+)
+DEADLINE_COUNTS = (
+    "deadline_timely_first_text",
+    "deadline_breach",
+    "deadline_or_cutoff_adverse",
+    "deadline_or_cutoff_unknown",
+)
+REQUEST_EVENTS = frozenset(
+    {
+        "feature_context_forecast",
+        "feature_context_feedback",
+        "feature_outcome",
+        "feature_outcome_ignored",
+        "feature_admission_decision",
+        "feature_deadline_started",
+        "feature_deadline_resolution",
+        "feature_deadline_ignored",
+    }
+)
 
 
 def number(value, name, *, nullable=False, maximum=None):
     if value is None and nullable:
         return None
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(value) or value < 0
-            or maximum is not None and value > maximum):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+        or maximum is not None
+        and value > maximum
+    ):
         raise ValueError("Invalid feature number: " + name)
     return value
 
@@ -45,8 +70,12 @@ def boolean(value, name):
 
 
 def coefficient(value, name):
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(value) or abs(value) > 2):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or abs(value) > 2
+    ):
         raise ValueError("Invalid bounded feature coefficient: " + name)
     return value
 
@@ -86,10 +115,16 @@ def payload(event):
 def validate_context(context, method=None):
     integer(context["bucket_second"], "context.bucket_second")
     clock(context["activity_origin_time_seconds"], "activity origin")
-    values = vector(context["values"], "context.values",
-                    lambda v, n: number(v, n, nullable=True, maximum=1))
+    values = vector(
+        context["values"], "context.values", lambda v, n: number(v, n, nullable=True, maximum=1)
+    )
     if method is None:
-        method = CURRENT_METHOD if "deadline_untracked_pending" in context or any(k in context["counts"] for k in DEADLINE_COUNTS) else METHOD
+        method = (
+            CURRENT_METHOD
+            if "deadline_untracked_pending" in context
+            or any(k in context["counts"] for k in DEADLINE_COUNTS)
+            else METHOD
+        )
     if method not in METHODS:
         raise ValueError("Unknown feature context method")
     names = COUNTS + DEADLINE_COUNTS if method in DEADLINE_METHODS else COUNTS
@@ -97,7 +132,9 @@ def validate_context(context, method=None):
         raise ValueError("Unexpected feature counter schema")
     counts = {name: integer(context["counts"][name], name) for name in names}
     if method in DEADLINE_METHODS:
-        pending_unknown = integer(context["deadline_untracked_pending"], "deadline_untracked_pending")
+        pending_unknown = integer(
+            context["deadline_untracked_pending"], "deadline_untracked_pending"
+        )
         cutoff = counts["deadline_or_cutoff_adverse"]
         known = counts["deadline_timely_first_text"] + cutoff
         unknown = counts["deadline_or_cutoff_unknown"]
@@ -110,11 +147,19 @@ def validate_context(context, method=None):
         unknown = counts["unknown_pretext_end"]
     resolved = known + unknown
     attempts = counts["admitted"] + counts["actual_rejected"]
-    expected_cutoff = (cutoff / known if known >= 16 and not counts["untracked_admitted"]
-                       and not pending_unknown and unknown < .1 * resolved else None)
+    expected_cutoff = (
+        cutoff / known
+        if known >= 16
+        and not counts["untracked_admitted"]
+        and not pending_unknown
+        and unknown < 0.1 * resolved
+        else None
+    )
     expected_rejection = counts["actual_rejected"] / attempts if attempts >= 16 else None
-    for actual, expected, name in [(values[1], expected_cutoff, "cutoff rate/outcome coverage"),
-                                   (values[2], expected_rejection, "actual rejection rate/admission coverage")]:
+    for actual, expected, name in [
+        (values[1], expected_cutoff, "cutoff rate/outcome coverage"),
+        (values[2], expected_rejection, "actual rejection rate/admission coverage"),
+    ]:
         if actual is None or expected is None:
             if actual != expected:
                 raise ValueError("Feature rate availability mismatch: " + name)
@@ -127,12 +172,26 @@ def audit_method(events, expected):
     """Historical parsing support must not relax a fresh run's frozen method."""
     if expected not in METHODS:
         raise ValueError("Unknown expected feature method")
-    captured = [(i, e) for i, e in enumerate(events) if str(e.get("event", "")).startswith("feature_")]
-    errors = [dict(event_index=i, event_kind=e.get("event"), request_id=e.get("request_id"),
-                   captured_method=e.get("feature_method"), expected_method=expected)
-              for i, e in captured if e.get("feature_method") != expected]
-    return dict(ok=bool(captured) and not errors, expected_method=expected,
-                event_count=len(captured), errors=errors)
+    captured = [
+        (i, e) for i, e in enumerate(events) if str(e.get("event", "")).startswith("feature_")
+    ]
+    errors = [
+        dict(
+            event_index=i,
+            event_kind=e.get("event"),
+            request_id=e.get("request_id"),
+            captured_method=e.get("feature_method"),
+            expected_method=expected,
+        )
+        for i, e in captured
+        if e.get("feature_method") != expected
+    ]
+    return dict(
+        ok=bool(captured) and not errors,
+        expected_method=expected,
+        event_count=len(captured),
+        errors=errors,
+    )
 
 
 def forecast(event, *, gate=None, ttft_deadline_seconds=300):
@@ -158,7 +217,7 @@ def forecast(event, *, gate=None, ttft_deadline_seconds=300):
     for j in range(3):
         if support[j] and not minimum[j] <= mean[j] <= maximum[j]:
             raise ValueError("Feature mean lies outside retained support")
-        if support[j] and maximum[j] - minimum[j] < .05 - 1e-10:
+        if support[j] and maximum[j] - minimum[j] < 0.05 - 1e-10:
             raise ValueError("Supported feature lacks minimum range")
         if not support[j] and beta[j] != 0:
             raise ValueError("Unsupported feature has a non-neutral coefficient")
@@ -168,7 +227,11 @@ def forecast(event, *, gate=None, ttft_deadline_seconds=300):
     gain = number(prediction["gain"], "prediction.gain")
     target = number(prediction["target_gain"], "prediction.target_gain")
     contextual = boolean(prediction["contextual"], "prediction.contextual")
-    if prediction["reason"] not in {"snapshot_unavailable", "context_supported", "legacy_fallback_no_current_support"}:
+    if prediction["reason"] not in {
+        "snapshot_unavailable",
+        "context_supported",
+        "legacy_fallback_no_current_support",
+    }:
         raise ValueError("Unknown feature fallback reason")
     legacy = number(value["legacy_gain"], "legacy_gain")
     number(value["legacy_target_gain"], "legacy_target_gain")
@@ -181,15 +244,24 @@ def forecast(event, *, gate=None, ttft_deadline_seconds=300):
             raise ValueError("Unknown joint coefficient order")
         if value.get("neutral_prior") != [1, 0, 0, 0]:
             raise ValueError("Unknown joint neutral prior")
-        close(number(value.get("coefficient_movement_l1_per_second"), "joint movement rate"), .5, "joint movement rate")
+        close(
+            number(value.get("coefficient_movement_l1_per_second"), "joint movement rate"),
+            0.5,
+            "joint movement rate",
+        )
         try:
             from .wait_feature_joint import validate_prediction
         except ImportError:
             from wait_feature_joint import validate_prediction
-        validate_prediction(prediction, fit, context, legacy,
-                            clock(event["diagnostic_time_seconds"], "admission time"),
-                            fresh and ready and scoped,
-                            number(value["original_queue_excess_seconds"], "original N"))
+        validate_prediction(
+            prediction,
+            fit,
+            context,
+            legacy,
+            clock(event["diagnostic_time_seconds"], "admission time"),
+            fresh and ready and scoped,
+            number(value["original_queue_excess_seconds"], "original N"),
+        )
     elif contextual:
         if not (fresh and ready and scoped and any(active)):
             raise ValueError("Context trajectory active without usable support")
@@ -198,7 +270,7 @@ def forecast(event, *, gate=None, ttft_deadline_seconds=300):
         elapsed = clock(event["diagnostic_time_seconds"], "admission time") - anchor_time
         if not math.isfinite(elapsed) or elapsed < -1e-8:
             raise ValueError("Feature trajectory anchor follows admission")
-        change = min(abs(target - anchor), .5 * max(0, elapsed))
+        change = min(abs(target - anchor), 0.5 * max(0, elapsed))
         expected_gain = anchor + change if target >= anchor else anchor - change
         close(gain, expected_gain, "logged trajectory gain")
         if prediction["reason"] != "context_supported":
@@ -206,8 +278,10 @@ def forecast(event, *, gate=None, ttft_deadline_seconds=300):
     else:
         close(gain, legacy, "legacy fallback gain")
         close(target, legacy, "legacy fallback target")
-        if (prediction["trajectory_anchor_gain"] is not None
-                or prediction["trajectory_anchor_time_seconds"] is not None):
+        if (
+            prediction["trajectory_anchor_gain"] is not None
+            or prediction["trajectory_anchor_time_seconds"] is not None
+        ):
             raise ValueError("Legacy fallback contains a feature trajectory")
     n = number(value["original_queue_excess_seconds"], "original N")
     baseline = number(value["baseline_seconds"], "baseline", nullable=True)
@@ -234,35 +308,54 @@ def forecast(event, *, gate=None, ttft_deadline_seconds=300):
     usable = fresh and ready and scoped and extra is not None and total is not None
     if boolean(value["prediction_available"], "prediction_available") != usable:
         raise ValueError("Feature prediction availability differs from its inputs")
-    for name, expected in [("extra_would_reject", extra >= threshold if usable else None),
-                           ("total_would_reject", total >= threshold if usable else None)]:
+    for name, expected in [
+        ("extra_would_reject", extra >= threshold if usable else None),
+        ("total_would_reject", total >= threshold if usable else None),
+    ]:
         actual = value[name]
         if actual is not None:
             boolean(actual, name)
         if actual != expected:
             raise ValueError("Feature decision mismatch: " + name)
-    for name, expected in [("ridge", .1), ("max_delta", .5), ("max_abs_coefficient", 2)]:
+    for name, expected in [("ridge", 0.1), ("max_delta", 0.5), ("max_abs_coefficient", 2)]:
         close(number(value[name], name), expected, name)
     if gate is not None:
-        if event.get("request_id") != gate.get("request_id") or event.get("worker") != gate.get("worker"):
+        if event.get("request_id") != gate.get("request_id") or event.get("worker") != gate.get(
+            "worker"
+        ):
             raise ValueError("Feature forecast lacks the exact original request/worker")
         close(n, gate["calibration_input_excess_seconds"], "original admission N")
         close(legacy, gate["calibration_scale"], "original admission gain")
         close(threshold, gate["threshold_seconds"], "original admission threshold")
-        original_b = gate.get("calibration_baseline_seconds") if gate.get("calibration_baseline_available") else None
+        original_b = (
+            gate.get("calibration_baseline_seconds")
+            if gate.get("calibration_baseline_available")
+            else None
+        )
         if baseline is None or original_b is None:
             if baseline != original_b:
                 raise ValueError("Feature baseline availability differs from admission")
         else:
             close(baseline, original_b, "original admission baseline")
-    return dict(method=event["feature_method"], total_ttft_seconds=total, extra_seconds=extra,
-                total_ttft_over_deadline=None if total is None else total >= ttft_deadline_seconds,
-                recorded_extra_would_reject=value["extra_would_reject"],
-                recorded_total_would_reject=value["total_would_reject"],
-                contextual=contextual, active_features=active, supported_features=support,
-                feature_values=context, recent_counts=counts, reason=prediction["reason"],
-                native_ready=ready, fresh=fresh, supported_path=scoped,
-                prediction_available=usable, snapshot=value)
+    return dict(
+        method=event["feature_method"],
+        total_ttft_seconds=total,
+        extra_seconds=extra,
+        total_ttft_over_deadline=None if total is None else total >= ttft_deadline_seconds,
+        recorded_extra_would_reject=value["extra_would_reject"],
+        recorded_total_would_reject=value["total_would_reject"],
+        contextual=contextual,
+        active_features=active,
+        supported_features=support,
+        feature_values=context,
+        recent_counts=counts,
+        reason=prediction["reason"],
+        native_ready=ready,
+        fresh=fresh,
+        supported_path=scoped,
+        prediction_available=usable,
+        snapshot=value,
+    )
 
 
 def audit_activity(events, rows):
@@ -283,8 +376,10 @@ def audit_activity(events, rows):
             _, counts = validate_context(context, event["feature_method"])
             if value["counts"] != counts:
                 errors.append("Activity counts differ from the captured bucket context")
-        elif (event.get("feature_method") not in METHODS
-              or event.get("reason") not in {"generation_changed", "worker_missing"}):
+        elif event.get("feature_method") not in METHODS or event.get("reason") not in {
+            "generation_changed",
+            "worker_missing",
+        }:
             errors.append("Unknown ignored-outcome provenance")
         if kind == "feature_admission_decision":
             decision = event.get("decision")
@@ -309,7 +404,10 @@ def audit_activity(events, rows):
         if rejected != bool(row.get("controlled_rejection")):
             errors.append("HTTP rejection and actual decision differ: " + rid)
         if rejected:
-            if row.get("status") != 503 or row.get("response_error_code") != "worker_overload_protection_shed":
+            if (
+                row.get("status") != 503
+                or row.get("response_error_code") != "worker_overload_protection_shed"
+            ):
                 errors.append("Actual rejection lacks the expected HTTP rejection response: " + rid)
             if rid in outcomes:
                 errors.append("Rejected request has an upstream terminal outcome: " + rid)
@@ -326,26 +424,50 @@ def audit_activity(events, rows):
                 errors.append("Terminal worker differs from admission: " + rid)
             if outcome["diagnostic_time_seconds"] < decision["diagnostic_time_seconds"]:
                 errors.append("Terminal outcome preceded admission: " + rid)
-    counts = Counter(e.get("outcome") for e in outcomes.values() if e.get("event") == "feature_outcome")
-    ignored = Counter(e.get("reason") for e in outcomes.values() if e.get("event") == "feature_outcome_ignored")
+    counts = Counter(
+        e.get("outcome") for e in outcomes.values() if e.get("event") == "feature_outcome"
+    )
+    ignored = Counter(
+        e.get("reason") for e in outcomes.values() if e.get("event") == "feature_outcome_ignored"
+    )
     actual = sum(e.get("decision") == "actual_rejected" for e in decisions.values())
     admitted = sum(e.get("decision") == "admitted" for e in decisions.values())
     by_phase = {}
     for phase in sorted({r["phase"] for r in rows}):
         subset = [r for r in rows if r["phase"] == phase]
-        rejected = sum(decisions.get(r["opc_request_id"], {}).get("decision") == "actual_rejected" for r in subset)
-        by_phase[phase] = dict(offered=len(subset), actual_rejected=rejected,
-                              actual_rejected_per_offered=rejected / len(subset))
-    return dict(ok=not errors, errors=errors, offered=len(rows), actual_decisions=len(decisions),
-                selected_admissions=admitted, actual_rejected=actual,
-                actual_rejected_per_offered=actual / len(rows) if rows else None,
-                actual_rejected_per_decided_attempt=actual / (admitted + actual) if admitted + actual else None,
-                terminal_outcomes=dict(counts), known_terminal_outcomes=sum(counts[k] for k in COUNTS[:3]),
-                unsupported_tracking_admissions=sum(e.get("decision") == "admitted" and not e["outcome_tracking_supported"]
-                                                    for e in decisions.values()),
-                ignored_terminal_outcomes=dict(ignored),
-                per_phase=by_phase,
-                limits="Local observed terminal categories, not native engine cancellation acknowledgement; rejected TTFT truth unknown.")
+        rejected = sum(
+            decisions.get(r["opc_request_id"], {}).get("decision") == "actual_rejected"
+            for r in subset
+        )
+        by_phase[phase] = dict(
+            offered=len(subset),
+            actual_rejected=rejected,
+            actual_rejected_per_offered=rejected / len(subset),
+        )
+    return dict(
+        ok=not errors,
+        errors=errors,
+        offered=len(rows),
+        actual_decisions=len(decisions),
+        selected_admissions=admitted,
+        actual_rejected=actual,
+        actual_rejected_per_offered=actual / len(rows) if rows else None,
+        actual_rejected_per_decided_attempt=actual / (admitted + actual)
+        if admitted + actual
+        else None,
+        terminal_outcomes=dict(counts),
+        known_terminal_outcomes=sum(counts[k] for k in COUNTS[:3]),
+        unsupported_tracking_admissions=sum(
+            e.get("decision") == "admitted" and not e["outcome_tracking_supported"]
+            for e in decisions.values()
+        ),
+        ignored_terminal_outcomes=dict(ignored),
+        per_phase=by_phase,
+        limits=(
+            "Local observed terminal categories, not native engine cancellation "
+            "acknowledgement; rejected TTFT truth unknown."
+        ),
+    )
 
 
 def audit_windows(events):
@@ -361,9 +483,14 @@ def audit_windows(events):
                 errors.append(dict(event_index=index, reason="Unexplained calibration reset epoch"))
             generations[worker] = dict(epoch=epoch, origin=None)
             continue
-        if kind not in {"feature_context_forecast", "feature_context_poll",
-                        "feature_admission_decision", "feature_outcome",
-                        "feature_deadline_started", "feature_deadline_resolution"}:
+        if kind not in {
+            "feature_context_forecast",
+            "feature_context_poll",
+            "feature_admission_decision",
+            "feature_outcome",
+            "feature_deadline_started",
+            "feature_deadline_resolution",
+        }:
             continue
         value = payload(event)
         context = value["context"] if kind.startswith("feature_context_") else value["activity"]
@@ -377,47 +504,80 @@ def audit_windows(events):
         epoch = integer(event["calibration_epoch"], "activity epoch")
         generation = generations.setdefault(worker, dict(epoch=epoch, origin=None))
         if epoch != generation["epoch"]:
-            errors.append(dict(event_index=index, reason="Activity epoch changed without captured reset"))
+            errors.append(
+                dict(event_index=index, reason="Activity epoch changed without captured reset")
+            )
         if generation["origin"] is None:
             generation["origin"] = origin
         elif origin != generation["origin"]:
-            errors.append(dict(event_index=index, reason="Activity origin changed without captured reset"))
+            errors.append(
+                dict(event_index=index, reason="Activity origin changed without captured reset")
+            )
         key = (worker, epoch)
         past = history.setdefault(key, [])
-        category = (event.get("decision") if kind == "feature_admission_decision"
-                    else event.get("outcome") if kind == "feature_outcome" else None)
+        category = (
+            event.get("decision")
+            if kind == "feature_admission_decision"
+            else event.get("outcome")
+            if kind == "feature_outcome"
+            else None
+        )
         if category is not None:
             if category not in COUNTS:
                 raise ValueError("Unknown feature activity category")
             past.append((second, category))
-            if kind == "feature_admission_decision" and category == "admitted" and not event["outcome_tracking_supported"]:
+            if (
+                kind == "feature_admission_decision"
+                and category == "admitted"
+                and not event["outcome_tracking_supported"]
+            ):
                 past.append((second, "untracked_admitted"))
             activity_events += 1
         if kind == "feature_deadline_resolution":
-            categories = {"timely_first_text": ["deadline_timely_first_text"],
-                          "deadline_breach": ["deadline_breach", "deadline_or_cutoff_adverse"],
-                          "actual_cutoff": ["deadline_or_cutoff_adverse"],
-                          "unknown_pretext_end": ["deadline_or_cutoff_unknown"]}.get(event.get("resolution"))
+            categories = {
+                "timely_first_text": ["deadline_timely_first_text"],
+                "deadline_breach": ["deadline_breach", "deadline_or_cutoff_adverse"],
+                "actual_cutoff": ["deadline_or_cutoff_adverse"],
+                "unknown_pretext_end": ["deadline_or_cutoff_unknown"],
+            }.get(event.get("resolution"))
             if categories is None or event["feature_method"] not in DEADLINE_METHODS:
                 raise ValueError("Unknown deadline resolution category")
             past.extend((second, name) for name in categories)
             activity_events += 1
         expected = Counter(category for bucket, category in past if second - 60 < bucket <= second)
         if any(captured[name] != expected[name] for name in names):
-            errors.append(dict(event_index=index, event_kind=kind,
-                               request_id=event.get("request_id"), reason="Activity window counts differ",
-                               expected={name: expected[name] for name in names}, captured=captured))
+            errors.append(
+                dict(
+                    event_index=index,
+                    event_kind=kind,
+                    request_id=event.get("request_id"),
+                    reason="Activity window counts differ",
+                    expected={name: expected[name] for name in names},
+                    captured=captured,
+                )
+            )
         snapshots += 1
-    return dict(ok=not errors, errors=errors, snapshots=snapshots,
-                activity_events=activity_events, worker_generations=len(history),
-                window="Captured current integer-second bucket plus59 preceding buckets; not a client future-label rate.")
+    return dict(
+        ok=not errors,
+        errors=errors,
+        snapshots=snapshots,
+        activity_events=activity_events,
+        worker_generations=len(history),
+        window="Captured current integer-second bucket plus59 preceding buckets; not a client future-label rate.",
+    )
 
 
 def scores(rows, threshold=300):
     """Unknown candidate flags never disappear from whole-cohort denominators."""
-    policies = ("original_scalar_total", "feature_reported_total", "feature_context_only_total",
-                "feature_legacy_fallback_total", "original_scalar_extra_flag",
-                "feature_reported_extra_flag", "feature_legacy_fallback_extra_flag")
+    policies = (
+        "original_scalar_total",
+        "feature_reported_total",
+        "feature_context_only_total",
+        "feature_legacy_fallback_total",
+        "original_scalar_extra_flag",
+        "feature_reported_extra_flag",
+        "feature_legacy_fallback_extra_flag",
+    )
 
     def prediction(row, policy):
         candidate = row.get("feature_context_candidate") or {}
@@ -435,12 +595,23 @@ def scores(rows, threshold=300):
         value = candidate.get("total_ttft_seconds")
         if policy == "feature_context_only_total" and not candidate.get("contextual"):
             return None
-        return original_total if value is None and policy == "feature_legacy_fallback_total" else value
+        return (
+            original_total if value is None and policy == "feature_legacy_fallback_total" else value
+        )
 
     result = {}
     for policy in policies:
-        card = dict(offered=len(rows), tp=0, fp=0, tn=0, fn=0, unknown=0,
-                    prediction_unknown=0, truth_unknown=0, censored_known_late=0)
+        card = dict(
+            offered=len(rows),
+            tp=0,
+            fp=0,
+            tn=0,
+            fn=0,
+            unknown=0,
+            prediction_unknown=0,
+            truth_unknown=0,
+            censored_known_late=0,
+        )
         for row in rows:
             truth = row.get("first_text_late")
             if row.get("controlled_rejection") or row.get("local_drop"):
@@ -457,8 +628,17 @@ def scores(rows, threshold=300):
         card["fpr"] = card["fp"] / (card["fp"] + card["tn"]) if card["fp"] + card["tn"] else None
         card["fnr"] = card["fn"] / (card["fn"] + card["tp"]) if card["fn"] + card["tp"] else None
         result[policy] = card
-    common = [r for r in rows if (r.get("feature_context_candidate") or {}).get("recorded_extra_would_reject") is not None
-              and r.get("pre_admission_recorded_extra_flags", {}).get("calibrated") is not None]
-    result["coverage"] = dict(contextual=sum(bool((r.get("feature_context_candidate") or {}).get("contextual")) for r in rows),
-                              common_extra_prediction_known=len(common), offered=len(rows))
+    common = [
+        r
+        for r in rows
+        if (r.get("feature_context_candidate") or {}).get("recorded_extra_would_reject") is not None
+        and r.get("pre_admission_recorded_extra_flags", {}).get("calibrated") is not None
+    ]
+    result["coverage"] = dict(
+        contextual=sum(
+            bool((r.get("feature_context_candidate") or {}).get("contextual")) for r in rows
+        ),
+        common_extra_prediction_known=len(common),
+        offered=len(rows),
+    )
     return result

@@ -1,19 +1,48 @@
 """Fail-closed readiness for an isolated, diagnostic TTFT experiment."""
+
 from __future__ import annotations
 
-import math
 import hashlib
 import json
+import math
 import re
 from collections import Counter
 
-
 METHOD = "mse_poll_two_wave_queue_v2"
-RECOVERY_REQUEST_EVENTS = frozenset({"recovery_forecast", "recovery_probe_attempt", "recovery_probe_reserved", "recovery_probe_response", "recovery_probe_released"})
-FEATURE_REQUEST_EVENTS = frozenset({"feature_context_forecast", "feature_context_feedback",
-    "feature_outcome", "feature_outcome_ignored", "feature_admission_decision",
-    "feature_deadline_started", "feature_deadline_resolution", "feature_deadline_ignored"})
-ISOLATION_REQUEST_EVENTS = frozenset({"forecast", "calibration_forecast", "calibration_feedback", "first_text", "request_transport"}) | RECOVERY_REQUEST_EVENTS | FEATURE_REQUEST_EVENTS
+RECOVERY_REQUEST_EVENTS = frozenset(
+    {
+        "recovery_forecast",
+        "recovery_probe_attempt",
+        "recovery_probe_reserved",
+        "recovery_probe_response",
+        "recovery_probe_released",
+    }
+)
+FEATURE_REQUEST_EVENTS = frozenset(
+    {
+        "feature_context_forecast",
+        "feature_context_feedback",
+        "feature_outcome",
+        "feature_outcome_ignored",
+        "feature_admission_decision",
+        "feature_deadline_started",
+        "feature_deadline_resolution",
+        "feature_deadline_ignored",
+    }
+)
+ISOLATION_REQUEST_EVENTS = (
+    frozenset(
+        {
+            "forecast",
+            "calibration_forecast",
+            "calibration_feedback",
+            "first_text",
+            "request_transport",
+        }
+    )
+    | RECOVERY_REQUEST_EVENTS
+    | FEATURE_REQUEST_EVENTS
+)
 
 
 def native_completion_stats_proof(initial_text, current_text, backend):
@@ -23,9 +52,13 @@ def native_completion_stats_proof(initial_text, current_text, backend):
     Label values are hashed so receipts contain no raw scrape labels or text.
     """
     if backend == "vllm":
-        required = ["vllm:request_prompt_tokens_count", "vllm:request_prompt_tokens_sum",
-                    "vllm:request_prefill_kv_computed_tokens_count", "vllm:request_prefill_kv_computed_tokens_sum",
-                    "vllm:e2e_request_latency_seconds_count"]
+        required = [
+            "vllm:request_prompt_tokens_count",
+            "vllm:request_prompt_tokens_sum",
+            "vllm:request_prefill_kv_computed_tokens_count",
+            "vllm:request_prefill_kv_computed_tokens_sum",
+            "vllm:e2e_request_latency_seconds_count",
+        ]
         names = {name: name for name in required}
     elif backend == "sglang":
         required = ["sglang:prompt_tokens_total", "sglang:e2e_request_latency_seconds_count"]
@@ -56,8 +89,9 @@ def native_completion_stats_proof(initial_text, current_text, backend):
                         raise ValueError
                     labels[item[1]] = json.loads(item[2])
                     position = item.end()
-                labels_hash = hashlib.sha256(json.dumps(labels, sort_keys=True,
-                    separators=(",", ":")).encode()).hexdigest()
+                labels_hash = hashlib.sha256(
+                    json.dumps(labels, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()
                 key = (name, labels_hash)
                 if key in values:
                     raise ValueError
@@ -93,12 +127,21 @@ def native_completion_stats_proof(initial_text, current_text, backend):
                 issues.append("Counter reset or decreased")
             elif delta == 0:
                 issues.append("Counter did not advance")
-        series.append(dict(metric=metric, labels_sha256=labels_hash, before=old, after=new,
-                           delta=delta, reasons=issues))
+        series.append(
+            dict(
+                metric=metric,
+                labels_sha256=labels_hash,
+                before=old,
+                after=new,
+                delta=delta,
+                reasons=issues,
+            )
+        )
     if any(row["reasons"] for row in series):
         reasons.append("Required native completion counter series did not all advance")
-    return dict(ok=not reasons, backend=backend, required_metrics=required, series=series,
-                reasons=reasons)
+    return dict(
+        ok=not reasons, backend=backend, required_metrics=required, series=series, reasons=reasons
+    )
 
 
 def audit_isolation(events, owned_request_ids):
@@ -131,8 +174,11 @@ def audit_isolation(events, owned_request_ids):
             continue
         kinds[kind] += 1
         stamp = value.get("timestamp")
-        occurrence = dict(capture_event_index=index, event_kind=kind,
-                          timestamp=stamp if isinstance(stamp, str) else None)
+        occurrence = dict(
+            capture_event_index=index,
+            event_kind=kind,
+            timestamp=stamp if isinstance(stamp, str) else None,
+        )
         rid = value.get("request_id")
         if not isinstance(rid, str) or not rid.strip():
             unattributed.append(occurrence)
@@ -145,7 +191,10 @@ def audit_isolation(events, owned_request_ids):
                 recovery_bindings.append((rid, value.get("worker"), occurrence))
             if kind in FEATURE_REQUEST_EVENTS:
                 feature_bindings.append((rid, value.get("worker"), occurrence))
-                if kind == "feature_admission_decision" and value.get("decision") == "actual_rejected":
+                if (
+                    kind == "feature_admission_decision"
+                    and value.get("decision") == "actual_rejected"
+                ):
                     try:
                         try:
                             from .wait_feature_context import payload, validate_context
@@ -153,45 +202,74 @@ def audit_isolation(events, owned_request_ids):
                             from wait_feature_context import payload, validate_context
                         snapshot = payload(value)
                         _, counts = validate_context(snapshot["activity"])
-                        if snapshot["counts"] != counts or value.get("outcome_tracking_supported") is not False:
+                        if (
+                            snapshot["counts"] != counts
+                            or value.get("outcome_tracking_supported") is not False
+                        ):
                             raise ValueError("Invalid actual rejection snapshot")
                         verified_rejections.add(rid)
                     except (ValueError, KeyError, TypeError):
-                        unattributed.append(dict(occurrence, reason="Unverified actual rejection event"))
+                        unattributed.append(
+                            dict(occurrence, reason="Unverified actual rejection event")
+                        )
         else:
             foreign.setdefault(rid, []).append(occurrence)
     missing = sorted(owned - forecasts)
-    mismatched_workers = [dict(request_id=rid, worker=worker, **occurrence)
+    mismatched_workers = [
+        dict(request_id=rid, worker=worker, **occurrence)
         for rid, worker, occurrence in recovery_bindings
-        if not isinstance(worker, str) or not worker or forecast_workers.get(rid) != worker]
-    feature_mismatches = [dict(request_id=rid, worker=worker, **occurrence)
+        if not isinstance(worker, str) or not worker or forecast_workers.get(rid) != worker
+    ]
+    feature_mismatches = [
+        dict(request_id=rid, worker=worker, **occurrence)
         for rid, worker, occurrence in feature_bindings
-        if not isinstance(worker, str) or not worker or forecast_workers.get(rid) != worker]
+        if not isinstance(worker, str) or not worker or forecast_workers.get(rid) != worker
+    ]
     reasons = []
     if foreign:
         reasons.append("Request events from outside the exact owned request ID set")
     if unattributed:
         reasons.append("Request events without an attributable request ID")
     if missing:
-        reasons.append("Owned requests missing raw admission forecasts; capture is absent or incomplete")
+        reasons.append(
+            "Owned requests missing raw admission forecasts; capture is absent or incomplete"
+        )
     if mismatched_workers:
         reasons.append("Recovery request events do not match the exact owned raw-forecast worker")
     if feature_mismatches:
         reasons.append("Feature request events do not match the exact owned raw-forecast worker")
-    return dict(ok=not reasons, scope="whole_router_capture", owned_request_id_count=len(owned),
-                capture_event_count=total, checked_event_count=sum(kinds.values()),
-                ignored_event_count=total-sum(kinds.values()), event_kind_counts=dict(sorted(kinds.items())),
-                owned_event_count=owned_events, owned_forecast_request_count=len(forecasts),
-                owned_actual_rejected_request_count=len(verified_rejections),
-                verified_preselection_rejections_without_forecasts=sorted(verified_rejections - forecasts),
-                missing_owned_forecasts=missing,
-                recovery_worker_mismatch_count=len(mismatched_workers), recovery_worker_mismatches=mismatched_workers,
-                feature_worker_mismatch_count=len(feature_mismatches), feature_worker_mismatches=feature_mismatches,
-                foreign_event_count=sum(len(rows) for rows in foreign.values()), foreign_request_count=len(foreign),
-                foreign_requests=[dict(request_id=rid, event_count=len(rows),
-                                       event_kind_counts=dict(sorted(Counter(row["event_kind"] for row in rows).items())),
-                                       events=rows) for rid, rows in sorted(foreign.items())],
-                unattributed_event_count=len(unattributed), unattributed_events=unattributed, reasons=reasons)
+    return dict(
+        ok=not reasons,
+        scope="whole_router_capture",
+        owned_request_id_count=len(owned),
+        capture_event_count=total,
+        checked_event_count=sum(kinds.values()),
+        ignored_event_count=total - sum(kinds.values()),
+        event_kind_counts=dict(sorted(kinds.items())),
+        owned_event_count=owned_events,
+        owned_forecast_request_count=len(forecasts),
+        owned_actual_rejected_request_count=len(verified_rejections),
+        verified_preselection_rejections_without_forecasts=sorted(verified_rejections - forecasts),
+        missing_owned_forecasts=missing,
+        recovery_worker_mismatch_count=len(mismatched_workers),
+        recovery_worker_mismatches=mismatched_workers,
+        feature_worker_mismatch_count=len(feature_mismatches),
+        feature_worker_mismatches=feature_mismatches,
+        foreign_event_count=sum(len(rows) for rows in foreign.values()),
+        foreign_request_count=len(foreign),
+        foreign_requests=[
+            dict(
+                request_id=rid,
+                event_count=len(rows),
+                event_kind_counts=dict(sorted(Counter(row["event_kind"] for row in rows).items())),
+                events=rows,
+            )
+            for rid, rows in sorted(foreign.items())
+        ],
+        unattributed_event_count=len(unattributed),
+        unattributed_events=unattributed,
+        reasons=reasons,
+    )
 
 
 def audit_entry_continuity(events, rows, readiness, measurement_phase):
@@ -203,27 +281,53 @@ def audit_entry_continuity(events, rows, readiness, measurement_phase):
     if first:
         for event in events:
             value = (event.get("fields", {}) or {}) | event
-            if value.get("event") == "forecast" and value.get("request_id") == first["opc_request_id"]:
+            if (
+                value.get("event") == "forecast"
+                and value.get("request_id") == first["opc_request_id"]
+            ):
                 candidates.append(value)
     if readiness.get("ready") is not True or len(candidates) != 1:
         errors.append("Missing successful readiness or exact first measured admission")
     gate = candidates[0] if len(candidates) == 1 else {}
-    expected = next((w for w in readiness.get("workers", []) if w["worker"] == gate.get("worker")), {})
-    checks = dict(same_trained_worker=bool(expected),
+    expected = next(
+        (w for w in readiness.get("workers", []) if w["worker"] == gate.get("worker")), {}
+    )
+    checks = dict(
+        same_trained_worker=bool(expected),
         known_scalar_method=gate.get("calibration_method") == METHOD,
-        same_trained_epoch=bool(expected) and gate.get("calibration_epoch") == expected.get("epoch"),
+        same_trained_epoch=bool(expected)
+        and gate.get("calibration_epoch") == expected.get("epoch"),
         native_capacity_fresh=gate.get("native_ready") is True,
         current_samples_retained=gate.get("calibration_sample_count", 0) >= 4,
-        current_fit_retained=bool(expected) and gate.get("calibration_fitted_revision", 0) >= expected.get("fitted_revision", 0) > 0,
-        baseline_retained=gate.get("calibration_baseline_available") is True)
+        current_fit_retained=bool(expected)
+        and gate.get("calibration_fitted_revision", 0) >= expected.get("fitted_revision", 0) > 0,
+        baseline_retained=gate.get("calibration_baseline_available") is True,
+    )
     if not all(checks.values()):
         errors.append("Training epoch or usable fitted history was lost before measurement entry")
-    return dict(ok=not errors, errors=errors, measurement_phase=measurement_phase,
-                first_measured_request_id=first["opc_request_id"] if first else None,
-                readiness_worker=expected, checks=checks,
-                admission={key: gate.get(key) for key in ["worker", "calibration_epoch", "calibration_sample_count",
-                    "calibration_fitted_revision", "native_ready", "calibration_baseline_available"]},
-                scope="Readiness to first measured admission only; later genuine lifecycle or recovery resets remain observable.")
+    return dict(
+        ok=not errors,
+        errors=errors,
+        measurement_phase=measurement_phase,
+        first_measured_request_id=first["opc_request_id"] if first else None,
+        readiness_worker=expected,
+        checks=checks,
+        admission={
+            key: gate.get(key)
+            for key in [
+                "worker",
+                "calibration_epoch",
+                "calibration_sample_count",
+                "calibration_fitted_revision",
+                "native_ready",
+                "calibration_baseline_available",
+            ]
+        },
+        scope=(
+            "Readiness to first measured admission only; later genuine "
+            "lifecycle or recovery resets remain observable."
+        ),
+    )
 
 
 class Readiness:
@@ -249,7 +353,13 @@ class Readiness:
             if not proof["ok"]:
                 self.errors.extend(proof["errors"])
             return
-        if not worker or kind not in {"forecast", "calibration_forecast", "calibration_feedback", "calibration_update", "calibration_reset"}:
+        if not worker or kind not in {
+            "forecast",
+            "calibration_forecast",
+            "calibration_feedback",
+            "calibration_update",
+            "calibration_reset",
+        }:
             return
         if kind == "forecast" and not event.get("calibration_enabled"):
             return
@@ -265,15 +375,26 @@ class Readiness:
             return
         self.epochs[worker] = epoch
         if kind in {"forecast", "calibration_forecast"}:
-            self.initial.setdefault(worker, all(event.get(k) == 0 for k in (
-                "calibration_observation_sequence", "calibration_fit_sequence",
-                "calibration_history_revision", "calibration_fitted_revision")))
+            self.initial.setdefault(
+                worker,
+                all(
+                    event.get(k) == 0
+                    for k in (
+                        "calibration_observation_sequence",
+                        "calibration_fit_sequence",
+                        "calibration_history_revision",
+                        "calibration_fitted_revision",
+                    )
+                ),
+            )
             self.forecasts[worker] = event
         elif kind == "calibration_update":
-            if (event.get("calibration_state") == "capacity_ready"
-                    and event.get("sample_count_after", 0) >= 4
-                    and event.get("fit_sequence_after", 0) >= 4
-                    and event.get("calibration_fitted_revision", 0) > 0):
+            if (
+                event.get("calibration_state") == "capacity_ready"
+                and event.get("sample_count_after", 0) >= 4
+                and event.get("fit_sequence_after", 0) >= 4
+                and event.get("calibration_fitted_revision", 0) > 0
+            ):
                 self.fits.add((worker, epoch, event["calibration_fitted_revision"]))
         elif kind == "calibration_feedback" and event.get("reason") == "accepted":
             self.accepted[(worker, epoch)] = self.accepted.get((worker, epoch), 0) + 1
@@ -283,24 +404,48 @@ class Readiness:
         for worker, epoch in self.epochs.items():
             f = self.forecasts.get(worker, {})
             baseline = f.get("calibration_baseline_seconds")
-            baseline_known = (f.get("calibration_baseline_available") is True
+            baseline_known = (
+                f.get("calibration_baseline_available") is True
                 and f.get("calibration_baseline_source") in {"provisional", "measured"}
-                and isinstance(baseline, (int, float)) and math.isfinite(baseline) and baseline >= 0)
+                and isinstance(baseline, (int, float))
+                and math.isfinite(baseline)
+                and baseline >= 0
+            )
             revision = f.get("calibration_fitted_revision", 0)
-            checks = dict(empty_initial_history=self.initial.get(worker) is True,
+            checks = dict(
+                empty_initial_history=self.initial.get(worker) is True,
                 current_epoch=f.get("calibration_epoch") == epoch,
                 baseline_with_provenance=baseline_known,
                 native_capacity_ready=f.get("native_ready") is True,
                 current_samples_at_least_four=f.get("calibration_sample_count", 0) >= 4,
                 accepted_in_current_epoch=self.accepted.get((worker, epoch), 0) >= 4,
-                actual_current_epoch_fit=(worker, epoch, revision) in self.fits)
+                actual_current_epoch_fit=(worker, epoch, revision) in self.fits,
+            )
             if self.expected_decision_method is not None:
-                checks["decision_method_current_epoch"] = self.decision_methods.get(worker) == (epoch, True)
-            workers.append(dict(worker=worker, epoch=epoch, checks=checks,
-                baseline_seconds=baseline, baseline_source=f.get("calibration_baseline_source"),
-                samples=f.get("calibration_sample_count"), fitted_revision=revision))
+                checks["decision_method_current_epoch"] = self.decision_methods.get(worker) == (
+                    epoch,
+                    True,
+                )
+            workers.append(
+                dict(
+                    worker=worker,
+                    epoch=epoch,
+                    checks=checks,
+                    baseline_seconds=baseline,
+                    baseline_source=f.get("calibration_baseline_source"),
+                    samples=f.get("calibration_sample_count"),
+                    fitted_revision=revision,
+                )
+            )
         startup = native_busy_verified if self.scenario == "busy_start" else native_idle_verified
-        return dict(ready=bool(workers) and startup and not self.errors
-                    and all(all(w["checks"].values()) for w in workers),
-                    scenario=self.scenario, initial_native_idle_verified=native_idle_verified,
-                    initial_native_busy_verified=native_busy_verified, workers=workers, errors=self.errors[:20])
+        return dict(
+            ready=bool(workers)
+            and startup
+            and not self.errors
+            and all(all(w["checks"].values()) for w in workers),
+            scenario=self.scenario,
+            initial_native_idle_verified=native_idle_verified,
+            initial_native_busy_verified=native_busy_verified,
+            workers=workers,
+            errors=self.errors[:20],
+        )

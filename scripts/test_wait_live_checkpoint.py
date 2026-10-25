@@ -2,9 +2,9 @@ import contextlib
 import copy
 import io
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 try:
@@ -36,8 +36,9 @@ class CheckpointTests(unittest.TestCase):
         return out.getvalue()
 
     def capture(self, execute=None, get=None):
-        return self.copy.capture(get or (lambda: self.pod), execute or self.execute,
-                                 "2026-10-20T08:00:00Z")
+        return self.copy.capture(
+            get or (lambda: self.pod), execute or self.execute, "2026-10-20T08:00:00Z"
+        )
 
     def test_append_partial_line_recovery_and_resume_without_duplicates(self):
         source = Path(self.paths["requests.jsonl"])
@@ -46,7 +47,7 @@ class CheckpointTests(unittest.TestCase):
         self.assertEqual(result["files"][source.name]["offset"], 8)
         self.assertEqual((self.copy.folder / source.name).read_bytes(), b'{"n":1}\n')
         with source.open("ab") as f:
-            f.write(b'2}\n')
+            f.write(b"2}\n")
         self.copy = c.Checkpoints(self.copy.folder, self.owner)
         self.capture()
         self.capture()
@@ -54,15 +55,15 @@ class CheckpointTests(unittest.TestCase):
         self.assertIn("Partial", self.copy.state["scope"])
 
     def test_live_reader_is_bounded_and_only_commits_whole_records(self):
-        Path(self.paths["metrics.jsonl"]).write_bytes(b'1\n2\n3\npartial')
+        Path(self.paths["metrics.jsonl"]).write_bytes(b"1\n2\n3\npartial")
         with patch.object(c, "CHUNK_BYTES", 5):
             first = self.capture()
             self.assertEqual(first["files"]["metrics.jsonl"]["offset"], 4)
         self.capture()
-        self.assertEqual((self.copy.folder / "metrics.jsonl").read_bytes(), b'1\n2\n3\n')
+        self.assertEqual((self.copy.folder / "metrics.jsonl").read_bytes(), b"1\n2\n3\n")
 
     def test_uid_change_before_or_during_transfer_never_commits(self):
-        Path(self.paths["requests.jsonl"]).write_bytes(b'{}\n')
+        Path(self.paths["requests.jsonl"]).write_bytes(b"{}\n")
         foreign = copy.deepcopy(self.pod)
         foreign["metadata"]["uid"] = "different"
         with self.assertRaisesRegex(ValueError, "identity"):
@@ -80,45 +81,52 @@ class CheckpointTests(unittest.TestCase):
                 source.write_bytes(b'{"n":1}\n')
                 self.copy = c.Checkpoints(self.root / ("host-" + mutation), self.owner)
                 self.capture()
-                if mutation == "truncate": source.write_bytes(b'')
-                if mutation == "missing": source.unlink()
+                if mutation == "truncate":
+                    source.write_bytes(b"")
+                if mutation == "missing":
+                    source.unlink()
                 if mutation == "replace":
                     other = source.with_suffix(".replacement")
                     other.write_bytes(source.read_bytes())
                     other.replace(source)
-                if mutation == "rewrite": source.write_bytes(b'{"n":9}\n')
-                with self.assertRaises(ValueError): self.capture()
+                if mutation == "rewrite":
+                    source.write_bytes(b'{"n":9}\n')
+                with self.assertRaises(ValueError):
+                    self.capture()
                 self.assertEqual((self.copy.folder / source.name).read_bytes(), b'{"n":1}\n')
 
     def test_all_packet_entries_checked_before_any_write(self):
         for name in ["requests.jsonl", "metrics.jsonl"]:
-            Path(self.paths[name]).write_bytes(b'{}\n')
+            Path(self.paths[name]).write_bytes(b"{}\n")
+
         def tampered(source):
             packet = json.loads(self.execute(source))
             packet["metrics.jsonl"]["chunk_sha256"] = "bad"
             return json.dumps(packet)
+
         with self.assertRaisesRegex(ValueError, "integrity"):
             self.capture(execute=tampered)
         self.assertFalse((self.copy.folder / "requests.jsonl").exists())
 
     def test_local_tamper_wrong_owner_and_unowned_files_rejected(self):
         source = Path(self.paths["requests.jsonl"])
-        source.write_bytes(b'{}\n')
+        source.write_bytes(b"{}\n")
         self.capture()
         with self.assertRaisesRegex(ValueError, "different"):
             c.Checkpoints(self.copy.folder, dict(self.owner, uid="new"))
-        (self.copy.folder / source.name).write_bytes(b'[]\n')
+        (self.copy.folder / source.name).write_bytes(b"[]\n")
         with self.assertRaisesRegex(ValueError, "prefix hash"):
             c.Checkpoints(self.copy.folder, self.owner)
         (self.copy.folder / source.name).write_bytes(source.read_bytes())
         source2 = Path(self.paths["metrics.jsonl"])
-        source2.write_bytes(b'{}\n')
-        (self.copy.folder / source2.name).write_bytes(b'preexisting')
+        source2.write_bytes(b"{}\n")
+        (self.copy.folder / source2.name).write_bytes(b"preexisting")
         with self.assertRaisesRegex(ValueError, "unowned"):
             self.capture()
 
     def test_remote_rejects_arbitrary_paths_and_symlinks(self):
-        with self.assertRaises(ValueError): c.remote_snapshot({"../secret": 0})
+        with self.assertRaises(ValueError):
+            c.remote_snapshot({"../secret": 0})
         Path(self.paths["requests.jsonl"]).symlink_to(__file__)
         with self.assertRaisesRegex(ValueError, "regular"):
             self.capture()

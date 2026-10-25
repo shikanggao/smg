@@ -20,11 +20,17 @@ The input directory must contain `requests.tsv`, `paired-requests.json`, `router
 Add this step immediately after analysis in future test runners:
 
 ```python
-subprocess.run([
-    python_executable, str(smg_repo / "scripts" / "plot_wait_estimates.py"),
-    "--input", str(run_directory),
-    "--output-dir", str(run_directory / "graphs"),
-], check=True)
+subprocess.run(
+    [
+        python_executable,
+        str(smg_repo / "scripts" / "plot_wait_estimates.py"),
+        "--input",
+        str(run_directory),
+        "--output-dir",
+        str(run_directory / "graphs"),
+    ],
+    check=True,
+)
 ```
 
 The existing DEV FRA `work/run_classifier_suite.py` runner already invokes this step. For later runners, use the same script path and analyzed run-directory contract.

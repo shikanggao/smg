@@ -8,6 +8,7 @@ of the full remote prefix. Local copies have full-prefix SHA256 hashes. A crash
 after an append but before the ledger commit fails closed on restart: preserve
 the partial files/ledger instead of silently replacing or resuming them.
 """
+
 from __future__ import annotations
 
 import base64
@@ -15,7 +16,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-
 
 FILES = {
     "requests.jsonl": "/work/output/production-shadow/requests.jsonl",
@@ -44,10 +44,10 @@ def validate_owner(pod, owner):
 
 def remote_snapshot(offsets):
     """Executed in the owned driver; bounded reads, no arbitrary path selection."""
-    from pathlib import Path
     import base64
     import hashlib
     import os
+    from pathlib import Path
 
     if set(offsets) - FILES.keys():
         raise ValueError("Unknown checkpoint evidence file")
@@ -74,8 +74,10 @@ def remote_snapshot(offsets):
             end = chunk.rfind(b"\n") + 1
             chunk = chunk[:end]
             result[name] = {
-                "offset": offset, "end": offset + len(chunk),
-                "source_size": stat.st_size, "source_identity": [stat.st_dev, stat.st_ino],
+                "offset": offset,
+                "end": offset + len(chunk),
+                "source_size": stat.st_size,
+                "source_identity": [stat.st_dev, stat.st_ino],
                 "anchor_sha256": hashlib.sha256(anchor).hexdigest(),
                 "chunk_sha256": hashlib.sha256(chunk).hexdigest(),
                 "data_base64": base64.b64encode(chunk).decode("ascii"),
@@ -85,10 +87,20 @@ def remote_snapshot(offsets):
 
 def remote_code(offsets):
     import inspect
-    return ("import json\nFILES=" + repr(FILES) + "\nCHUNK_BYTES=" + str(CHUNK_BYTES)
-            + "\nANCHOR_BYTES=" + str(ANCHOR_BYTES) + "\n"
-            + inspect.getsource(remote_snapshot)
-            + "\nprint(json.dumps(remote_snapshot(" + repr(offsets) + ")))\n")
+
+    return (
+        "import json\nFILES="
+        + repr(FILES)
+        + "\nCHUNK_BYTES="
+        + str(CHUNK_BYTES)
+        + "\nANCHOR_BYTES="
+        + str(ANCHOR_BYTES)
+        + "\n"
+        + inspect.getsource(remote_snapshot)
+        + "\nprint(json.dumps(remote_snapshot("
+        + repr(offsets)
+        + ")))\n"
+    )
 
 
 class Checkpoints:
@@ -98,16 +110,25 @@ class Checkpoints:
         self.folder, self.owner = Path(folder), dict(owner)
         self.folder.mkdir(parents=True, exist_ok=True)
         self.ledger = self.folder / "checkpoint.json"
-        self.state = json.loads(self.ledger.read_text()) if self.ledger.exists() else {
-            "schema_version": 1, "owner": self.owner, "files": {}, "checkpoints": 0,
-            "scope": "Partial append-only evidence; not full-run validity or completion",
-        }
+        self.state = (
+            json.loads(self.ledger.read_text())
+            if self.ledger.exists()
+            else {
+                "schema_version": 1,
+                "owner": self.owner,
+                "files": {},
+                "checkpoints": 0,
+                "scope": "Partial append-only evidence; not full-run validity or completion",
+            }
+        )
         if self.state.get("schema_version") != 1 or self.state.get("owner") != self.owner:
             raise ValueError("Checkpoint ledger belongs to a different driver")
         for name, saved in self.state["files"].items():
             path = self.folder / name
             if name not in FILES or not path.is_file() or path.stat().st_size != saved["offset"]:
-                raise ValueError("Checkpoint local offset does not match ledger; preserve partial files and ledger")
+                raise ValueError(
+                    "Checkpoint local offset does not match ledger; preserve partial files and ledger"
+                )
             if sha(path.read_bytes()) != saved["prefix_sha256"]:
                 raise ValueError("Checkpoint local prefix hash changed")
 
@@ -142,8 +163,13 @@ class Checkpoints:
             if sha(anchor) != value["anchor_sha256"]:
                 raise ValueError("Checkpoint source prefix changed")
             chunk = base64.b64decode(value["data_base64"], validate=True)
-            if (len(chunk) > CHUNK_BYTES or sha(chunk) != value["chunk_sha256"]
-                    or value["end"] != offset + len(chunk) or chunk and not chunk.endswith(b"\n")):
+            if (
+                len(chunk) > CHUNK_BYTES
+                or sha(chunk) != value["chunk_sha256"]
+                or value["end"] != offset + len(chunk)
+                or chunk
+                and not chunk.endswith(b"\n")
+            ):
                 raise ValueError("Checkpoint chunk integrity failed")
             if not old and path.exists():
                 raise ValueError("Checkpoint refuses to overwrite an unowned local file")
@@ -155,12 +181,17 @@ class Checkpoints:
                 stream.flush()
                 os.fsync(stream.fileno())
             self.state["files"][name] = {
-                "offset": value["end"], "source_size_at_read": value["source_size"],
-                "source_identity": value["source_identity"], "prefix_sha256": sha(path.read_bytes()),
+                "offset": value["end"],
+                "source_size_at_read": value["source_size"],
+                "source_identity": value["source_identity"],
+                "prefix_sha256": sha(path.read_bytes()),
                 "last_chunk_sha256": value["chunk_sha256"],
             }
-        self.state.update(checkpoints=self.state["checkpoints"] + 1,
-                          observed_utc=observed_utc, missing_not_yet_created=missing)
+        self.state.update(
+            checkpoints=self.state["checkpoints"] + 1,
+            observed_utc=observed_utc,
+            missing_not_yet_created=missing,
+        )
         temp = self.ledger.with_suffix(".pending")
         with temp.open("w") as stream:
             json.dump(self.state, stream, indent=2, allow_nan=False)

@@ -18,30 +18,30 @@ from pathlib import Path
 
 try:
     from .analyze_wait_calibration import (
+        QUEUE_METHOD,
+        TWO_WAVE_METHOD,
+        TWO_WAVE_METHODS,
+        TWO_WAVE_RATE,
         applied_scale,
         audit,
         close,
         events,
         median_scale,
         mse_scale,
-        TWO_WAVE_METHOD,
-        QUEUE_METHOD,
-        TWO_WAVE_METHODS,
-        TWO_WAVE_RATE,
         two_wave_trace,
     )
 except ImportError:
     from analyze_wait_calibration import (
+        QUEUE_METHOD,
+        TWO_WAVE_METHOD,
+        TWO_WAVE_METHODS,
+        TWO_WAVE_RATE,
         applied_scale,
         audit,
         close,
         events,
         median_scale,
         mse_scale,
-        TWO_WAVE_METHOD,
-        QUEUE_METHOD,
-        TWO_WAVE_METHODS,
-        TWO_WAVE_RATE,
         two_wave_trace,
     )
 
@@ -195,11 +195,20 @@ def replay_two_wave(log, rows, checked):
     _, records = two_wave_trace(log, keep_records=True)
     live_method = checked["calibration_method"]
     queue_only = live_method == QUEUE_METHOD
-    prediction_methods = ("raw",) + METHODS + (live_method,) + (("queue_only_raw",) if queue_only else ())
+    prediction_methods = (
+        ("raw",) + METHODS + (live_method,) + (("queue_only_raw",) if queue_only else ())
+    )
     forecasts = {e["request_id"]: e for e in log if e.get("event") == "calibration_forecast"}
-    gates = {e["request_id"]: e for e in log if e.get("event") == "forecast" and e.get("calibration_enabled")}
+    gates = {
+        e["request_id"]: e
+        for e in log
+        if e.get("event") == "forecast" and e.get("calibration_enabled")
+    }
     versions, trajectories, diagnostic = {}, {}, []
-    initial = lambda: {m: (1.0, 1.0, 0.0, 0) for m in METHODS}
+
+    def initial():
+        return {m: (1.0, 1.0, 0.0, 0) for m in METHODS}
+
     for record in records:
         event, key = record["event"], record["key"]
         kind = event["event"]
@@ -213,35 +222,68 @@ def replay_two_wave(log, rows, checked):
         elif kind != "calibration_rotation":
             for method in METHODS:
                 if method.endswith("poll") == (kind == "calibration_update"):
-                    target = (median_scale if method.startswith("median") else mse_scale)([(ratio, x) for ratio, x, _, _ in history])
-                    current[method] = (applied_scale(current[method], now, TWO_WAVE_RATE), target, now, len(history))
+                    target = (median_scale if method.startswith("median") else mse_scale)(
+                        [(ratio, x) for ratio, x, _, _ in history]
+                    )
+                    current[method] = (
+                        applied_scale(current[method], now, TWO_WAVE_RATE),
+                        target,
+                        now,
+                        len(history),
+                    )
         versions[key + (record["history_revision"], record["fitted_revision"])] = current.copy()
-        diagnostic.append(dict(worker=key[0], epoch=key[1], state=key[2], time=now, event=kind,
-            feedback_age=event.get("feedback_age_seconds"),
-            history_admission_age_p50=quantile([age + now - at for _, _, at, age in history], 0.5),
-            scales={m: applied_scale(v, now, TWO_WAVE_RATE) for m, v in current.items()}, targets={m: v[1] for m, v in current.items()},
-            bank_index=record["bank_index"], previous_sample_count=record["previous_sample_count"], current_sample_count=record["current_sample_count"],
-            history_revision=record["history_revision"], fitted_revision=record["fitted_revision"],
-            removed_samples=record["removed"], gain_rate=TWO_WAVE_RATE))
+        diagnostic.append(
+            dict(
+                worker=key[0],
+                epoch=key[1],
+                state=key[2],
+                time=now,
+                event=kind,
+                feedback_age=event.get("feedback_age_seconds"),
+                history_admission_age_p50=quantile(
+                    [age + now - at for _, _, at, age in history], 0.5
+                ),
+                scales={m: applied_scale(v, now, TWO_WAVE_RATE) for m, v in current.items()},
+                targets={m: v[1] for m, v in current.items()},
+                bank_index=record["bank_index"],
+                previous_sample_count=record["previous_sample_count"],
+                current_sample_count=record["current_sample_count"],
+                history_revision=record["history_revision"],
+                fitted_revision=record["fitted_revision"],
+                removed_samples=record["removed"],
+                gain_rate=TWO_WAVE_RATE,
+            )
+        )
 
     def predictions(forecast):
         values = {method: None for method in prediction_methods}
         if forecast is None:
             return values
         key = state_key(forecast)
-        revision = (forecast["calibration_history_revision"], forecast["calibration_fitted_revision"])
+        revision = (
+            forecast["calibration_history_revision"],
+            forecast["calibration_fitted_revision"],
+        )
         previous = versions.get(key + revision, initial() if revision == (0, 0) else None)
         if previous is None:
             raise ValueError(f"Missing causal revision {key + revision}")
         now = forecast["calibration_time_seconds"]
         baseline = forecast["calibration_baseline_seconds" if queue_only else "baseline_seconds"]
-        extra = forecast["calibration_input_excess_seconds" if queue_only else "predicted_excess_seconds"]
-        available = forecast["calibration_baseline_available" if queue_only else "baseline_available"]
+        extra = forecast[
+            "calibration_input_excess_seconds" if queue_only else "predicted_excess_seconds"
+        ]
+        available = forecast[
+            "calibration_baseline_available" if queue_only else "baseline_available"
+        ]
         for method, version in previous.items():
             if now < version[2]:
                 raise ValueError("Prediction used future feedback")
             value = baseline + applied_scale(version, now, TWO_WAVE_RATE) * extra
-            if method == "mse_poll" and available and not close(value, forecast["calibrated_ttft_seconds"]):
+            if (
+                method == "mse_poll"
+                and available
+                and not close(value, forecast["calibrated_ttft_seconds"])
+            ):
                 raise ValueError("Two-wave replay does not reproduce live prediction")
             if available:
                 values[method] = value
@@ -259,22 +301,38 @@ def replay_two_wave(log, rows, checked):
         row.update(predictions(forecast))
         row["gate_predictions"] = predictions(gate)
         row["gate_ready"] = gate["ready"] if gate else None
-        row["pre_admission_gate_flags"] = {name: gate.get(field) if gate else None for name, field in (("raw", "would_reject"), ("calibrated", "calibrated_would_reject"))}
+        row["pre_admission_gate_flags"] = {
+            name: gate.get(field) if gate else None
+            for name, field in (("raw", "would_reject"), ("calibrated", "calibrated_would_reject"))
+        }
         if queue_only:
-            row["gate_calibration_baseline_source"] = gate.get("calibration_baseline_source") if gate else None
+            row["gate_calibration_baseline_source"] = (
+                gate.get("calibration_baseline_source") if gate else None
+            )
             row["gate_native_ready"] = gate["native_ready"] if gate else None
             row["gate_calibration_ready"] = gate["calibration_ready"] if gate else None
         row.pop("calibration_epoch", None)
         if forecast:
-            row.update(baseline_seconds=forecast["baseline_seconds"], calibration_epoch=forecast["calibration_epoch"],
-                calibration_bank_index=forecast["calibration_bank_index"], calibration_history_revision=forecast["calibration_history_revision"],
-                calibration_fitted_revision=forecast["calibration_fitted_revision"])
+            row.update(
+                baseline_seconds=forecast["baseline_seconds"],
+                calibration_epoch=forecast["calibration_epoch"],
+                calibration_bank_index=forecast["calibration_bank_index"],
+                calibration_history_revision=forecast["calibration_history_revision"],
+                calibration_fitted_revision=forecast["calibration_fitted_revision"],
+            )
             if queue_only:
-                for field in ("calibration_baseline_seconds", "calibration_baseline_source", "calibration_baseline_available",
-                              "queue_excess_seconds", "calibration_input_excess_seconds"):
+                for field in (
+                    "calibration_baseline_seconds",
+                    "calibration_baseline_source",
+                    "calibration_baseline_available",
+                    "queue_excess_seconds",
+                    "calibration_input_excess_seconds",
+                ):
                     row[field] = forecast[field]
             if row.get("started_elapsed_seconds") is not None:
-                offsets[state_key(forecast)].append(row["started_elapsed_seconds"] - forecast["calibration_time_seconds"])
+                offsets[state_key(forecast)].append(
+                    row["started_elapsed_seconds"] - forecast["calibration_time_seconds"]
+                )
         result.append(row)
     for item in diagnostic:
         values = offsets.get((item["worker"], item["epoch"], item["state"]))
@@ -288,11 +346,25 @@ def ttft_scorecard(rows, method, deadline, pre_admission=True):
     Existing extra-delay gate flags and protocol completion are separate outcomes.
     Readiness is reported separately from this >=deadline numeric comparison.
     """
-    counts = dict(offered=len(rows), tp=0, fp=0, tn=0, fn=0, unknown=0,
-                  truth_healthy=0, truth_late=0, truth_unknown=0, prediction_unknown=0,
-                  gate_unready=0, gate_readiness_unknown=0, native_gate_unready=0,
-                  native_gate_readiness_unknown=0, calibration_history_unready=0,
-                  calibration_history_readiness_unknown=0, censored_known_late=0)
+    counts = dict(
+        offered=len(rows),
+        tp=0,
+        fp=0,
+        tn=0,
+        fn=0,
+        unknown=0,
+        truth_healthy=0,
+        truth_late=0,
+        truth_unknown=0,
+        prediction_unknown=0,
+        gate_unready=0,
+        gate_readiness_unknown=0,
+        native_gate_unready=0,
+        native_gate_readiness_unknown=0,
+        calibration_history_unready=0,
+        calibration_history_readiness_unknown=0,
+        censored_known_late=0,
+    )
     for row in rows:
         observed = row.get("client_ttft_seconds")
         truth = row.get("first_text_late")
@@ -302,19 +374,28 @@ def ttft_scorecard(rows, method, deadline, pre_admission=True):
             if observed is not None:
                 if not math.isfinite(observed) or observed < 0 or truth != (observed >= deadline):
                     raise ValueError("Invalid observed TTFT truth")
-            elif not (truth and row.get("timed_out") is True and row.get("status") in (0, 200)
-                      and row.get("error") is None and not row.get("cancelled")
-                      and not row.get("intentional_stream_abort")
-                      and (row.get("observation_horizon_seconds") or 0) >= deadline
-                      and math.isfinite(row.get("e2e_seconds", -1))
-                      and row.get("e2e_seconds", -1) >= deadline):
+            elif not (
+                truth
+                and row.get("timed_out") is True
+                and row.get("status") in (0, 200)
+                and row.get("error") is None
+                and not row.get("cancelled")
+                and not row.get("intentional_stream_abort")
+                and (row.get("observation_horizon_seconds") or 0) >= deadline
+                and math.isfinite(row.get("e2e_seconds", -1))
+                and row.get("e2e_seconds", -1) >= deadline
+            ):
                 raise ValueError("Censored TTFT truth lacks a valid deadline-reaching observation")
             else:
                 counts["censored_known_late"] += 1
         else:
             truth = None
-        counts["truth_unknown" if truth is None else "truth_late" if truth else "truth_healthy"] += 1
-        prediction = row.get("gate_predictions", {}).get(method) if pre_admission else row.get(method)
+        counts[
+            "truth_unknown" if truth is None else "truth_late" if truth else "truth_healthy"
+        ] += 1
+        prediction = (
+            row.get("gate_predictions", {}).get(method) if pre_admission else row.get(method)
+        )
         if prediction is None:
             counts["prediction_unknown"] += 1
         elif not math.isfinite(prediction) or prediction < 0:
@@ -323,8 +404,14 @@ def ttft_scorecard(rows, method, deadline, pre_admission=True):
             counts["gate_unready"] += 1
         elif row.get("gate_ready") is None:
             counts["gate_readiness_unknown"] += 1
-        for field, unready, unknown in (("gate_native_ready", "native_gate_unready", "native_gate_readiness_unknown"),
-                                        ("gate_calibration_ready", "calibration_history_unready", "calibration_history_readiness_unknown")):
+        for field, unready, unknown in (
+            ("gate_native_ready", "native_gate_unready", "native_gate_readiness_unknown"),
+            (
+                "gate_calibration_ready",
+                "calibration_history_unready",
+                "calibration_history_readiness_unknown",
+            ),
+        ):
             if row.get(field) is False:
                 counts[unready] += 1
             elif row.get(field) is None:
@@ -335,11 +422,24 @@ def ttft_scorecard(rows, method, deadline, pre_admission=True):
         reject = prediction >= deadline
         counts["tp" if reject and truth else "fp" if reject else "fn" if truth else "tn"] += 1
     assert sum(counts[k] for k in ("tp", "fp", "tn", "fn", "unknown")) == len(rows)
-    return counts | dict(method=method, deadline_seconds=deadline,
-        prediction_source="exact pre-admission total TTFT" if pre_admission else "selected diagnostic total TTFT",
+    return counts | dict(
+        method=method,
+        deadline_seconds=deadline,
+        prediction_source="exact pre-admission total TTFT"
+        if pre_admission
+        else "selected diagnostic total TTFT",
         rule="Known total prediction >=deadline; readiness separate, extra-delay flags separate.",
-        readiness_note="gate_unready is raw floor-inclusive gate readiness; native capacity/freshness and calibration history readiness are counted separately.",
-        truth_note="Observed first text or a valid deadline-reaching censored lower bound. Numeric missing TTFT remains missing; short/error/rejected outcomes stay unknown.")
+        readiness_note=(
+            "gate_unready is raw floor-inclusive gate readiness; native "
+            "capacity/freshness and calibration history readiness are "
+            "counted separately."
+        ),
+        truth_note=(
+            "Observed first text or a valid deadline-reaching censored "
+            "lower bound. Numeric missing TTFT remains missing; short/error/rejected "
+            "outcomes stay unknown."
+        ),
+    )
 
 
 def scorecard(rows, deadline):
@@ -434,7 +534,9 @@ def plot(rows, diagnostic, stages, resets, output, two_wave=False, live_method=T
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(6 if two_wave else 4, 1, figsize=(14, 19 if two_wave else 13), sharex=True)
+    fig, axes = plt.subplots(
+        6 if two_wave else 4, 1, figsize=(14, 19 if two_wave else 13), sharex=True
+    )
     for method in METHODS:
         # Separate epochs/banks so lifecycle discontinuities are not interpolated.
         groups = defaultdict(list)
@@ -447,7 +549,9 @@ def plot(rows, diagnostic, stages, resets, output, two_wave=False, live_method=T
                 [d["elapsed_seconds"] for d in values],
                 [d["scales"][method] for d in values],
                 color=color,
-                label=(live_method + " (live)" if two_wave and method == "mse_poll" else method) if i == 0 else None,
+                label=(live_method + " (live)" if two_wave and method == "mse_poll" else method)
+                if i == 0
+                else None,
                 linewidth=0.8,
             )
             if method == "mse_poll":
@@ -479,7 +583,11 @@ def plot(rows, diagnostic, stages, resets, output, two_wave=False, live_method=T
             color="C3",
             label="Median age of admissions in fitting window" if i == 0 else None,
         )
-    for method in (("raw", "queue_only_raw", "mse_poll") if live_method == QUEUE_METHOD else ("raw", "median_feedback", "mse_poll")):
+    for method in (
+        ("raw", "queue_only_raw", "mse_poll")
+        if live_method == QUEUE_METHOD
+        else ("raw", "median_feedback", "mse_poll")
+    ):
         exact = [
             r for r in rows if r.get(method) is not None and r.get("smg_ttft_seconds") is not None
         ]
@@ -493,8 +601,10 @@ def plot(rows, diagnostic, stages, resets, output, two_wave=False, live_method=T
     axes[2].axhline(0, color="black", linewidth=0.5)
     for phase in dict.fromkeys(r["phase"] for r in rows):
         rr = [
-            r for r in rows
-            if r["phase"] == phase and r.get("started_elapsed_seconds") is not None
+            r
+            for r in rows
+            if r["phase"] == phase
+            and r.get("started_elapsed_seconds") is not None
             and r.get("calibration_epoch") is not None
         ]
         times = [r["started_elapsed_seconds"] for r in rr]
@@ -505,7 +615,12 @@ def plot(rows, diagnostic, stages, resets, output, two_wave=False, live_method=T
                 s=2,
                 label=phase,
             )
-    labels = ["Calibration gain", "Feedback age (seconds)", "Predicted − actual TTFT (s)", "Selected/admitted epoch (known only)"]
+    labels = [
+        "Calibration gain",
+        "Feedback age (seconds)",
+        "Predicted − actual TTFT (s)",
+        "Selected/admitted epoch (known only)",
+    ]
     if two_wave:
         labels += ["Retained samples (max 64)", "History / fitted revision"]
         groups = defaultdict(list)
@@ -517,19 +632,59 @@ def plot(rows, diagnostic, stages, resets, output, two_wave=False, live_method=T
         for i, values in enumerate(groups.values()):
             times = [d["elapsed_seconds"] for d in values]
             for name, color in (("previous_sample_count", "C0"), ("current_sample_count", "C1")):
-                axes[4].step(times, [d[name] for d in values], where="post", color=color,
-                    linestyle="--" if live_method == QUEUE_METHOD and name == "previous_sample_count" else "-",
-                    linewidth=2.5 if live_method == QUEUE_METHOD and name == "previous_sample_count" else 1,
-                    label=name if i == 0 else None)
+                axes[4].step(
+                    times,
+                    [d[name] for d in values],
+                    where="post",
+                    color=color,
+                    linestyle="--"
+                    if live_method == QUEUE_METHOD and name == "previous_sample_count"
+                    else "-",
+                    linewidth=2.5
+                    if live_method == QUEUE_METHOD and name == "previous_sample_count"
+                    else 1,
+                    label=name if i == 0 else None,
+                )
             if live_method == QUEUE_METHOD:
-                axes[4].step(times, [d["previous_sample_count"] + d["current_sample_count"] for d in values],
-                    where="post", color="black", linestyle=":", label="Total retained (max64)" if i == 0 else None)
-            bank_axis.step(times, [d["bank_index"] for d in values], where="post", color="gray", linestyle=":", label="bank index" if i == 0 else None)
+                axes[4].step(
+                    times,
+                    [d["previous_sample_count"] + d["current_sample_count"] for d in values],
+                    where="post",
+                    color="black",
+                    linestyle=":",
+                    label="Total retained (max64)" if i == 0 else None,
+                )
+            bank_axis.step(
+                times,
+                [d["bank_index"] for d in values],
+                where="post",
+                color="gray",
+                linestyle=":",
+                label="bank index" if i == 0 else None,
+            )
             for name, color in (("history_revision", "C2"), ("fitted_revision", "C3")):
-                axes[5].step(times, [d[name] for d in values], where="post", color=color, label=name if i == 0 else None)
-        rotations = sorted({d["elapsed_seconds"] for d in diagnostic if d["event"] == "calibration_rotation" and d["elapsed_seconds"] is not None})
+                axes[5].step(
+                    times,
+                    [d[name] for d in values],
+                    where="post",
+                    color=color,
+                    label=name if i == 0 else None,
+                )
+        rotations = sorted(
+            {
+                d["elapsed_seconds"]
+                for d in diagnostic
+                if d["event"] == "calibration_rotation" and d["elapsed_seconds"] is not None
+            }
+        )
         for i, at in enumerate(rotations):
-            axes[4].axvline(at, color="teal", alpha=0.25, linestyle="--", label="Bank rotation; same epoch" if i == 0 else None)
+            axes[4].axvline(
+                at,
+                color="teal",
+                alpha=0.25,
+                linestyle="--",
+                label="Bank rotation; same epoch" if i == 0 else None,
+            )
         bank_axis.set_yscale("linear")
         bank_axis.legend(fontsize=7, loc="upper right")
     for ax, label in zip(
@@ -564,9 +719,12 @@ def plot(rows, diagnostic, stages, resets, output, two_wave=False, live_method=T
         "Elapsed client time (s); feedback panels use observation time, errors use admission time"
     )
     lifecycle = " — all ablations: recorded two-wave banks, 0.5 gain/s" if two_wave else ""
-    title = output.parent.name + " — fixed-trace causal ablations; no policy intervention" + lifecycle
+    title = (
+        output.parent.name + " — fixed-trace causal ablations; no policy intervention" + lifecycle
+    )
     if live_method == QUEUE_METHOD:
         import textwrap
+
         title = textwrap.fill(title + "; queue-only N, saved CalB provenance", width=110)
     fig.suptitle(title)
     fig.tight_layout()
@@ -586,7 +744,12 @@ def analyze(source, output, plots=False):
     deadline = profile["deadline_seconds"]
     two_wave = checked["calibration_method"] in TWO_WAVE_METHODS
     queue_only = checked["calibration_method"] == QUEUE_METHOD
-    methods = ("raw",) + METHODS + ((checked["calibration_method"],) if two_wave else ()) + (("queue_only_raw",) if queue_only else ())
+    methods = (
+        ("raw",)
+        + METHODS
+        + ((checked["calibration_method"],) if two_wave else ())
+        + (("queue_only_raw",) if queue_only else ())
+    )
     groups = {"all": rows}
     groups.update(
         {
@@ -607,13 +770,22 @@ def analyze(source, output, plots=False):
         resets=resets,
         analyzer_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         interpretation=(
-            "Queue-only ablations use saved calibration baseline provenance and queue work/capacity N, excluding the raw empirical floor/visibility. "
-            "queue_only_raw=CalB+N; live=mse_poll_two_wave_queue_v2=CalB+g*N. Raw F-based predictions retain measured-raw-baseline availability. "
-            "All ablations hold recorded eligibility,300s two-wave banks and0.5/s gain fixed; historical median is weighted, not an old binary rerun."
-        ) if queue_only else (
-            "All new-trace ablations use recorded two-wave acceptance-time banks (300s, previous/current32 each), fixed eligibility and0.5/s gain. "
-            "mse_poll_two_wave_v1 is the explicit live alias of mse_poll. No ablation represents the old binary or old32-sample/600s-epoch lifecycle."
-        ) if two_wave else (
+            "Queue-only ablations use saved calibration baseline provenance and queue work/capacity N, "
+            "excluding the raw empirical floor/visibility. "
+            "queue_only_raw=CalB+N; live=mse_poll_two_wave_queue_v2=CalB+g*N. Raw F-based predictions "
+            "retain measured-raw-baseline availability. "
+            "All ablations hold recorded eligibility,300s two-wave banks and0.5/s gain fixed; "
+            "historical median is weighted, not an old binary rerun."
+        )
+        if queue_only
+        else (
+            "All new-trace ablations use recorded two-wave acceptance-time banks (300s, "
+            "previous/current32 each), fixed eligibility and0.5/s gain. "
+            "mse_poll_two_wave_v1 is the explicit live alias of mse_poll. No ablation represents the "
+            "old binary or old32-sample/600s-epoch lifecycle."
+        )
+        if two_wave
+        else (
             "Fixed eligibility, raw state and 600s epochs; historical median algorithm with current lifecycle. "
             "Not a historical binary replay or closed-loop policy simulation."
         ),
@@ -639,11 +811,32 @@ def analyze(source, output, plots=False):
         },
     )
     if queue_only:
-        result.update(primary_outcome="first text >=deadline; full completion is separate and usually unobserved after intentional abort",
-            ttft_scorecards={group: {method: ttft_scorecard(rr, method, deadline) for method in methods} for group, rr in groups.items()},
-            selected_ttft_diagnostics={group: {method: ttft_scorecard(rr, method, deadline, pre_admission=False) for method in methods} for group, rr in groups.items()},
-            baseline_source_counts={source: sum(r.get("calibration_baseline_source") == source for r in rows) for source in ("unknown", "provisional", "measured")},
-            censoring_note="420s observation horizon is distinct from300s TTFT classification. Known-late lower bounds never enter numeric TTFT error distributions; incomplete/aborted protocol completion remains unknown.")
+        result.update(
+            primary_outcome=(
+                "first text >=deadline; full completion is separate and usually "
+                "unobserved after intentional abort"
+            ),
+            ttft_scorecards={
+                group: {method: ttft_scorecard(rr, method, deadline) for method in methods}
+                for group, rr in groups.items()
+            },
+            selected_ttft_diagnostics={
+                group: {
+                    method: ttft_scorecard(rr, method, deadline, pre_admission=False)
+                    for method in methods
+                }
+                for group, rr in groups.items()
+            },
+            baseline_source_counts={
+                source: sum(r.get("calibration_baseline_source") == source for r in rows)
+                for source in ("unknown", "provisional", "measured")
+            },
+            censoring_note=(
+                "420s observation horizon is distinct from300s TTFT classification. "
+                "Known-late lower bounds never enter numeric TTFT error distributions; "
+                "incomplete/aborted protocol completion remains unknown."
+            ),
+        )
     output.mkdir(parents=True, exist_ok=False)
     (output / "analysis.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
     for name, values in (("replay.jsonl", rows), ("transitions.jsonl", diagnostics)):
