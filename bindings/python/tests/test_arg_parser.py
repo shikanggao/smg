@@ -1547,6 +1547,7 @@ class TestRouterArgsFieldOrder:
         "estimated_wait_fallback_prefill_throughput",
         "estimated_wait_calibration_shadow",
         "estimated_wait_provisional_baseline_secs",
+        "estimated_wait_feature_shadow",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
