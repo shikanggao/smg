@@ -30,6 +30,7 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
+use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -76,6 +77,7 @@ use crate::{
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
+        estimated_wait::{CalibrationForecast, StreamTtftObserver},
         AttachedBody, ConnectionMode, RoutingPool, Worker, WorkerLoadGuard, WorkerRegistry,
         WorkerType,
     },
@@ -239,12 +241,8 @@ impl Router {
     fn select_worker_for_model(
         &self,
         model_id: &str,
-        text: Option<&str>,
-        tokens: Option<&[u32]>,
-        headers: Option<&HeaderMap>,
-        rid_key: Option<&str>,
-        cache_namespace: Option<CacheNamespace>,
-    ) -> Option<Arc<dyn Worker>> {
+        inputs: PlacementInputs<'_>,
+    ) -> Result<Option<Arc<dyn Worker>>, Response> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
         placement::select_single(
@@ -253,13 +251,7 @@ impl Router {
             model_id,
             RoutingPool::HttpRegular,
             None,
-            PlacementInputs {
-                text,
-                tokens,
-                headers,
-                rid_key,
-                cache_namespace,
-            },
+            inputs,
         )
     }
 
@@ -491,18 +483,25 @@ impl Router {
         canonical_model: Option<&str>,
         is_stream: bool,
     ) -> Response {
+        let calibration = Mutex::new(None);
         let worker = match lease.with_view(|view| {
             self.select_worker_for_model(
                 model_id,
-                view.text,
-                view.tokens,
-                headers,
-                view.rid_key,
-                view.cache_namespace,
+                PlacementInputs {
+                    text: view.text,
+                    tokens: view.tokens,
+                    headers,
+                    rid_key: view.rid_key,
+                    cache_namespace: view.cache_namespace,
+                    calibration: is_stream.then_some(&calibration),
+                    feature_context_supported: is_stream
+                        && matches!(route, "/v1/chat/completions" | "/v1/completions"),
+                },
             )
         }) {
-            Some(w) => w,
-            None => {
+            Err(shed) => return shed,
+            Ok(Some(w)) => w,
+            Ok(None) => {
                 // The verdict is judged from exactly the pool selection drew
                 // from, wildcard model included: that is what makes the shed
                 // fire for a model-less `/generate` and for a model that is
@@ -564,6 +563,7 @@ impl Router {
                     worker.as_ref(),
                     is_stream,
                     load_guard,
+                    calibration.into_inner(),
                 )
                 .await
             }
@@ -802,7 +802,8 @@ impl Router {
             record_pre_send_error(&resp);
             return resp;
         }
-        let Some(worker) = placement::select_from(
+        let calibration = Mutex::new(None);
+        let selection = placement::select_from(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
@@ -813,29 +814,39 @@ impl Router {
                 headers,
                 rid_key: None,
                 cache_namespace: None,
+                calibration: is_stream.then_some(&calibration),
+                feature_context_supported: false,
             },
-        ) else {
-            // Judged from the same candidates whether the pre-filter emptied
-            // or a self-filtering policy missed on an all-overloaded pool, so
-            // a shed keeps its Retry-After, retryability and metric.
-            let resp = match placement::failure_from(&non_dp_workers, model_id) {
-                PlacementFailure::AllOverloaded(shed) => shed,
-                PlacementFailure::NoCandidates
-                | PlacementFailure::Unavailable
-                | PlacementFailure::PolicyDeclined(_)
-                | PlacementFailure::NoCompatiblePair { .. } => {
-                    // The verdict cannot tell a policy miss from a drained
-                    // pool; the pool can.
-                    let message = if non_dp_workers.iter().any(|w| w.is_available()) {
-                        "Policy returned no eligible worker"
-                    } else {
-                        "All workers are unavailable (circuit breaker open or unhealthy)"
-                    };
-                    error::service_unavailable("no_available_workers", message)
-                }
-            };
-            record_pre_send_error(&resp);
-            return resp;
+        );
+        let worker = match selection {
+            Err(shed) => {
+                record_pre_send_error(&shed);
+                return shed;
+            }
+            Ok(Some(worker)) => worker,
+            Ok(None) => {
+                // Judged from the same candidates whether the pre-filter emptied
+                // or a self-filtering policy missed on an all-overloaded pool, so
+                // a shed keeps its Retry-After, retryability and metric.
+                let resp = match placement::failure_from(&non_dp_workers, model_id) {
+                    PlacementFailure::AllOverloaded(shed) => shed,
+                    PlacementFailure::NoCandidates
+                    | PlacementFailure::Unavailable
+                    | PlacementFailure::PolicyDeclined(_)
+                    | PlacementFailure::NoCompatiblePair { .. } => {
+                        // The verdict cannot tell a policy miss from a drained
+                        // pool; the pool can.
+                        let message = if non_dp_workers.iter().any(|w| w.is_available()) {
+                            "Policy returned no eligible worker"
+                        } else {
+                            "All workers are unavailable (circuit breaker open or unhealthy)"
+                        };
+                        error::service_unavailable("no_available_workers", message)
+                    }
+                };
+                record_pre_send_error(&resp);
+                return resp;
+            }
         };
 
         // Same dispatch-time re-check the regular path takes. A transcription
@@ -879,9 +890,32 @@ impl Router {
             worker.api_key(),
         );
 
+        let mut ttft_observer = is_stream.then(|| {
+            StreamTtftObserver::new(&self.worker_registry, worker.url(), start)
+                .with_request_id(
+                    headers
+                        .and_then(|headers| headers.get("opc-request-id"))
+                        .and_then(|value| value.to_str().ok()),
+                )
+                .with_calibration(calibration.into_inner())
+        });
+        if let Some(observer) = &ttft_observer {
+            observer.transport_event("upstream_send_started");
+        }
         let res = match send_with_stale_conn_retry(request_builder).await {
-            Ok(res) => res,
+            Ok(res) => {
+                if let Some(observer) = &ttft_observer {
+                    observer.transport_event("upstream_headers_received");
+                }
+                res
+            }
             Err(e) => {
+                if let Some(observer) = &mut ttft_observer {
+                    if e.is_timeout() {
+                        observer.upstream_timeout();
+                    }
+                    observer.transport_event("upstream_send_failed");
+                }
                 error!(
                     "Failed to send multipart transcription request worker_url={} route={} error={}",
                     worker.url(),
@@ -954,6 +988,7 @@ impl Router {
             let stream_model_id = model_id.to_string();
             let stream_endpoint = endpoint;
             let stream_start = start;
+            let mut ttft_observer = ttft_observer.expect("stream observer initialized before send");
             #[expect(
                 clippy::disallowed_methods,
                 reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
@@ -975,28 +1010,40 @@ impl Router {
                             // no frame.
                             Some(Ok(bytes)) if bytes.is_empty() => {}
                             Some(Ok(bytes)) => {
+                                if tx.capacity() == 0 { ttft_observer.cancel(); }
+                                if stream_header_status.is_success() { ttft_observer.push(&bytes); }
                                 if tx.send(Ok(bytes)).await.is_err() {
+                                    ttft_observer.downstream_disconnected();
+                                    ttft_observer.transport_event("downstream_receiver_closed");
                                     client_disconnected = true;
                                     break;
                                 }
                             }
                             Some(Err(e)) => {
+                                if e.is_timeout() { ttft_observer.upstream_timeout(); }
+                                ttft_observer.transport_event("upstream_stream_error");
                                 stream_failed = true;
                                 let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                 break;
                             }
-                            None => break,
+                            None => {
+                                ttft_observer.transport_event("upstream_eof");
+                                break;
+                            },
                         },
                         // Client gone with no chunk in flight (long prefill,
-                        // stalled upstream): break so the reqwest stream drops,
-                        // closing the upstream connection and letting the
-                        // engine abort generation.
+                        // stalled upstream): release the reqwest response stream.
+                        // This does not acknowledge native scheduler cancellation.
                         () = tx.closed() => {
+                            ttft_observer.downstream_disconnected();
+                                    ttft_observer.transport_event("downstream_receiver_closed");
                             client_disconnected = true;
                             break;
                         }
                     }
                 }
+                drop(stream);
+                ttft_observer.transport_event("upstream_stream_released");
                 // Effective status = BAD_GATEWAY if the relay failed, else the
                 // worker's header status. Covers both "5xx header returned
                 // while stream=true" and "200 header then mid-stream break".
@@ -1143,7 +1190,9 @@ impl Router {
         worker: &dyn Worker,
         is_stream: bool,
         load_guard: WorkerLoadGuard,
+        calibration: Option<CalibrationForecast>,
     ) -> Response {
+        let started = Instant::now();
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
@@ -1161,9 +1210,32 @@ impl Router {
             api_key.as_ref(),
         );
 
+        let mut ttft_observer = is_stream.then(|| {
+            StreamTtftObserver::new(&self.worker_registry, worker.url(), started)
+                .with_request_id(
+                    headers
+                        .and_then(|headers| headers.get("opc-request-id"))
+                        .and_then(|value| value.to_str().ok()),
+                )
+                .with_calibration(calibration)
+        });
+        if let Some(observer) = &ttft_observer {
+            observer.transport_event("upstream_send_started");
+        }
         let res = match send_with_stale_conn_retry(request_builder).await {
-            Ok(res) => res,
+            Ok(res) => {
+                if let Some(observer) = &ttft_observer {
+                    observer.transport_event("upstream_headers_received");
+                }
+                res
+            }
             Err(e) => {
+                if let Some(observer) = &mut ttft_observer {
+                    if e.is_timeout() {
+                        observer.upstream_timeout();
+                    }
+                    observer.transport_event("upstream_send_failed");
+                }
                 error!(
                     "Failed to send typed request worker_url={} route={} error={}",
                     worker.url(),
@@ -1175,8 +1247,15 @@ impl Router {
             }
         };
 
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard)
-            .await
+        self.forward_worker_response(
+            res,
+            is_stream,
+            worker.url(),
+            load_guard,
+            started,
+            ttft_observer,
+        )
+        .await
     }
 
     /// Relay a worker response to the client. A streaming response flows
@@ -1188,6 +1267,8 @@ impl Router {
         is_stream: bool,
         worker_url: &str,
         load_guard: WorkerLoadGuard,
+        started: Instant,
+        ttft_observer: Option<StreamTtftObserver>,
     ) -> Response {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1205,6 +1286,14 @@ impl Router {
             // Bounded channel applies backpressure: a slow client makes the
             // relay await on `send` instead of buffering the whole response.
             let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
+            let mut ttft_observer = ttft_observer.unwrap_or_else(|| {
+                StreamTtftObserver::new(&self.worker_registry, worker_url, started)
+            });
+
+            // An HTTP error body is not a successful streaming TTFT attempt.
+            if !status.is_success() {
+                ttft_observer.cancel();
+            }
 
             // Spawn task to forward stream
             #[expect(
@@ -1220,23 +1309,37 @@ impl Router {
                             // not become an empty h2 DATA frame toward the client.
                             Some(Ok(bytes)) if bytes.is_empty() => {}
                             Some(Ok(bytes)) => {
+                                if tx.capacity() == 0 { ttft_observer.cancel(); }
+                                if status.is_success() { ttft_observer.push(&bytes); }
                                 if tx.send(Ok(bytes)).await.is_err() {
+                                    ttft_observer.downstream_disconnected();
+                                    ttft_observer.transport_event("downstream_receiver_closed");
                                     break;
                                 }
                             }
                             Some(Err(e)) => {
+                                if e.is_timeout() { ttft_observer.upstream_timeout(); }
+                                ttft_observer.transport_event("upstream_stream_error");
                                 let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                 break;
                             }
-                            None => break,
+                            None => {
+                                ttft_observer.transport_event("upstream_eof");
+                                break;
+                            },
                         },
                         // Client gone with no chunk in flight (long prefill,
-                        // stalled upstream): break so the reqwest stream drops,
-                        // closing the upstream connection and letting the
-                        // engine abort generation.
-                        () = tx.closed() => break,
+                        // stalled upstream): release the reqwest response stream.
+                        // This does not acknowledge native scheduler cancellation.
+                        () = tx.closed() => {
+                            ttft_observer.downstream_disconnected();
+                                    ttft_observer.transport_event("downstream_receiver_closed");
+                            break;
+                        },
                     }
                 }
+                drop(stream);
+                ttft_observer.transport_event("upstream_stream_released");
             });
 
             let stream = ReceiverStream::new(rx);
@@ -1293,7 +1396,9 @@ impl Router {
         route: &'static str,
         worker: &dyn Worker,
         load_guard: WorkerLoadGuard,
+        calibration: Option<CalibrationForecast>,
     ) -> Response {
+        let started = Instant::now();
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
@@ -1371,7 +1476,16 @@ impl Router {
             .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
             .is_some_and(|ct| ct.starts_with("text/event-stream"));
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard)
+        let observer = is_stream.then(|| {
+            StreamTtftObserver::new(&self.worker_registry, worker.url(), started)
+                .with_request_id(
+                    headers
+                        .get("opc-request-id")
+                        .and_then(|value| value.to_str().ok()),
+                )
+                .with_calibration(calibration)
+        });
+        self.forward_worker_response(res, is_stream, worker.url(), load_guard, started, observer)
             .await
     }
 
@@ -1652,16 +1766,24 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
-        let Some(worker) = self.select_worker_for_model(
+        let calibration = Mutex::new(None);
+        let selection = self.select_worker_for_model(
             model_id,
-            None,
-            hinted_tokens.as_deref(),
-            Some(req.headers()),
-            None,
-            None,
-        ) else {
-            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
-            return Err(req);
+            PlacementInputs {
+                tokens: hinted_tokens.as_deref(),
+                headers: Some(req.headers()),
+                calibration: Some(&calibration),
+                feature_context_supported: false,
+                ..Default::default()
+            },
+        );
+        let worker = match selection {
+            Err(shed) => return Ok(shed),
+            Ok(Some(worker)) => worker,
+            Ok(None) => {
+                Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
+                return Err(req);
+            }
         };
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
@@ -1705,6 +1827,7 @@ impl Router {
                 route,
                 worker.as_ref(),
                 load_guard,
+                calibration.into_inner(),
             )
             .await;
 
@@ -2317,14 +2440,8 @@ mod tests {
         let router = create_test_unhealthy_router();
 
         let selected = router
-            .select_worker_for_model(
-                crate::worker::UNKNOWN_MODEL_ID,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, PlacementInputs::default())
+            .unwrap()
             .unwrap();
         assert!(selected.is_available());
 
@@ -2332,15 +2449,67 @@ mod tests {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
         }
         assert!(router
-            .select_worker_for_model(
-                crate::worker::UNKNOWN_MODEL_ID,
-                None,
-                None,
-                None,
-                None,
-                None
-            )
+            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, PlacementInputs::default(),)
+            .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn estimated_wait_returns_503_before_http_dispatch_without_internal_retry() {
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+        let router = create_test_regular_router();
+        router
+            .worker_registry
+            .estimated_wait()
+            .configure(EstimatedWaitConfig {
+                max_estimated_wait_secs: Some(1.0),
+                ..Default::default()
+            });
+        for worker in router.worker_registry.get_all() {
+            let stamp = router
+                .worker_registry
+                .estimated_wait()
+                .poll_started(&worker);
+            let load = WorkerLoadResponse {
+                loads: vec![SchedulerLoadSnapshot {
+                    num_waiting_uncached_tokens: 2000,
+                    gen_throughput: 2000.0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            router.worker_registry.estimated_wait().publish(
+                &worker,
+                Some(&load),
+                stamp,
+                Instant::now(),
+            );
+        }
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.route_typed_request(
+                None,
+                DropProbeRequest {
+                    text: "shed".to_owned(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            ),
+        )
+        .await
+        .expect("must shed without contacting workers or waiting for retries");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "worker_overload_protection_shed"
+        );
+        assert!(!is_retryable_response(&response));
     }
 
     #[tokio::test]

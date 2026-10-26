@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "description": "Synthetic production-style simulation, not a measured production trace",
+  "seed": 20261019,
+  "deadline_seconds": 300,
+  "router_extra_ttft_budget_seconds": 300,
+  "max_requests": 2400,
+  "max_inflight": 2048,
+  "sample_interval_seconds": 1,
+  "drain_timeout_seconds": 660,
+  "shared_prefix_fraction": 0.35,
+  "prefix_sessions": 16,
+  "maximum_p99_dispatch_lag_seconds": 0.25,
+  "coverage": {
+    "minimum_healthy_controls_per_cohort": 1,
+    "minimum_pressure_ttft_misses": 1,
+    "minimum_observed_late_ttft": 1
+  },
+  "cohorts": [
+    {
+      "name": "short-chat",
+      "weight": 40,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "rag",
+      "weight": 25,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "summarization",
+      "weight": 10,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "long-generation",
+      "weight": 10,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "code",
+      "weight": 10,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "long-context-generation",
+      "weight": 5,
+      "input_words": [
+        16384,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    }
+  ],
+  "phases": [
+    {
+      "name": "readiness-learn",
+      "seconds": 60,
+      "rps": 4,
+      "arrivals": "periodic",
+      "balanced_controls": true,
+      "input_words": [
+        8192,
+        16384
+      ]
+    },
+    {
+      "name": "pressure",
+      "seconds": 420,
+      "rps": 2,
+      "arrivals": "periodic"
+    },
+    {
+      "name": "pressure-high",
+      "seconds": 180,
+      "rps": 4,
+      "arrivals": "periodic"
+    },
+    {
+      "name": "recovery",
+      "seconds": 720,
+      "rps": 0.1,
+      "arrivals": "periodic",
+      "balanced_controls": true,
+      "drain_before": false
+    }
+  ],
+  "measurement_target": "ttft",
+  "recovery_candidate_required": true,
+  "startup_scenario": "isolated",
+  "observation_horizon_seconds": 420,
+  "readiness": {
+    "before_phase": "pressure",
+    "timeout_seconds": 180,
+    "require_native_completion_stats": true,
+    "require_entry_epoch_continuity": true
+  },
+  "capture_content_chars": 0,
+  "cache_namespace": "deadline-aligned-observe420-20261021",
+  "interpretation": {
+    "primary_target": "Total first-text delay >=300 seconds. A clean full 300-second pending-text cancellation is right-censored binary late, never an exact 300-second TTFT.",
+    "stream": "Observe first text for up to 420 seconds and allow capped 32-token normal completion; the router feature independently records its 300-second deadline-or-cutoff event.",
+    "history": "Fresh owned router and initial native idle/empty history, then bounded 60-second learning. Preserve the current trained epoch into immediate pressure; no quiet ramps or forced drain at entry.",
+    "workload": "Long-prefill ramp; changed from previous longdecode tests. No historical causal comparison.",
+    "baseline_seed": "Prior to each focused main case, run representative sequential seed profile; configure medianSMGfirsttext with frozen raw/model/runtime provenance.",
+    "template_labels": "Cohort names are prompttemplate keys. All main inputs are standardized longprefill16\u201332kwords with32outputtokens; labels do not imply actualshortchat/longdecode or representativeproductionmix. No answerquality claim.",
+    "recovery": "Undrained 720-second scheduled recovery requests continue beyond the 300/420-second feedback bounds. Later natural drain resets are recorded, not called fit convergence.",
+    "isolation": "Ownedephemeralservingkeyauth beforeadmission, no rawkeyinPodspec/config/logs. Missing/wrongkey401+correctinvalidbody400controls beforeSTART; finalwhole-captureexactrequest-IDaudit. Engine/directbypass notcovered.",
+    "comparison": "Scalar, deadline-conditioned feature and live-v2 are compared on the same admissions within this arm. Different cancellation policies change traffic, so cross-arm differences are descriptive and not a causal per-request treatment effect.",
+    "features": "Neutral initialization and unchanged fit/slew constants. Separate actual terminal cutoff counters from deduplicated 300-second deadline-or-cutoff outcomes."
+  },
+  "ttft_stream_policy": "complete_bounded_response",
+  "serving_auth_env": "SMG_EXPERIMENT_INGRESS_KEY",
+  "ttft_deadline_policy": "observe",
+  "feature_context_required": true,
+  "expected_feature_method": "feature_joint_gains_deadline_ridge_v3",
+  "expected_feature_deadline_seconds": 300,
+  "decision_calibration_required": true,
+  "expected_decision_method": "decision_live_queue_context_continuity_hinge_v4"
+}

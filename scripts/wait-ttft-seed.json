@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "description": "Synthetic production-style simulation, not a measured production trace",
+  "seed": 20261019,
+  "deadline_seconds": 300,
+  "router_extra_ttft_budget_seconds": 300,
+  "max_requests": 12,
+  "max_inflight": 1,
+  "sample_interval_seconds": 1,
+  "drain_timeout_seconds": 660,
+  "shared_prefix_fraction": 0.35,
+  "prefix_sessions": 16,
+  "maximum_p99_dispatch_lag_seconds": 0.25,
+  "coverage": {
+    "minimum_pressure_timeouts": 3,
+    "minimum_healthy_controls_per_cohort": 3,
+    "minimum_kv_90_observed_seconds": 30,
+    "minimum_completed_long_outputs": 3,
+    "minimum_healthy_boundary_completions": 10,
+    "long_output_tokens": 512
+  },
+  "cohorts": [
+    {
+      "name": "short-chat",
+      "weight": 1,
+      "input_words": [
+        16384,
+        16384
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "rag",
+      "weight": 1,
+      "input_words": [
+        24576,
+        24576
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    },
+    {
+      "name": "long-context-generation",
+      "weight": 1,
+      "input_words": [
+        32768,
+        32768
+      ],
+      "max_output_tokens": [
+        32,
+        32
+      ]
+    }
+  ],
+  "phases": [
+    {
+      "name": "representative-sequential-seed",
+      "seconds": 13,
+      "rps": 1,
+      "arrivals": "periodic",
+      "balanced_controls": true,
+      "sequential_seed": true
+    }
+  ],
+  "capture_content_chars": 0,
+  "cache_namespace": "queueonly-seed-20261019",
+  "interpretation": {
+    "purpose": "Bounded preparation:12 fully sequential requests,4 at each representative inputlength, outputcap32; freshnativeidle beforeeach. Fail immediately on incomplete seed.",
+    "schedule": "Nominal plan selects12items. Actual dispatch occurs after priorcompletion andfreshidle, notanindependentarrival experiment.",
+    "baseline": "MedianobservedSMGfirsttext withactualusageprompttokens/contextheadroom verification; sourcehashes retained. Notarbitraryconstant.",
+    "isolation": "Ownedephemeralservingkeyauth beforeadmission, no rawkeyinPodspec/config/logs. Missing/wrongkey401+correctinvalidbody400controls beforeSTART; finalwhole-captureexactrequest-IDaudit. Engine/directbypass notcovered."
+  },
+  "serving_auth_env": "SMG_EXPERIMENT_INGRESS_KEY"
+}

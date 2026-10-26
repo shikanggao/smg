@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "focused_cases": [
+    {
+      "backend": "vllm",
+      "model": "qwen",
+      "profile": "wait-ttft-focused.json",
+      "enabled": true
+    },
+    {
+      "backend": "sglang",
+      "model": "gpt-oss-20b",
+      "profile": "wait-ttft-focused.json",
+      "enabled": true
+    }
+  ],
+  "preparation_profile": "wait-ttft-seed.json",
+  "full_suite_cases": [
+    {
+      "name": "isolated",
+      "profile": "wait-ttft-focused.json",
+      "startup_scenario": "isolated"
+    },
+    {
+      "name": "busy-start-provisional",
+      "profile": "wait-ttft-busy-start.json",
+      "focused_enabled": false,
+      "focused_skip_reason": "User explicitly skipped busy-start DEV case in this focused round.",
+      "requirements": [
+        "Freshownedrouter withconfiguredprovisionalseed; boundedownedbackgroundengineworkload mustalreadybeactive.",
+        "Runnerverify_busy_start requires twofreshbusy nativesamples, provisionalonehotbaseline andemptyhistory/fittedrevision0 beforelearning.",
+        "Samecurrentepochaccepted>=4+actualfit gate; finalnative drain remainsmandatory."
+      ],
+      "runnable_command": "python scripts/run_wait_production_mix.py plan --profile scripts/wait-ttft-busy-start.json --output NEW_PLAN; then run with that plan, live router-events path, and guarded fresh router on the bounded owned busy engine."
+    }
+  ]
+}

@@ -121,6 +121,7 @@ mod tests {
     ) -> WorkerLoadResponse {
         let mut load = make_load(0, token_usage, gen_throughput);
         load.loads[0].num_waiting_reqs = num_waiting_reqs;
+        load.loads[0].num_waiting_uncached_tokens_available = Some(false);
         load
     }
 
