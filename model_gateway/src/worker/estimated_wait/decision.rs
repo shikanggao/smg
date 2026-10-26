@@ -9,8 +9,8 @@
 //! Only contextual slopes receive ridge regularization. Penalizing q toward1
 //! biases even an exact, noiseless queue-only fit away from its observed gain.
 //! z contains pending growth over30s, oldest pending age/300, and timely native
-//! progress deficit. The declared [0,1] domain permits bounded extrapolation;
-//! diagnostics distinguish predictions outside the observed training ranges.
+//! progress deficit. Early predictions require selected features inside their
+//! retained fit ranges; otherwise they use the matching independent queue fit.
 //! The convex fit uses an unclipped linear response. Prediction retains the
 //! contextual ±0.5 cap; both objectives and clipping are exported explicitly.
 //! This is not an exact optimizer of the capped, time-slewed prediction.
@@ -21,11 +21,16 @@
 //! exported coefficients are effective output weights, not learned weights;
 //! the scalar can exceed the fitted q cap and fallback transitions are not
 //! constrained by the learned trajectory. Learned vectors remain in diagnostics.
+//! Supported mask changes preserve q and shared applied slopes, initializing new
+//! slopes and removing dropped slopes at zero. Removing a slope changes the
+//! prediction basis immediately; it and source fallback switches are not covered
+//! by the coefficient slew bound. Compatible coefficients remain continuous,
+//! but total prediction continuity is not guaranteed across these transitions.
 use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
 
-pub(super) const METHOD: &str = "decision_live_queue_slope_ridge_hinge_v3";
+pub(super) const METHOD: &str = "decision_live_queue_context_continuity_hinge_v4";
 const PRIOR: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
 const RIDGE: f64 = 0.1;
 const MIN_X: f64 = 0.001;
@@ -136,6 +141,16 @@ fn project(mut theta: [f64; 4]) -> [f64; 4] {
     theta
 }
 impl Fit {
+    fn within_ranges(&self, context: Context) -> Option<bool> {
+        if !self.supported {
+            return None;
+        }
+        let z = vector(context, self.mask)?;
+        Some((0..3).all(|j| {
+            self.mask & (1 << j) == 0
+                || (z[j + 1] >= self.minimum[j] && z[j + 1] <= self.maximum[j])
+        }))
+    }
     fn learn(rows: &VecDeque<Label>, early: bool, censor: bool) -> Self {
         let masks: &[u8] = if early {
             &[7, 6, 5, 3, 4, 2, 1, 0]
@@ -315,9 +330,17 @@ impl Model {
         std::array::from_fn(|j| self.anchor[j] + fraction * (self.target[j] - self.anchor[j]))
     }
     fn update(&mut self, fit: Fit, now: f64) {
-        // Unsupported/subset changes cannot retain an intercept from a different basis.
-        self.anchor = if self.fit.mask == fit.mask && self.fit.supported && fit.supported {
-            self.applied(now)
+        self.anchor = if self.fit.supported && fit.supported {
+            // q always multiplies the same uncalibrated N. Carry its current
+            // applied value, not its target, and only slopes shared by both fits.
+            let applied = self.applied(now);
+            std::array::from_fn(|j| {
+                if j == 0 || self.fit.mask & fit.mask & (1 << (j - 1)) != 0 {
+                    applied[j]
+                } else {
+                    0.0
+                }
+            })
         } else {
             PRIOR
         };
@@ -331,6 +354,8 @@ pub(super) struct Prediction {
     pub arm: &'static str,
     pub source_arm: &'static str,
     pub scalar_fallback: bool,
+    pub fallback_reason: Option<&'static str>,
+    pub requested_within_fitted_ranges: Option<bool>,
     pub coefficients: [f64; 4],
     pub contributions: [f64; 4],
     pub extra: f64,
@@ -554,15 +579,24 @@ impl State {
     pub fn predictions(&self, snapshot: Snapshot, now: f64, available: bool) -> [Prediction; 4] {
         std::array::from_fn(|i| {
             let requested = &self.models[i];
-            let index = if i % 2 == 1
-                && (!requested.fit.supported
-                    || vector(snapshot.context, requested.fit.mask).is_none())
-            {
-                i - 1
+            let requested_within_fitted_ranges = requested.fit.within_ranges(snapshot.context);
+            let context_fallback = if i % 2 == 1 {
+                match (requested.fit.supported, requested_within_fitted_ranges) {
+                    (false, _) => Some("early_fit_unsupported"),
+                    (true, None) => Some("missing_context"),
+                    (true, Some(false)) => Some("outside_fitted_ranges"),
+                    (true, Some(true)) => None,
+                }
             } else {
-                i
+                None
             };
+            let index = if context_fallback.is_some() { i - 1 } else { i };
             let model = &self.models[index];
+            let fallback_reason = if available {
+                context_fallback.or_else(|| (!model.fit.supported).then_some("fit_unsupported"))
+            } else {
+                Some("snapshot_unavailable")
+            };
             if !available || !model.fit.supported {
                 let unbounded_extra = snapshot.x * snapshot.scalar_gain;
                 let extra = unbounded_extra.max(0.0);
@@ -570,6 +604,8 @@ impl State {
                     arm: ARMS[i],
                     source_arm: "live_n_scalar",
                     scalar_fallback: true,
+                    fallback_reason,
+                    requested_within_fitted_ranges,
                     coefficients: [snapshot.scalar_gain, 0.0, 0.0, 0.0],
                     contributions: [extra, 0.0, 0.0, 0.0],
                     extra,
@@ -592,20 +628,18 @@ impl State {
                 }
             }
             let extra = contributions.iter().sum::<f64>().max(0.0);
-            let within = (0..3).all(|j| {
-                model.fit.mask & (1 << j) == 0
-                    || (z[j + 1] >= model.fit.minimum[j] && z[j + 1] <= model.fit.maximum[j])
-            });
             Prediction {
                 arm: ARMS[i],
                 source_arm: ARMS[index],
                 scalar_fallback: false,
+                fallback_reason,
+                requested_within_fitted_ranges,
                 coefficients,
                 contributions,
                 extra,
                 total: snapshot.baseline + extra,
                 supported: model.fit.supported,
-                within_fitted_ranges: within,
+                within_fitted_ranges: model.fit.within_ranges(snapshot.context) == Some(true),
                 available: available && extra.is_finite(),
                 unbounded_extra: snapshot.x * dot(coefficients, z),
                 contextual_clip_applied: shift != bounded,
@@ -954,7 +988,7 @@ mod tests {
         assert!((c.extra - 2.0 * b.extra).abs() < 1e-10);
     }
     #[test]
-    fn missing_feature_falls_back_whole_queue_model_and_range_is_reported() {
+    fn missing_or_extrapolated_feature_uses_matching_independent_queue_model() {
         let mut s = state();
         s.rows = labels();
         s.revision += 1;
@@ -963,15 +997,220 @@ mod tests {
         assert_eq!(pred[3].source_arm, "bound_queue");
         assert_eq!(pred[3].coefficients, pred[2].coefficients);
         assert!(!pred[3].scalar_fallback);
-        // Declared [0,1] domain permits bounded extrapolation, with explicit evidence.
+        assert_eq!(pred[3].fallback_reason, Some("missing_context"));
+        assert_eq!(pred[3].requested_within_fitted_ranges, None);
+        // Reproduce a rising context beyond the retained range: never continue
+        // the early fit's intercept after dropping its contextual correction.
         for r in &mut s.rows {
             r.snapshot.context.values[0] = r.snapshot.context.values[0].map(|x| x * 0.5);
         }
         s.revision += 1;
         s.poll(2.0, Some(7), true, 5.0);
         let pred = s.predictions(snapshot(2.0, [Some(1.0), Some(0.5), None]), 10.0, true);
-        assert!(!pred[3].within_fitted_ranges);
-        assert!(pred[3].available);
+        for (early, queue) in [(1, 0), (3, 2)] {
+            assert_eq!(pred[early].source_arm, ARMS[queue]);
+            assert_eq!(pred[early].fallback_reason, Some("outside_fitted_ranges"));
+            assert_eq!(pred[early].requested_within_fitted_ranges, Some(false));
+            assert!(pred[early].within_fitted_ranges && pred[early].available);
+            assert_eq!(pred[early].coefficients, pred[queue].coefficients);
+            assert_eq!(pred[early].extra, pred[queue].extra);
+            assert_eq!(pred[early].contributions, pred[queue].contributions);
+        }
+    }
+    #[test]
+    fn supported_feature_arrival_keeps_learned_queue_gain() {
+        let mut s = state();
+        s.rows = labels();
+        for row in &mut s.rows {
+            row.exact = true;
+            row.snapshot.context.values = [None, Some(0.0), None];
+            row.elapsed = row.snapshot.baseline + 2.4 * row.snapshot.x;
+        }
+        s.revision += 1;
+        s.poll(1.0, Some(7), true, 5.0);
+        assert_eq!(s.models[1].fit.mask, 0);
+        let before = s.models[1].applied(5.0);
+        assert!((before[0] - 2.4).abs() < 1e-12);
+        for (i, row) in s.rows.iter_mut().enumerate() {
+            let age = i as f64 / 31.0;
+            row.snapshot.context.values[1] = Some(age);
+            row.elapsed += 0.3 * age * row.snapshot.x;
+        }
+        s.revision += 1;
+        s.poll(5.0, Some(7), true, 5.0);
+        assert_eq!(s.models[1].fit.mask, 2);
+        assert_eq!(s.models[1].applied(5.0), before);
+        let snap = snapshot(5.0, [None, Some(0.5), None]);
+        let prediction = s.predictions(snap, 5.0, true);
+        assert!((prediction[1].extra - 240.0).abs() < 1e-9);
+        assert_eq!(prediction[1].source_arm, "exact_early");
+        assert_eq!(prediction[1].fallback_reason, None);
+    }
+    #[test]
+    fn mask_changes_keep_applied_shared_coefficients_and_restart_bounded_motion() {
+        let fit = |mask, coefficients| Fit {
+            mask,
+            coefficients,
+            supported: true,
+            ..Fit::default()
+        };
+        let mut model = Model::default();
+        model.update(fit(3, [3.0, 0.4, -0.2, 0.0]), 0.0);
+        let before = model.applied(2.0);
+        assert_ne!(before, model.target);
+        model.update(fit(6, [2.5, 0.0, -0.3, 0.5]), 2.0);
+        assert_eq!(model.anchor, [before[0], 0.0, before[2], 0.0]);
+        let after = model.applied(2.4);
+        let distance: f64 = (0..4).map(|j| (after[j] - model.anchor[j]).abs()).sum();
+        assert!(distance <= 0.200000001);
+        // Same-mask updates preserve every applied value; target is not an anchor.
+        model.update(fit(6, [2.0, 0.0, 0.2, -0.4]), 2.4);
+        assert_eq!(model.anchor, after);
+        // Losing fit support is a true prior reset, not a compatible mask change.
+        model.update(Fit::default(), 2.5);
+        assert_eq!(model.anchor, PRIOR);
+        model.update(fit(2, [2.0, 0.0, 0.2, 0.0]), 2.6);
+        assert_eq!(model.anchor, PRIOR);
+    }
+    #[test]
+    fn qwen_mask_five_to_four_keeps_partially_slewed_q_and_progress_slope() {
+        let mut model = Model::default();
+        let initial = Fit {
+            mask: 5,
+            coefficients: [2.8, -0.4, 0.0, 0.2],
+            supported: true,
+            maximum: [1.0, 0.0, 1.0],
+            ..Fit::default()
+        };
+        model.update(initial.clone(), 0.0);
+        let before_model = model.clone();
+        let before = model.applied(1.0);
+        assert!(before[0] > 1.0 && before[0] < 2.8);
+        assert!(before[1] < 0.0 && before[3] > 0.0);
+        let next = Fit {
+            mask: 4,
+            coefficients: [3.0, 0.0, 0.0, 0.25],
+            supported: true,
+            maximum: [0.0, 0.0, 1.0],
+            ..Fit::default()
+        };
+        model.update(next.clone(), 1.0);
+        assert_eq!(model.applied(1.0), [before[0], 0.0, 0.0, before[3]]);
+        let later = model.applied(1.2);
+        assert!(
+            (0..4)
+                .map(|j| (later[j] - model.anchor[j]).abs())
+                .sum::<f64>()
+                <= 0.100000001
+        );
+        println!(
+            "QWEN_MASK_FIXTURE={}",
+            serde_json::json!({"initial_fit":initial,"initial_at":0.0,"before_model":before_model,
+                "update_fit":next,"update_at":1.0,"before_applied":before,"after_model":model,
+                "later_at":1.2,"later_applied":later})
+        );
+    }
+    #[test]
+    fn dropped_slope_is_an_explicit_basis_change_not_a_hidden_queue_gain_reset() {
+        let mut s = state();
+        let fit = Fit {
+            mask: 2,
+            coefficients: [2.0, 0.0, -0.4, 0.0],
+            supported: true,
+            maximum: [0.0, 1.0, 0.0],
+            ..Fit::default()
+        };
+        s.models[1].update(fit.clone(), 0.0);
+        let snap = snapshot(10.0, [None, Some(1.0), None]);
+        let before = s.predictions(snap, 10.0, true)[1].clone();
+        let prior_model = s.models[1].clone();
+        let next = Fit {
+            mask: 0,
+            coefficients: [2.5, 0.0, 0.0, 0.0],
+            supported: true,
+            ..Fit::default()
+        };
+        s.models[1].update(next.clone(), 10.0);
+        let after = s.predictions(snap, 10.0, true)[1].clone();
+        assert_eq!(before.coefficients[0], after.coefficients[0]);
+        assert!((before.extra - 160.0).abs() < 1e-10);
+        assert!((after.extra - 200.0).abs() < 1e-10);
+        assert_eq!(after.contributions, [200.0, 0.0, 0.0, 0.0]);
+        // This immediate basis change is deliberate; subsequent coefficient
+        // movement resumes the original cap and cannot resurrect the old slope.
+        let later = s.predictions(snap, 10.4, true)[1].clone();
+        assert!((later.coefficients[0] - 2.2).abs() < 1e-10);
+        println!(
+            "MODEL_CONTINUITY_FIXTURE={}",
+            serde_json::json!({"initial_fit":fit,"initial_at":0.0,"before_model":prior_model,
+                "update_fit":next,"update_at":10.0,"after_model":s.models[1],
+                "snapshot":snap,"before":before,"after":after,"later_at":10.4,"later":later})
+        );
+    }
+    #[test]
+    fn retained_range_boundaries_and_unselected_values_do_not_trigger_fallback() {
+        let mut s = state();
+        s.rows = labels();
+        for row in &mut s.rows {
+            row.snapshot.context.values[0] = row.snapshot.context.values[0].map(|x| x * 0.5);
+        }
+        s.revision += 1;
+        s.poll(1.0, Some(7), true, 5.0);
+        for growth in [0.0, 0.5] {
+            let pred = s.predictions(
+                snapshot(1.0, [Some(growth), Some(0.5), Some(f64::NAN)]),
+                5.0,
+                true,
+            );
+            for early in [1, 3] {
+                assert_eq!(pred[early].source_arm, ARMS[early]);
+                assert_eq!(pred[early].fallback_reason, None);
+                assert_eq!(pred[early].requested_within_fitted_ranges, Some(true));
+            }
+        }
+        for growth in [None, Some(f64::NAN), Some(f64::INFINITY), Some(1.1)] {
+            let pred = s.predictions(snapshot(1.0, [growth, Some(0.5), None]), 5.0, true);
+            for (early, queue) in [(1, 0), (3, 2)] {
+                assert_eq!(pred[early].source_arm, ARMS[queue]);
+                assert_eq!(pred[early].fallback_reason, Some("missing_context"));
+                assert_eq!(pred[early].requested_within_fitted_ranges, None);
+                assert_eq!(pred[early].extra, pred[queue].extra);
+            }
+        }
+        let snap = snapshot(1.0, [Some(0.75), Some(0.5), None]);
+        s.models[2] = Model::default();
+        let pred = s.predictions(snap, 5.0, true);
+        assert_eq!(pred[3].source_arm, "live_n_scalar");
+        assert_eq!(pred[3].fallback_reason, Some("outside_fitted_ranges"));
+        assert_eq!(pred[3].requested_within_fitted_ranges, Some(false));
+        assert!(pred[3].scalar_fallback && !pred[3].supported);
+        let pred = s.predictions(snap, 5.0, false);
+        assert_eq!(pred[3].fallback_reason, Some("snapshot_unavailable"));
+        assert_eq!(pred[3].requested_within_fitted_ranges, Some(false));
+    }
+    #[test]
+    fn compatible_mask_policy_does_not_preserve_across_profile_stale_gap_or_expiry_reset() {
+        for (now, profile, fresh, max_gap) in [
+            (5.0, 8, true, 5.0),
+            (5.0, 7, false, 5.0),
+            (10.0, 7, true, 5.0),
+            (600.0, 7, true, 1000.0),
+        ] {
+            let mut s = state();
+            s.rows = labels();
+            s.origin = Some(20.0);
+            s.revision += 1;
+            s.poll(1.0, Some(7), true, 5.0);
+            assert_ne!(s.models[3].applied(4.0), PRIOR);
+            s.poll(now, Some(profile), fresh, max_gap);
+            for model in &s.models {
+                assert_eq!(model.anchor, PRIOR);
+                assert_eq!(model.applied(now), PRIOR);
+            }
+            if profile != 7 || now == 600.0 {
+                assert!(s.rows.is_empty());
+            }
+        }
     }
     #[test]
     fn no_feedback_poll_does_not_refit_or_restart_movement() {
