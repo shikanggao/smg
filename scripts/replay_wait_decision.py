@@ -10,11 +10,13 @@ from pathlib import Path
 
 try:
     from . import wait_decision_calibration as d
+    from . import wait_decision_context_continuity as continuity
     from . import wait_decision_direct as direct
     from . import wait_decision_direct_unpenalized as unpenalized
     from .replay_wait_joint_gains import close, read_events, require, sha
 except ImportError:
     import wait_decision_calibration as d
+    import wait_decision_context_continuity as continuity
     import wait_decision_direct as direct
     import wait_decision_direct_unpenalized as unpenalized
     from replay_wait_joint_gains import close, read_events, require, sha
@@ -31,9 +33,11 @@ EVENTS = {
 
 def implementation(method):
     require(
-        method in (d.METHOD, direct.METHOD, unpenalized.METHOD),
+        method in (d.METHOD, direct.METHOD, unpenalized.METHOD, continuity.METHOD),
         "Unsupported required decision method",
     )
+    if method == continuity.METHOD:
+        return continuity
     return unpenalized if method == unpenalized.METHOD else direct if method == direct.METHOD else d
 
 
@@ -78,7 +82,7 @@ def audit_schema(events, expected=d.METHOD):
                     and all(k in p["state"] for k in d.State().diagnostics()),
                     "Missing decision state",
                 )
-                if expected == unpenalized.METHOD:
+                if expected in (unpenalized.METHOD, continuity.METHOD):
                     require(
                         p["state"].get("coefficient_ridge") == unpenalized.COEFFICIENT_RIDGE,
                         "Missing or invalid slope-only ridge diagnostics",
@@ -92,7 +96,7 @@ def audit_schema(events, expected=d.METHOD):
                     all(type(v["available"]) is bool for v in p["predictions"]),
                     "Invalid availability",
                 )
-                if expected in (direct.METHOD, unpenalized.METHOD):
+                if expected in (direct.METHOD, unpenalized.METHOD, continuity.METHOD):
                     require(
                         all(
                             type(v.get("scalar_fallback")) is bool
@@ -107,6 +111,17 @@ def audit_schema(events, expected=d.METHOD):
                             for v in p["predictions"]
                         ),
                         "Inconsistent direct fallback source",
+                    )
+                if expected == continuity.METHOD:
+                    require(
+                        all(
+                            "fallback_reason" in v
+                            and v["fallback_reason"] in continuity.FALLBACK_REASONS
+                            and "requested_within_fitted_ranges" in v
+                            and type(v["requested_within_fitted_ranges"]) in (bool, type(None))
+                            for v in p["predictions"]
+                        ),
+                        "Missing or invalid v4 fallback provenance",
                     )
         except (ValueError, KeyError, TypeError) as exc:
             errors.append(str(exc))
@@ -125,7 +140,7 @@ def verify_snapshot(s, state, max_gap, selected=None, method=d.METHOD):
             "Nonneutral state lacks a profile",
         )
     implementation(method)
-    direct_basis = method in (direct.METHOD, unpenalized.METHOD)
+    direct_basis = method in (direct.METHOD, unpenalized.METHOD, continuity.METHOD)
     sources = (
         ("live_n", "original_n_fallback")
         if direct_basis
@@ -593,7 +608,11 @@ def score_admissions(admissions, paired, capture_name, model, method=d.METHOD):
         require(type(fallback) in (bool, type(None)), "Invalid scalar fallback")
         baseline_extra = (
             snapshot["x"]
-            * (snapshot["scalar_gain"] if method in (direct.METHOD, unpenalized.METHOD) else 1.0)
+            * (
+                snapshot["scalar_gain"]
+                if method in (direct.METHOD, unpenalized.METHOD, continuity.METHOD)
+                else 1.0
+            )
             if snapshot
             else None
         )

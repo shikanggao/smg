@@ -227,13 +227,13 @@ class DirectTests(unittest.TestCase):
         self.assertTrue(result["admissions"][0]["predictions"][0]["scalar_fallback"])
         self.assertTrue(replay(event_fixture())["ok"])
 
-    def test_current_profiles_require_v3(self):
+    def test_current_profiles_require_v4(self):
         from pathlib import Path
 
         for name in ("wait-ttft-deadline300.json", "wait-ttft-observe420.json"):
             self.assertEqual(
                 json.loads(Path(__file__).with_name(name).read_text())["expected_decision_method"],
-                "decision_live_queue_slope_ridge_hinge_v3",
+                "decision_live_queue_context_continuity_hinge_v4",
             )
 
 
