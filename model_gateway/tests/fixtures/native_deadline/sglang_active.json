@@ -1,0 +1,48 @@
+{
+  "timestamp": "",
+  "version": "sglang-c9e5799-native-deadline-v1",
+  "dp_rank_count": 1,
+  "loads": [
+    {
+      "dp_rank": 0,
+      "num_waiting_reqs": 1,
+      "num_running_reqs": 0,
+      "num_total_reqs": 1,
+      "deadline_recovery": {
+        "schema_version": 1,
+        "engine_epoch": "da05da92-4ab9-4467-8bbf-7bc4491de811",
+        "profile_id": "sglang-c9e5799:02f860d2f7a6f7b75ee534deb9aa879de9a44edc9c62cc6f2d9ae1d86082b162",
+        "dp_rank": 0,
+        "snapshot_seq": 2,
+        "captured_at_monotonic_secs": 1118917.714384083,
+        "snapshot_age_seconds": 0.0,
+        "active_inventory_complete": true,
+        "native_population": 1,
+        "scheduler_semantics": "continuous_batching",
+        "remaining_work_source": "unknown",
+        "effective_capacity_tokens_per_sec": null,
+        "capacity_source": null,
+        "cancellation_ack_supported": true,
+        "hard_ttft_deadline_supported": true,
+        "abort_enforcement_enabled": true,
+        "abort_max_lag_seconds": null,
+        "deadline_boundary": "first_nonempty_text",
+        "deadline_origin": "engine_http_receive_monotonic",
+        "ack_floor_seq": 0,
+        "active_requests": [
+          {
+            "attempt_id": "sglang-component-attempt-0001",
+            "native_request_id": "native-engine-id-0001",
+            "state_seq": 1,
+            "remaining_prefill_work_tokens": null,
+            "hard_ttft_deadline_monotonic_secs": null,
+            "queue_position": null,
+            "state": "waiting",
+            "first_text_emitted": false
+          }
+        ],
+        "cancellation_acks": []
+      }
+    }
+  ]
+}

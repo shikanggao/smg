@@ -780,6 +780,9 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
                 },
             );
         Self {
+            // The existing gRPC RPC has no native ACK/deadline side channel.
+            deadline_recovery: None,
+            prefill_metric_provenance: None,
             // Set only by a gateway reporting a fleet; an engine reports
             // ranks, not which worker they came from.
             worker: None,
@@ -787,13 +790,22 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             dp_rank: load.dp_rank,
             num_running_reqs: load.num_running_reqs,
             num_waiting_reqs: load.num_waiting_reqs,
+            native_request_counts_available: None,
+            native_request_counts_profile: None,
             num_waiting_uncached_tokens: load.num_waiting_uncached_tokens,
             num_waiting_uncached_tokens_available: Some(true),
             num_total_reqs: load.num_total_reqs,
             num_used_tokens: load.num_used_tokens,
             max_total_num_tokens: load.max_total_num_tokens,
             token_usage: load.token_usage,
+            // The protobuf scalar has no presence bit, so its default zero
+            // cannot establish native KV measurement availability.
+            native_kv_usage_available: None,
+            native_kv_usage_profile: None,
             prefill_throughput: None,
+            timely_prefill_progress: None,
+            timely_prefill_progress_source: None,
+            timely_prefill_progress_interval: None,
             gen_throughput: load.gen_throughput,
             avg_request_prefill_kv_computed_tokens: None,
             median_request_prefill_kv_computed_tokens: None,

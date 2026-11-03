@@ -390,7 +390,7 @@ impl Router {
                     route,
                     model_id,
                     canonical_model.as_deref(),
-                    is_stream,
+                    start,
                 )
                 .await;
             Metrics::record_router_upstream_response(
@@ -418,7 +418,7 @@ impl Router {
                             route,
                             model_id,
                             canonical_model.as_deref(),
-                            is_stream,
+                            start,
                         )
                         .await;
 
@@ -474,15 +474,22 @@ impl Router {
         response
     }
 
-    async fn route_typed_request_once<T: serde::Serialize>(
+    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         lease: &RequestLease<T>,
         route: &'static str,
         model_id: &str,
         canonical_model: Option<&str>,
-        is_stream: bool,
+        request_started: Instant,
     ) -> Response {
+        let is_stream = lease.with_view(|view| view.request.is_stream());
+        let prompt_work =
+            if is_stream && self.worker_registry.estimated_wait().pending_work_enabled() {
+                lease.with_view(|view| view.request.prompt_work_hint())
+            } else {
+                openai_protocol::common::PromptWorkHint::Unknown
+            };
         let calibration = Mutex::new(None);
         let worker = match lease.with_view(|view| {
             self.select_worker_for_model(
@@ -494,6 +501,8 @@ impl Router {
                     rid_key: view.rid_key,
                     cache_namespace: view.cache_namespace,
                     calibration: is_stream.then_some(&calibration),
+                    feature_context_supported: is_stream
+                        && matches!(route, "/v1/chat/completions" | "/v1/completions"),
                 },
             )
         }) {
@@ -521,6 +530,9 @@ impl Router {
                 };
             }
         };
+        if let Some(forecast) = calibration.lock().as_mut() {
+            forecast.set_prompt_work(prompt_work);
+        }
 
         // Dispatch-time re-check of the one chosen worker: O(1), and the only
         // thing that closes the window between selection and dispatch in which
@@ -562,6 +574,7 @@ impl Router {
                     is_stream,
                     load_guard,
                     calibration.into_inner(),
+                    request_started,
                 )
                 .await
             }
@@ -813,6 +826,7 @@ impl Router {
                 rid_key: None,
                 cache_namespace: None,
                 calibration: is_stream.then_some(&calibration),
+                feature_context_supported: false,
             },
         );
         let worker = match selection {
@@ -887,18 +901,32 @@ impl Router {
             worker.api_key(),
         );
 
-        let ttft_observer = is_stream.then(|| {
+        let mut ttft_observer = is_stream.then(|| {
             StreamTtftObserver::new(&self.worker_registry, worker.url(), start)
-                .with_calibration(calibration.into_inner())
                 .with_request_id(
                     headers
                         .and_then(|headers| headers.get("opc-request-id"))
                         .and_then(|value| value.to_str().ok()),
                 )
+                .with_calibration(calibration.into_inner())
         });
+        if let Some(observer) = &ttft_observer {
+            observer.transport_event("upstream_send_started");
+        }
         let res = match send_with_stale_conn_retry(request_builder).await {
-            Ok(res) => res,
+            Ok(res) => {
+                if let Some(observer) = &ttft_observer {
+                    observer.transport_event("upstream_headers_received");
+                }
+                res
+            }
             Err(e) => {
+                if let Some(observer) = &mut ttft_observer {
+                    if e.is_timeout() {
+                        observer.upstream_timeout();
+                    }
+                    observer.transport_event("upstream_send_failed");
+                }
                 error!(
                     "Failed to send multipart transcription request worker_url={} route={} error={}",
                     worker.url(),
@@ -1000,27 +1028,37 @@ impl Router {
                                 if tx.capacity() == 0 { ttft_observer.cancel(); }
                                 if stream_header_status.is_success() { ttft_observer.push(&bytes); }
                                 if tx.send(Ok(bytes)).await.is_err() {
+                                    ttft_observer.downstream_disconnected();
+                                    ttft_observer.transport_event("downstream_receiver_closed");
                                     client_disconnected = true;
                                     break;
                                 }
                             }
                             Some(Err(e)) => {
+                                if e.is_timeout() { ttft_observer.upstream_timeout(); }
+                                ttft_observer.transport_event("upstream_stream_error");
                                 stream_failed = true;
                                 let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                 break;
                             }
-                            None => break,
+                            None => {
+                                ttft_observer.transport_event("upstream_eof");
+                                break;
+                            },
                         },
                         // Client gone with no chunk in flight (long prefill,
-                        // stalled upstream): break so the reqwest stream drops,
-                        // closing the upstream connection and letting the
-                        // engine abort generation.
+                        // stalled upstream): release the reqwest response stream.
+                        // This does not acknowledge native scheduler cancellation.
                         () = tx.closed() => {
+                            ttft_observer.downstream_disconnected();
+                                    ttft_observer.transport_event("downstream_receiver_closed");
                             client_disconnected = true;
                             break;
                         }
                     }
                 }
+                drop(stream);
+                ttft_observer.transport_event("upstream_stream_released");
                 // Effective status = BAD_GATEWAY if the relay failed, else the
                 // worker's header status. Covers both "5xx header returned
                 // while stream=true" and "200 header then mid-stream break".
@@ -1172,6 +1210,7 @@ impl Router {
         is_stream: bool,
         load_guard: WorkerLoadGuard,
         calibration: Option<CalibrationForecast>,
+        request_started: Instant,
     ) -> Response {
         let started = Instant::now();
         let api_key = worker.api_key().cloned();
@@ -1191,18 +1230,64 @@ impl Router {
             api_key.as_ref(),
         );
 
-        let ttft_observer = is_stream.then(|| {
+        // These internal headers are not on the caller-forwarding allowlist.
+        // Only a lease-generated UUID and explicitly configured remaining
+        // budget may reach a native engine.
+        if is_stream && matches!(route, "/v1/chat/completions" | "/v1/completions") {
+            let required = self
+                .worker_registry
+                .estimated_wait()
+                .native_deadline_timeout_configured();
+            let headers = calibration
+                .as_ref()
+                .map(|forecast| forecast.native_dispatch_headers(request_started, Instant::now()));
+            match headers {
+                None | Some(Ok(None)) if required => return error::service_unavailable("native_deadline_unavailable", "The request has no tracked native deadline dispatch context"),
+                None | Some(Ok(None)) => {},
+                Some(Ok(Some((_, None)))) if required => return error::service_unavailable("native_deadline_unavailable", "The request has no verified native deadline budget"),
+                Some(Ok(Some((attempt, timeout)))) => {
+                    tracing::debug!(target:"smg::estimated_wait::observation",event="native_deadline_dispatch_requested",
+                        worker=worker.url(),native_attempt_id=attempt,requested_native_timeout_ms=timeout,
+                        per_request_native_deadline_confirmed=false,
+                        confirmation_source="native_active_inventory_required",
+                        deadline_budget_origin="gateway_request_start_remaining_at_send",
+                        engine_deadline_origin="engine_http_receive_plus_remaining_budget; network_transit_not_zero");
+                    request_builder = request_builder.header("x-smg-attempt-id", attempt);
+                    if let Some(milliseconds) = timeout {
+                        request_builder = request_builder.header("x-smg-hard-ttft-timeout-ms", milliseconds.to_string());
+                    }
+                }
+                Some(Err("native_deadline_budget_exhausted_before_dispatch")) => return error::gateway_timeout("native_deadline_budget_exhausted", "Native first-output budget elapsed before upstream dispatch"),
+                Some(Err(_)) => return error::service_unavailable("native_deadline_unavailable", "The selected engine has no fresh verified native deadline enforcement capability"),
+            }
+        }
+
+        let mut ttft_observer = is_stream.then(|| {
             StreamTtftObserver::new(&self.worker_registry, worker.url(), started)
-                .with_calibration(calibration)
                 .with_request_id(
                     headers
                         .and_then(|headers| headers.get("opc-request-id"))
                         .and_then(|value| value.to_str().ok()),
                 )
+                .with_calibration(calibration)
         });
+        if let Some(observer) = &ttft_observer {
+            observer.transport_event("upstream_send_started");
+        }
         let res = match send_with_stale_conn_retry(request_builder).await {
-            Ok(res) => res,
+            Ok(res) => {
+                if let Some(observer) = &ttft_observer {
+                    observer.transport_event("upstream_headers_received");
+                }
+                res
+            }
             Err(e) => {
+                if let Some(observer) = &mut ttft_observer {
+                    if e.is_timeout() {
+                        observer.upstream_timeout();
+                    }
+                    observer.transport_event("upstream_send_failed");
+                }
                 error!(
                     "Failed to send typed request worker_url={} route={} error={}",
                     worker.url(),
@@ -1257,6 +1342,11 @@ impl Router {
                 StreamTtftObserver::new(&self.worker_registry, worker_url, started)
             });
 
+            // An HTTP error body is not a successful streaming TTFT attempt.
+            if !status.is_success() {
+                ttft_observer.cancel();
+            }
+
             // Spawn task to forward stream
             #[expect(
                 clippy::disallowed_methods,
@@ -1274,22 +1364,34 @@ impl Router {
                                 if tx.capacity() == 0 { ttft_observer.cancel(); }
                                 if status.is_success() { ttft_observer.push(&bytes); }
                                 if tx.send(Ok(bytes)).await.is_err() {
+                                    ttft_observer.downstream_disconnected();
+                                    ttft_observer.transport_event("downstream_receiver_closed");
                                     break;
                                 }
                             }
                             Some(Err(e)) => {
+                                if e.is_timeout() { ttft_observer.upstream_timeout(); }
+                                ttft_observer.transport_event("upstream_stream_error");
                                 let _ = tx.send(Err(format!("Stream error: {e}"))).await;
                                 break;
                             }
-                            None => break,
+                            None => {
+                                ttft_observer.transport_event("upstream_eof");
+                                break;
+                            },
                         },
                         // Client gone with no chunk in flight (long prefill,
-                        // stalled upstream): break so the reqwest stream drops,
-                        // closing the upstream connection and letting the
-                        // engine abort generation.
-                        () = tx.closed() => break,
+                        // stalled upstream): release the reqwest response stream.
+                        // This does not acknowledge native scheduler cancellation.
+                        () = tx.closed() => {
+                            ttft_observer.downstream_disconnected();
+                                    ttft_observer.transport_event("downstream_receiver_closed");
+                            break;
+                        },
                     }
                 }
+                drop(stream);
+                ttft_observer.transport_event("upstream_stream_released");
             });
 
             let stream = ReceiverStream::new(rx);
@@ -1428,12 +1530,12 @@ impl Router {
             .is_some_and(|ct| ct.starts_with("text/event-stream"));
         let observer = is_stream.then(|| {
             StreamTtftObserver::new(&self.worker_registry, worker.url(), started)
-                .with_calibration(calibration)
                 .with_request_id(
                     headers
                         .get("opc-request-id")
                         .and_then(|value| value.to_str().ok()),
                 )
+                .with_calibration(calibration)
         });
         self.forward_worker_response(res, is_stream, worker.url(), load_guard, started, observer)
             .await
@@ -1723,6 +1825,7 @@ impl Router {
                 tokens: hinted_tokens.as_deref(),
                 headers: Some(req.headers()),
                 calibration: Some(&calibration),
+                feature_context_supported: false,
                 ..Default::default()
             },
         );
@@ -2459,6 +2562,122 @@ mod tests {
             "worker_overload_protection_shed"
         );
         assert!(!is_retryable_response(&response));
+    }
+
+    #[tokio::test]
+    async fn native_deadline_http_headers_are_internal_opt_in_and_require_verified_engine() {
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+        for (timeout, verified, raw_available) in [
+            (None, false, true),
+            (Some(10.0), true, true),
+            (Some(10.0), false, true),
+            (Some(10.0), true, false),
+        ] {
+            let captured = Arc::new(Mutex::new(None::<HeaderMap>));
+            let sink = Arc::clone(&captured);
+            let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move |headers: HeaderMap| {
+                let sink = Arc::clone(&sink);
+                async move { *sink.lock() = Some(headers);
+                    ([(CONTENT_TYPE, "text/event-stream")], "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n") }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Loopback native contract test server is aborted after assertions"
+            )]
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let router = streaming_router(
+                PolicyConfig::RoundRobin,
+                1024 * 1024,
+                vec![plain_worker(&url)],
+            );
+            let admission = router.worker_registry.estimated_wait();
+            admission.configure(EstimatedWaitConfig {
+                max_estimated_wait_secs: Some(300.0),
+                estimated_wait_calibration_shadow: true,
+                estimated_wait_feature_shadow: true,
+                estimated_wait_native_hard_ttft_timeout_secs: timeout,
+                ..Default::default()
+            });
+            let worker = router.worker_registry.get_by_url(&url).unwrap();
+            let raw = WorkerLoadResponse {
+                dp_rank_count: 1,
+                loads: vec![SchedulerLoadSnapshot {
+                    learned_prefill_capacity: Some(2000.0),
+                    prefill_capacity_learning_active: Some(false),
+                    prefill_capacity_sample_count: Some(8),
+                    low_load_ttft_seconds: Some(0.1),
+                    num_waiting_uncached_tokens_available: Some(true),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let stamp = admission.poll_started(&worker);
+            let raw_started = Instant::now();
+            admission.publish(
+                &worker,
+                raw_available.then_some(&raw),
+                stamp.clone(),
+                raw_started,
+            );
+            if verified {
+                let native: WorkerLoadResponse = serde_json::from_str(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/native_deadline/sglang_active.json"
+                )))
+                .unwrap();
+                admission.publish_native_deadline(
+                    &worker,
+                    Some(&native),
+                    stamp,
+                    raw_started,
+                    Instant::now(),
+                );
+            }
+            let mut client_headers = HeaderMap::new();
+            client_headers.insert("x-smg-attempt-id", "forged-client-id".parse().unwrap());
+            client_headers.insert("x-smg-hard-ttft-timeout-ms", "999999999".parse().unwrap());
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({"model":"test","stream":true,"messages":[{"role":"user","content":"hello"}]})).unwrap();
+            let response = router
+                .route_typed_request(
+                    Some(&client_headers),
+                    request,
+                    "/v1/chat/completions",
+                    crate::worker::UNKNOWN_MODEL_ID,
+                )
+                .await;
+            if timeout.is_some() && (!verified || !raw_available) {
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert!(captured.lock().is_none());
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let headers = captured.lock().clone().unwrap();
+                let attempt = headers.get("x-smg-attempt-id").unwrap().to_str().unwrap();
+                let (gateway_epoch, nonce) = attempt.split_once('.').unwrap();
+                assert!(uuid::Uuid::parse_str(gateway_epoch).is_ok());
+                assert!(uuid::Uuid::parse_str(nonce).is_ok());
+                assert_eq!(headers.get_all("x-smg-attempt-id").iter().count(), 1);
+                if timeout.is_some() {
+                    let milliseconds = headers
+                        .get("x-smg-hard-ttft-timeout-ms")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap();
+                    assert!(milliseconds > 0 && milliseconds <= 10_000);
+                } else {
+                    assert!(headers.get("x-smg-hard-ttft-timeout-ms").is_none());
+                }
+            }
+            server.abort();
+        }
     }
 
     #[tokio::test]

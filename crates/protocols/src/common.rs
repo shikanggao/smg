@@ -80,6 +80,15 @@ impl CachePartition<'_> {
     }
 }
 
+/// Body-derived size evidence, never a routing-header hint or uncached-work claim.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum PromptWorkHint {
+    #[default]
+    Unknown,
+    TextBytes(usize),
+    BodyTokenIds(usize),
+}
+
 /// Trait for unified access to generation request properties
 /// Implemented by ChatCompletionRequest, CompletionRequest, GenerateRequest,
 /// EmbeddingRequest, RerankRequest, and ResponsesRequest
@@ -98,6 +107,12 @@ pub trait GenerationRequest: Send + Sync {
     /// rendering of the same IDs.
     fn routing_tokens(&self) -> Option<&[i32]> {
         None
+    }
+
+    /// Optional full-prompt size evidence for diagnostic pending-work accounting.
+    /// Unsupported/batched/multimodal requests retain the historical fallback.
+    fn prompt_work_hint(&self) -> PromptWorkHint {
+        PromptWorkHint::Unknown
     }
 
     /// Client-provided request id, when the protocol carries one. Routing may

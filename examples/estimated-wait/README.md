@@ -31,11 +31,16 @@ the `--router-` prefix. JSON config uses the corresponding snake_case names at
 the top level. Rust callers can set `RouterConfig.estimated_wait` or call the
 builder's `estimated_wait(EstimatedWaitConfig)` method.
 
+The optional [native deadline and cancellation contract](NATIVE_DEADLINE.md)
+uses a separate shadow endpoint and an explicit engine-enforcement budget.
+
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--max-estimated-wait-secs` | unset | Gateway wait budget; disabled unless a worker sets its own |
 | `--estimated-wait-shadow` | false | Record would-reject decisions and continue routing |
 | `--estimated-wait-calibration-shadow` | false | Experimental multiplicative TTFT diagnostics only; never affects admission |
+| `--estimated-wait-feature-shadow` | false | Enable the C2 native-survival shadow candidate and paired control; requires calibration shadow |
+| `--estimated-wait-native-hard-ttft-timeout-secs` | unset | Explicit native first-output budget for supported regular HTTP feature streams; requires verified opt-in engine enforcement and feature shadow; independent of admission budgets |
 | `--estimated-wait-provisional-baseline-secs` | unset | Positive, finite same-model representative baseline for calibration startup only; measured baseline takes precedence |
 | `--estimated-wait-queue-tokens-per-request` | 0 | Explicit waiting-request proxy; 0 disables it |
 | `--estimated-wait-fallback-prefill-throughput` | 2000 | Cold-start prefill capacity until a qualified value is learned; `--estimated-wait-min-prefill-throughput` and `--estimated-wait-default-throughput` remain aliases |
@@ -109,6 +114,47 @@ prediction. The raw floor-inclusive path remains the admission comparator.
 Failed/stale/duplicate polls do not fit. The applied scale approaches
 the target at at most **0.5 absolute units per second**, independent of polling
 frequency; retargeting starts from the current applied value without idle credit.
+
+### Experimental C2 candidate (optional branch only)
+
+`--estimated-wait-feature-shadow` enables one C2 native-survival candidate,
+its paired control, and the observations needed to fit and audit them. The flag
+retains its existing name for launch-config compatibility and defaults to false.
+It requires `--estimated-wait-calibration-shadow`. Neither prediction controls
+admission; the raw extra-delay budget remains independent.
+
+The retained fit uses exact TTFT labels and right-censored lower bounds. It fits
+`T = B + X * max(0, q + clamp(a·z, -0.5, 0.5))`, where the three context inputs are
+pending growth, oldest pending age, and native progress deficit. The queue-only
+fit supplies the fallback when context is missing or outside fitted ranges.
+The exact-only comparison arms and old KV/cutoff/rejection regression are omitted.
+Decision, basis and pending-work diagnostic methods are versioned for the
+two-arm layout; readers must select `bound_queue`/`bound_early` by name.
+Local rejection and cutoff counts remain observations, not a negative multiplier
+that assumes rejected requests release native work.
+
+C2 applies this fit to a provenance-consistent queue-work basis, then projects
+remaining predecessor work using same-poll native inventory and hard deadlines.
+Native acknowledgements govern observed release. Expected expiry is never an
+acknowledgement. Missing/stale/unsupported native evidence explicitly falls back;
+unknown remaining decode work prevents native projection. Cleanup lag includes
+an engineering prior and is not a guaranteed bound. See
+[NATIVE_DEADLINE.md](NATIVE_DEADLINE.md) and
+[BASIS_CONSISTENCY.md](BASIS_CONSISTENCY.md) for contracts and provenance.
+
+The supported observation path is typed streaming HTTP chat/completions with a
+single-worker pool. Actual first text, timeout, native cutoff, disconnect,
+unknown outcome, and admission rejection remain separate. A no-text timeout
+provides a lower bound, never an invented exact 300-second TTFT. Worker identity,
+baseline lifecycle, freshness, inventory completeness, and expiry gates remain.
+
+This candidate has not met the accuracy goal. In the recorded DEV runs, Qwen
+improved but remained above 2% FP; SGLang regressed. Keep it opt-in for research.
+See the [vLLM research record](https://confluence.oraclecorp.com/confluence/pages/viewpage.action?pageId=22052672691)
+and [SGLang research record](https://confluence.oraclecorp.com/confluence/pages/viewpage.action?pageId=22100017789).
+Those runs tested the research source, not this trimmed branch.
+
+### Baseline and history
 
 For startup under an already busy workload, explicitly supply a representative
 same-model, same-deployment baseline using `--estimated-wait-provisional-baseline-secs`.

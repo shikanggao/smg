@@ -1284,13 +1284,62 @@ pub struct StopProfileRequest {
     pub url: Option<String>,
 }
 
-/// Per-DP-rank load snapshot from a backend.
-///
-/// Contains core metrics from the sglang `/v1/loads` endpoint or `GetLoads` gRPC RPC.
-/// Each snapshot represents one data-parallel rank's scheduler state.
+/// Same-poll diagnostic inputs for the queue-size and capacity estimators.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct PrefillMetricProvenance {
+    pub schema_version: u32,
+    pub counter_epoch: u64,
+    pub progress_source: Option<String>,
+    pub raw_counter: Option<f64>,
+    pub previous_raw_counter: Option<f64>,
+    pub interval_seconds: Option<f64>,
+    /// Endpoints on the gateway's diagnostic monotonic clock, not engine time.
+    pub interval_started_time_seconds: Option<f64>,
+    pub interval_ended_time_seconds: Option<f64>,
+    pub raw_rate: Option<f64>,
+    pub previous_conversion_size_mean: Option<f64>,
+    pub current_unshrunk_size_mean: Option<f64>,
+    /// The explicit observed sample count usable by the queue's size blend.
+    /// Some(0) means the observed component contributes no samples; missing is
+    /// unknown and must not be inferred from a mean equal to the prior.
+    pub queue_size_observed_sample_count: Option<u64>,
+    pub native_size_counter_count: Option<f64>,
+    pub capacity_interval_eligible: bool,
+    pub counter_reset: bool,
+}
+
+fn optional_prefill_metric_provenance<'de, D>(
+    deserializer: D,
+) -> Result<Option<PrefillMetricProvenance>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .filter(serde_json::Value::is_object)
+        .and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// Per-DP-rank load snapshot from a backend's HTTP endpoint or gRPC RPC.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SchedulerLoadSnapshot {
+    /// Same-poll diagnostic provenance; absent on older/native RPC producers.
+    #[serde(
+        default,
+        deserialize_with = "optional_prefill_metric_provenance",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prefill_metric_provenance: Option<PrefillMetricProvenance>,
+    /// Native per-request cancellation/deadline side channel. Missing or
+    /// malformed telemetry grants no recovery credit and leaves raw load intact.
+    #[serde(
+        default,
+        deserialize_with = "crate::native_deadline::optional_telemetry",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deadline_recovery: Option<crate::native_deadline::NativeDeadlineTelemetry>,
     /// URL of the worker this rank belongs to. Set by a gateway serving a
     /// fleet-wide `/loads`; engines reporting their own load leave it unset.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1301,6 +1350,13 @@ pub struct SchedulerLoadSnapshot {
     pub dp_rank: i32,
     pub num_running_reqs: i32,
     pub num_waiting_reqs: i32,
+    /// Explicit native gauge provenance for experimental recovery tracking.
+    /// Missing is unknown, never an inferred empty queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_request_counts_available: Option<bool>,
+    /// Opaque signature of native count series; changes invalidate recovery history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_request_counts_profile: Option<u64>,
     /// Queued uncached token-work. Kept required for wire compatibility with
     /// existing generated clients; use the companion flag to distinguish an
     /// unavailable signal from an exact empty queue.
@@ -1315,11 +1371,28 @@ pub struct SchedulerLoadSnapshot {
     pub max_total_num_tokens: i32,
     /// Token usage ratio (0.0–1.0).
     pub token_usage: f64,
+    /// Explicit presence and validity of the native KV gauge for experimental
+    /// calibration. Missing is unknown; a default numeric zero is not evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_kv_usage_available: Option<bool>,
+    /// Opaque KV source/series signature. Changes invalidate feature-fit history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_kv_usage_profile: Option<u64>,
     /// Recent aggregate uncached-prefill throughput in tokens/s when the
     /// backend can derive it. `None` keeps older producers and counter cold
     /// starts on the existing generation-throughput/configured fallback path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_throughput: Option<f64>,
+    /// Timely prefill progress only (local compute or started-prefill counter).
+    /// Zero is observed zero progress; None is unknown. Never uses completion counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timely_prefill_progress: Option<f64>,
+    /// Source identity, paired with native_request_counts_profile for reset provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timely_prefill_progress_source: Option<String>,
+    /// Counter interval in seconds. Long/cold/reset intervals are not live evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timely_prefill_progress_interval: Option<f64>,
     pub gen_throughput: f64,
     /// Recent mean uncached prefill tokens per completed request. Gauge-only
     /// backends use this to turn waiting-request counts into queued token-work.

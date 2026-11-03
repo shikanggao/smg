@@ -51,6 +51,9 @@ tokenspeed = ["pyzmq>=25.0.0", "msgspec>=0.18.0"]
 Homepage = "https://github.com/smg-project/smg"
 Repository = "https://github.com/smg-project/smg"
 
+[project.entry-points."vllm.general_plugins"]
+smg_native_deadline = "smg_grpc_servicer.native_deadline_vllm:register"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["smg_grpc_servicer*"]
