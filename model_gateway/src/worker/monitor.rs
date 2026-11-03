@@ -1442,7 +1442,7 @@ impl WorkerMonitor {
         observed: Instant,
         previous: Option<EngineMetricsHistory>,
     ) -> Option<(SchedulerLoadSnapshot, EngineMetricsHistory)> {
-        let m = PromScrape::parse(&body);
+        let m = PromScrape::parse(body);
 
         // Require the KV-usage gauge — the load signal routing acts on.
         // Without it `token_usage` would default to 0.0 and hide real KV

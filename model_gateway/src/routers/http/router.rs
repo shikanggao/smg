@@ -971,6 +971,10 @@ impl Router {
             let stream_model_id = model_id.to_string();
             let stream_endpoint = endpoint;
             let stream_start = start;
+            #[expect(
+                clippy::expect_used,
+                reason = "the same is_stream condition initializes this observer before sending"
+            )]
             let mut ttft_observer = ttft_observer.expect("stream observer initialized before send");
             #[expect(
                 clippy::disallowed_methods,
@@ -1155,6 +1159,10 @@ impl Router {
     // Send an already-serialized request body. The stale-connection resend
     // guard inside `send_with_stale_conn_retry` shares the body allocation by
     // refcount, so the bytes live exactly until the response head arrives.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "request metadata, load guard and admission-time forecast travel together"
+    )]
     async fn send_serialized_request(
         &self,
         headers: Option<&HeaderMap>,
