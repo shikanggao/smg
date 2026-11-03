@@ -307,17 +307,19 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     estimated_wait_shadow: bool,
 
+    /// Learn per-worker excess-TTFT correction in shadow diagnostics only.
+    /// Requires a gateway or worker wait budget; never changes rejection behavior.
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    estimated_wait_calibration_shadow: bool,
+
+    /// Same-model representative TTFT baseline for diagnostic calibration startup.
+    /// Omit when unknown; measured low-load baseline takes precedence.
+    #[arg(long, help_heading = "Routing Policy")]
+    estimated_wait_provisional_baseline_secs: Option<f64>,
+
     /// Deprecated compatibility option; only zero is accepted. Admission has no KV term.
     #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
     estimated_wait_kv_pressure_weight: f64,
-
-    /// Fixed estimated-wait overhead in seconds.
-    #[arg(long, default_value_t = 0.0, help_heading = "Routing Policy")]
-    estimated_wait_base_overhead_secs: f64,
-
-    /// Correction applied to queued token work.
-    #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
-    estimated_wait_queue_work_correction: f64,
 
     /// Fraction of newly dispatched token work that blocks an arrival.
     #[arg(long, default_value_t = 0.05, help_heading = "Routing Policy")]
@@ -1913,9 +1915,10 @@ impl CliArgs {
             .estimated_wait(EstimatedWaitConfig {
                 max_estimated_wait_secs: self.max_estimated_wait_secs,
                 estimated_wait_shadow: self.estimated_wait_shadow,
+                estimated_wait_calibration_shadow: self.estimated_wait_calibration_shadow,
+                estimated_wait_provisional_baseline_secs: self
+                    .estimated_wait_provisional_baseline_secs,
                 estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
-                estimated_wait_base_overhead_secs: self.estimated_wait_base_overhead_secs,
-                estimated_wait_queue_work_correction: self.estimated_wait_queue_work_correction,
                 estimated_wait_dispatch_blocking_factor: self
                     .estimated_wait_dispatch_blocking_factor,
                 estimated_wait_mean_prefill_tokens: self.estimated_wait_mean_prefill_tokens,
@@ -2639,21 +2642,32 @@ mod tests {
     /// into `ServerConfig.router_config` — the consumer (load monitor) reads
     /// them off `RouterConfig`. Two-path config-plumbing guard.
     #[test]
+    fn estimated_wait_provisional_baseline_rejects_invalid_cli_values() {
+        for value in ["0", "-1", "NaN", "inf"] {
+            let argument = format!("--estimated-wait-provisional-baseline-secs={value}");
+            let cli = cli_args_from(&[argument.as_str()]);
+            assert!(
+                cli.to_router_config(vec![], vec![]).is_err(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
     fn estimated_wait_options_flow_into_server_config() {
         let cli = cli_args_from(&[
             "--max-estimated-wait-secs",
             "12",
             "--estimated-wait-shadow",
+            "--estimated-wait-calibration-shadow",
+            "--estimated-wait-provisional-baseline-secs",
+            "0.25",
             "--estimated-wait-queue-tokens-per-request",
             "2048",
             "--estimated-wait-fallback-prefill-throughput",
             "500",
             "--estimated-wait-prompt-size-prior-samples",
             "24",
-            "--estimated-wait-base-overhead-secs",
-            "0.1",
-            "--estimated-wait-queue-work-correction",
-            "0.7",
             "--estimated-wait-kv-pressure-weight",
             "0",
             "--estimated-wait-mean-prefill-tokens",
@@ -2668,12 +2682,17 @@ mod tests {
         let config = &server.router_config.estimated_wait;
         assert_eq!(config.max_estimated_wait_secs, Some(12.0));
         assert!(config.estimated_wait_shadow);
+        assert!(config.estimated_wait_calibration_shadow);
+        assert_eq!(config.estimated_wait_provisional_baseline_secs, Some(0.25));
+        assert_eq!(
+            cli_args_from(&[]).estimated_wait_provisional_baseline_secs,
+            None
+        );
+        assert!(!cli_args_from(&[]).estimated_wait_calibration_shadow);
         assert!(!cli_args_from(&[]).estimated_wait_shadow);
         assert_eq!(config.estimated_wait_queue_tokens_per_request, 2048);
         assert_eq!(config.estimated_wait_fallback_prefill_throughput, 500.0);
         assert_eq!(config.estimated_wait_prompt_size_prior_samples, 24);
-        assert_eq!(config.estimated_wait_base_overhead_secs, 0.1);
-        assert_eq!(config.estimated_wait_queue_work_correction, 0.7);
         assert_eq!(config.estimated_wait_kv_pressure_weight, 0.0);
         assert_eq!(config.estimated_wait_mean_prefill_tokens, 800);
         assert_eq!(config.estimated_wait_max_snapshot_age_secs, 8.0);
@@ -2689,6 +2708,16 @@ mod tests {
             defaults.estimated_wait.estimated_wait_kv_pressure_weight,
             0.0
         );
+    }
+
+    #[test]
+    fn estimated_wait_removed_coefficients_are_not_cli_options() {
+        for flag in [
+            "--estimated-wait-base-overhead-secs",
+            "--estimated-wait-queue-work-correction",
+        ] {
+            assert!(Cli::try_parse_from(["smg", flag, "1"]).is_err());
+        }
     }
 
     #[test]

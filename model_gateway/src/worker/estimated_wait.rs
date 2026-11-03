@@ -2,6 +2,36 @@
 //!
 //! The ledger lock spans admission and selection/credit. Polls capture a
 //! watermark before I/O so admissions during a poll survive its publication.
+//!
+//! `--estimated-wait-calibration-shadow` adds diagnostic excess-TTFT learning:
+//! T* = B + g * N, where N=(Q+rho*D)/C excludes the observed-delay floor.
+//! Raw admission retains its independent floor-inclusive estimate. Each fresh load poll fits g = sum(x*y)/sum(x*x) from the last
+//! two 300-second banks of up to 32 usable first-text observations each
+//! (minimum 4 combined, otherwise g=1), where x is
+//! saved queue-only extra delay and y is observed extra delay. Only new feedback
+//! or removal of an old bank triggers a fit. Native-capacity unready/ready
+//! states have separate histories.
+//! The applied scale approaches that MSE target at at most 0.5 absolute
+//! scale units per second. New targets start at the old trajectory's current
+//! value, so callback bursts and prior idle time cannot cause scale jumps.
+//! Only admission snapshots with mature native capacity and a visible native
+//! waiting queue train this correction; idle/dispatch-only delay is not queue
+//! calibration evidence. A configured same-model provisional baseline may seed
+//! calibration until measured low-load baseline is available; it never changes
+//! raw admission. A material provisional-to-measured shift starts a new epoch.
+//! Regular HTTP OpenAI-compatible SSE carries the admission-time snapshot to
+//! its first nonempty reasoning/content text callback. Metadata, cancellation,
+//! completion, and nonstreaming responses never supply training observations.
+//! No calibrated field feeds admission or promotes raw readiness. Worker
+//! invalidation and detectable native-capacity profile resets clear learning;
+//! two fresh queue-empty polls without local pending work also reset learning.
+//! Banks rotate every 300 seconds from the first accepted observation. Keep
+//! the previous and current banks; ordinary rotation preserves the generation
+//! and gain trajectory unless fewer than four observations remain (raw fallback).
+//! Bank membership uses feedback acceptance time; admission snapshots separately
+//! expire after 600 seconds. Lifecycle resets still invalidate in-flight feedback.
+//! A model/configuration change without a lifecycle/profile signal is not
+//! immediately detectable here; age expiry still bounds the retained history.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -9,7 +39,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, OnceLock, Weak,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use axum::response::Response;
@@ -37,8 +67,6 @@ pub struct EstimatedWaitConfig {
     /// Deprecated compatibility field; the admission formula has no KV term.
     /// Only zero is accepted so old disabled-KV configurations still load.
     pub estimated_wait_kv_pressure_weight: f64,
-    pub estimated_wait_base_overhead_secs: f64,
-    pub estimated_wait_queue_work_correction: f64,
     pub estimated_wait_dispatch_blocking_factor: f64,
     pub estimated_wait_mean_prefill_tokens: u32,
     #[serde(
@@ -53,6 +81,10 @@ pub struct EstimatedWaitConfig {
     pub estimated_wait_max_snapshot_age_secs: f64,
     /// Record would-reject decisions without enforcing estimated-wait budgets.
     pub estimated_wait_shadow: bool,
+    /// Learn excess-TTFT correction for diagnostics only; never changes admission.
+    pub estimated_wait_calibration_shadow: bool,
+    /// Same-model deployment baseline for diagnostic calibration until measured.
+    pub estimated_wait_provisional_baseline_secs: Option<f64>,
 }
 
 impl Default for EstimatedWaitConfig {
@@ -60,8 +92,6 @@ impl Default for EstimatedWaitConfig {
         Self {
             max_estimated_wait_secs: None,
             estimated_wait_kv_pressure_weight: 0.0,
-            estimated_wait_base_overhead_secs: 0.0,
-            estimated_wait_queue_work_correction: 1.0,
             estimated_wait_dispatch_blocking_factor: DEFAULT_DISPATCH_BLOCKING_FACTOR,
             estimated_wait_mean_prefill_tokens: DEFAULT_MEAN_PREFILL_TOKENS,
             estimated_wait_fallback_prefill_throughput: DEFAULT_THROUGHPUT,
@@ -69,6 +99,8 @@ impl Default for EstimatedWaitConfig {
             estimated_wait_queue_tokens_per_request: 0,
             estimated_wait_max_snapshot_age_secs: 30.0,
             estimated_wait_shadow: false,
+            estimated_wait_calibration_shadow: false,
+            estimated_wait_provisional_baseline_secs: None,
         }
     }
 }
@@ -83,21 +115,24 @@ impl EstimatedWaitConfig {
                     .to_string(),
             });
         }
+        if self
+            .estimated_wait_provisional_baseline_secs
+            .is_some_and(|value| !value.is_finite() || value <= 0.0)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "estimated_wait_provisional_baseline_secs".to_owned(),
+                value: self
+                    .estimated_wait_provisional_baseline_secs
+                    .unwrap_or_default()
+                    .to_string(),
+                reason: "Must be a finite same-model baseline > 0; omit when unknown".to_owned(),
+            });
+        }
         for (field, value, allow_zero) in [
             (
                 "max_estimated_wait_secs",
                 self.max_estimated_wait_secs.unwrap_or(1.0),
                 false,
-            ),
-            (
-                "estimated_wait_base_overhead_secs",
-                self.estimated_wait_base_overhead_secs,
-                true,
-            ),
-            (
-                "estimated_wait_queue_work_correction",
-                self.estimated_wait_queue_work_correction,
-                true,
             ),
             (
                 "estimated_wait_dispatch_blocking_factor",
@@ -263,8 +298,7 @@ impl EstimatedWaitConfig {
         let estimate = ExpectedWait::calibrated(
             queued,
             throughput,
-            baseline.unwrap_or(0.0) + self.estimated_wait_base_overhead_secs,
-            self.estimated_wait_queue_work_correction,
+            baseline.unwrap_or(0.0),
             self.estimated_wait_dispatch_blocking_factor,
         );
         estimate.seconds(0).is_finite().then_some(PreparedWait {
@@ -319,6 +353,10 @@ impl EstimatedWaitConfig {
                     <= 1,
             capacity_learned_ready: !capacity_learning_backend
                 || learned.is_some_and(|value| value.is_finite() && value > 0.0),
+            capacity_profile_sample_count: load.loads.iter().try_fold(0_u64, |sum, rank| {
+                rank.prefill_capacity_sample_count
+                    .map(|count| sum + u64::from(count))
+            }),
             visibility_delay: 0.0,
             has_backlog: queued > 0.0 || load.loads.iter().any(|rank| rank.num_waiting_reqs > 0),
         })
@@ -354,11 +392,17 @@ struct PreparedWait {
     baseline: Option<f64>,
     low_load: bool,
     capacity_learned_ready: bool,
+    capacity_profile_sample_count: Option<u64>,
     visibility_delay: f64,
     has_backlog: bool,
 }
 
 impl PreparedWait {
+    /// Queue arithmetic only: no observed floor or visibility adjustment.
+    fn queue_excess_seconds(self, dispatched_tokens: u64) -> f64 {
+        self.native_estimate.token_work(dispatched_tokens) / self.native_prefill_capacity
+    }
+
     fn measured_delay_only(self) -> bool {
         self.fallback && !self.capacity_learned_ready && self.observed_delay_available
     }
@@ -408,12 +452,316 @@ fn invalidate_diagnostic_metrics(worker_url: &str) {
         .set(-1.0);
     metrics::gauge!("smg_estimated_wait_baseline_sample_count", "worker" => worker.clone())
         .set(-1.0);
+    for name in [
+        "smg_estimated_wait_calibration_epoch",
+        "smg_estimated_wait_calibration_observation_sequence",
+        "smg_estimated_wait_calibration_history_revision",
+        "smg_estimated_wait_calibration_fitted_revision",
+        "smg_estimated_wait_calibration_baseline_seconds",
+        "smg_estimated_wait_calibration_baseline_provisional",
+        "smg_estimated_wait_calibration_baseline_measured",
+        "smg_estimated_wait_calibration_input_excess_seconds",
+        "smg_estimated_wait_calibrated_seconds",
+        "smg_estimated_wait_calibrated_excess_seconds",
+        "smg_estimated_wait_calibration_scale",
+        "smg_estimated_wait_calibration_target_scale",
+        "smg_estimated_wait_calibration_sample_count",
+        "smg_estimated_wait_calibration_ready",
+        "smg_estimated_wait_calibration_native_capacity_ready",
+        "smg_estimated_wait_calibrated_would_reject",
+    ] {
+        metrics::gauge!(name, "worker" => worker.clone()).set(-1.0);
+    }
     metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker).set(0.0);
 }
 
 const TTFT_WINDOW_SAMPLES: usize = 32;
 const TTFT_MIN_SAMPLES: usize = 4;
 const MAX_TTFT_EVENT_BYTES: usize = 64 * 1024;
+const CALIBRATION_MAX_SCALE_CHANGE_PER_SECOND: f64 = 0.5;
+// A diagnostic validity horizon, not a latency SLO or an accuracy guarantee.
+// Snapshot age is separate from bank retention, which is 300–600 seconds
+// from feedback acceptance, subject to the 32-observation per-bank cap.
+const CALIBRATION_HISTORY_MAX_AGE: Duration = Duration::from_secs(600);
+const CALIBRATION_BANK_DURATION: Duration = Duration::from_secs(300);
+const CALIBRATION_METHOD: &str = "mse_poll_two_wave_queue_v2";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum BaselineSource {
+    #[default]
+    Unknown,
+    Provisional,
+    Measured,
+}
+
+impl BaselineSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Provisional => "provisional",
+            Self::Measured => "measured",
+        }
+    }
+}
+
+fn materially_different_baseline(provisional: f64, measured: f64) -> bool {
+    (measured - provisional).abs() > 0.1_f64.max(0.2 * provisional)
+}
+
+/// Admission-time inputs travel with the request, not with the mutable load sample.
+#[derive(Clone, Debug)]
+pub(crate) struct CalibrationForecast {
+    generation: Arc<()>,
+    calibration_generation: Arc<()>,
+    epoch: u64,
+    baseline: Option<f64>,
+    raw_extra: f64,
+    queue_extra: f64,
+    raw_baseline: Option<f64>,
+    baseline_source: BaselineSource,
+    native_capacity_ready: bool,
+    native_waiting: f64,
+    raw_ready: bool,
+    fresh: bool,
+    captured_at: Instant,
+    scale: f64,
+    target_scale: f64,
+    time_seconds: f64,
+    sample_count: usize,
+    observation_sequence: u64,
+    fit_sequence: u64,
+    bank_index: u64,
+    history_revision: u64,
+    fitted_revision: u64,
+    threshold: f64,
+}
+
+impl CalibrationForecast {
+    fn queue_visible(&self) -> bool {
+        self.native_waiting > 0.0
+    }
+
+    fn state(&self) -> &'static str {
+        if self.native_capacity_ready {
+            "capacity_ready"
+        } else {
+            "capacity_unready"
+        }
+    }
+
+    fn extra(&self) -> f64 {
+        self.scale * self.queue_extra
+    }
+
+    fn seconds(&self) -> f64 {
+        self.baseline
+            .map_or(-1.0, |baseline| baseline + self.extra())
+    }
+
+    fn would_reject(&self) -> bool {
+        self.fresh
+            && self.native_capacity_ready
+            && self.baseline.is_some()
+            && self.extra().is_finite()
+            && self.extra() >= self.threshold
+    }
+}
+
+#[derive(Debug)]
+struct ScaleTrajectory {
+    anchor_scale: f64,
+    target_scale: f64,
+    anchor_time: Instant,
+}
+
+impl ScaleTrajectory {
+    fn new(now: Instant) -> Self {
+        Self {
+            anchor_scale: 1.0,
+            target_scale: 1.0,
+            anchor_time: now,
+        }
+    }
+
+    fn applied(&self, now: Instant) -> f64 {
+        let limit = CALIBRATION_MAX_SCALE_CHANGE_PER_SECOND
+            * now
+                .saturating_duration_since(self.anchor_time)
+                .as_secs_f64();
+        if self.target_scale >= self.anchor_scale {
+            self.anchor_scale + (self.target_scale - self.anchor_scale).min(limit)
+        } else {
+            self.anchor_scale - (self.anchor_scale - self.target_scale).min(limit)
+        }
+    }
+
+    fn retarget(&mut self, target: f64, now: Instant) {
+        self.anchor_scale = self.applied(now);
+        self.anchor_time = now;
+        self.target_scale = target;
+    }
+}
+
+#[derive(Debug)]
+struct ExcessCalibration {
+    // Separate histories across native capacity warm-up, even when F promotes
+    // the independent raw admission-readiness gate.
+    samples: [VecDeque<(f64, f64)>; 2],
+    accepted: [u64; 2],
+    fitted: [u64; 2],
+    trajectories: [ScaleTrajectory; 2],
+    started: Instant,
+    // Samples remain chronological: previous bank followed by current bank.
+    previous_count: [usize; 2],
+    bank_started: Option<Instant>,
+    bank_index: u64,
+    history_revision: [u64; 2],
+    fitted_revision: [u64; 2],
+}
+
+impl Default for ExcessCalibration {
+    fn default() -> Self {
+        Self::new(Instant::now())
+    }
+}
+
+impl ExcessCalibration {
+    fn new(now: Instant) -> Self {
+        Self {
+            samples: Default::default(),
+            accepted: [0; 2],
+            fitted: [0; 2],
+            trajectories: [ScaleTrajectory::new(now), ScaleTrajectory::new(now)],
+            started: now,
+            previous_count: [0; 2],
+            bank_started: None,
+            bank_index: 0,
+            history_revision: [0; 2],
+            fitted_revision: [0; 2],
+        }
+    }
+
+    fn time_seconds(&self, now: Instant) -> f64 {
+        now.saturating_duration_since(self.started).as_secs_f64()
+    }
+
+    fn stats(&self, native_ready: bool, now: Instant) -> (f64, usize) {
+        let index = usize::from(native_ready);
+        (
+            self.trajectories[index].applied(now),
+            self.samples[index].len(),
+        )
+    }
+
+    fn target(&self, native_ready: bool) -> f64 {
+        self.trajectories[usize::from(native_ready)].target_scale
+    }
+
+    /// Advance both feedback-time banks in O(window size), even after long idle.
+    /// Ordinary rotation never changes the admission generation.
+    fn rotate(&mut self, now: Instant) -> bool {
+        let Some(started) = self.bank_started else {
+            return false;
+        };
+        let steps =
+            now.saturating_duration_since(started).as_secs() / CALIBRATION_BANK_DURATION.as_secs();
+        if steps == 0 {
+            return false;
+        }
+        self.bank_started =
+            Some(started + Duration::from_secs(steps * CALIBRATION_BANK_DURATION.as_secs()));
+        self.bank_index = self.bank_index.saturating_add(steps);
+        for index in 0..2 {
+            let remove = if steps >= 2 {
+                self.samples[index].len()
+            } else {
+                self.previous_count[index]
+            };
+            self.samples[index].drain(..remove);
+            self.previous_count[index] = self.samples[index].len();
+            if remove > 0 {
+                self.history_revision[index] += 1;
+                // Never continue a stale trajectory when evidence disappears.
+                // With enough history, only a fresh poll may fit a new target.
+                if self.samples[index].len() < TTFT_MIN_SAMPLES {
+                    self.trajectories[index] = ScaleTrajectory::new(now);
+                }
+            }
+        }
+        true
+    }
+
+    fn mse_target(samples: &VecDeque<(f64, f64)>) -> f64 {
+        if samples.len() < TTFT_MIN_SAMPLES {
+            return 1.0;
+        }
+        // sum(x*y)/sum(x*x) is the x^2-weighted mean of y/x. Normalize x
+        // before squaring, then use a running mean to avoid overflowing sums.
+        let largest = samples.iter().map(|(_, x)| *x).fold(0.0, f64::max);
+        let mut total = 0.0;
+        let mut target = 0.0;
+        for &(ratio, x) in samples {
+            let weight = (x / largest).powi(2);
+            if weight > 0.0 {
+                total += weight;
+                target += (ratio - target) * (weight / total);
+            }
+        }
+        target
+    }
+
+    fn fit_on_poll(&mut self, native_ready: bool, now: Instant) -> bool {
+        let index = usize::from(native_ready);
+        self.rotate(now);
+        if self.fitted_revision[index] == self.history_revision[index] {
+            return false;
+        }
+        let target = Self::mse_target(&self.samples[index]);
+        self.trajectories[index].retarget(target, now);
+        self.fitted[index] = self.accepted[index];
+        self.fitted_revision[index] = self.history_revision[index];
+        true
+    }
+
+    fn observe(&mut self, forecast: &CalibrationForecast, ttft: f64, now: Instant) -> &'static str {
+        if !forecast.fresh {
+            return "stale_at_admission";
+        }
+        if now.saturating_duration_since(forecast.captured_at) >= CALIBRATION_HISTORY_MAX_AGE {
+            return "feedback_expired";
+        }
+        let Some(baseline) = forecast.baseline else {
+            return "baseline_unavailable";
+        };
+        if !baseline.is_finite() || baseline < 0.0 || !ttft.is_finite() || ttft <= 0.0 {
+            return "invalid_observation";
+        }
+        if !forecast.queue_extra.is_finite() || forecast.queue_extra <= 0.0 {
+            return "nonpositive_extra";
+        }
+        let ratio = (ttft - baseline).max(0.0) / forecast.queue_extra;
+        if !ratio.is_finite() {
+            return "invalid_ratio";
+        }
+        if !forecast.native_capacity_ready {
+            return "native_capacity_unready";
+        }
+        if !forecast.queue_visible() {
+            return "native_queue_not_visible";
+        }
+        self.rotate(now);
+        self.bank_started.get_or_insert(now);
+        let index = usize::from(forecast.native_capacity_ready);
+        let samples = &mut self.samples[index];
+        samples.push_back((ratio, forecast.queue_extra));
+        self.accepted[index] += 1;
+        self.history_revision[index] += 1;
+        if samples.len() - self.previous_count[index] > TTFT_WINDOW_SAMPLES {
+            samples.remove(self.previous_count[index]);
+        }
+        "accepted"
+    }
+}
 
 fn push_ttft_sample(samples: &mut VecDeque<f64>, value: f64) {
     samples.push_back(value);
@@ -455,6 +803,8 @@ struct TtftProbe {
     baseline: Option<f64>,
     observation_id: u64,
     backlog_size: f64,
+    calibration: Option<CalibrationForecast>,
+    request_id: Option<String>,
 }
 
 /// Observe standard OpenAI SSE without altering or delaying relayed bytes.
@@ -495,6 +845,16 @@ impl StreamTtftObserver {
 
     pub(crate) fn with_request_id(mut self, request_id: Option<&str>) -> Self {
         self.request_id = request_id.map(|id| id.chars().take(256).collect());
+        if let Some(probe) = &mut self.probe {
+            probe.request_id.clone_from(&self.request_id);
+        }
+        self
+    }
+
+    pub(crate) fn with_calibration(mut self, forecast: Option<CalibrationForecast>) -> Self {
+        if let Some(probe) = &mut self.probe {
+            probe.calibration = forecast;
+        }
         self
     }
 
@@ -609,6 +969,12 @@ struct Entry {
     pending_first_text: HashSet<u64>,
     backlog_peak_size: f64,
     pipeline_idle: bool,
+    calibration: ExcessCalibration,
+    calibration_generation: Arc<()>,
+    calibration_epoch: u64,
+    calibration_profile: Option<(bool, Option<u64>)>,
+    calibration_empty_polls: u8,
+    calibration_baseline: (Option<f64>, BaselineSource),
 }
 
 impl Entry {
@@ -628,6 +994,12 @@ impl Entry {
             pending_first_text: HashSet::new(),
             backlog_peak_size: 0.0,
             pipeline_idle: true,
+            calibration: ExcessCalibration::default(),
+            calibration_generation: Arc::new(()),
+            calibration_epoch: 0,
+            calibration_profile: None,
+            calibration_empty_polls: 0,
+            calibration_baseline: (None, BaselineSource::Unknown),
         }
     }
 
@@ -643,10 +1015,165 @@ impl Entry {
         self.pending_first_text.clear();
         self.backlog_peak_size = 0.0;
         self.pipeline_idle = true;
+        self.reset_calibration(Instant::now(), "worker_invalidated");
+        self.calibration_profile = None;
+        self.calibration_empty_polls = 0;
         self.backlog_generation = self.backlog_generation.wrapping_add(1);
     }
 
-    fn refresh(&mut self, worker: &Arc<dyn Worker>, max_age_secs: f64) {
+    fn reset_calibration(&mut self, now: Instant, reason: &'static str) {
+        self.calibration = ExcessCalibration::new(now);
+        self.calibration_baseline = (None, BaselineSource::Unknown);
+        self.calibration_generation = Arc::new(());
+        self.calibration_epoch = self.calibration_epoch.wrapping_add(1);
+        if let Some(worker) = self.source.upgrade() {
+            tracing::debug!(target: "smg::estimated_wait::observation",
+                event = "calibration_reset", worker = worker.url(), reason,
+                calibration_epoch = self.calibration_epoch);
+        }
+    }
+
+    fn update_calibration_baseline(&mut self, config: &EstimatedWaitConfig, now: Instant) {
+        if !config.estimated_wait_calibration_shadow {
+            return;
+        }
+        // A failed scrape removes the raw sample, not calibration evidence.
+        // Re-evaluate provenance only when a usable load sample exists.
+        let Some(sample) = self.sample.as_ref() else {
+            return;
+        };
+        let measured = sample.prepared.baseline;
+        let next = if let Some(value) = measured {
+            (Some(value), BaselineSource::Measured)
+        } else if let Some(value) = config.estimated_wait_provisional_baseline_secs {
+            (Some(value), BaselineSource::Provisional)
+        } else {
+            (None, BaselineSource::Unknown)
+        };
+        let previous = self.calibration_baseline;
+        let material_promotion = previous.1 == BaselineSource::Provisional
+            && next.1 == BaselineSource::Measured
+            && previous
+                .0
+                .zip(next.0)
+                .is_some_and(|(old, new)| materially_different_baseline(old, new));
+        let changed_fallback = previous.1 != BaselineSource::Unknown
+            && next.1 != BaselineSource::Measured
+            && previous != next;
+        if material_promotion || changed_fallback {
+            self.reset_calibration(
+                now,
+                if material_promotion {
+                    "baseline_promoted"
+                } else {
+                    "baseline_fallback_changed"
+                },
+            );
+        }
+        self.calibration_baseline = next;
+        if previous != next {
+            if let Some(worker) = self.source.upgrade() {
+                tracing::debug!(target: "smg::estimated_wait::observation",
+                    event = "calibration_baseline", calibration_method = CALIBRATION_METHOD,
+                    worker = worker.url(), calibration_epoch = self.calibration_epoch,
+                    baseline_previous_source = previous.1.as_str(),
+                    baseline_previous_seconds = previous.0.unwrap_or(-1.0),
+                    calibration_baseline_source = next.1.as_str(),
+                    calibration_baseline_seconds = next.0.unwrap_or(-1.0),
+                    calibration_baseline_available = next.0.is_some(),
+                    calibration_baseline_material_promotion = material_promotion,
+                    calibration_time_seconds = self.calibration.time_seconds(now));
+            }
+        }
+    }
+
+    fn rotate_calibration(&mut self, now: Instant) {
+        let before = [
+            self.calibration.stats(false, now),
+            self.calibration.stats(true, now),
+        ];
+        if self.calibration.rotate(now) {
+            if let Some(worker) = self.source.upgrade() {
+                for native_ready in [false, true] {
+                    let index = usize::from(native_ready);
+                    let after = self.calibration.stats(native_ready, now);
+                    tracing::debug!(target: "smg::estimated_wait::observation",
+                        event = "calibration_rotation", calibration_method = CALIBRATION_METHOD,
+                        worker = worker.url(), calibration_epoch = self.calibration_epoch,
+                        calibration_state = if native_ready { "capacity_ready" } else { "capacity_unready" },
+                        calibration_bank_index = self.calibration.bank_index,
+                        calibration_bank_seconds = CALIBRATION_BANK_DURATION.as_secs(),
+                        calibration_history_revision = self.calibration.history_revision[index],
+                        calibration_previous_sample_count = self.calibration.previous_count[index],
+                        calibration_current_sample_count = after.1 - self.calibration.previous_count[index],
+                        sample_count_before = before[index].1, sample_count_after = after.1,
+                        scale_before = before[index].0, scale_after = after.0,
+                        target_scale_after = self.calibration.target(native_ready),
+                        calibration_time_seconds = self.calibration.time_seconds(now));
+                }
+            }
+        }
+    }
+
+    fn calibration_forecast(
+        &mut self,
+        config: &EstimatedWaitConfig,
+        now: Instant,
+    ) -> Option<CalibrationForecast> {
+        if !config.estimated_wait_calibration_shadow {
+            return None;
+        }
+        self.update_calibration_baseline(config, now);
+        self.rotate_calibration(now);
+        let sample = self.sample.as_ref()?;
+        let fresh = now.saturating_duration_since(sample.started).as_secs_f64()
+            <= config.estimated_wait_max_snapshot_age_secs;
+        let (scale, sample_count) = self
+            .calibration
+            .stats(sample.prepared.capacity_learned_ready, now);
+        Some(CalibrationForecast {
+            generation: Arc::clone(&self.generation),
+            calibration_generation: Arc::clone(&self.calibration_generation),
+            epoch: self.calibration_epoch,
+            baseline: self.calibration_baseline.0,
+            baseline_source: self.calibration_baseline.1,
+            raw_baseline: sample.prepared.baseline,
+            queue_extra: sample
+                .prepared
+                .queue_excess_seconds(self.total_dispatched.saturating_sub(sample.watermark)),
+            raw_extra: sample
+                .prepared
+                .excess_seconds(self.total_dispatched.saturating_sub(sample.watermark)),
+            native_capacity_ready: sample.prepared.capacity_learned_ready,
+            native_waiting: sample.prepared.native_waiting,
+            raw_ready: fresh && sample.prepared.capacity_ready,
+            fresh,
+            captured_at: now,
+            scale,
+            target_scale: self
+                .calibration
+                .target(sample.prepared.capacity_learned_ready),
+            time_seconds: self.calibration.time_seconds(now),
+            sample_count,
+            observation_sequence: self.calibration.accepted
+                [usize::from(sample.prepared.capacity_learned_ready)],
+            fit_sequence: self.calibration.fitted
+                [usize::from(sample.prepared.capacity_learned_ready)],
+            bank_index: self.calibration.bank_index,
+            history_revision: self.calibration.history_revision
+                [usize::from(sample.prepared.capacity_learned_ready)],
+            fitted_revision: self.calibration.fitted_revision
+                [usize::from(sample.prepared.capacity_learned_ready)],
+            threshold: sample.threshold,
+        })
+    }
+
+    fn refresh(&mut self, worker: &Arc<dyn Worker>, config: &EstimatedWaitConfig) {
+        let now = Instant::now();
+        if config.estimated_wait_calibration_shadow {
+            self.update_calibration_baseline(config, now);
+            self.rotate_calibration(now);
+        }
         if let Some(sample) = &mut self.sample {
             let seconds = sample
                 .prepared
@@ -662,7 +1189,7 @@ impl Entry {
                 .set(seconds);
             metrics::gauge!("smg_estimated_wait_excess_seconds", "worker" => worker.url().to_owned())
                 .set(excess);
-            metrics::gauge!("smg_estimated_wait_snapshot_age_seconds", "worker" => worker.url().to_owned()).set(sample.started.elapsed().as_secs_f64());
+            metrics::gauge!("smg_estimated_wait_snapshot_age_seconds", "worker" => worker.url().to_owned()).set(now.saturating_duration_since(sample.started).as_secs_f64());
             metrics::gauge!("smg_estimated_wait_capacity_ready", "worker" => worker.url().to_owned())
                 .set(u8::from(sample.prepared.capacity_ready));
             metrics::gauge!("smg_estimated_wait_effective_prefill_capacity", "worker" => worker.url().to_owned())
@@ -677,10 +1204,40 @@ impl Entry {
                 .set(sample.prepared.observed_delay_floor);
             metrics::gauge!("smg_estimated_wait_observed_delay_sample_count", "worker" => worker.url().to_owned())
                 .set(self.observed_delays.len() as f64);
+            if config.estimated_wait_calibration_shadow {
+                let (scale, count) = self
+                    .calibration
+                    .stats(sample.prepared.capacity_learned_ready, now);
+                let index = usize::from(sample.prepared.capacity_learned_ready);
+                metrics::gauge!("smg_estimated_wait_calibration_epoch", "worker" => worker.url().to_owned()).set(self.calibration_epoch as f64);
+                metrics::gauge!("smg_estimated_wait_calibration_observation_sequence", "worker" => worker.url().to_owned()).set(self.calibration.accepted[index] as f64);
+                metrics::gauge!("smg_estimated_wait_calibration_history_revision", "worker" => worker.url().to_owned()).set(self.calibration.history_revision[index] as f64);
+                metrics::gauge!("smg_estimated_wait_calibration_fitted_revision", "worker" => worker.url().to_owned()).set(self.calibration.fitted_revision[index] as f64);
+                metrics::gauge!("smg_estimated_wait_calibration_baseline_seconds", "worker" => worker.url().to_owned()).set(self.calibration_baseline.0.unwrap_or(-1.0));
+                metrics::gauge!("smg_estimated_wait_calibration_baseline_provisional", "worker" => worker.url().to_owned()).set(u8::from(self.calibration_baseline.1 == BaselineSource::Provisional));
+                metrics::gauge!("smg_estimated_wait_calibration_baseline_measured", "worker" => worker.url().to_owned()).set(u8::from(self.calibration_baseline.1 == BaselineSource::Measured));
+                metrics::gauge!("smg_estimated_wait_calibration_input_excess_seconds", "worker" => worker.url().to_owned()).set(sample.prepared.queue_excess_seconds(self.total_dispatched.saturating_sub(sample.watermark)));
+                let calibrated_extra = scale
+                    * sample.prepared.queue_excess_seconds(
+                        self.total_dispatched.saturating_sub(sample.watermark),
+                    );
+                let fresh = now.saturating_duration_since(sample.started).as_secs_f64()
+                    <= config.estimated_wait_max_snapshot_age_secs;
+                metrics::gauge!("smg_estimated_wait_calibrated_seconds", "worker" => worker.url().to_owned()).set(self.calibration_baseline.0.map_or(-1.0, |baseline| baseline + calibrated_extra));
+                metrics::gauge!("smg_estimated_wait_calibrated_excess_seconds", "worker" => worker.url().to_owned()).set(calibrated_extra);
+                metrics::gauge!("smg_estimated_wait_calibration_scale", "worker" => worker.url().to_owned()).set(scale);
+                metrics::gauge!("smg_estimated_wait_calibration_target_scale", "worker" => worker.url().to_owned()).set(self.calibration.target(sample.prepared.capacity_learned_ready));
+                metrics::gauge!("smg_estimated_wait_calibration_sample_count", "worker" => worker.url().to_owned()).set(count as f64);
+                metrics::gauge!("smg_estimated_wait_calibration_ready", "worker" => worker.url().to_owned()).set(u8::from(count >= TTFT_MIN_SAMPLES));
+                metrics::gauge!("smg_estimated_wait_calibration_native_capacity_ready", "worker" => worker.url().to_owned()).set(u8::from(sample.prepared.capacity_learned_ready));
+                metrics::gauge!("smg_estimated_wait_calibrated_would_reject", "worker" => worker.url().to_owned()).set(u8::from(fresh && sample.prepared.capacity_learned_ready && self.calibration_baseline.0.is_some() && calibrated_extra.is_finite() && calibrated_extra >= sample.threshold));
+            }
         }
         metrics::gauge!("smg_estimated_wait_data_usable", "worker" => worker.url().to_owned()).set(
             u8::from(self.sample.as_ref().is_some_and(|s| {
-                s.overloaded.is_some() && s.started.elapsed().as_secs_f64() <= max_age_secs
+                s.overloaded.is_some()
+                    && now.saturating_duration_since(s.started).as_secs_f64()
+                        <= config.estimated_wait_max_snapshot_age_secs
             })),
         );
     }
@@ -715,10 +1272,12 @@ impl EstimatedWaitAdmission {
             baseline: ttft_median(&entry.low_load_ttfts),
             observation_id: entry.next_observation_id,
             backlog_size: sample.prepared.backlog_size,
+            calibration: None,
+            request_id: None,
         };
         entry.pending_first_text.insert(probe.observation_id);
-        Self::apply_observations(entry, self.config());
-        entry.refresh(&worker, self.config().estimated_wait_max_snapshot_age_secs);
+        Self::apply_observations(entry);
+        entry.refresh(&worker, self.config());
         Some(probe)
     }
 
@@ -731,9 +1290,9 @@ impl EstimatedWaitAdmission {
             return;
         }
         entry.pending_first_text.remove(&probe.observation_id);
-        Self::apply_observations(entry, self.config());
+        Self::apply_observations(entry);
         if let Some(worker) = entry.source.upgrade() {
-            entry.refresh(&worker, self.config().estimated_wait_max_snapshot_age_secs);
+            entry.refresh(&worker, self.config());
         }
     }
 
@@ -754,7 +1313,66 @@ impl EstimatedWaitAdmission {
         if !Arc::ptr_eq(&entry.generation, &probe.generation) {
             return;
         }
-        entry.pending_first_text.remove(&probe.observation_id);
+        if !entry.pending_first_text.remove(&probe.observation_id) {
+            return;
+        }
+        if let Some(forecast) = probe
+            .calibration
+            .as_ref()
+            .filter(|_| self.config().estimated_wait_calibration_shadow)
+        {
+            let now = Instant::now();
+            entry.update_calibration_baseline(self.config(), now);
+            entry.rotate_calibration(now);
+            let before = entry.calibration.stats(forecast.native_capacity_ready, now);
+            let target_before = entry.calibration.target(forecast.native_capacity_ready);
+            let sequence_before =
+                entry.calibration.accepted[usize::from(forecast.native_capacity_ready)];
+            let reason = if Arc::ptr_eq(&entry.generation, &forecast.generation)
+                && Arc::ptr_eq(
+                    &entry.calibration_generation,
+                    &forecast.calibration_generation,
+                ) {
+                entry.calibration.observe(forecast, ttft, now)
+            } else {
+                "calibration_generation_changed"
+            };
+            let after = entry.calibration.stats(forecast.native_capacity_ready, now);
+            let sequence_after =
+                entry.calibration.accepted[usize::from(forecast.native_capacity_ready)];
+            tracing::debug!(
+                target: "smg::estimated_wait::observation", event = "calibration_feedback",
+                request_id = probe.request_id.as_deref().unwrap_or(""), worker = probe.worker_url,
+                baseline_seconds = forecast.raw_baseline.unwrap_or(0.0), baseline_available = forecast.raw_baseline.is_some(),
+                calibration_baseline_seconds = forecast.baseline.unwrap_or(-1.0),
+                calibration_baseline_available = forecast.baseline.is_some(),
+                calibration_baseline_source = forecast.baseline_source.as_str(),
+                queue_excess_seconds = forecast.queue_extra,
+                calibration_input_excess_seconds = forecast.queue_extra,
+                raw_excess_seconds = forecast.raw_extra, calibration_state = forecast.state(),
+                ttft_seconds = ttft, reason, admission_scale = forecast.scale,
+                admission_sample_count = forecast.sample_count,
+                admission_observation_sequence = forecast.observation_sequence, sequence_before, sequence_after,
+                calibration_epoch = forecast.epoch, current_calibration_epoch = entry.calibration_epoch,
+                calibration_method = CALIBRATION_METHOD,
+                calibration_bank_index = entry.calibration.bank_index,
+                calibration_history_revision = entry.calibration.history_revision[usize::from(forecast.native_capacity_ready)],
+                admission_fit_sequence = forecast.fit_sequence,
+                admission_bank_index = forecast.bank_index,
+                admission_history_revision = forecast.history_revision,
+                admission_fitted_revision = forecast.fitted_revision,
+                fit_sequence_before = entry.calibration.fitted[usize::from(forecast.native_capacity_ready)],
+                fit_sequence_after = entry.calibration.fitted[usize::from(forecast.native_capacity_ready)],
+                scale_before = before.0, sample_count_before = before.1,
+                scale_after = after.0, sample_count_after = after.1,
+                target_scale_before = target_before, target_scale_after = entry.calibration.target(forecast.native_capacity_ready),
+                calibration_time_seconds = entry.calibration.time_seconds(now), admission_calibration_time_seconds = forecast.time_seconds,
+                feedback_age_seconds = now.saturating_duration_since(forecast.captured_at).as_secs_f64(),
+                calibration_max_age_seconds = CALIBRATION_HISTORY_MAX_AGE.as_secs_f64(),
+                admission_native_waiting = forecast.native_waiting, admission_native_queue_visible = forecast.queue_visible(),
+                admission_native_capacity_ready = forecast.native_capacity_ready,
+            );
+        }
         let Some(worker) = entry.source.upgrade() else {
             return;
         };
@@ -790,11 +1408,11 @@ impl EstimatedWaitAdmission {
                 }
             }
         }
-        Self::apply_observations(entry, self.config());
-        entry.refresh(&worker, self.config().estimated_wait_max_snapshot_age_secs);
+        Self::apply_observations(entry);
+        entry.refresh(&worker, self.config());
     }
 
-    fn apply_observations(entry: &mut Entry, config: &EstimatedWaitConfig) {
+    fn apply_observations(entry: &mut Entry) {
         let baseline = ttft_median(&entry.low_load_ttfts);
         let busy_visibility = observation_quantile(&entry.busy_visibility, 0.75);
         let low_visibility = ttft_median(&entry.low_load_visibility);
@@ -822,9 +1440,7 @@ impl EstimatedWaitAdmission {
         prepared.has_backlog =
             prepared.native_estimate.queued_work() > 0.0 || prepared.native_waiting > 0.0;
         if let Some(baseline) = baseline {
-            prepared.estimate = prepared
-                .estimate
-                .with_base_overhead(baseline + config.estimated_wait_base_overhead_secs);
+            prepared.estimate = prepared.estimate.with_base_overhead(baseline);
             prepared.baseline = Some(baseline);
             prepared.capacity_ready = prepared.capacity_learned_ready;
         }
@@ -952,7 +1568,82 @@ impl EstimatedWaitAdmission {
         {
             return;
         }
+        let new_poll = entry.last_published.is_none_or(|last| started > last);
         entry.last_published = Some(started);
+        // Native capacity samples only shrink when the monitor resets its
+        // counter/profile history. Do not let pre-reset responses train the
+        // new profile, and leave all raw estimator state untouched.
+        if let Some(new) = prepared.filter(|_| config.estimated_wait_calibration_shadow) {
+            if entry
+                .calibration_profile
+                .is_some_and(|(old_ready, old_count)| {
+                    (old_ready && !new.capacity_learned_ready)
+                        || old_count
+                            .zip(new.capacity_profile_sample_count)
+                            .is_some_and(|(old, new)| new < old)
+                })
+            {
+                entry.reset_calibration(Instant::now(), "native_profile_changed");
+            }
+            // A failed scrape invalidates the raw report, not this reset
+            // watermark. Otherwise a counter reset across one failed poll
+            // could silently retain the preceding calibration history.
+            entry.calibration_profile = Some((
+                new.capacity_learned_ready,
+                new.capacity_profile_sample_count,
+            ));
+        }
+        if config.estimated_wait_calibration_shadow && new_poll {
+            // Two consecutive fresh queue-empty reports, with no local pre-text
+            // observers or admissions during the poll, delimit a new workload.
+            // Decoding may continue; this confirms queue drain, not engine idle.
+            let drained = prepared.is_some_and(|p| !p.has_backlog)
+                && entry.pending_first_text.is_empty()
+                && entry.total_dispatched == watermark.dispatched
+                && started.elapsed().as_secs_f64() <= config.estimated_wait_max_snapshot_age_secs;
+            if drained {
+                if entry.calibration_empty_polls < 2 {
+                    entry.calibration_empty_polls += 1;
+                    if entry.calibration_empty_polls == 2 {
+                        entry.reset_calibration(Instant::now(), "queue_drained");
+                    }
+                }
+            } else {
+                entry.calibration_empty_polls = 0;
+            }
+            // Fit after lifecycle/drain checks, using only saved admission inputs.
+            // Failed, stale and duplicate polls cannot teach or advance a target.
+            let now = Instant::now();
+            entry.rotate_calibration(now);
+            if prepared.is_some()
+                && now.saturating_duration_since(started).as_secs_f64()
+                    <= config.estimated_wait_max_snapshot_age_secs
+            {
+                for native_ready in [false, true] {
+                    let index = usize::from(native_ready);
+                    let before = entry.calibration.stats(native_ready, now);
+                    let target_before = entry.calibration.target(native_ready);
+                    let fitted_before = entry.calibration.fitted[index];
+                    if entry.calibration.fit_on_poll(native_ready, now) {
+                        tracing::debug!(target: "smg::estimated_wait::observation",
+                            event = "calibration_update", calibration_method = CALIBRATION_METHOD,
+                            calibration_bank_index = entry.calibration.bank_index,
+                            calibration_history_revision = entry.calibration.history_revision[index],
+                            calibration_fitted_revision = entry.calibration.fitted_revision[index],
+                            worker = worker.url(), calibration_epoch = entry.calibration_epoch,
+                            current_calibration_epoch = entry.calibration_epoch,
+                            calibration_state = if native_ready { "capacity_ready" } else { "capacity_unready" },
+                            sequence_before = entry.calibration.accepted[index],
+                            sequence_after = entry.calibration.accepted[index],
+                            fit_sequence_before = fitted_before, fit_sequence_after = entry.calibration.fitted[index],
+                            scale_before = before.0, scale_after = entry.calibration.stats(native_ready, now).0,
+                            sample_count_before = before.1, sample_count_after = before.1,
+                            target_scale_before = target_before, target_scale_after = entry.calibration.target(native_ready),
+                            calibration_time_seconds = entry.calibration.time_seconds(now));
+                    }
+                }
+            }
+        }
         // A verified idle worker begins a new queue epoch. Responses from the
         // preceding busy epoch cannot recalibrate a later workload after drain.
         if prepared.is_some_and(|prepared| prepared.low_load) && entry.pending_first_text.len() <= 1
@@ -985,7 +1676,7 @@ impl EstimatedWaitAdmission {
             threshold,
             overloaded: None,
         });
-        Self::apply_observations(entry, config);
+        Self::apply_observations(entry);
         if let Some(sample) = &entry.sample {
             metrics::gauge!("smg_estimated_wait_threshold_seconds", "worker" => worker.url().to_owned()).set(sample.threshold);
             metrics::gauge!("smg_estimated_wait_queue_proxy", "worker" => worker.url().to_owned())
@@ -1006,7 +1697,7 @@ impl EstimatedWaitAdmission {
             metrics::gauge!("smg_estimated_wait_observed_delay_sample_count", "worker" => worker.url().to_owned())
                 .set(entry.observed_delays.len() as f64);
         }
-        entry.refresh(worker, config.estimated_wait_max_snapshot_age_secs);
+        entry.refresh(worker, config);
     }
 
     pub(crate) fn evict(&self, worker: &Arc<dyn Worker>) {
@@ -1054,7 +1745,53 @@ pub(crate) struct AdmissionGuard<'a> {
 }
 
 impl AdmissionGuard<'_> {
-    pub(crate) fn record_forecast(&self, candidates: &[Arc<dyn Worker>], request_id: Option<&str>) {
+    pub(crate) fn capture_calibration(
+        &mut self,
+        worker: &Arc<dyn Worker>,
+        request_id: Option<&str>,
+    ) -> Option<CalibrationForecast> {
+        let forecast = self
+            .entries
+            .get_mut(worker.url())?
+            .calibration_forecast(self.config, Instant::now())?;
+        tracing::debug!(
+            target: "smg::estimated_wait::observation", event = "calibration_forecast",
+            request_id = request_id.unwrap_or(""), worker = worker.url(),
+            calibration_enabled = true, calibration_state = forecast.state(),
+            calibration_epoch = forecast.epoch,
+            calibration_method = CALIBRATION_METHOD, calibration_fit_sequence = forecast.fit_sequence,
+            calibration_bank_index = forecast.bank_index,
+            calibration_history_revision = forecast.history_revision,
+            calibration_fitted_revision = forecast.fitted_revision,
+            calibration_max_scale_change_per_second = CALIBRATION_MAX_SCALE_CHANGE_PER_SECOND,
+            calibration_bank_seconds = CALIBRATION_BANK_DURATION.as_secs(),
+            calibration_bank_max_samples = TTFT_WINDOW_SAMPLES,
+            calibration_observation_sequence = forecast.observation_sequence,
+            calibration_scale = forecast.scale, calibration_sample_count = forecast.sample_count,
+            calibration_target_scale = forecast.target_scale, calibration_time_seconds = forecast.time_seconds,
+            calibration_ready = forecast.sample_count >= TTFT_MIN_SAMPLES,
+            baseline_seconds = forecast.raw_baseline.unwrap_or(0.0), baseline_available = forecast.raw_baseline.is_some(),
+                calibration_baseline_seconds = forecast.baseline.unwrap_or(-1.0),
+                calibration_baseline_available = forecast.baseline.is_some(),
+                calibration_baseline_source = forecast.baseline_source.as_str(),
+                queue_excess_seconds = forecast.queue_extra,
+                calibration_input_excess_seconds = forecast.queue_extra,
+            predicted_ttft_seconds = forecast.raw_baseline.unwrap_or(0.0) + forecast.raw_extra,
+            predicted_excess_seconds = forecast.raw_extra,
+            calibrated_ttft_seconds = forecast.seconds(), calibrated_excess_seconds = forecast.extra(),
+            ready = forecast.raw_ready, native_ready = forecast.native_capacity_ready,
+            native_waiting = forecast.native_waiting, native_queue_visible = forecast.queue_visible(),
+            would_reject = forecast.raw_ready && forecast.raw_extra >= forecast.threshold,
+            threshold_seconds = forecast.threshold, calibrated_would_reject = forecast.would_reject(),
+        );
+        Some(forecast)
+    }
+
+    pub(crate) fn record_forecast(
+        &mut self,
+        candidates: &[Arc<dyn Worker>],
+        request_id: Option<&str>,
+    ) {
         let Some(request_id) = request_id else {
             return;
         };
@@ -1062,14 +1799,16 @@ impl AdmissionGuard<'_> {
             return;
         }
         for worker in candidates.iter().filter(|worker| worker.is_available()) {
-            let Some(entry) = self.entries.get(worker.url()) else {
+            let now = Instant::now();
+            let Some(entry) = self.entries.get_mut(worker.url()) else {
                 continue;
             };
+            let calibration = entry.calibration_forecast(self.config, now);
             let Some(sample) = &entry.sample else {
                 continue;
             };
             let dispatched = entry.total_dispatched.saturating_sub(sample.watermark);
-            let fresh = sample.started.elapsed().as_secs_f64()
+            let fresh = now.saturating_duration_since(sample.started).as_secs_f64()
                 <= self.config.estimated_wait_max_snapshot_age_secs;
             let ready = fresh && sample.prepared.capacity_ready;
             let legacy_visibility = if sample.prepared.low_load {
@@ -1082,8 +1821,7 @@ impl AdmissionGuard<'_> {
             };
             // Counterfactual arithmetic on the same shadow trace. It does not
             // simulate a separately enforced policy or its resulting queue.
-            let native_excess = self.config.estimated_wait_base_overhead_secs
-                + legacy_visibility
+            let native_excess = legacy_visibility
                 + sample.prepared.native_estimate.token_work(dispatched)
                     / sample.prepared.native_prefill_capacity;
             tracing::debug!(
@@ -1108,7 +1846,7 @@ impl AdmissionGuard<'_> {
                 observed_delay_available = sample.prepared.observed_delay_available,
                 measured_delay_only = sample.prepared.measured_delay_only(),
                 capacity_learned_ready = sample.prepared.capacity_learned_ready,
-                snapshot_age_seconds = sample.started.elapsed().as_secs_f64(),
+                snapshot_age_seconds = now.saturating_duration_since(sample.started).as_secs_f64(),
                 native_capacity = sample.prepared.native_prefill_capacity,
                 effective_capacity = sample.prepared.effective_prefill_capacity,
                 visibility_seconds = sample.prepared.visibility_delay,
@@ -1116,8 +1854,34 @@ impl AdmissionGuard<'_> {
                 observed_delay_floor = sample.prepared.observed_delay_floor,
                 pending_engine = sample.prepared.pending_engine,
                 native_waiting = sample.prepared.native_waiting,
+                native_queue_visible = sample.prepared.native_waiting > 0.0,
                 native_queue_delay = sample.prepared.native_queue_delay.unwrap_or(-1.0),
                 baseline_available = sample.prepared.baseline.is_some(),
+                calibration_enabled = calibration.is_some(),
+                queue_excess_seconds = sample.prepared.queue_excess_seconds(dispatched),
+                calibration_input_excess_seconds = calibration.as_ref().map_or(-1.0, |forecast| forecast.queue_extra),
+                calibration_baseline_seconds = calibration.as_ref().and_then(|forecast| forecast.baseline).unwrap_or(-1.0),
+                calibration_baseline_available = calibration.as_ref().is_some_and(|forecast| forecast.baseline.is_some()),
+                calibration_baseline_source = calibration.as_ref().map_or("unknown", |forecast| forecast.baseline_source.as_str()),
+                calibration_method = CALIBRATION_METHOD,
+                calibration_fit_sequence = calibration.as_ref().map_or(0, |forecast| forecast.fit_sequence),
+                calibration_bank_index = calibration.as_ref().map_or(0, |forecast| forecast.bank_index),
+                calibration_history_revision = calibration.as_ref().map_or(0, |forecast| forecast.history_revision),
+                calibration_fitted_revision = calibration.as_ref().map_or(0, |forecast| forecast.fitted_revision),
+                calibration_max_scale_change_per_second = CALIBRATION_MAX_SCALE_CHANGE_PER_SECOND,
+                calibration_bank_seconds = CALIBRATION_BANK_DURATION.as_secs(),
+                calibration_bank_max_samples = TTFT_WINDOW_SAMPLES,
+                calibrated_ttft_seconds = calibration.as_ref().map_or(-1.0, CalibrationForecast::seconds),
+                calibrated_excess_seconds = calibration.as_ref().map_or(-1.0, CalibrationForecast::extra),
+                calibration_scale = calibration.as_ref().map_or(-1.0, |forecast| forecast.scale),
+                calibration_target_scale = calibration.as_ref().map_or(-1.0, |forecast| forecast.target_scale),
+                calibration_time_seconds = calibration.as_ref().map_or(-1.0, |forecast| forecast.time_seconds),
+                calibration_sample_count = calibration.as_ref().map_or(0, |forecast| forecast.sample_count),
+                calibration_state = calibration.as_ref().map_or("disabled", CalibrationForecast::state),
+                calibration_epoch = calibration.as_ref().map_or(0, |forecast| forecast.epoch),
+                calibration_observation_sequence = calibration.as_ref().map_or(0, |forecast| forecast.observation_sequence),
+                calibration_ready = calibration.as_ref().is_some_and(|forecast| forecast.sample_count >= TTFT_MIN_SAMPLES),
+                calibrated_would_reject = calibration.as_ref().is_some_and(CalibrationForecast::would_reject),
             );
         }
     }
@@ -1205,7 +1969,7 @@ impl AdmissionGuard<'_> {
             return;
         };
         entry.total_dispatched = entry.total_dispatched.saturating_add(count);
-        entry.refresh(worker, self.config.estimated_wait_max_snapshot_age_secs);
+        entry.refresh(worker, self.config);
     }
 }
 
@@ -1282,6 +2046,1353 @@ mod tests {
     ) {
         let stamp = admission.poll_started(worker);
         admission.publish(worker, Some(report), stamp, Instant::now());
+    }
+
+    fn calibration_registry(native_ready: bool) -> (Arc<WorkerRegistry>, Arc<dyn Worker>) {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.estimated_wait().configure(EstimatedWaitConfig {
+            estimated_wait_calibration_shadow: true,
+            ..config()
+        });
+        let worker = worker("http://calibration:1");
+        registry.register(worker.clone()).unwrap();
+        let mut report = load(Some(1_000), 2, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = Some(0.2);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(if native_ready { 8 } else { 0 });
+        if !native_ready {
+            report.loads[0].learned_prefill_capacity = None;
+        }
+        publish_load(registry.estimated_wait(), &worker, &report);
+        (registry, worker)
+    }
+
+    fn calibration_poll(admission: &EstimatedWaitAdmission, worker: &Arc<dyn Worker>) {
+        let mut report = load(Some(1_000), 2, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = Some(0.2);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        publish_load(admission, worker, &report);
+    }
+
+    fn calibration_probe(
+        admission: &EstimatedWaitAdmission,
+        worker: &Arc<dyn Worker>,
+    ) -> TtftProbe {
+        let forecast = admission
+            .begin()
+            .unwrap()
+            .capture_calibration(worker, Some("test"))
+            .unwrap();
+        let mut probe = admission.ttft_probe(worker.url()).unwrap();
+        probe.calibration = Some(forecast);
+        probe
+    }
+
+    #[test]
+    fn calibration_ignores_dispatch_and_pending_without_a_native_queue() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let mut report = load(Some(0), 0, 100.0, 0.0);
+        report.loads[0].num_running_reqs = 1;
+        report.loads[0].low_load_ttft_seconds = Some(0.2);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        publish_load(admission, &worker, &report);
+        admission.begin().unwrap().credit(&worker, Some(&[0; 100]));
+        let probes: Vec<_> = (0..4)
+            .map(|_| calibration_probe(admission, &worker))
+            .collect();
+        {
+            let mut entries = admission.entries.lock();
+            let entry = entries.get_mut(worker.url()).unwrap();
+            let now = Instant::now();
+            let forecast = entry.calibration_forecast(admission.config(), now).unwrap();
+            assert!(forecast.raw_extra > 0.0 && forecast.native_capacity_ready);
+            assert_eq!(forecast.native_waiting, 0.0);
+            assert!(!forecast.queue_visible());
+            assert!(entry.sample.as_ref().unwrap().prepared.pending_engine > 0.0);
+            let mut isolated = ExcessCalibration::new(now);
+            assert_eq!(
+                isolated.observe(&forecast, 20.2, now),
+                "native_queue_not_visible"
+            );
+        }
+        for probe in probes {
+            admission.observe_ttft(probe, 20.2, 0.0);
+        }
+        let entries = admission.entries.lock();
+        let entry = &entries[worker.url()];
+        let now = Instant::now() + Duration::from_secs(100);
+        assert_eq!(entry.calibration.stats(true, now), (1.0, 0));
+        assert_eq!(entry.calibration.target(true), 1.0);
+        assert_eq!(entry.calibration.accepted, [0, 0]);
+    }
+
+    #[test]
+    fn calibration_skips_immature_capacity_even_when_floor_promotes_raw_readiness() {
+        let (registry, worker) = calibration_registry(false);
+        let admission = registry.estimated_wait();
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        for _ in 0..4 {
+            entry.observed_delays.push_back((10.0, 2.0));
+        }
+        EstimatedWaitAdmission::apply_observations(entry);
+        let now = Instant::now();
+        let forecast = entry.calibration_forecast(admission.config(), now).unwrap();
+        assert!(forecast.raw_ready && forecast.queue_visible());
+        assert!(!forecast.native_capacity_ready);
+        assert_eq!(forecast.raw_extra, 10.0);
+        for _ in 0..4 {
+            assert_eq!(
+                entry.calibration.observe(&forecast, 20.2, now),
+                "native_capacity_unready"
+            );
+        }
+        assert_eq!(
+            entry
+                .calibration
+                .stats(false, now + Duration::from_secs(100)),
+            (1.0, 0)
+        );
+        assert_eq!(entry.calibration.target(false), 1.0);
+    }
+
+    #[test]
+    fn calibration_rejects_a_saved_zero_queue_even_if_it_grows_before_first_text() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let mut report = load(Some(0), 0, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = Some(0.2);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        publish_load(admission, &worker, &report);
+        admission.begin().unwrap().credit(&worker, Some(&[0; 100]));
+        let probes: Vec<_> = (0..4)
+            .map(|_| calibration_probe(admission, &worker))
+            .collect();
+        report.loads[0].num_waiting_reqs = 8;
+        report.loads[0].num_waiting_uncached_tokens = 800;
+        publish_load(admission, &worker, &report);
+        for probe in probes {
+            admission.observe_ttft(probe, 20.2, 0.0);
+        }
+        let entries = admission.entries.lock();
+        assert!(
+            entries[worker.url()]
+                .sample
+                .as_ref()
+                .unwrap()
+                .prepared
+                .native_waiting
+                > 0.0
+        );
+        assert_eq!(
+            entries[worker.url()]
+                .calibration
+                .stats(true, Instant::now()),
+            (1.0, 0)
+        );
+    }
+
+    #[test]
+    fn calibration_ineligible_healthy_requests_still_learn_the_low_load_baseline() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        worker.increment_load();
+        let mut report = load(Some(0), 0, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = None;
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        publish_load(admission, &worker, &report);
+        for _ in 0..8 {
+            let probe = calibration_probe(admission, &worker);
+            admission.observe_ttft(probe, 0.25, 0.05);
+        }
+        let entries = admission.entries.lock();
+        let entry = &entries[worker.url()];
+        assert_eq!(ttft_median(&entry.low_load_ttfts), Some(0.25));
+        assert_eq!(entry.sample.as_ref().unwrap().prepared.baseline, Some(0.25));
+        assert_eq!(entry.calibration.accepted, [0, 0]);
+        assert_eq!(entry.calibration.stats(true, Instant::now()), (1.0, 0));
+        worker.decrement_load();
+    }
+
+    #[test]
+    fn calibration_slew_rises_falls_clamps_and_recovers_from_zero() {
+        let start = Instant::now();
+        let mut trajectory = ScaleTrajectory::new(start);
+        trajectory.retarget(3.0, start);
+        assert_eq!(trajectory.applied(start), 1.0);
+        assert_eq!(trajectory.applied(start + Duration::from_secs(1)), 1.5);
+        assert_eq!(trajectory.applied(start + Duration::from_secs(30)), 3.0);
+        trajectory.retarget(0.0, start + Duration::from_secs(30));
+        assert_eq!(trajectory.applied(start + Duration::from_secs(30)), 3.0);
+        assert_eq!(trajectory.applied(start + Duration::from_secs(32)), 2.0);
+        assert_eq!(trajectory.applied(start + Duration::from_secs(60)), 0.0);
+        // Seventy idle seconds at zero cannot be spent on a newly seen target.
+        trajectory.retarget(2.0, start + Duration::from_secs(100));
+        assert_eq!(trajectory.applied(start + Duration::from_secs(100)), 0.0);
+        assert_eq!(trajectory.applied(start + Duration::from_secs(101)), 0.5);
+        assert_eq!(trajectory.applied(start + Duration::from_secs(130)), 2.0);
+    }
+
+    #[test]
+    fn mse_fit_uses_squared_raw_weights_and_retains_large_errors() {
+        // (x,y) = (1,1), (2,4), (3,6), (4,40): sum(x*y)/sum(x*x) = 187/30.
+        // The old x-weighted median of y/x would be 2, not this MSE target.
+        let samples = VecDeque::from([(1.0, 1.0), (2.0, 2.0), (2.0, 3.0), (10.0, 4.0)]);
+        assert!((ExcessCalibration::mse_target(&samples) - 187.0 / 30.0).abs() < 1e-12);
+        for scale in [1e-200, 1e200] {
+            let scaled = samples
+                .iter()
+                .map(|&(ratio, x)| (ratio, x * scale))
+                .collect();
+            assert!((ExcessCalibration::mse_target(&scaled) - 187.0 / 30.0).abs() < 1e-12);
+        }
+        let extremes = VecDeque::from([(f64::MAX, 1e200); 4]);
+        assert_eq!(ExcessCalibration::mse_target(&extremes), f64::MAX);
+    }
+
+    #[test]
+    fn calibration_fits_only_on_distinct_fresh_polls_with_new_feedback() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let mut probes: Vec<_> = (0..5)
+            .map(|_| calibration_probe(admission, &worker))
+            .collect();
+        let later_feedback = probes.pop().unwrap();
+        for probe in probes {
+            admission.observe_ttft(probe, 20.2, 0.0);
+        }
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .calibration
+                .target(true),
+            1.0
+        );
+        let stamp = admission.poll_started(&worker);
+        admission.publish(&worker, None, stamp, Instant::now());
+        assert_eq!(
+            admission.entries.lock()[worker.url()].calibration.fitted[1],
+            0
+        );
+
+        let mut report = load(Some(1_000), 2, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = Some(0.2);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        // A stale report cannot consume the pending feedback batch.
+        admission
+            .entries
+            .lock()
+            .get_mut(worker.url())
+            .unwrap()
+            .last_published = None;
+        let stamp = admission.poll_started(&worker);
+        admission.publish(
+            &worker,
+            Some(&report),
+            stamp,
+            Instant::now() - Duration::from_secs(60),
+        );
+        assert_eq!(
+            admission.entries.lock()[worker.url()].calibration.fitted[1],
+            0
+        );
+        calibration_poll(admission, &worker);
+        let (published, anchor) = {
+            let entries = admission.entries.lock();
+            let entry = &entries[worker.url()];
+            assert_eq!(entry.calibration.target(true), 2.0);
+            assert_eq!(entry.calibration.fitted[1], 4);
+            (
+                entry.last_published.unwrap(),
+                entry.calibration.trajectories[1].anchor_time,
+            )
+        };
+        // Fresh polling without new feedback does not re-anchor the trajectory.
+        calibration_poll(admission, &worker);
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .calibration
+                .trajectories[1]
+                .anchor_time,
+            anchor
+        );
+        admission.observe_ttft(later_feedback, 50.2, 0.0);
+        let latest = admission.entries.lock()[worker.url()]
+            .last_published
+            .unwrap();
+        for duplicate_or_old in [latest, published] {
+            let stamp = admission.poll_started(&worker);
+            admission.publish(&worker, Some(&report), stamp, duplicate_or_old);
+            assert_eq!(
+                admission.entries.lock()[worker.url()].calibration.fitted[1],
+                4
+            );
+        }
+        calibration_poll(admission, &worker);
+        let entries = admission.entries.lock();
+        let entry = &entries[worker.url()];
+        assert_eq!(entry.calibration.fitted[1], 5);
+        assert!((entry.calibration.target(true) - 2.6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn calibration_accepts_long_feedback_until_ten_minute_boundary() {
+        let (registry, worker) = calibration_registry(true);
+        let mut forecast = registry
+            .estimated_wait()
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let now = Instant::now();
+        let mut calibration = ExcessCalibration::new(now);
+        assert_eq!(CALIBRATION_HISTORY_MAX_AGE, Duration::from_secs(600));
+        for age in [357, 599] {
+            forecast.captured_at = now - Duration::from_secs(age);
+            assert_eq!(calibration.observe(&forecast, age as f64, now), "accepted");
+        }
+        forecast.captured_at = now - Duration::from_secs(600);
+        assert_eq!(
+            calibration.observe(&forecast, 600.0, now),
+            "feedback_expired"
+        );
+        assert_eq!(calibration.accepted[1], 2);
+    }
+
+    #[test]
+    fn calibration_fourth_sample_has_no_jump_or_prior_idle_credit() {
+        let (registry, worker) = calibration_registry(true);
+        let mut forecast = registry
+            .estimated_wait()
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let start = Instant::now();
+        let update = start + Duration::from_secs(3_600);
+        // Requests arrive after the idle period; their snapshots are still valid.
+        forecast.captured_at = update - Duration::from_secs(21);
+        let mut calibration = ExcessCalibration::new(start);
+        for _ in 0..3 {
+            calibration.observe(&forecast, 20.2, update);
+        }
+        assert_eq!(calibration.target(true), 1.0);
+        assert_eq!(calibration.stats(true, update), (1.0, 3));
+        calibration.observe(&forecast, 20.2, update);
+        assert_eq!(calibration.target(true), 1.0);
+        assert!(calibration.fit_on_poll(true, update));
+        assert_eq!(calibration.target(true), 2.0);
+        assert_eq!(calibration.stats(true, update), (1.0, 4));
+        for _ in 0..64 {
+            calibration.observe(&forecast, 20.2, update);
+        }
+        assert_eq!(calibration.stats(true, update), (1.0, 32));
+        assert_eq!(
+            calibration.stats(true, update + Duration::from_secs(1)).0,
+            1.5
+        );
+        assert_eq!(
+            calibration.stats(false, update + Duration::from_secs(100)),
+            (1.0, 0)
+        );
+    }
+
+    #[test]
+    fn calibration_slew_is_independent_of_callback_frequency() {
+        let (registry, worker) = calibration_registry(true);
+        let forecast = registry
+            .estimated_wait()
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let start = Instant::now();
+        let mut sparse = ExcessCalibration::new(start);
+        let mut dense = ExcessCalibration::new(start);
+        for _ in 0..4 {
+            sparse.observe(&forecast, 50.2, start);
+            dense.observe(&forecast, 50.2, start);
+        }
+        sparse.fit_on_poll(true, start);
+        dense.fit_on_poll(true, start);
+        for step in 1..=1_000 {
+            dense.observe(&forecast, 50.2, start + Duration::from_millis(step));
+        }
+        let later = start + Duration::from_secs(3);
+        assert_eq!(sparse.stats(true, later).0, 2.5);
+        assert!((sparse.stats(true, later).0 - dense.stats(true, later).0).abs() < 1e-12);
+        assert_eq!(dense.target(true), 5.0);
+        assert_eq!(sparse.target(true), 5.0);
+    }
+
+    #[test]
+    fn calibration_new_mse_target_reverses_old_trajectory_without_a_jump() {
+        let (registry, worker) = calibration_registry(true);
+        let forecast = registry
+            .estimated_wait()
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let start = Instant::now();
+        let mut calibration = ExcessCalibration::new(start);
+        for _ in 0..4 {
+            calibration.observe(&forecast, 50.2, start);
+        }
+        calibration.fit_on_poll(true, start);
+        let reversal = start + Duration::from_secs(1);
+        assert_eq!(calibration.stats(true, reversal).0, 1.5);
+        for _ in 0..32 {
+            calibration.observe(&forecast, 0.1, reversal);
+        }
+        calibration.fit_on_poll(true, reversal);
+        assert_eq!(calibration.target(true), 0.0);
+        assert_eq!(calibration.stats(true, reversal).0, 1.5);
+        assert_eq!(
+            calibration.stats(true, reversal + Duration::from_secs(1)).0,
+            1.0
+        );
+        assert_eq!(
+            calibration
+                .stats(true, reversal + Duration::from_secs(20))
+                .0,
+            0.0
+        );
+    }
+
+    #[test]
+    fn calibration_snapshot_advances_purely_with_time_and_records_one_clock() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        let start = Instant::now();
+        entry.calibration = ExcessCalibration::new(start);
+        let original = entry
+            .calibration_forecast(admission.config(), start)
+            .unwrap();
+        for _ in 0..4 {
+            entry.calibration.observe(&original, 20.2, start);
+        }
+        entry.calibration.fit_on_poll(true, start);
+        let at_start = entry
+            .calibration_forecast(admission.config(), start)
+            .unwrap();
+        assert_eq!(
+            (at_start.scale, at_start.target_scale, at_start.time_seconds),
+            (1.0, 2.0, 0.0)
+        );
+        let later = start + Duration::from_secs(5);
+        let mut unready = original.clone();
+        unready.native_capacity_ready = false;
+        for _ in 0..4 {
+            assert_eq!(
+                entry.calibration.observe(&unready, 0.1, start),
+                "native_capacity_unready"
+            );
+        }
+        assert_eq!(entry.calibration.stats(false, later), (1.0, 0));
+        let first = entry
+            .calibration_forecast(admission.config(), later)
+            .unwrap();
+        let repeated = entry
+            .calibration_forecast(admission.config(), later)
+            .unwrap();
+        assert_eq!(
+            (first.scale, first.target_scale, first.time_seconds),
+            (2.0, 2.0, 5.0)
+        );
+        assert_eq!(first.scale, repeated.scale);
+        assert_eq!((first.observation_sequence, first.sample_count), (4, 4));
+        assert_eq!(original.scale, 1.0);
+        assert_eq!(entry.calibration.trajectories[1].anchor_time, start);
+        assert_eq!(entry.calibration.trajectories[1].anchor_scale, 1.0);
+        // Resetting a history also discards its elapsed movement and old target.
+        entry.calibration = ExcessCalibration::new(later);
+        let reset = entry
+            .calibration_forecast(admission.config(), later)
+            .unwrap();
+        assert_eq!(
+            (reset.scale, reset.target_scale, reset.time_seconds),
+            (1.0, 1.0, 0.0)
+        );
+        assert_eq!((reset.observation_sequence, reset.sample_count), (0, 0));
+    }
+
+    #[test]
+    fn excess_calibration_mse_window_and_invalid_inputs() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let mut forecast = admission
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let now = Instant::now();
+        let mut learned = ExcessCalibration::new(now);
+        assert_eq!(learned.stats(true, now), (1.0, 0));
+        for _ in 0..3 {
+            assert_eq!(learned.observe(&forecast, 20.2, now), "accepted");
+        }
+        assert_eq!(learned.stats(true, now), (1.0, 3));
+        assert_eq!(learned.observe(&forecast, 20.2, now), "accepted");
+        learned.fit_on_poll(true, now);
+        assert!((learned.target(true) - 2.0).abs() < 1e-6);
+        assert_eq!(learned.stats(true, now), (1.0, 4));
+        // A huge ratio from tiny extra delay gets tiny weight, not a huge influence.
+        forecast.queue_extra = 0.000_001;
+        learned.observe(&forecast, 10.2, now);
+        learned.fit_on_poll(true, now);
+        assert!((learned.target(true) - 2.0).abs() < 1e-6);
+        forecast.queue_extra = 10.0;
+        for _ in 0..TTFT_WINDOW_SAMPLES {
+            learned.observe(&forecast, 5.2, now);
+        }
+        learned.fit_on_poll(true, now);
+        assert_eq!(learned.target(true), 0.5);
+        assert_eq!(learned.stats(true, now), (1.0, 32));
+        assert_eq!(learned.stats(false, now), (1.0, 0));
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            forecast.queue_extra = bad;
+            assert_eq!(learned.observe(&forecast, 5.0, now), "nonpositive_extra");
+        }
+        forecast.queue_extra = 10.0;
+        forecast.baseline = None;
+        assert_eq!(learned.observe(&forecast, 5.0, now), "baseline_unavailable");
+        forecast.baseline = Some(0.2);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(learned.observe(&forecast, bad, now), "invalid_observation");
+        }
+        forecast.fresh = false;
+        assert_eq!(learned.observe(&forecast, 5.0, now), "stale_at_admission");
+        learned.fit_on_poll(true, now);
+        assert_eq!(learned.target(true), 0.5);
+        assert_eq!(learned.stats(true, now), (1.0, 32));
+    }
+
+    #[test]
+    fn queue_only_calibration_ignores_floor_while_raw_keeps_it() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        let sample = entry.sample.as_mut().unwrap();
+        sample.prepared.observed_delay_floor = 30.0;
+        sample.prepared.observed_delay_available = true;
+        let mut forecast = entry
+            .calibration_forecast(admission.config(), Instant::now())
+            .unwrap();
+        assert_eq!(forecast.raw_extra, 30.0);
+        assert_eq!(forecast.queue_extra, 10.0);
+        assert_eq!(entry.sample.as_ref().unwrap().prepared.seconds(0), 30.2);
+        let now = Instant::now();
+        let mut calibration = ExcessCalibration::new(now);
+        for _ in 0..4 {
+            assert_eq!(calibration.observe(&forecast, 20.2, now), "accepted");
+        }
+        calibration.fit_on_poll(true, now);
+        assert_eq!(calibration.target(true), 2.0);
+        forecast.scale = 0.5;
+        assert_eq!(forecast.seconds(), 5.2);
+        forecast.queue_extra = 0.0;
+        forecast.scale = 50.0;
+        assert_eq!(forecast.seconds(), 0.2);
+        drop(entries);
+    }
+
+    fn provisional_calibration_registry(
+        provisional: Option<f64>,
+    ) -> (Arc<WorkerRegistry>, Arc<dyn Worker>) {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.estimated_wait().configure(EstimatedWaitConfig {
+            estimated_wait_calibration_shadow: true,
+            estimated_wait_provisional_baseline_secs: provisional,
+            ..config()
+        });
+        let worker = worker("http://provisional:1");
+        registry.register(worker.clone()).unwrap();
+        let mut report = load(Some(1_000), 2, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = None;
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        publish_load(registry.estimated_wait(), &worker, &report);
+        (registry, worker)
+    }
+
+    #[test]
+    fn provisional_baseline_bootstraps_fit_without_changing_raw_baseline() {
+        let (registry, worker) = provisional_calibration_registry(Some(2.0));
+        let admission = registry.estimated_wait();
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        let now = Instant::now();
+        let forecast = entry.calibration_forecast(admission.config(), now).unwrap();
+        assert_eq!(forecast.baseline, Some(2.0));
+        assert_eq!(forecast.baseline_source, BaselineSource::Provisional);
+        assert_eq!(forecast.raw_baseline, None);
+        assert_eq!(forecast.seconds(), 12.0);
+        for _ in 0..4 {
+            assert_eq!(entry.calibration.observe(&forecast, 22.0, now), "accepted");
+        }
+        entry.calibration.fit_on_poll(true, now);
+        assert_eq!(entry.calibration.target(true), 2.0);
+        assert_eq!(entry.sample.as_ref().unwrap().prepared.baseline, None);
+        assert_eq!(entry.sample.as_ref().unwrap().prepared.seconds(0), 10.0);
+        assert!(entry.sample.as_ref().unwrap().prepared.capacity_ready);
+    }
+
+    #[test]
+    fn unknown_baseline_never_becomes_zero_calibration_baseline() {
+        let (registry, worker) = provisional_calibration_registry(None);
+        let mut forecast = registry
+            .estimated_wait()
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        assert_eq!(forecast.baseline_source, BaselineSource::Unknown);
+        assert_eq!(forecast.baseline, None);
+        assert_eq!(forecast.seconds(), -1.0);
+        forecast.threshold = 0.01;
+        assert!(!forecast.would_reject());
+        let now = Instant::now();
+        assert_eq!(
+            ExcessCalibration::new(now).observe(&forecast, 20.0, now),
+            "baseline_unavailable"
+        );
+    }
+
+    #[test]
+    fn measured_baseline_needs_four_observations_and_material_promotion_isolates_feedback() {
+        let (registry, worker) = provisional_calibration_registry(Some(2.0));
+        let admission = registry.estimated_wait();
+        let old_probe = calibration_probe(admission, &worker);
+        let saved = old_probe.calibration.as_ref().unwrap().clone();
+        {
+            let mut entries = admission.entries.lock();
+            let entry = entries.get_mut(worker.url()).unwrap();
+            let now = Instant::now();
+            for _ in 0..4 {
+                entry.calibration.observe(&saved, 22.0, now);
+            }
+            entry.calibration.fit_on_poll(true, now);
+            for _ in 0..3 {
+                push_ttft_sample(&mut entry.low_load_ttfts, 3.0);
+            }
+            EstimatedWaitAdmission::apply_observations(entry);
+            let before = entry.calibration_forecast(admission.config(), now).unwrap();
+            assert_eq!(before.baseline_source, BaselineSource::Provisional);
+            assert_eq!(before.epoch, saved.epoch);
+            push_ttft_sample(&mut entry.low_load_ttfts, 3.0);
+            EstimatedWaitAdmission::apply_observations(entry);
+            let after = entry.calibration_forecast(admission.config(), now).unwrap();
+            assert_eq!(after.baseline, Some(3.0));
+            assert_eq!(after.baseline_source, BaselineSource::Measured);
+            assert_eq!(after.epoch, saved.epoch + 1);
+            assert_eq!((after.scale, after.sample_count), (1.0, 0));
+            assert!(!Arc::ptr_eq(
+                &after.calibration_generation,
+                &saved.calibration_generation
+            ));
+            assert_eq!(saved.baseline, Some(2.0));
+            // Re-reading the new baseline must not repeatedly reset.
+            assert_eq!(
+                entry
+                    .calibration_forecast(admission.config(), now)
+                    .unwrap()
+                    .epoch,
+                after.epoch
+            );
+        }
+        admission.observe_ttft(old_probe, 22.0, 0.0);
+        assert_eq!(
+            admission.entries.lock()[worker.url()].calibration.accepted[1],
+            0
+        );
+    }
+
+    #[test]
+    fn small_baseline_promotion_keeps_history_and_saved_baseline() {
+        let (registry, worker) = provisional_calibration_registry(Some(2.0));
+        let admission = registry.estimated_wait();
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        let now = Instant::now();
+        let saved = entry.calibration_forecast(admission.config(), now).unwrap();
+        for _ in 0..4 {
+            entry.calibration.observe(&saved, 22.0, now);
+        }
+        entry.sample.as_mut().unwrap().prepared.baseline = Some(2.25);
+        let promoted = entry.calibration_forecast(admission.config(), now).unwrap();
+        assert_eq!(promoted.baseline_source, BaselineSource::Measured);
+        assert_eq!(promoted.baseline, Some(2.25));
+        assert_eq!(promoted.epoch, saved.epoch);
+        assert_eq!(promoted.sample_count, 4);
+        assert_eq!(saved.baseline, Some(2.0));
+        assert_eq!(entry.calibration.observe(&saved, 22.0, now), "accepted");
+        assert_eq!(entry.calibration.samples[1].back(), Some(&(2.0, 10.0)));
+    }
+
+    #[test]
+    fn provisional_baseline_validation_and_material_change_boundaries() {
+        assert!(!materially_different_baseline(5.0, 6.0));
+        assert!(materially_different_baseline(5.0, 6.000_001));
+        assert!(!materially_different_baseline(5.0, 4.0));
+        assert!(materially_different_baseline(5.0, 3.999_999));
+        assert!(!materially_different_baseline(0.1, 0.2));
+        assert!(materially_different_baseline(0.1, 0.200_001));
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(EstimatedWaitConfig {
+                estimated_wait_provisional_baseline_secs: Some(invalid),
+                ..config()
+            }
+            .validate()
+            .is_err());
+        }
+        assert!(EstimatedWaitConfig {
+            estimated_wait_provisional_baseline_secs: Some(0.2),
+            ..config()
+        }
+        .validate()
+        .is_ok());
+        assert_eq!(
+            EstimatedWaitConfig::default().estimated_wait_provisional_baseline_secs,
+            None
+        );
+    }
+
+    #[test]
+    fn calibrated_verdict_never_uses_floor_promoted_native_readiness() {
+        let (registry, worker) = calibration_registry(false);
+        let mut entries = registry.estimated_wait().entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        entry.sample.as_mut().unwrap().prepared.capacity_ready = true;
+        let mut forecast = entry
+            .calibration_forecast(registry.estimated_wait().config(), Instant::now())
+            .unwrap();
+        forecast.threshold = 0.01;
+        assert!(forecast.raw_ready);
+        assert!(!forecast.native_capacity_ready);
+        assert!(!forecast.would_reject());
+    }
+
+    #[test]
+    fn excess_calibration_first_text_callback_is_causal_and_exactly_once() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let forecast = admission
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, Some("causal"))
+            .unwrap();
+        // Later ledger changes must not replace the raw excess saved at admission.
+        admission.begin().unwrap().credit(&worker, Some(&[0; 100]));
+        let mut observer = StreamTtftObserver::new(
+            &registry,
+            worker.url(),
+            Instant::now() - Duration::from_secs(20),
+        )
+        .with_calibration(Some(forecast))
+        .with_request_id(Some("causal"));
+        observer.push(
+            b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+        );
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .calibration
+                .stats(true, Instant::now()),
+            (1.0, 0)
+        );
+        observer.push(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thi");
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .calibration
+                .stats(true, Instant::now())
+                .1,
+            0
+        );
+        observer.push(b"nking\"}}]}\n\n");
+        {
+            let entries = admission.entries.lock();
+            let samples = &entries[worker.url()].calibration.samples[1];
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].1, 10.0);
+            assert!((samples[0].0 - 1.98).abs() < 0.01);
+        }
+        observer.push(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\ndata: [DONE]\n\n",
+        );
+        drop(observer);
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .calibration
+                .stats(true, Instant::now())
+                .1,
+            1
+        );
+        let forecast = admission
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None);
+        let mut cancelled = StreamTtftObserver::new(&registry, worker.url(), Instant::now())
+            .with_calibration(forecast);
+        cancelled.cancel();
+        cancelled.push(b"data: {\"choices\":[{\"text\":\"ignored\"}]}\n\n");
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .calibration
+                .stats(true, Instant::now())
+                .1,
+            1
+        );
+    }
+
+    #[test]
+    fn excess_calibration_placement_captures_before_dispatch_credit() {
+        let (registry, worker) = calibration_registry(true);
+        let mut report = load(Some(100), 2, 100.0, 0.0);
+        report.loads[0].low_load_ttft_seconds = Some(0.2);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        publish_load(registry.estimated_wait(), &worker, &report);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let capture = Mutex::new(None);
+        let selected = placement::select_from(
+            &registry,
+            &policies,
+            "m",
+            std::slice::from_ref(&worker),
+            PlacementInputs {
+                tokens: Some(&[0; 100]),
+                calibration: Some(&capture),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.url(), worker.url());
+        let saved = capture.into_inner().unwrap();
+        assert_eq!(saved.raw_extra, 1.0);
+        assert!(saved.native_capacity_ready && saved.queue_visible());
+        assert_eq!(
+            registry.estimated_wait().entries.lock()[worker.url()].total_dispatched,
+            100
+        );
+        assert_eq!(
+            registry.estimated_wait().entries.lock()[worker.url()]
+                .sample
+                .as_ref()
+                .unwrap()
+                .prepared
+                .excess_seconds(100),
+            2.0
+        );
+        let mut observer = StreamTtftObserver::new(
+            &registry,
+            worker.url(),
+            Instant::now() - Duration::from_secs(20),
+        )
+        .with_calibration(Some(saved));
+        observer.push(b"data: {\"choices\":[{\"text\":\"first text\"}]}\n\n");
+        assert_eq!(
+            registry.estimated_wait().entries.lock()[worker.url()]
+                .calibration
+                .samples[1][0]
+                .1,
+            1.0
+        );
+    }
+
+    #[test]
+    fn excess_calibration_uses_saved_baseline_native_state_and_queue() {
+        for initially_ready in [false, true] {
+            let (registry, worker) = calibration_registry(initially_ready);
+            let admission = registry.estimated_wait();
+            let probes: Vec<_> = (0..4)
+                .map(|_| calibration_probe(admission, &worker))
+                .collect();
+            let mut report = load(Some(0), 0, 100.0, 0.0);
+            report.loads[0].low_load_ttft_seconds = Some(9.0);
+            report.loads[0].prefill_capacity_learning_active = Some(false);
+            report.loads[0].prefill_capacity_sample_count = Some(8);
+            publish_load(admission, &worker, &report);
+            for probe in probes {
+                admission.observe_ttft(probe, 20.2, 0.0);
+            }
+            let mut entries = admission.entries.lock();
+            let calibration = &mut entries.get_mut(worker.url()).unwrap().calibration;
+            calibration.fit_on_poll(true, Instant::now());
+            assert_eq!(
+                calibration.target(true),
+                if initially_ready { 2.0 } else { 1.0 }
+            );
+            assert_eq!(
+                calibration.stats(true, Instant::now()).1,
+                if initially_ready { 4 } else { 0 }
+            );
+            assert_eq!(calibration.stats(false, Instant::now()), (1.0, 0));
+        }
+    }
+
+    #[test]
+    fn excess_calibration_resets_with_lifecycle_and_native_profile() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let probes: Vec<_> = (0..4)
+            .map(|_| calibration_probe(admission, &worker))
+            .collect();
+        for probe in probes {
+            admission.observe_ttft(probe, 20.2, 0.0);
+        }
+        calibration_poll(admission, &worker);
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .calibration
+                .target(true),
+            2.0
+        );
+        calibration_poll(admission, &worker);
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .calibration
+                .stats(true, Instant::now())
+                .1,
+            4
+        );
+        let late = calibration_probe(admission, &worker);
+        let old_epoch = late.calibration.as_ref().unwrap().epoch;
+        let watermark = admission.poll_started(&worker);
+        admission.publish(&worker, None, watermark, Instant::now());
+        let mut report = load(Some(1_000), 2, 100.0, 0.0);
+        report.loads[0].prefill_capacity_sample_count = Some(1);
+        publish_load(admission, &worker, &report);
+        admission.observe_ttft(late, 40.0, 0.0);
+        let reset = admission
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        assert_eq!(reset.epoch, old_epoch + 1);
+        assert_eq!((reset.scale, reset.target_scale), (1.0, 1.0));
+        assert_eq!(reset.observation_sequence, 0);
+        calibration_poll(admission, &worker);
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .calibration
+                .stats(true, Instant::now()),
+            (1.0, 0)
+        );
+        for evict in [true, false] {
+            let probe = calibration_probe(admission, &worker);
+            if evict {
+                admission.evict(&worker);
+            } else {
+                admission.clear();
+            }
+            admission.observe_ttft(probe, 20.2, 0.0);
+            assert_eq!(
+                admission.entries.lock()[worker.url()]
+                    .calibration
+                    .stats(true, Instant::now()),
+                (1.0, 0)
+            );
+            publish_load(admission, &worker, &report);
+        }
+    }
+
+    #[test]
+    fn empty_two_wave_history_falls_back_before_forecast_without_changing_raw_state() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        let now = Instant::now();
+        let start = now - CALIBRATION_HISTORY_MAX_AGE;
+        let mut saved = entry
+            .calibration_forecast(admission.config(), start)
+            .unwrap();
+        saved.fresh = true;
+        entry.calibration = ExcessCalibration::new(start);
+        for _ in 0..4 {
+            assert_eq!(entry.calibration.observe(&saved, 20.2, start), "accepted");
+        }
+        // Replacing a bank does not extend its scheduled retention horizon.
+        for _ in 0..TTFT_WINDOW_SAMPLES {
+            entry
+                .calibration
+                .observe(&saved, 20.2, start + Duration::from_secs(1));
+        }
+        entry
+            .calibration
+            .fit_on_poll(true, start + Duration::from_secs(1));
+        let before = entry
+            .calibration_forecast(admission.config(), now - Duration::from_nanos(1))
+            .unwrap();
+        assert_eq!((before.scale, before.sample_count), (2.0, 32));
+        entry.sample.as_mut().unwrap().prepared.observed_delay_floor = 12.0;
+        let raw = entry.sample.as_ref().unwrap().prepared.seconds(0);
+        let after = entry.calibration_forecast(admission.config(), now).unwrap();
+        assert_eq!(
+            (after.scale, after.target_scale, after.sample_count),
+            (1.0, 1.0, 0)
+        );
+        assert_eq!(after.epoch, saved.epoch);
+        assert!(Arc::ptr_eq(
+            &after.calibration_generation,
+            &saved.calibration_generation
+        ));
+        assert_eq!(entry.sample.as_ref().unwrap().prepared.seconds(0), raw);
+        assert!(entry.sample.as_ref().unwrap().prepared.capacity_ready);
+        assert_eq!(entry.sample.as_ref().unwrap().prepared.baseline, Some(0.2));
+        assert_eq!(
+            entry
+                .calibration_forecast(admission.config(), now)
+                .unwrap()
+                .epoch,
+            after.epoch
+        );
+    }
+
+    #[test]
+    fn normal_rotation_accepts_inflight_feedback_without_a_forecast_or_poll() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let probe = calibration_probe(admission, &worker);
+        let epoch = probe.calibration.as_ref().unwrap().epoch;
+        {
+            let mut entries = admission.entries.lock();
+            let entry = entries.get_mut(worker.url()).unwrap();
+            let old = Instant::now() - CALIBRATION_HISTORY_MAX_AGE;
+            let mut saved = probe.calibration.clone().unwrap();
+            saved.captured_at = old;
+            entry.calibration = ExcessCalibration::new(old);
+            for _ in 0..4 {
+                entry.calibration.observe(&saved, 20.2, old);
+            }
+        }
+        admission.observe_ttft(probe, 40.2, 0.0);
+        let entries = admission.entries.lock();
+        let entry = &entries[worker.url()];
+        assert_eq!(entry.calibration_epoch, epoch);
+        assert_eq!(entry.calibration.stats(true, Instant::now()), (1.0, 1));
+    }
+
+    #[test]
+    fn two_wave_boundaries_keep_recent_history_and_refit_without_feedback() {
+        let (registry, worker) = calibration_registry(true);
+        let mut forecast = registry
+            .estimated_wait()
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let start = Instant::now();
+        forecast.captured_at = start;
+        let mut calibration = ExcessCalibration::new(start);
+        for _ in 0..4 {
+            assert_eq!(calibration.observe(&forecast, 20.2, start), "accepted");
+        }
+        calibration.fit_on_poll(true, start);
+        let boundary = start + Duration::from_secs(300);
+        assert!(!calibration.rotate(boundary - Duration::from_nanos(1)));
+        assert!(calibration.rotate(boundary));
+        assert_eq!(calibration.previous_count[1], 4);
+        assert_eq!(calibration.stats(true, boundary), (2.0, 4));
+        assert!(!calibration.fit_on_poll(true, boundary));
+        // Feedback accepted on the boundary belongs to the new bank even
+        // though its admission preceded the rotation. There is no relearning gap.
+        for _ in 0..4 {
+            assert_eq!(calibration.observe(&forecast, 40.2, boundary), "accepted");
+        }
+        calibration.fit_on_poll(true, boundary);
+        assert_eq!(calibration.target(true), 3.0);
+        let second = start + Duration::from_secs(600);
+        assert!(calibration.rotate(second));
+        assert_eq!(calibration.bank_index, 2);
+        assert_eq!(calibration.stats(true, second), (3.0, 4));
+        assert_eq!(calibration.previous_count[1], 4);
+        let accepted = calibration.accepted[1];
+        assert!(calibration.fit_on_poll(true, second));
+        assert_eq!(calibration.accepted[1], accepted);
+        assert_eq!(calibration.target(true), 4.0);
+        assert_eq!(calibration.stats(true, second).0, 3.0);
+        assert!(!calibration.fit_on_poll(true, second));
+        let third = start + Duration::from_secs(900);
+        assert!(calibration.rotate(third));
+        assert_eq!(calibration.stats(true, third), (1.0, 0));
+        assert_eq!(calibration.target(true), 1.0);
+        // Rotation does not extend the separate admission-snapshot deadline.
+        assert_eq!(
+            calibration.observe(&forecast, 900.0, third),
+            "feedback_expired"
+        );
+    }
+
+    #[test]
+    fn two_wave_banks_are_independently_count_bounded_and_idle_advances_in_bulk() {
+        let (registry, worker) = calibration_registry(true);
+        let mut forecast = registry
+            .estimated_wait()
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let start = Instant::now();
+        forecast.captured_at = start;
+        let mut calibration = ExcessCalibration::new(start);
+        for _ in 0..40 {
+            calibration.observe(&forecast, 20.2, start);
+        }
+        let next = start + Duration::from_secs(300);
+        for _ in 0..40 {
+            calibration.observe(&forecast, 40.2, next);
+        }
+        assert_eq!(calibration.samples[1].len(), 64);
+        assert_eq!(calibration.previous_count[1], 32);
+        assert_eq!(calibration.samples[1].front(), Some(&(2.0, 10.0)));
+        calibration.fit_on_poll(true, next);
+        assert!((calibration.target(true) - 3.0).abs() < 1e-12);
+        let later = start + Duration::from_secs(3_000);
+        assert!(calibration.rotate(later));
+        assert_eq!(calibration.bank_index, 10);
+        assert_eq!(calibration.bank_started, Some(later));
+        assert_eq!(calibration.stats(true, later), (1.0, 0));
+        assert_eq!(calibration.previous_count[1], 0);
+        forecast.captured_at = later;
+        for _ in 0..4 {
+            calibration.observe(&forecast, 40.2, later);
+        }
+        calibration.fit_on_poll(true, later);
+        assert_eq!(calibration.stats(true, later).0, 1.0);
+        assert_eq!(
+            calibration
+                .stats(true, later + Duration::from_millis(200))
+                .0,
+            1.1
+        );
+    }
+
+    #[test]
+    fn two_wave_sparse_retained_bank_falls_back_immediately() {
+        let (registry, worker) = calibration_registry(true);
+        let mut forecast = registry
+            .estimated_wait()
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let start = Instant::now();
+        forecast.captured_at = start;
+        let mut calibration = ExcessCalibration::new(start);
+        for _ in 0..4 {
+            calibration.observe(&forecast, 20.2, start);
+        }
+        calibration.fit_on_poll(true, start);
+        for _ in 0..3 {
+            calibration.observe(&forecast, 20.2, start + Duration::from_secs(300));
+        }
+        calibration.rotate(start + Duration::from_secs(600));
+        assert_eq!(
+            calibration.stats(true, start + Duration::from_secs(600)),
+            (1.0, 3)
+        );
+        assert_eq!(calibration.target(true), 1.0);
+    }
+
+    #[test]
+    fn calibration_rejects_expired_feedback_even_without_prior_samples() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let mut forecast = admission
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let now = Instant::now();
+        forecast.captured_at = now - CALIBRATION_HISTORY_MAX_AGE;
+        let mut calibration = ExcessCalibration::new(now);
+        assert_eq!(
+            calibration.observe(&forecast, 600.0, now),
+            "feedback_expired"
+        );
+        assert_eq!(calibration.stats(true, now), (1.0, 0));
+    }
+
+    #[test]
+    fn calibration_drain_requires_two_fresh_empty_polls_and_invalidates_old_forecasts() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        for _ in 0..4 {
+            let probe = calibration_probe(admission, &worker);
+            admission.observe_ttft(probe, 20.2, 0.0);
+        }
+        let old = admission
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        let mut empty = load(Some(0), 0, 100.0, 0.0);
+        // Match native capacity profile; continuing decode does not prevent queue drain.
+        empty.loads[0].prefill_capacity_sample_count = Some(8);
+        empty.loads[0].num_running_reqs = 10;
+        let pending = admission.ttft_probe(worker.url()).unwrap();
+        publish_load(admission, &worker, &empty);
+        publish_load(admission, &worker, &empty);
+        assert_eq!(
+            admission.entries.lock()[worker.url()].calibration_epoch,
+            old.epoch
+        );
+        admission.finish_ttft_probe(&pending);
+        publish_load(admission, &worker, &empty);
+        let published = admission.entries.lock()[worker.url()]
+            .last_published
+            .unwrap();
+        let duplicate = admission.poll_started(&worker);
+        admission.publish(&worker, Some(&empty), duplicate, published);
+        assert_eq!(
+            admission.entries.lock()[worker.url()].calibration_epoch,
+            old.epoch
+        );
+        // A failed report breaks confirmation rather than proving drain.
+        let stamp = admission.poll_started(&worker);
+        admission.publish(&worker, None, stamp, Instant::now());
+        publish_load(admission, &worker, &empty);
+        assert_eq!(
+            admission.entries.lock()[worker.url()].calibration_epoch,
+            old.epoch
+        );
+        publish_load(admission, &worker, &empty);
+        let reset = admission
+            .begin()
+            .unwrap()
+            .capture_calibration(&worker, None)
+            .unwrap();
+        assert_eq!(reset.epoch, old.epoch + 1);
+        assert_eq!(
+            (reset.scale, reset.target_scale, reset.sample_count),
+            (1.0, 1.0, 0)
+        );
+        publish_load(admission, &worker, &empty);
+        assert_eq!(
+            admission.entries.lock()[worker.url()].calibration_epoch,
+            reset.epoch
+        );
+        // Selection can race observer registration; a saved pre-drain forecast
+        // must not train the new epoch even if its observer is registered later.
+        let mut late = admission.ttft_probe(worker.url()).unwrap();
+        late.calibration = Some(old);
+        admission.observe_ttft(late, 40.2, 0.0);
+        assert_eq!(
+            admission.entries.lock()[worker.url()]
+                .calibration
+                .stats(true, Instant::now()),
+            (1.0, 0)
+        );
+    }
+
+    #[test]
+    fn calibration_drain_does_not_use_stale_polls_or_hide_dispatch_during_poll() {
+        let (registry, worker) = calibration_registry(true);
+        let admission = registry.estimated_wait();
+        let mut empty = load(Some(0), 0, 100.0, 0.0);
+        empty.loads[0].prefill_capacity_sample_count = Some(8);
+        publish_load(admission, &worker, &empty);
+        let stamp = admission.poll_started(&worker);
+        admission.begin().unwrap().credit(&worker, None);
+        admission.publish(&worker, Some(&empty), stamp, Instant::now());
+        assert_eq!(
+            admission.entries.lock()[worker.url()].calibration_empty_polls,
+            0
+        );
+        {
+            let mut entries = admission.entries.lock();
+            entries.get_mut(worker.url()).unwrap().last_published = None;
+        }
+        let stamp = admission.poll_started(&worker);
+        admission.publish(
+            &worker,
+            Some(&empty),
+            stamp,
+            Instant::now() - Duration::from_secs(60),
+        );
+        assert_eq!(
+            admission.entries.lock()[worker.url()].calibration_empty_polls,
+            0
+        );
+    }
+
+    #[test]
+    fn excess_calibration_never_changes_raw_admission_or_promotes_readiness() {
+        for shadow in [false, true] {
+            let (registry, worker) = calibration_registry(false);
+            let admission = registry.estimated_wait();
+            let mut entries = admission.entries.lock();
+            let entry = entries.get_mut(worker.url()).unwrap();
+            let now = Instant::now();
+            let forecast = entry.calibration_forecast(admission.config(), now).unwrap();
+            for _ in 0..4 {
+                assert_eq!(
+                    entry.calibration.observe(&forecast, 100.2, now),
+                    "native_capacity_unready"
+                );
+            }
+            let calibrated = entry
+                .calibration_forecast(admission.config(), now + Duration::from_secs(15))
+                .unwrap();
+            assert_eq!(calibrated.target_scale, 1.0);
+            assert_eq!(calibrated.scale, 1.0);
+            assert!(!calibrated.raw_ready);
+            assert!(!calibrated.would_reject());
+            assert!(!entry.sample.as_ref().unwrap().prepared.capacity_ready);
+            drop(entries);
+            assert!(admission
+                .begin()
+                .unwrap()
+                .check(std::slice::from_ref(&worker), "m")
+                .is_ok());
+            // Native-ready raw estimate is 10 s > 2 s; calibration predicts 0,
+            // but hard mode must still reject exactly as the raw policy does.
+            let mut cfg = config();
+            cfg.estimated_wait_shadow = shadow;
+            let unchanged = EstimatedWaitAdmission::default();
+            unchanged.configure(EstimatedWaitConfig {
+                estimated_wait_calibration_shadow: true,
+                ..cfg
+            });
+            let mut queued = load(Some(1_000), 2, 100.0, 0.0);
+            queued.loads[0].prefill_capacity_learning_active = Some(false);
+            queued.loads[0].prefill_capacity_sample_count = Some(8);
+            publish_load(&unchanged, &worker, &queued);
+            let mut entries = unchanged.entries.lock();
+            let entry = entries.get_mut(worker.url()).unwrap();
+            let now = Instant::now();
+            let forecast = entry.calibration_forecast(unchanged.config(), now).unwrap();
+            for _ in 0..4 {
+                entry.calibration.observe(&forecast, 0.01, now);
+            }
+            entry.calibration.fit_on_poll(true, now);
+            assert!(
+                entry
+                    .calibration_forecast(unchanged.config(), now + Duration::from_secs(10))
+                    .unwrap()
+                    .extra()
+                    < 2.0
+            );
+            drop(entries);
+            assert_eq!(
+                unchanged
+                    .begin()
+                    .unwrap()
+                    .check(std::slice::from_ref(&worker), "m")
+                    .is_err(),
+                !shadow
+            );
+        }
     }
 
     #[test]
@@ -1444,19 +3555,17 @@ mod tests {
     }
 
     #[test]
-    fn calibrated_coefficients_match_formula_and_defaults_match_legacy() {
+    fn dispatch_factor_changes_only_dispatch_work() {
         let state = load(Some(300), 0, 100.0, 0.5);
         let legacy = config().score(&state, 100).unwrap().0;
         assert!((legacy - 4.0).abs() < f64::EPSILON);
 
         let calibrated = EstimatedWaitConfig {
-            estimated_wait_base_overhead_secs: 0.25,
-            estimated_wait_queue_work_correction: 0.5,
             estimated_wait_dispatch_blocking_factor: 0.25,
             ..config()
         };
-        // 0.25 + 0.5 * (300 + 0.25 * 100) / 100
-        assert!((calibrated.score(&state, 100).unwrap().0 - 1.875).abs() < 1e-10);
+        // (300 + 0.25 * 100) / 100
+        assert!((calibrated.score(&state, 100).unwrap().0 - 3.25).abs() < 1e-10);
     }
 
     #[test]

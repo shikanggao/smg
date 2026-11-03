@@ -217,7 +217,7 @@ impl LeastLoadPolicy {
                 let throughput = Self::live_throughput(load).unwrap_or(self.default_throughput);
                 // Least-load's legacy KV index is independent of admission.
                 let k = load.effective_token_usage().clamp(0.0, 0.999);
-                ExpectedWait::calibrated(queued_tokens, throughput, 0.0, 1.0, 1.0)
+                ExpectedWait::calibrated(queued_tokens, throughput, 0.0, 1.0)
                     .seconds(inflight_tokens)
                     + self.kv_pressure_weight * k / (1.0 - k)
             }

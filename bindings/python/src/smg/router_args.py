@@ -268,9 +268,9 @@ class RouterArgs:
     estimated_wait_dispatch_blocking_factor: float = 0.05
     estimated_wait_min_prefill_throughput: float | None = None
     estimated_wait_prompt_size_prior_samples: int = 32
-    estimated_wait_base_overhead_secs: float = 0.0
-    estimated_wait_queue_work_correction: float = 1.0
     estimated_wait_fallback_prefill_throughput: float | None = None
+    estimated_wait_calibration_shadow: bool = False
+    estimated_wait_provisional_baseline_secs: float | None = None
 
     @staticmethod
     def add_cli_args(
@@ -658,22 +658,22 @@ class RouterArgs:
             help="Cold-start prefill capacity until saturated capacity is learned",
         )
         routing_group.add_argument(
+            f"--{prefix}estimated-wait-provisional-baseline-secs",
+            type=float,
+            default=RouterArgs.estimated_wait_provisional_baseline_secs,
+            help="Same-model TTFT baseline for diagnostic calibration; measured baseline takes precedence",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-calibration-shadow",
+            action="store_true",
+            default=RouterArgs.estimated_wait_calibration_shadow,
+            help="Experimental excess-TTFT calibration diagnostics; default off, never changes admission",
+        )
+        routing_group.add_argument(
             f"--{prefix}estimated-wait-prompt-size-prior-samples",
             type=int,
             default=RouterArgs.estimated_wait_prompt_size_prior_samples,
             help="Effective samples assigned to the configured prompt-size prior",
-        )
-        routing_group.add_argument(
-            f"--{prefix}estimated-wait-base-overhead-secs",
-            type=float,
-            default=RouterArgs.estimated_wait_base_overhead_secs,
-            help="Fixed base term in the calibrated wait estimate",
-        )
-        routing_group.add_argument(
-            f"--{prefix}estimated-wait-queue-work-correction",
-            type=float,
-            default=RouterArgs.estimated_wait_queue_work_correction,
-            help="Multiplier applied to queued and dispatch-blocking work",
         )
         routing_group.add_argument(
             f"--{prefix}estimated-wait-queue-tokens-per-request",
