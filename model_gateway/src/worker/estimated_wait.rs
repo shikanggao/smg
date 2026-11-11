@@ -62,6 +62,7 @@ use crate::{
 
 mod basis;
 mod deadline_recovery;
+mod coherent_pair;
 mod decision;
 mod feature;
 mod native_deadline;
@@ -1314,7 +1315,7 @@ impl Drop for StreamTtftObserver {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Sample {
     prepared: PreparedWait,
     started: Instant,
@@ -1361,6 +1362,7 @@ struct Entry {
     pending_work_profile: Option<u64>,
     deadline_work: Arc<std::sync::Mutex<deadline_recovery::AcceptedWork>>,
     native_deadline: native_deadline::State,
+    coherent_pair: coherent_pair::State,
 }
 
 impl Entry {
@@ -1399,6 +1401,7 @@ impl Entry {
                 deadline_recovery::AcceptedWork::default(),
             )),
             native_deadline: native_deadline::State::default(),
+            coherent_pair: coherent_pair::State::default(),
         }
     }
 
@@ -1428,6 +1431,7 @@ impl Entry {
     }
 
     fn reset_calibration(&mut self, now: Instant, reason: &'static str) {
+        self.coherent_pair.revoke("coherent_calibration_reset");
         self.recovery.reset(reason);
         self.calibration = ExcessCalibration::new(now);
         self.feature_activity = Activity::new(now);
@@ -2585,6 +2589,7 @@ impl EstimatedWaitAdmission {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let received = Instant::now();
+        let duplicate_facts_changed = entry.survival.native.candidate_duplicate_facts_changed(native);
         if observation.transport_timeout {
             entry.native_deadline.observe_transport_timeout(
                 received,
@@ -2621,6 +2626,9 @@ impl EstimatedWaitAdmission {
                 diagnostic_time(received),
             );
         }
+        coherent_pair::native_publication(entry, watermark.coherent_raw,
+            diagnostic_time(received), observation.transport_timeout,
+            worker.metadata().spec.runtime_type == RuntimeType::Sglang, duplicate_facts_changed);
         tracing::debug!(target: "smg::estimated_wait::observation",
             event="native_deadline_poll",worker=worker.url(),
             diagnostic_time_seconds=diagnostic_time(Instant::now()),
@@ -2729,6 +2737,7 @@ impl EstimatedWaitAdmission {
             dispatched_requests: entry.total_dispatched_requests,
             pending_work: entry.pending_work.summary(Instant::now()),
             sg_raw_evidence: None,
+            coherent_raw: None,
         })
     }
 
@@ -3146,7 +3155,7 @@ impl EstimatedWaitAdmission {
         // Freeze the successful raw evidence in the same transaction as its
         // publication. The bounded native task carries this exact proof; its
         // callback must never reconstruct a rate from a newer raw sample.
-        if config.estimated_wait_feature_shadow
+        let sg_proof = if config.estimated_wait_feature_shadow
             && worker.metadata().spec.runtime_type == RuntimeType::Sglang
             && outcome == "success"
         {
@@ -3162,7 +3171,19 @@ impl EstimatedWaitAdmission {
             )
         } else {
             None
+        };
+        if config.estimated_wait_feature_shadow {
+            coherent_pair::raw_publication(entry, config, load, &watermark, started,
+                outcome == "success", sg_proof.clone());
         }
+        sg_proof
+    }
+
+    pub(crate) fn coherent_raw_context(&self, worker: &Arc<dyn Worker>, started: Instant)
+        -> Option<coherent_pair::RawContext> {
+        let entries = self.entries.lock();
+        let entry = entries.get(worker.url()).filter(|e| e.source.ptr_eq(&Arc::downgrade(worker)))?;
+        coherent_pair::issued(entry, started)
     }
 
     pub(crate) fn evict(&self, worker: &Arc<dyn Worker>) {
@@ -3206,6 +3227,7 @@ pub(crate) struct PollWatermark {
     dispatched_requests: u64,
     pending_work: pending_work::Summary,
     pub(crate) sg_raw_evidence: Option<SgRawEvidence>,
+    pub(crate) coherent_raw: Option<coherent_pair::RawContext>,
 }
 
 pub(crate) struct AdmissionGuard<'a> {
@@ -3308,6 +3330,8 @@ impl AdmissionGuard<'_> {
                         .native
                         .select_sg_raw_basis(&mut admission, entry.calibration_epoch);
                 }
+                admission.paired_native_candidate = Some(coherent_pair::select(entry,self.config,
+                    forecast.captured_at,&admission,worker.metadata().spec.runtime_type == RuntimeType::Sglang));
                 Box::new(admission)
             });
             forecast.feature_context =

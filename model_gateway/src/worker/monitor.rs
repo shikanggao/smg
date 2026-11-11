@@ -2376,6 +2376,8 @@ async fn group_monitor_loop(
                     .publish_with_sg_raw(&worker, response.as_ref(), watermark, started);
                 if let Some(watermark) = native_watermark.as_mut() {
                     watermark.sg_raw_evidence = sg_raw_evidence;
+                    watermark.coherent_raw = monitor.worker_registry.estimated_wait()
+                        .coherent_raw_context(&worker, started);
                 }
                 if group_key.connection_mode == ConnectionMode::Http {
                     monitor.schedule_native_deadline(
