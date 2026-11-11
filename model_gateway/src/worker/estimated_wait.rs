@@ -451,6 +451,7 @@ impl EstimatedWaitConfig {
             blended_prompt_size,
             effective_prefill_capacity: throughput,
             native_prefill_capacity: throughput,
+            started_capacity_source_key: survival::started_source_key(load),
             backlog_size: load
                 .loads
                 .iter()
@@ -520,6 +521,7 @@ struct PreparedWait {
     blended_prompt_size: Option<f64>,
     effective_prefill_capacity: f64,
     native_prefill_capacity: f64,
+    started_capacity_source_key: Option<survival::StartedSourceKey>,
     backlog_size: f64,
     observed_delay_floor: f64,
     observed_delay_available: bool,
@@ -687,6 +689,7 @@ pub(crate) struct CalibrationForecast {
     epoch: u64,
     baseline: Option<f64>,
     raw_extra: f64,
+    raw_fallback_work: survival::FrozenRawWork,
     queue_extra: f64,
     raw_baseline: Option<f64>,
     baseline_source: BaselineSource,
@@ -1411,6 +1414,7 @@ impl Entry {
         self.pending_first_text.clear();
         self.backlog_peak_size = 0.0;
         self.pipeline_idle = true;
+        self.survival.clear_started_history();
         self.reset_calibration(Instant::now(), "worker_invalidated");
         self.deadline_work
             .lock()
@@ -1429,7 +1433,7 @@ impl Entry {
         self.feature_deadlines = Deadlines::default();
         self.decision = decision::State::default();
         self.basis_decision = basis::State::default();
-        self.survival = survival::State::default();
+        self.survival.reset_calibration_preserving_started_history();
         self.pending_work.reset();
         self.calibration_baseline = (None, BaselineSource::Unknown);
         self.calibration_generation = Arc::new(());
@@ -1856,6 +1860,18 @@ impl Entry {
             raw_extra: sample
                 .prepared
                 .excess_seconds(self.total_dispatched.saturating_sub(sample.watermark)),
+            raw_fallback_work: survival::FrozenRawWork {
+                poll_started: diagnostic_time(sample.started),
+                source: sample.prepared.size_basis.map(|p| p.progress_source),
+                key: sample.prepared.started_capacity_source_key,
+                token_work: sample
+                    .prepared
+                    .estimate
+                    .token_work(self.total_dispatched.saturating_sub(sample.watermark)),
+                original_capacity: sample.prepared.effective_prefill_capacity,
+                observed_delay_floor: sample.prepared.observed_delay_floor,
+                measured_delay_only: sample.prepared.measured_delay_only(),
+            },
             native_capacity_ready: sample.prepared.capacity_learned_ready,
             native_waiting: sample.prepared.native_waiting,
             raw_ready: fresh && sample.prepared.capacity_ready,
@@ -3233,6 +3249,11 @@ impl AdmissionGuard<'_> {
                     scalar,
                 );
                 admission.select_raw_fallback(forecast.raw_total_for_fallback());
+                entry.survival.native.rebase_selected_raw_fallback(
+                    &mut admission,
+                    forecast.raw_fallback_work,
+                    self.config.estimated_wait_fallback_prefill_throughput,
+                );
                 Box::new(admission)
             });
             forecast.feature_context =
@@ -4023,6 +4044,142 @@ mod tests {
             }
             assert!(unavailable.raw_total_for_fallback().is_none());
         }
+    }
+
+    #[test]
+    fn c2_current_basis_raw_inputs_are_frozen_before_a_later_poll() {
+        let (registry, worker) = feature_registry();
+        // The fixture intentionally exceeds the admission budget. Capture the
+        // same constructor under its guard without asserting a placement succeeds.
+        let first = {
+            let mut guard = registry.estimated_wait().begin().unwrap();
+            guard.capture_calibration(&worker, None).unwrap()
+        };
+        let frozen = first.raw_fallback_work;
+        let original_extra = first.raw_extra;
+        let expected_extra = if frozen.measured_delay_only {
+            frozen.observed_delay_floor
+        } else {
+            (frozen.token_work / frozen.original_capacity).max(frozen.observed_delay_floor)
+        };
+        assert!((first.raw_extra - expected_extra).abs() < 1e-9);
+        let mut newer = load(Some(50000), 20, 100.0, 0.4);
+        newer.dp_rank_count = 1;
+        publish_load(registry.estimated_wait(), &worker, &newer);
+        let later = {
+            let mut guard = registry.estimated_wait().begin().unwrap();
+            guard.capture_calibration(&worker, None).unwrap()
+        };
+        assert!(later.raw_fallback_work.poll_started > frozen.poll_started);
+        assert_ne!(later.raw_fallback_work.token_work, frozen.token_work);
+        assert_eq!(first.raw_fallback_work, frozen);
+        assert_eq!(first.raw_extra, original_extra);
+    }
+
+    fn entry_started_history_load(second: u32) -> WorkerLoadResponse {
+        serde_json::from_value(serde_json::json!({"dp_rank_count":1,"loads":[{
+            "dp_rank":0,"native_request_counts_available":true,"native_request_counts_profile":7,
+            "timely_prefill_progress_source":"prefill_started_requests",
+            "prefill_capacity_learning_active":second>0,"prefill_capacity_sample_count":second.min(32),
+            "learned_prefill_capacity":(second>=8).then_some(2000.0),
+            "prefill_metric_provenance":{"schema_version":1,"counter_epoch":0,
+                "progress_source":"prefill_started_requests","raw_counter":2.0*f64::from(second),
+                "previous_raw_counter":(second>0).then(||2.0*f64::from(second-1)),
+                "interval_seconds":(second>0).then_some(1.0),
+                "interval_started_time_seconds":(second>0).then(||f64::from(second-1)),
+                "interval_ended_time_seconds":f64::from(second),
+                "raw_rate":(second>0).then_some(2.0),"previous_conversion_size_mean":1000.0,
+                "capacity_interval_eligible":second>0,"counter_reset":false}
+        }]})).unwrap()
+    }
+
+    #[test]
+    fn entry_calibration_reset_preserves_capacity_history_but_invalidation_clears_it() {
+        let worker = worker("http://entry-lifecycle:1");
+        let mut entry = Entry::new(&worker);
+        for second in 0..=8 {
+            entry.survival.native.raw_poll(
+                Some(&entry_started_history_load(second)),
+                f64::from(second),
+                true,
+            );
+        }
+        let key = survival::started_source_key(&entry_started_history_load(8));
+        let before = entry.survival.started_history_selection_for_test(8.0, key);
+        assert_eq!(before.status, "available");
+        assert_eq!(before.lower_quartile_request_start_rate, Some(2.0));
+        for reason in [
+            "queue_drained",
+            "baseline_changed",
+            "native_profile_changed",
+        ] {
+            entry.reset_calibration(Instant::now(), reason);
+            let after = entry.survival.started_history_selection_for_test(8.0, key);
+            assert_eq!(
+                serde_json::to_value(after).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+        }
+        // The next source interval still has exactly the old counter/time lineage.
+        entry
+            .survival
+            .native
+            .raw_poll(Some(&entry_started_history_load(9)), 9.0, true);
+        let continued = entry.survival.started_history_selection_for_test(9.0, key);
+        assert_eq!(continued.status, "available");
+        assert_eq!(continued.history_samples, 9);
+        assert_eq!(
+            continued.lower_quartile_request_start_rate,
+            before.lower_quartile_request_start_rate
+        );
+        assert_eq!(
+            serde_json::to_value(continued.source).unwrap(),
+            serde_json::to_value(before.source).unwrap()
+        );
+        let mut changed_source = entry_started_history_load(10);
+        changed_source.loads[0].native_request_counts_profile = Some(8);
+        changed_source.loads[0]
+            .prefill_metric_provenance
+            .as_mut()
+            .unwrap()
+            .counter_epoch = 1;
+        let changed_key = survival::started_source_key(&changed_source);
+        entry
+            .survival
+            .native
+            .raw_poll(Some(&changed_source), 10.0, true);
+        let changed = entry
+            .survival
+            .started_history_selection_for_test(10.0, changed_key);
+        assert_eq!(changed.status, "unavailable");
+        assert!(!changed.history_complete);
+        // A late enabled, incomplete prefix is not turned into a proven empty window.
+        entry.survival.clear_started_history();
+        entry
+            .survival
+            .native
+            .raw_poll(Some(&entry_started_history_load(11)), 11.0, true);
+        let unknown = entry.survival.started_history_selection_for_test(11.0, key);
+        assert!(!unknown.history_complete);
+        assert_eq!(unknown.history_samples, 1);
+        entry.reset_calibration(Instant::now(), "queue_drained");
+        assert_eq!(
+            serde_json::to_value(entry.survival.started_history_selection_for_test(11.0, key))
+                .unwrap(),
+            serde_json::to_value(unknown).unwrap()
+        );
+        entry.invalidate();
+        let invalidated = entry.survival.started_history_selection_for_test(11.0, key);
+        assert!(!invalidated.history_complete);
+        assert_eq!(invalidated.history_samples, 0);
+        entry
+            .survival
+            .native
+            .raw_poll(Some(&entry_started_history_load(12)), 12.0, true);
+        let new_worker = entry.survival.started_history_selection_for_test(12.0, key);
+        assert_eq!(new_worker.status, "unavailable");
+        assert!(!new_worker.history_complete);
+        assert_eq!(new_worker.history_samples, 1);
     }
 
     #[test]
