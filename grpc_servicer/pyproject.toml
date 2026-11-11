@@ -83,6 +83,7 @@ smg-servicer = "smg_grpc_servicer.sglang.plugin:register"
 # to the `vllm serve --grpc` parser (see smg_grpc_servicer/vllm/plugin.py).
 [project.entry-points."vllm.general_plugins"]
 smg-servicer = "smg_grpc_servicer.vllm.plugin:register"
+smg_native_deadline = "smg_grpc_servicer.native_deadline_vllm:register"
 
 [project.urls]
 Homepage = "https://github.com/smg-project/smg"

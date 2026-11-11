@@ -1722,6 +1722,8 @@ impl ZmqEngineClient {
                 dp_rank: i32::try_from(dp_rank).unwrap_or(i32::MAX),
                 num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
                 num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
+                // Scheduler stats carry counts, not queued token work.
+                num_waiting_uncached_tokens_available: Some(false),
                 token_usage: load.kv_cache_usage,
                 ..Default::default()
             })
