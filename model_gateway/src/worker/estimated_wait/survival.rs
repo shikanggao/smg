@@ -10,7 +10,9 @@ use serde::Serialize;
 use super::{basis, decision, pending_work};
 
 mod joint_work_service;
+mod sg_raw_basis;
 mod started_capacity;
+pub(crate) use sg_raw_basis::SgRawEvidence;
 pub(super) use started_capacity::{
     source_key as started_source_key, SourceKey as StartedSourceKey,
 };
@@ -48,6 +50,10 @@ pub(super) struct Admission {
     pub training_snapshot: decision::Snapshot,
     pub predictions: [decision::Prediction; 2],
     pub projection: Projection,
+    /// Separate SG output shadow. Original projection and fit membership stay
+    /// unchanged, including own-admission structural-expiry label exclusion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sg_raw_basis_deadline: Option<sg_raw_basis::SgProjection>,
 }
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(super) struct RawFallback {
@@ -226,6 +232,7 @@ impl State {
         self.native.joint_work_service = completed;
     }
     pub fn clear_started_history(&mut self) {
+        self.native.invalidate_sg_raw();
         self.native.started_requests = started_capacity::History::default();
         self.native.joint_work_service = joint_work_service::History::default();
     }
@@ -239,6 +246,7 @@ impl State {
     }
     pub fn poll(&mut self, at: f64, profile: Option<u64>, epoch: u64, fresh: bool, max_gap: f64) {
         if self.basis_epoch.is_some_and(|old| old != epoch) {
+            self.native.invalidate_sg_raw();
             self.fit = decision::State::default();
             self.reference = None;
             self.pending_expiry_credit.clear();
@@ -310,6 +318,7 @@ impl State {
             training_snapshot: training,
             predictions,
             projection,
+            sg_raw_basis_deadline: None,
         }
     }
     fn normalize(
@@ -471,6 +480,7 @@ pub(super) struct Native {
     capacity_poll: Option<(f64, bool, Option<f64>)>,
     started_requests: started_capacity::History,
     joint_work_service: joint_work_service::History,
+    sg_raw_basis: sg_raw_basis::State,
 }
 impl Native {
     fn identity(&self) -> Option<(String, String)> {
@@ -574,6 +584,15 @@ impl Native {
             load.and_then(|l| l.loads.first())
                 .and_then(|r| r.learned_prefill_capacity),
         ));
+        let sg_source = load
+            .filter(|_| success)
+            .and_then(started_capacity::source_key);
+        if self.sg_raw_basis.raw_source != sg_source
+            || !self.capacity_poll.is_some_and(|(_, valid, _)| valid)
+        {
+            self.invalidate_sg_raw();
+        }
+        self.sg_raw_basis.raw_source = sg_source;
     }
     /// Only the already selected eligible raw fallback may use this private
     /// divisor. The native guard, fitted state and published raw inputs stay intact.
@@ -696,9 +715,16 @@ impl Native {
     ) {
         // Commit only a wholly validated observation. An invalid late row must
         // not leave an earlier ACK/lag mutation available to the next poll.
+        self.sg_before_observe(load);
         let mut next = self.clone();
         match next.observe_inner(load, accepted, started, received, raw_poll, max_age) {
             Ok(()) => {
+                // A newer committed Native view must replace the SG pair or
+                // clear it; retaining an older view would break seen_native.
+                next.sg_raw_basis.bundle = None;
+                if !next.valid {
+                    next.invalidate_sg_raw();
+                }
                 // Both endpoints must pass C2's complete inventory/ACK/rebound
                 // validation. Reset/rebound observations are deliberately not
                 // usable endpoints even when the shared native adapter accepts.
@@ -707,6 +733,7 @@ impl Native {
                 *self = next;
             }
             Err(reason) => {
+                self.invalidate_sg_raw();
                 self.valid = false;
                 self.reason = reason;
                 self.joint_work_service.observe(None, false, received);
@@ -812,6 +839,7 @@ impl Native {
                     .zip(&lane.active_requests)
                 {
                     old.original_full_prompt_tokens = new.original_full_prompt_tokens;
+                    old.original_prefill_observation = new.original_prefill_observation.clone();
                 }
                 self.valid = true;
                 self.reason = "duplicate_retains_original_expiry";
@@ -1291,6 +1319,7 @@ mod tests {
             state: "prefill".into(),
             first_text_emitted: Some(false),
             original_full_prompt_tokens: None,
+            original_prefill_observation: None,
         }
     }
     fn observe(n: &mut Native, load: &WorkerLoadResponse, received: f64, raw: f64) {
@@ -1773,7 +1802,7 @@ mod tests {
         assert_eq!(n.reason, "capacity_source_or_profile_reset");
         assert!(!n.valid);
     }
-    fn admissions(
+    pub(super) fn admissions(
         at: f64,
         epoch: u64,
         x: f64,

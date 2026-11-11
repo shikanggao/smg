@@ -65,6 +65,48 @@ pub struct NativeDeadlineRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub original_full_prompt_tokens: Option<u64>,
+    /// SG-only optional stage facts. They never change legacy work/ACK
+    /// acceptance, and malformed evidence is unavailable only to that shadow.
+    #[serde(
+        default,
+        deserialize_with = "optional_sg_prefill",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub original_prefill_observation: Option<SgOriginalPrefillObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SgOriginalPrefillObservation {
+    pub schema_version: u32,
+    pub diagnostic_only: bool,
+    pub method: String,
+    pub source_commit: String,
+    pub native_request_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub state_seq: u64,
+    pub observed_at_monotonic_secs: f64,
+    pub available: bool,
+    pub supported_mode: Option<bool>,
+    pub original_alias_verified: Option<bool>,
+    pub original_prompt_tokens: Option<u64>,
+    pub normal_return_frontier_tokens: Option<u64>,
+    pub committed_output_tokens: Option<u64>,
+    pub lifetime_retraction_count: Option<u64>,
+    pub input_embeds_none: Option<bool>,
+    pub session_none: Option<bool>,
+    pub multimodal_inputs_none: Option<bool>,
+    pub is_retracted: Option<bool>,
+    pub abort_pending: Option<bool>,
+}
+
+fn optional_sg_prefill<'de, D>(
+    deserializer: D,
+) -> Result<Option<SgOriginalPrefillObservation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -239,6 +281,24 @@ mod tests {
         let parsed: NativeDeadlineTelemetry = serde_json::from_value(value).unwrap();
         assert!(parsed.legacy_snapshot_eq(&original));
         assert_ne!(parsed, original);
+    }
+
+    #[test]
+    fn malformed_sg_stage_evidence_is_local_and_legacy_equality_ignores_it() {
+        let original: NativeDeadlineTelemetry = serde_json::from_value(base()).unwrap();
+        for bad in [
+            serde_json::json!(true),
+            serde_json::json!({}),
+            serde_json::json!({"schema_version":"1"}),
+        ] {
+            let mut value = base();
+            value["active_requests"][0]["original_prefill_observation"] = bad;
+            let parsed: NativeDeadlineTelemetry = serde_json::from_value(value).unwrap();
+            assert!(parsed.active_requests[0]
+                .original_prefill_observation
+                .is_none());
+            assert!(parsed.legacy_snapshot_eq(&original));
+        }
     }
 
     #[test]
