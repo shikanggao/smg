@@ -76,8 +76,8 @@ use crate::{
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        AttachedBody, ConnectionMode, RoutingPool, Worker, WorkerLoadGuard, WorkerRegistry,
-        WorkerType,
+        estimated_wait::StreamTtftObserver, AttachedBody, ConnectionMode, RoutingPool, Worker,
+        WorkerLoadGuard, WorkerRegistry, WorkerType,
     },
 };
 
@@ -244,7 +244,7 @@ impl Router {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Result<Option<Arc<dyn Worker>>, Response> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
         placement::select_single(
@@ -501,8 +501,9 @@ impl Router {
                 view.cache_namespace,
             )
         }) {
-            Some(w) => w,
-            None => {
+            Err(shed) => return shed,
+            Ok(Some(w)) => w,
+            Ok(None) => {
                 // The verdict is judged from exactly the pool selection drew
                 // from, wildcard model included: that is what makes the shed
                 // fire for a model-less `/generate` and for a model that is
@@ -802,7 +803,7 @@ impl Router {
             record_pre_send_error(&resp);
             return resp;
         }
-        let Some(worker) = placement::select_from(
+        let selection = placement::select_from(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
@@ -814,28 +815,36 @@ impl Router {
                 rid_key: None,
                 cache_namespace: None,
             },
-        ) else {
-            // Judged from the same candidates whether the pre-filter emptied
-            // or a self-filtering policy missed on an all-overloaded pool, so
-            // a shed keeps its Retry-After, retryability and metric.
-            let resp = match placement::failure_from(&non_dp_workers, model_id) {
-                PlacementFailure::AllOverloaded(shed) => shed,
-                PlacementFailure::NoCandidates
-                | PlacementFailure::Unavailable
-                | PlacementFailure::PolicyDeclined(_)
-                | PlacementFailure::NoCompatiblePair { .. } => {
-                    // The verdict cannot tell a policy miss from a drained
-                    // pool; the pool can.
-                    let message = if non_dp_workers.iter().any(|w| w.is_available()) {
-                        "Policy returned no eligible worker"
-                    } else {
-                        "All workers are unavailable (circuit breaker open or unhealthy)"
-                    };
-                    error::service_unavailable("no_available_workers", message)
-                }
-            };
-            record_pre_send_error(&resp);
-            return resp;
+        );
+        let worker = match selection {
+            Err(shed) => {
+                record_pre_send_error(&shed);
+                return shed;
+            }
+            Ok(Some(worker)) => worker,
+            Ok(None) => {
+                // Judged from the same candidates whether the pre-filter emptied
+                // or a self-filtering policy missed on an all-overloaded pool, so
+                // a shed keeps its Retry-After, retryability and metric.
+                let resp = match placement::failure_from(&non_dp_workers, model_id) {
+                    PlacementFailure::AllOverloaded(shed) => shed,
+                    PlacementFailure::NoCandidates
+                    | PlacementFailure::Unavailable
+                    | PlacementFailure::PolicyDeclined(_)
+                    | PlacementFailure::NoCompatiblePair { .. } => {
+                        // The verdict cannot tell a policy miss from a drained
+                        // pool; the pool can.
+                        let message = if non_dp_workers.iter().any(|w| w.is_available()) {
+                            "Policy returned no eligible worker"
+                        } else {
+                            "All workers are unavailable (circuit breaker open or unhealthy)"
+                        };
+                        error::service_unavailable("no_available_workers", message)
+                    }
+                };
+                record_pre_send_error(&resp);
+                return resp;
+            }
         };
 
         // Same dispatch-time re-check the regular path takes. A transcription
@@ -879,6 +888,13 @@ impl Router {
             worker.api_key(),
         );
 
+        let ttft_observer = is_stream.then(|| {
+            StreamTtftObserver::new(&self.worker_registry, worker.url(), start).with_request_id(
+                headers
+                    .and_then(|headers| headers.get("opc-request-id"))
+                    .and_then(|value| value.to_str().ok()),
+            )
+        });
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
@@ -955,6 +971,11 @@ impl Router {
             let stream_endpoint = endpoint;
             let stream_start = start;
             #[expect(
+                clippy::expect_used,
+                reason = "the same is_stream condition initializes this observer before sending"
+            )]
+            let mut ttft_observer = ttft_observer.expect("stream observer initialized before send");
+            #[expect(
                 clippy::disallowed_methods,
                 reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
             )]
@@ -975,6 +996,8 @@ impl Router {
                             // no frame.
                             Some(Ok(bytes)) if bytes.is_empty() => {}
                             Some(Ok(bytes)) => {
+                                if tx.capacity() == 0 { ttft_observer.cancel(); }
+                                if stream_header_status.is_success() { ttft_observer.push(&bytes); }
                                 if tx.send(Ok(bytes)).await.is_err() {
                                     client_disconnected = true;
                                     break;
@@ -1135,6 +1158,10 @@ impl Router {
     // Send an already-serialized request body. The stale-connection resend
     // guard inside `send_with_stale_conn_retry` shares the body allocation by
     // refcount, so the bytes live exactly until the response head arrives.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "request metadata, load guard and admission-time forecast travel together"
+    )]
     async fn send_serialized_request(
         &self,
         headers: Option<&HeaderMap>,
@@ -1144,6 +1171,7 @@ impl Router {
         is_stream: bool,
         load_guard: WorkerLoadGuard,
     ) -> Response {
+        let started = Instant::now();
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
@@ -1161,6 +1189,13 @@ impl Router {
             api_key.as_ref(),
         );
 
+        let ttft_observer = is_stream.then(|| {
+            StreamTtftObserver::new(&self.worker_registry, worker.url(), started).with_request_id(
+                headers
+                    .and_then(|headers| headers.get("opc-request-id"))
+                    .and_then(|value| value.to_str().ok()),
+            )
+        });
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
@@ -1175,8 +1210,15 @@ impl Router {
             }
         };
 
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard)
-            .await
+        self.forward_worker_response(
+            res,
+            is_stream,
+            worker.url(),
+            load_guard,
+            started,
+            ttft_observer,
+        )
+        .await
     }
 
     /// Relay a worker response to the client. A streaming response flows
@@ -1188,6 +1230,8 @@ impl Router {
         is_stream: bool,
         worker_url: &str,
         load_guard: WorkerLoadGuard,
+        started: Instant,
+        ttft_observer: Option<StreamTtftObserver>,
     ) -> Response {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1205,6 +1249,9 @@ impl Router {
             // Bounded channel applies backpressure: a slow client makes the
             // relay await on `send` instead of buffering the whole response.
             let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
+            let mut ttft_observer = ttft_observer.unwrap_or_else(|| {
+                StreamTtftObserver::new(&self.worker_registry, worker_url, started)
+            });
 
             // Spawn task to forward stream
             #[expect(
@@ -1220,6 +1267,8 @@ impl Router {
                             // not become an empty h2 DATA frame toward the client.
                             Some(Ok(bytes)) if bytes.is_empty() => {}
                             Some(Ok(bytes)) => {
+                                if tx.capacity() == 0 { ttft_observer.cancel(); }
+                                if status.is_success() { ttft_observer.push(&bytes); }
                                 if tx.send(Ok(bytes)).await.is_err() {
                                     break;
                                 }
@@ -1294,6 +1343,7 @@ impl Router {
         worker: &dyn Worker,
         load_guard: WorkerLoadGuard,
     ) -> Response {
+        let started = Instant::now();
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
@@ -1371,7 +1421,7 @@ impl Router {
             .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
             .is_some_and(|ct| ct.starts_with("text/event-stream"));
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard)
+        self.forward_worker_response(res, is_stream, worker.url(), load_guard, started, None)
             .await
     }
 
@@ -1652,16 +1702,21 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
-        let Some(worker) = self.select_worker_for_model(
+        let selection = self.select_worker_for_model(
             model_id,
             None,
             hinted_tokens.as_deref(),
             Some(req.headers()),
             None,
             None,
-        ) else {
-            Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
-            return Err(req);
+        );
+        let worker = match selection {
+            Err(shed) => return Ok(shed),
+            Ok(Some(worker)) => worker,
+            Ok(None) => {
+                Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
+                return Err(req);
+            }
         };
         // Guard the registration races the decision left open: a mutating
         // worker that joined after the fleet check must not receive an
@@ -2325,6 +2380,7 @@ mod tests {
                 None,
                 None,
             )
+            .unwrap()
             .unwrap();
         assert!(selected.is_available());
 
@@ -2340,7 +2396,66 @@ mod tests {
                 None,
                 None
             )
+            .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn estimated_wait_returns_503_before_http_dispatch_without_internal_retry() {
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+        let router = create_test_regular_router();
+        router
+            .worker_registry
+            .estimated_wait()
+            .configure(EstimatedWaitConfig {
+                max_estimated_wait_secs: Some(1.0),
+                ..Default::default()
+            });
+        for worker in router.worker_registry.get_all() {
+            let stamp = router
+                .worker_registry
+                .estimated_wait()
+                .poll_started(&worker);
+            let load = WorkerLoadResponse {
+                loads: vec![SchedulerLoadSnapshot {
+                    num_waiting_uncached_tokens: 2000,
+                    gen_throughput: 2000.0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            router.worker_registry.estimated_wait().publish(
+                &worker,
+                Some(&load),
+                stamp,
+                Instant::now(),
+            );
+        }
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.route_typed_request(
+                None,
+                DropProbeRequest {
+                    text: "shed".to_owned(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            ),
+        )
+        .await
+        .expect("must shed without contacting workers or waiting for retries");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "worker_overload_protection_shed"
+        );
+        assert!(!is_retryable_response(&response));
     }
 
     #[tokio::test]

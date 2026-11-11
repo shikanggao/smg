@@ -334,6 +334,7 @@ mod tests {
                 .overload(OverloadUpdate {
                     waiting_requests: Some(8),
                     token_usage: None,
+                    max_estimated_wait_secs: Some(2.5),
                 })
                 .status(WorkerStatus::Ready)
                 .build(),
@@ -378,6 +379,11 @@ mod tests {
         // effective threshold resolved from it.
         assert_eq!(new.metadata().spec.overload.waiting_requests, Some(8));
         assert_eq!(new.metadata().overload.waiting_requests, Some(8));
+        assert_eq!(
+            new.metadata().spec.overload.max_estimated_wait_secs,
+            Some(2.5)
+        );
+        assert_eq!(new.metadata().overload.max_estimated_wait_secs, Some(2.5));
         assert!(
             new.connect_signal_tx.is_some(),
             "ZMQ promotion stays event-driven after an update"
