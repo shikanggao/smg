@@ -116,3 +116,10 @@ Without the source path, the source-dependent lifecycle tests are explicitly
 skipped. Supply a local checkout of the pinned upstream commit; the lifecycle
 tests verify its source hashes. Manual source-download and fixture-generation
 helpers are kept outside the repository.
+
+## Optional completed input-work diagnostics
+
+The separate `SMG_NATIVE_ENGINE_WORK_DIAGNOSTICS=1` switch adds raw diagnostic
+counters after native completion. It is off by default and does not change
+deadline/admission behavior. See [the shared field contract](engine_work_progress.md)
+for completion boundaries, unsupported modes, overlay packaging and limitations.

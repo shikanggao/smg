@@ -244,7 +244,158 @@ class SchedulerSignals:
             "cache_config": str(getattr(scheduler, "cache_config", None)),
             "semantics": "continuous_batching:first_nonempty_text:v1",
         }
+        diagnostic_work = os.environ.get("SMG_NATIVE_ENGINE_WORK_DIAGNOSTICS") == "1"
+        if diagnostic_work:
+            profile["engine_work_diagnostics_schema"] = 1
         self.profile = hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest()
+        self.work_progress = None
+        self.work_batches = {}
+        if diagnostic_work:
+            from smg_grpc_servicer.engine_work_progress import CompletedWorkProgress
+
+            self.work_progress = CompletedWorkProgress(
+                self.epoch,
+                self.profile,
+                rank,
+                UPSTREAM_COMMIT,
+                "scheduler_update_from_output_after_native_model_future",
+                supported=self.supported,
+            )
+
+    def capture_engine_work(self, output):
+        if self.work_progress is None:
+            return
+        rows = []
+        unsupported = (
+            not self.supported
+            or bool(getattr(output, "scheduled_spec_decode_tokens", None))
+            or bool(getattr(output, "scheduled_encoder_inputs", None))
+            or getattr(output, "kv_connector_metadata", None) is not None
+            or getattr(output, "ec_connector_metadata", None) is not None
+        )
+        for rid, count in output.num_scheduled_tokens.items():
+            request = self.scheduler.requests.get(rid)
+            if (
+                request is None
+                or getattr(request, "has_encoder_inputs", False)
+                or getattr(request, "mm_features", None)
+                or getattr(request, "prompt_embeds", None) is not None
+                or getattr(request, "pooling_params", None) is not None
+                or getattr(
+                    getattr(getattr(self.scheduler, "vllm_config", None), "model_config", None),
+                    "is_encoder_decoder",
+                    False,
+                )
+            ):
+                unsupported = True
+                continue
+            # The pinned schedule has already advanced this field, including
+            # queued async chunks. Freeze the exact range for THIS output now;
+            # never infer completion from this scheduling-time increment.
+            end = request.num_computed_tokens
+            rows.append((end - count, end, request.num_prompt_tokens))
+        if unsupported:
+            self.work_progress.invalidate("unsupported_or_missing_input_work_metadata")
+            rows = [(0, 0, 0)]
+        batch = self.work_progress.begin(rows)
+        # Hold the exact output strongly while in flight; id alone can be reused.
+        self.work_batches[id(output)] = (output, batch, tuple(output.num_scheduled_tokens))
+
+    def complete_engine_work(self, output, model_output):
+        if self.work_progress is None or getattr(output, "_smg_work_observed", False):
+            return
+        tracked = self.work_batches.pop(id(output), None)
+        if tracked is None or tracked[0] is not output:
+            self.work_progress.invalidate("completion_without_submission_record")
+            return
+        _, batch, request_ids = tracked
+        # Set only AFTER native processing; the marker never enters the worker
+        # submission. A repeated callback cannot credit the same result twice.
+        output._smg_work_observed = True
+        indices = getattr(model_output, "req_id_to_index", None)
+        if (
+            not isinstance(indices, dict)
+            or any(rid not in indices for rid in request_ids)
+            or getattr(model_output, "kv_connector_output", None) is not None
+        ):
+            self.work_progress.invalidate("nonstandard_or_missing_completed_request_output")
+            batch.valid = False
+        self.work_progress.complete(batch)
+
+    def observe_engine_work(self, method, *args):
+        if self.work_progress is None:
+            return
+        try:
+            getattr(self, method)(*args)
+        except Exception:
+            # A diagnostic metadata failure cannot turn successful native
+            # execution into a serving failure. Original native calls remain
+            # outside this guard and their exceptions still propagate.
+            self.work_progress.invalidate("engine_work_diagnostic_observation_failed")
+
+    def engine_work_snapshot(self, now):
+        try:
+            return self.work_progress.snapshot(now)
+        except Exception:
+            self.work_progress.invalidate("engine_work_diagnostic_observation_failed")
+            return dict(
+                schema_version=1,
+                engine_epoch=self.epoch,
+                profile_id=self.profile,
+                dp_rank=self.rank,
+                snapshot_monotonic_secs=now,
+                counters_available=False,
+                unavailable_reason="engine_work_diagnostic_observation_failed",
+            )
+
+    def _request_engine_work_state(self, request, rid, attempt):
+        output = request.num_output_tokens
+        preemptions = getattr(request, "num_preemptions", None)
+        output_known = type(output) is int and output >= 0
+        preemptions_known = type(preemptions) is int and preemptions >= 0
+        # A retained native FINISHED_ABORTED status / pending ACK is an
+        # explicit abort witness. No such witness means unknown, not False:
+        # EngineCore may not yet have delivered an external abort to Scheduler.
+        abort_pending = (
+            rid in self.pending_acks or request.status == self.scheduler._smg_aborted_status
+        )
+        return dict(
+            schema_version=1,
+            diagnostic_only=True,
+            native_request_id=rid,
+            attempt_id=attempt,
+            available=output_known and preemptions_known,
+            unavailable_reason=None if output_known and preemptions_known else "request_work_metadata_unavailable",
+            output_token_count=output if output_known else None,
+            retraction_count=None,
+            preemption_count=preemptions if preemptions_known else None,
+            abort_pending=True if abort_pending else None,
+            abort_pending_source="native_aborted_status_or_pending_ack" if abort_pending else "unknown",
+            # Historical return from the existing _free_blocks observer only;
+            # this is not present allocation, reuse or free-capacity evidence.
+            cache_release_observed=self.retired.get(rid) is request,
+        )
+
+    def request_engine_work_state(self, request, rid, attempt):
+        try:
+            if not self.supported:
+                raise ValueError("unsupported native configuration")
+            return self._request_engine_work_state(request, rid, attempt)
+        except Exception:
+            return dict(
+                schema_version=1,
+                diagnostic_only=True,
+                native_request_id=rid,
+                attempt_id=attempt,
+                available=False,
+                unavailable_reason="request_work_diagnostic_unavailable",
+                output_token_count=None,
+                retraction_count=None,
+                preemption_count=None,
+                abort_pending=None,
+                abort_pending_source="unknown",
+                cache_release_observed=None,
+            )
 
     def next_seq(self):
         self.sequence += 1
@@ -359,6 +510,11 @@ class SchedulerSignals:
                     "queue_position": None,
                     "state": state,
                     "first_text_emitted": first_text,
+                    **(
+                        {"engine_work_state": self.request_engine_work_state(request, rid, attempt)}
+                        if self.work_progress is not None
+                        else {}
+                    ),
                 }
             )
         self.store.publish(
@@ -388,6 +544,11 @@ class SchedulerSignals:
                 "ack_floor_seq": self.ack_floor,
                 "active_requests": rows,
                 "cancellation_acks": list(self.acks),
+                **(
+                    {"engine_work_progress": self.engine_work_snapshot(now)}
+                    if self.work_progress is not None
+                    else {}
+                ),
             },
         )
 
@@ -430,8 +591,11 @@ def install_scheduler_hooks(scheduler_cls, aborted_status, store_factory=_store_
                         signals.inflight[id(result)] = dict(result.num_scheduled_tokens)
                         signals.ever_scheduled.update(result.num_scheduled_tokens)
                         signals.cleanup_batches[id(result)] = set(result.finished_req_ids)
+                        signals.observe_engine_work("capture_engine_work", result)
                     elif method_name == "update_from_output":
                         output = args[0] if args else kwargs["scheduler_output"]
+                        model_output = args[1] if len(args) > 1 else kwargs.get("model_runner_output")
+                        signals.observe_engine_work("complete_engine_work", output, model_output)
                         signals.inflight.pop(id(output), None)
                         signals.cleanup_complete.update(signals.cleanup_batches.pop(id(output), ()))
                     elif method_name == "_free_blocks":
@@ -447,6 +611,13 @@ def install_scheduler_hooks(scheduler_cls, aborted_status, store_factory=_store_
                                 extras.get(BINDING_XARG),
                                 request.request_id,
                             )
+                except BaseException:
+                    if signals.work_progress is not None and method_name in (
+                        "schedule",
+                        "update_from_output",
+                    ):
+                        signals.work_progress.invalidate("native_schedule_or_result_processing_failed")
+                    raise
                 finally:
                     signals.call_depth -= 1
                 if signals.call_depth == 0:
@@ -487,17 +658,23 @@ def register():
     install_scheduler_hooks(Scheduler, RequestStatus.FINISHED_ABORTED)
     for name in ("step", "step_with_batch_queue"):
         original = getattr(EngineCore, name)
+        setattr(EngineCore, name, _wrap_engine_step(original))
 
-        def wrap(method):
-            @functools.wraps(method)
-            def step(self, *args, **kwargs):
-                if hasattr(self, "_send_abort_outputs"):
-                    self.scheduler._smg_abort_outputs = self._send_abort_outputs
-                return method(self, *args, **kwargs)
 
-            return step
+def _wrap_engine_step(method):
+    @functools.wraps(method)
+    def step(self, *args, **kwargs):
+        if hasattr(self, "_send_abort_outputs"):
+            self.scheduler._smg_abort_outputs = self._send_abort_outputs
+        try:
+            return method(self, *args, **kwargs)
+        except BaseException:
+            progress = getattr(self.scheduler._smg_signals, "work_progress", None)
+            if progress is not None:
+                progress.invalidate("native_model_execution_or_result_failed")
+            raise
 
-        setattr(EngineCore, name, wrap(original))
+    return step
 
 
 def _contains_text(frame):

@@ -93,6 +93,10 @@ def prepare(root):
     content["managers/smg_native_deadline.py"] = (
         Path(__file__).with_name("native_deadline.py").read_text()
     )
+    content["managers/smg_engine_work_progress.py"] = (
+        Path(__file__).resolve().parents[2]
+        / "smg_grpc_servicer/engine_work_progress.py"
+    ).read_text()
     for relative, source in content.items():
         ast.parse(source, filename=relative)
     return srt, content
