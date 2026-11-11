@@ -1717,6 +1717,85 @@ class TestParseRouterArgs:
         # SystemExit with code 0 indicates help was displayed
         assert exc_info.value.code == 0
 
+    def test_estimated_wait_flags_and_prefixed_aliases(self):
+        for prefix in ("", "router-"):
+            parser = argparse.ArgumentParser()
+            RouterArgs.add_cli_args(parser, use_router_prefix=bool(prefix))
+            namespace = parser.parse_args(
+                [
+                    f"--{prefix}estimated-wait-shadow",
+                    f"--{prefix}estimated-wait-native-hard-ttft-timeout-secs",
+                    "42",
+                    f"--{prefix}estimated-wait-provisional-baseline-secs",
+                    "0.25",
+                    f"--{prefix}max-estimated-wait-secs",
+                    "12",
+                    f"--{prefix}estimated-wait-queue-tokens-per-request",
+                    "2048",
+                    f"--{prefix}estimated-wait-default-throughput",
+                    "500",
+                    f"--{prefix}estimated-wait-fallback-prefill-throughput",
+                    "450",
+                    f"--{prefix}estimated-wait-prompt-size-prior-samples",
+                    "24",
+                    f"--{prefix}estimated-wait-kv-pressure-weight",
+                    "0",
+                    f"--{prefix}estimated-wait-mean-prefill-tokens",
+                    "800",
+                    f"--{prefix}estimated-wait-max-snapshot-age-secs",
+                    "8",
+                    f"--{prefix}estimated-wait-dispatch-blocking-factor",
+                    "0.2",
+                ]
+            )
+            args = RouterArgs.from_cli_args(namespace, use_router_prefix=bool(prefix))
+            assert args.max_estimated_wait_secs == 12.0
+            assert args.estimated_wait_shadow is True
+            enforce = RouterArgs.from_cli_args(
+                parser.parse_args([f"--no-{prefix}estimated-wait-shadow"]),
+                use_router_prefix=bool(prefix),
+            )
+            assert enforce.estimated_wait_shadow is False
+            assert args.estimated_wait_native_hard_ttft_timeout_secs == 42.0
+            assert args.estimated_wait_provisional_baseline_secs == 0.25
+            assert args.estimated_wait_queue_tokens_per_request == 2048
+            assert args.estimated_wait_default_throughput == 500.0
+            assert args.estimated_wait_fallback_prefill_throughput == 450.0
+            assert args.estimated_wait_prompt_size_prior_samples == 24
+            assert args.estimated_wait_kv_pressure_weight == 0.0
+            assert args.estimated_wait_mean_prefill_tokens == 800
+            assert args.estimated_wait_max_snapshot_age_secs == 8.0
+            assert args.estimated_wait_dispatch_blocking_factor == 0.2
+        assert RouterArgs().max_estimated_wait_secs is None
+        assert RouterArgs().estimated_wait_shadow is True
+        assert RouterArgs().estimated_wait_native_hard_ttft_timeout_secs is None
+        assert RouterArgs().estimated_wait_provisional_baseline_secs is None
+        assert RouterArgs().estimated_wait_queue_tokens_per_request == 0
+        assert RouterArgs().estimated_wait_dispatch_blocking_factor == 0.05
+        assert RouterArgs().estimated_wait_kv_pressure_weight == 0.0
+        assert RouterArgs().estimated_wait_prompt_size_prior_samples == 32
+
+    def test_removed_estimated_wait_coefficients_are_rejected(self):
+        for prefix in ("", "router-"):
+            parser = argparse.ArgumentParser()
+            RouterArgs.add_cli_args(parser, use_router_prefix=bool(prefix))
+            for flag in (
+                "base-overhead-secs",
+                "queue-work-correction",
+                "feature-shadow",
+                "calibration-shadow",
+            ):
+                with pytest.raises(SystemExit):
+                    parser.parse_args([f"--{prefix}estimated-wait-{flag}", "1"])
+        for name in (
+            "estimated_wait_base_overhead_secs",
+            "estimated_wait_queue_work_correction",
+            "estimated_wait_feature_shadow",
+            "estimated_wait_calibration_shadow",
+        ):
+            with pytest.raises(TypeError):
+                RouterArgs(**{name: 1.0})
+
 
 class TestPrefixHashArgs:
     """The prefix_hash knobs parse, default, and honor the router prefix."""

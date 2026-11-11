@@ -489,6 +489,13 @@ class Router:
         """Create a router from a RouterArgs instance."""
 
         args_dict = vars(args).copy()
+        # This legacy Python field no longer exists in the native policy API.
+        # Keep default construction usable without silently dropping a requested veto.
+        if args_dict.pop("least_load_max_waiting_requests") != 0:
+            raise ValueError(
+                "least_load_max_waiting_requests is no longer supported; "
+                "use worker_overload_waiting_requests"
+            )
         provider = args.selected_discovery_provider()
         for field in _DISCOVERY_FIELDS:
             del args_dict[field]
