@@ -544,6 +544,11 @@ fn infer_non_generation_type(labels: &HashMap<String, String>) -> ModelType {
 /// `worker_overload_*` fields. Both comparisons are inclusive, so the excluded
 /// ends of these ranges would mark this worker overloaded unconditionally.
 fn validate_overload_overrides(config: &WorkerSpec) -> Result<(), String> {
+    if let Some(threshold) = config.overload.max_estimated_wait_secs {
+        if !threshold.is_finite() || threshold <= 0.0 {
+            return Err(format!("worker {} sets overload.max_estimated_wait_secs to {threshold}: Must be finite and > 0", config.url));
+        }
+    }
     if config.overload.waiting_requests == Some(0) {
         return Err(format!(
             "worker {} sets overload.waiting_requests to 0: Must be >= 1 \
@@ -848,6 +853,19 @@ mod tests {
             normalize_url("localhost:30001", ConnectionMode::Grpc),
             "grpc://localhost:30001"
         );
+    }
+
+    #[test]
+    fn estimated_wait_override_is_validated_at_registration() {
+        let mut spec = WorkerSpec::new("http://worker:8080");
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            spec.overload.max_estimated_wait_secs = Some(value);
+            assert!(validate_overload_overrides(&spec)
+                .unwrap_err()
+                .contains("overload.max_estimated_wait_secs"));
+        }
+        spec.overload.max_estimated_wait_secs = Some(0.01);
+        assert!(validate_overload_overrides(&spec).is_ok());
     }
 
     #[test]
