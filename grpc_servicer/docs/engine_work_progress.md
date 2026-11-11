@@ -1,5 +1,8 @@
 # Completed input-work diagnostics
 
+For opt-in retention at the router's actual native poll, see
+[router_engine_work_capture.md](router_engine_work_capture.md).
+
 Set `SMG_NATIVE_ENGINE_WORK_DIAGNOSTICS=1` in an already enabled native
 deadline-signals process. It is off by default. The authenticated raw native
 snapshot adds `deadline_recovery.engine_work_progress`; no predictor, admission

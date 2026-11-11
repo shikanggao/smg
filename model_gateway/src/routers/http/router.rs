@@ -2637,6 +2637,7 @@ mod tests {
                     stamp,
                     raw_started,
                     Instant::now(),
+                    None,
                 );
             }
             let mut client_headers = HeaderMap::new();

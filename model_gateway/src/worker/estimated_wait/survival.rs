@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use super::{basis, decision, pending_work};
 
-pub(super) const METHOD: &str = "stable_work_native_service_composition_C2_guarded";
+pub(super) const METHOD: &str = "stable_work_native_service_composition_C2_raw_fallback_v1";
 const LIMIT: usize = 8192;
 const LAG_WINDOW: f64 = 600.0;
 const ENGINEERING_PRIOR: f64 = 1.0;
@@ -42,12 +42,58 @@ pub(super) struct Admission {
     pub predictions: [decision::Prediction; 2],
     pub projection: Projection,
 }
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(super) struct RawFallback {
+    pub baseline_seconds: f64,
+    pub baseline_source: &'static str,
+    pub raw_extra_seconds: f64,
+    pub total_ttft_seconds: f64,
+}
+impl RawFallback {
+    pub fn new(baseline: f64, source: &'static str, extra: f64) -> Option<Self> {
+        let total = baseline + extra;
+        (nonnegative(baseline)
+            && nonnegative(extra)
+            && nonnegative(total)
+            && matches!(source, "measured" | "provisional"))
+        .then_some(Self {
+            baseline_seconds: baseline,
+            baseline_source: source,
+            raw_extra_seconds: extra,
+            total_ttft_seconds: total,
+        })
+    }
+}
+impl Admission {
+    /// Select only the displayed shadow fallback. The normalized fit and native
+    /// service projection retain their original inputs and training provenance.
+    pub fn select_raw_fallback(&mut self, raw: Option<RawFallback>) {
+        let stable = &self.predictions[1];
+        if self.projection.supported
+            || !self.training_snapshot.fresh
+            || !self.training_snapshot.native_ready
+            || !stable.available
+            || !nonnegative(stable.total)
+            || self.projection.total_ttft_seconds != Some(stable.total)
+            || self.projection.stable_work_fallback_seconds != Some(stable.total)
+        {
+            return;
+        }
+        if let Some(raw) = raw {
+            self.projection.selected_raw_fallback = Some(raw);
+            self.projection.total_ttft_seconds = Some(raw.total_ttft_seconds);
+        }
+    }
+}
 #[derive(Clone, Debug, Default, Serialize)]
 pub(super) struct Projection {
     pub supported: bool,
     pub reason: &'static str,
     pub total_ttft_seconds: Option<f64>,
     pub stable_work_fallback_seconds: Option<f64>,
+    /// Present only when the eligible same-admission raw total was selected.
+    /// `stable_work_fallback_seconds` still records the unmodified internal fit.
+    pub selected_raw_fallback: Option<RawFallback>,
     pub effective_capacity_tokens_per_second: Option<f64>,
     pub gain: Option<f64>,
     pub native_snapshot_seq: Option<u64>,
@@ -1227,6 +1273,91 @@ mod tests {
         };
         (basis, pending)
     }
+    #[test]
+    fn raw_fallback_changes_only_selected_forecast_and_preserves_learning() {
+        let mut original = State::default();
+        let mut selected = State::default();
+        original.poll(0.0, Some(7), 0, true, 30.0);
+        selected.poll(0.0, Some(7), 0, true, 30.0);
+        let (basis, pending) = admissions(0.0, 0, 100.0, 10.0);
+        for id in 1..=16 {
+            let a = original.admission(&basis, Some(&pending), None);
+            let mut b = selected.admission(&basis, Some(&pending), None);
+            b.select_raw_fallback(RawFallback::new(2.0, "provisional", 42.0));
+            near(b.projection.total_ttft_seconds.unwrap(), 44.0);
+            near(b.projection.stable_work_fallback_seconds.unwrap(), 102.0);
+            let mut changed = serde_json::to_value(&b).unwrap();
+            let unchanged = serde_json::to_value(&a).unwrap();
+            changed["projection"]["total_ttft_seconds"] =
+                unchanged["projection"]["total_ttft_seconds"].clone();
+            changed["projection"]["selected_raw_fallback"] = serde_json::Value::Null;
+            assert_eq!(changed, unchanged);
+            original.register(Some(id), 0.0, Some(&a));
+            selected.register(Some(id), 0.0, Some(&b));
+            let label = decision::Label {
+                id,
+                at: 12.0,
+                observed_at: 12.0,
+                elapsed: 12.0,
+                exact: true,
+                first_label_at: 12.0,
+                snapshot: a.training_snapshot,
+            };
+            assert_eq!(original.label(&label, true), selected.label(&label, true));
+        }
+        original.poll(13.0, Some(7), 0, true, 30.0);
+        selected.poll(13.0, Some(7), 0, true, 30.0);
+        assert_eq!(original.fit.diagnostics(), selected.fit.diagnostics());
+        assert_eq!(
+            original.pending_expiry_credit,
+            selected.pending_expiry_credit
+        );
+        let (basis, pending) = admissions(14.0, 0, 100.0, 10.0);
+        assert_eq!(
+            serde_json::to_value(original.admission(&basis, Some(&pending), None)).unwrap(),
+            serde_json::to_value(selected.admission(&basis, Some(&pending), None)).unwrap()
+        );
+    }
+
+    #[test]
+    fn raw_fallback_preserves_native_projection_and_unavailable_named_source() {
+        let mut state = State::default();
+        state.poll(0.0, Some(7), 0, true, 30.0);
+        let (basis, pending) = admissions(0.0, 0, 100.0, 10.0);
+        let initial = state.admission(&basis, Some(&pending), None);
+        for case in 0..5 {
+            let mut a = initial.clone();
+            match case {
+                0 => {
+                    project_rows([(100.0, None)], 10.0, 2.0, 1.0, &mut a.projection).unwrap();
+                }
+                1 => a.predictions[1].available = false,
+                2 => a.training_snapshot.fresh = false,
+                3 => a.training_snapshot.native_ready = false,
+                _ => a.projection.stable_work_fallback_seconds = Some(999.0),
+            }
+            let before = serde_json::to_value(&a).unwrap();
+            a.select_raw_fallback(RawFallback::new(2.0, "measured", 42.0));
+            assert_eq!(serde_json::to_value(a).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn raw_fallback_requires_finite_nonnegative_components_and_known_baseline() {
+        for (baseline, source, extra) in [
+            (f64::NAN, "measured", 1.0),
+            (1.0, "measured", f64::INFINITY),
+            (-1.0, "provisional", 42.0),
+            (1.0, "measured", -1.0),
+            (f64::MAX, "measured", f64::MAX),
+            (1.0, "unknown", 42.0),
+        ] {
+            assert!(RawFallback::new(baseline, source, extra).is_none());
+        }
+        let zero = RawFallback::new(0.0, "measured", 0.0).unwrap();
+        near(zero.total_ttft_seconds, 0.0);
+    }
+
     #[test]
     fn own_x_reference_is_immutable_and_delayed_old_basis_labels_cannot_contaminate() {
         let mut state = State::default();
