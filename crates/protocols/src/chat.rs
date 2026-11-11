@@ -671,6 +671,50 @@ impl GenerationRequest for ChatCompletionRequest {
         Some(&self.model)
     }
 
+    fn prompt_work_hint(&self) -> super::common::PromptWorkHint {
+        use super::common::PromptWorkHint;
+        // Tool schemas and multimodal inputs require a model-specific processor.
+        #[expect(deprecated)]
+        if self.tools.is_some() || self.functions.is_some() || self.n.is_some_and(|n| n != 1) {
+            return PromptWorkHint::Unknown;
+        }
+        let mut bytes = 0usize;
+        for message in &self.messages {
+            let content = match message {
+                ChatMessage::User { content, .. } => content,
+                ChatMessage::System { content, ext, .. } if ext.tools.is_none() => content,
+                ChatMessage::Developer {
+                    content,
+                    tools: None,
+                    ..
+                } => content,
+                ChatMessage::Assistant {
+                    content: Some(content),
+                    tool_calls: None,
+                    reasoning_content: None,
+                    ..
+                } => content,
+                _ => return PromptWorkHint::Unknown,
+            };
+            let count = match content {
+                MessageContent::Text(text) => Some(text.len()),
+                MessageContent::Parts(parts) => parts.iter().try_fold(0usize, |sum, part| {
+                    if let ContentPart::Text { text } = part {
+                        sum.checked_add(text.len())
+                    } else {
+                        None
+                    }
+                }),
+            };
+            let Some(sum) = count.and_then(|count| bytes.checked_add(count)) else {
+                return PromptWorkHint::Unknown;
+            };
+            bytes = sum;
+        }
+        // Message/template delimiters are deliberately not guessed as exact tokens.
+        PromptWorkHint::TextBytes(bytes)
+    }
+
     fn extract_text_for_routing(&self) -> String {
         // Extract text from messages for routing decisions
         // Use a single buffer to avoid intermediate Vec<String> allocations

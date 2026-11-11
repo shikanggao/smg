@@ -59,6 +59,21 @@ use crate::{
     routers::common::overload,
 };
 
+mod basis;
+mod deadline_recovery;
+mod decision;
+mod feature;
+mod native_deadline;
+mod pending_work;
+mod recovery;
+mod survival;
+static NATIVE_GATEWAY_EPOCH: OnceLock<uuid::Uuid> = OnceLock::new();
+use feature::{
+    Activity, Context as FeatureContext, DeadlineHandle, DeadlineResolution, Deadlines,
+    Outcome as FeatureOutcome,
+};
+use recovery::{RecoveryForecast, RecoveryTracker};
+
 /// All defaults are starting points for calibration, not capacity guarantees.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -83,6 +98,13 @@ pub struct EstimatedWaitConfig {
     pub estimated_wait_shadow: bool,
     /// Learn excess-TTFT correction for diagnostics only; never changes admission.
     pub estimated_wait_calibration_shadow: bool,
+    /// Experimental C2 candidate and paired control; requires calibration shadow.
+    /// Predictions never replace raw admission.
+    pub estimated_wait_feature_shadow: bool,
+    /// Opt-in native first-output budget for regular HTTP feature streams.
+    /// Sent as remaining time at dispatch; requires a verified enforcing engine.
+    /// Independent of admission thresholds; absent means no native deadline.
+    pub estimated_wait_native_hard_ttft_timeout_secs: Option<f64>,
     /// Same-model deployment baseline for diagnostic calibration until measured.
     pub estimated_wait_provisional_baseline_secs: Option<f64>,
 }
@@ -100,6 +122,8 @@ impl Default for EstimatedWaitConfig {
             estimated_wait_max_snapshot_age_secs: 30.0,
             estimated_wait_shadow: false,
             estimated_wait_calibration_shadow: false,
+            estimated_wait_feature_shadow: false,
+            estimated_wait_native_hard_ttft_timeout_secs: None,
             estimated_wait_provisional_baseline_secs: None,
         }
     }
@@ -107,6 +131,26 @@ impl Default for EstimatedWaitConfig {
 
 impl EstimatedWaitConfig {
     pub fn validate(&self) -> ConfigResult<()> {
+        if self
+            .estimated_wait_native_hard_ttft_timeout_secs
+            .is_some_and(|value| {
+                !self.estimated_wait_feature_shadow
+                    || !value.is_finite()
+                    || value <= 0.0
+                    || value > 86400.0
+            })
+        {
+            return Err(ConfigError::InvalidValue { field: "estimated_wait_native_hard_ttft_timeout_secs".into(),
+                value: format!("{:?}", self.estimated_wait_native_hard_ttft_timeout_secs),
+                reason: "Requires feature shadow and a finite native first-output budget in (0,86400] seconds; omitted by default".into() });
+        }
+        if self.estimated_wait_feature_shadow && !self.estimated_wait_calibration_shadow {
+            return Err(ConfigError::InvalidValue {
+                field: "estimated_wait_feature_shadow".into(),
+                value: "true".into(),
+                reason: "Requires estimated_wait_calibration_shadow".into(),
+            });
+        }
         if self.estimated_wait_kv_pressure_weight != 0.0 {
             return Err(ConfigError::InvalidValue {
                 field: "estimated_wait_kv_pressure_weight".to_string(),
@@ -302,6 +346,15 @@ impl EstimatedWaitConfig {
             self.estimated_wait_dispatch_blocking_factor,
         );
         estimate.seconds(0).is_finite().then_some(PreparedWait {
+            size_basis: basis::provenance(
+                load,
+                f64::from(if self.estimated_wait_queue_tokens_per_request > 0 {
+                    self.estimated_wait_queue_tokens_per_request
+                } else {
+                    self.estimated_wait_mean_prefill_tokens
+                }),
+                self.estimated_wait_prompt_size_prior_samples,
+            ),
             estimate,
             native_estimate: estimate,
             native_waiting: load
@@ -314,6 +367,77 @@ impl EstimatedWaitConfig {
                 .iter()
                 .map(|rank| f64::from(rank.num_running_reqs.max(0)))
                 .sum(),
+            kv_usage: (!load.loads.is_empty()
+                && load.dp_rank_count as usize == load.loads.len()
+                && load
+                    .loads
+                    .iter()
+                    .map(|r| r.dp_rank)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    == load.loads.len()
+                && load.loads.iter().all(|rank| {
+                    rank.native_kv_usage_available == Some(true)
+                        && rank.token_usage.is_finite()
+                        && (0.0..=1.0).contains(&rank.token_usage)
+                }))
+            .then(|| {
+                load.loads.iter().map(|rank| rank.token_usage).sum::<f64>()
+                    / load.loads.len() as f64
+            }),
+            decision_profile: {
+                use std::{
+                    collections::hash_map::DefaultHasher,
+                    hash::{Hash, Hasher},
+                };
+                let mut h = DefaultHasher::new();
+                let mut ranks: Vec<_> = load
+                    .loads
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.dp_rank,
+                            r.native_request_counts_profile,
+                            r.timely_prefill_progress_source.as_deref(),
+                        )
+                    })
+                    .collect();
+                ranks.sort_unstable();
+                ranks.hash(&mut h);
+                h.finish()
+            },
+            progress_capacity: learned.filter(|v| v.is_finite() && *v > 0.0),
+            timely_progress: (!load.loads.is_empty()
+                && load.dp_rank_count as usize == load.loads.len()
+                && load
+                    .loads
+                    .iter()
+                    .map(|r| r.dp_rank)
+                    .collect::<HashSet<_>>()
+                    .len()
+                    == load.loads.len())
+            .then(|| {
+                load.loads.iter().try_fold(0.0, |sum, r| {
+                    if r.native_request_counts_available != Some(true)
+                        || r.native_request_counts_profile.is_none()
+                        || !matches!(
+                            r.timely_prefill_progress_source.as_deref(),
+                            Some("local_compute_tokens" | "prefill_started_requests")
+                        )
+                        || !r.timely_prefill_progress_interval.is_some_and(|s| {
+                            s.is_finite()
+                                && s > 0.0
+                                && s <= self.estimated_wait_max_snapshot_age_secs
+                        })
+                    {
+                        return None;
+                    }
+                    r.timely_prefill_progress
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .map(|v| sum + v)
+                })
+            })
+            .flatten(),
             pending_engine: 0.0,
             proxy,
             fallback,
@@ -374,10 +498,15 @@ impl EstimatedWaitConfig {
 
 #[derive(Clone, Copy, Debug)]
 struct PreparedWait {
+    size_basis: Option<basis::Provenance>,
     estimate: ExpectedWait,
     native_estimate: ExpectedWait,
     native_waiting: f64,
     native_running: f64,
+    kv_usage: Option<f64>,
+    decision_profile: u64,
+    timely_progress: Option<f64>,
+    progress_capacity: Option<f64>,
     pending_engine: f64,
     proxy: bool,
     fallback: bool,
@@ -486,6 +615,42 @@ const CALIBRATION_HISTORY_MAX_AGE: Duration = Duration::from_secs(600);
 const CALIBRATION_BANK_DURATION: Duration = Duration::from_secs(300);
 const CALIBRATION_METHOD: &str = "mse_poll_two_wave_queue_v2";
 
+// Shared across workers/epochs; diagnostic clock starts at its first use.
+pub(super) fn diagnostic_time(now: Instant) -> f64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    let origin = *ORIGIN.get_or_init(|| now);
+    now.checked_duration_since(origin).map_or_else(
+        || -origin.duration_since(now).as_secs_f64(),
+        |elapsed| elapsed.as_secs_f64(),
+    )
+}
+
+fn poll_outcome(
+    generation_matches: bool,
+    previous: Option<Instant>,
+    started: Instant,
+    now: Instant,
+    has_load: bool,
+    prepared: bool,
+    max_age: f64,
+) -> &'static str {
+    if !generation_matches {
+        "generation_changed"
+    } else if previous.is_some_and(|last| last > started) {
+        "out_of_order"
+    } else if previous == Some(started) {
+        "duplicate"
+    } else if !has_load {
+        "failed"
+    } else if !prepared {
+        "invalid_load"
+    } else if now.saturating_duration_since(started).as_secs_f64() > max_age {
+        "stale"
+    } else {
+        "success"
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum BaselineSource {
     #[default]
@@ -534,9 +699,52 @@ pub(crate) struct CalibrationForecast {
     history_revision: u64,
     fitted_revision: u64,
     threshold: f64,
+    feature_context: Option<FeatureContext>,
+    decision_admission: Option<Box<decision::Admission>>,
+    basis_admission: Option<Box<basis::Admission>>,
+    survival_admission: Option<Box<survival::Admission>>,
+    pending_work_admission: Option<Box<pending_work::Admission>>,
+    deadline_dispatch: Option<Arc<deadline_recovery::DispatchLease>>,
+    native_hard_ttft_timeout_secs: Option<f64>,
+    native_deadline_capability_valid_until: Option<Instant>,
+    prompt_work: pending_work::Estimate,
 }
 
 impl CalibrationForecast {
+    pub(crate) fn native_dispatch_headers(
+        &self,
+        request_started: Instant,
+        now: Instant,
+    ) -> Result<Option<(&str, Option<u64>)>, &'static str> {
+        let Some(lease) = &self.deadline_dispatch else {
+            return if self.native_hard_ttft_timeout_secs.is_some() {
+                Err("native_deadline_request_not_tracked")
+            } else {
+                Ok(None)
+            };
+        };
+        let timeout = if let Some(seconds) = self.native_hard_ttft_timeout_secs {
+            if self
+                .native_deadline_capability_valid_until
+                .is_none_or(|expiry| now > expiry)
+            {
+                return Err("native_deadline_not_verified_or_stale");
+            }
+            let remaining = seconds - now.saturating_duration_since(request_started).as_secs_f64();
+            if remaining < 0.001 {
+                return Err("native_deadline_budget_exhausted_before_dispatch");
+            }
+            Some((remaining * 1000.0).floor() as u64)
+        } else {
+            None
+        };
+        Ok(Some((lease.native_attempt(), timeout)))
+    }
+
+    pub(crate) fn set_prompt_work(&mut self, hint: openai_protocol::common::PromptWorkHint) {
+        self.prompt_work = pending_work::Estimate::from_hint(hint);
+    }
+
     fn queue_visible(&self) -> bool {
         self.native_waiting > 0.0
     }
@@ -617,6 +825,8 @@ struct ExcessCalibration {
     bank_index: u64,
     history_revision: [u64; 2],
     fitted_revision: [u64; 2],
+    // Diagnostics only: never used for eligibility, retention or fitting.
+    last_feedback: [Option<(Instant, Instant)>; 2],
 }
 
 impl Default for ExcessCalibration {
@@ -638,6 +848,7 @@ impl ExcessCalibration {
             bank_index: 0,
             history_revision: [0; 2],
             fitted_revision: [0; 2],
+            last_feedback: [None; 2],
         }
     }
 
@@ -678,6 +889,7 @@ impl ExcessCalibration {
                 self.previous_count[index]
             };
             self.samples[index].drain(..remove);
+
             self.previous_count[index] = self.samples[index].len();
             if remove > 0 {
                 self.history_revision[index] += 1;
@@ -754,6 +966,7 @@ impl ExcessCalibration {
         let index = usize::from(forecast.native_capacity_ready);
         let samples = &mut self.samples[index];
         samples.push_back((ratio, forecast.queue_extra));
+        self.last_feedback[index] = Some((now, forecast.captured_at));
         self.accepted[index] += 1;
         self.history_revision[index] += 1;
         if samples.len() - self.previous_count[index] > TTFT_WINDOW_SAMPLES {
@@ -805,6 +1018,7 @@ struct TtftProbe {
     backlog_size: f64,
     calibration: Option<CalibrationForecast>,
     request_id: Option<String>,
+    pending_work: Option<pending_work::Handle>,
 }
 
 /// Observe standard OpenAI SSE without altering or delaying relayed bytes.
@@ -816,11 +1030,48 @@ pub(crate) struct StreamTtftObserver {
     first_event: Option<Instant>,
     pending: Vec<u8>,
     done: bool,
+    worker_url: String,
     request_id: Option<String>,
+    feature_identity: Option<CalibrationForecast>,
+    feature_resolved: bool,
+    feature_deadline: Option<DeadlineHandle>,
+    native_deadline_pending: bool,
 }
 
 impl StreamTtftObserver {
+    pub(crate) fn transport_event(&self, phase: &'static str) {
+        if phase == "upstream_send_started" {
+            if let Some(lease) = self.deadline_dispatch() {
+                lease.forwarded();
+            }
+        }
+        tracing::debug!(target: "smg::estimated_wait::observation",
+            event = "request_transport", phase, worker = self.worker_url,
+            request_id = self.request_id.as_deref().unwrap_or(""),
+            diagnostic_time_seconds = diagnostic_time(Instant::now()),
+            request_elapsed_seconds = self.started.elapsed().as_secs_f64(),
+            engine_cancellation_acknowledgement = "unavailable",
+            engine_ack_observable = false,
+            native_attempt_id = self.deadline_dispatch().map_or("", |lease| lease.native_attempt()));
+    }
+
+    fn deadline_dispatch(&self) -> Option<&Arc<deadline_recovery::DispatchLease>> {
+        self.feature_identity
+            .as_ref()
+            .and_then(|f| f.deadline_dispatch.as_ref())
+            .or_else(|| {
+                self.probe
+                    .as_ref()?
+                    .calibration
+                    .as_ref()?
+                    .deadline_dispatch
+                    .as_ref()
+            })
+    }
+
     pub(crate) fn cancel(&mut self) {
+        // Observation stopped by backpressure is unknown, not proof of cutoff.
+        self.feature_outcome(FeatureOutcome::Unknown);
         self.finish_probe();
         self.pending.clear();
         self.done = true;
@@ -839,7 +1090,12 @@ impl StreamTtftObserver {
             first_event: None,
             pending: Vec::new(),
             done: false,
+            worker_url: worker_url.to_owned(),
             request_id: None,
+            feature_identity: None,
+            feature_resolved: false,
+            feature_deadline: None,
+            native_deadline_pending: false,
         }
     }
 
@@ -852,6 +1108,25 @@ impl StreamTtftObserver {
     }
 
     pub(crate) fn with_calibration(mut self, forecast: Option<CalibrationForecast>) -> Self {
+        if let (Some(registry), Some(probe)) = (self.registry.upgrade(), self.probe.as_mut()) {
+            registry
+                .estimated_wait()
+                .register_pending_work(probe, forecast.as_ref());
+        }
+        self.feature_identity = forecast
+            .as_ref()
+            .filter(|f| f.feature_context.is_some())
+            .cloned();
+        if let (Some(registry), Some(identity)) =
+            (self.registry.upgrade(), self.feature_identity.as_ref())
+        {
+            self.feature_deadline = registry.estimated_wait().register_feature_deadline(
+                &self.worker_url,
+                self.request_id.as_deref(),
+                identity,
+                self.started,
+            );
+        }
         if let Some(probe) = &mut self.probe {
             probe.calibration = forecast;
         }
@@ -859,10 +1134,19 @@ impl StreamTtftObserver {
     }
 
     pub(crate) fn push(&mut self, bytes: &[u8]) {
-        if self.probe.is_none() {
+        if self.probe.is_none() && (self.feature_identity.is_none() || self.feature_resolved) {
             return;
         }
-        if let Some((ttft, visibility)) = self.scan(bytes, Instant::now()) {
+        let _observation_claim = self
+            .feature_deadline
+            .as_ref()
+            .and_then(DeadlineHandle::observing);
+        let observed_at = Instant::now();
+        if let Some((ttft, visibility)) = self.scan(bytes, observed_at) {
+            if let Some(lease) = self.deadline_dispatch() {
+                lease.first_text();
+            }
+            self.feature_outcome_at(FeatureOutcome::FirstText, observed_at);
             tracing::debug!(
                 target: "smg::estimated_wait::observation",
                 event = "first_text",
@@ -878,11 +1162,47 @@ impl StreamTtftObserver {
         }
     }
 
+    fn feature_outcome(&mut self, outcome: FeatureOutcome) {
+        if let Some(deadline) = &self.feature_deadline {
+            deadline.claim_terminal();
+        }
+        self.feature_outcome_at(outcome, Instant::now());
+    }
+    fn feature_outcome_at(&mut self, outcome: FeatureOutcome, observed_at: Instant) {
+        if self.feature_resolved {
+            return;
+        }
+        self.feature_resolved = true;
+        if let Some(deadline) = &self.feature_deadline {
+            deadline.claim_terminal();
+        }
+        if let (Some(registry), Some(identity)) =
+            (self.registry.upgrade(), self.feature_identity.as_ref())
+        {
+            registry.estimated_wait().record_feature_outcome(
+                &self.worker_url,
+                self.request_id.as_deref(),
+                identity,
+                outcome,
+                self.feature_deadline.take(),
+                self.started,
+                observed_at,
+            );
+        }
+    }
+    pub(crate) fn upstream_timeout(&mut self) {
+        self.feature_outcome(FeatureOutcome::Timeout);
+    }
+    pub(crate) fn downstream_disconnected(&mut self) {
+        self.feature_outcome(FeatureOutcome::Disconnect);
+    }
+
     fn scan(&mut self, bytes: &[u8], now: Instant) -> Option<(f64, f64)> {
         if self.done {
             return None;
         }
         if self.pending.len().saturating_add(bytes.len()) > MAX_TTFT_EVENT_BYTES {
+            self.feature_outcome(FeatureOutcome::Unknown);
             self.done = true;
             self.pending.clear();
             return None;
@@ -895,6 +1215,13 @@ impl StreamTtftObserver {
             };
             let data = data.trim_ascii();
             if data == b"[DONE]" {
+                if self.native_deadline_pending {
+                    self.feature_outcome_at(FeatureOutcome::NativeDeadline, now);
+                    self.finish_probe();
+                    self.done = true;
+                    self.pending.clear();
+                    return None;
+                }
                 continue;
             }
             let Ok(value) = serde_json::from_slice::<serde_json::Value>(data) else {
@@ -930,6 +1257,29 @@ impl StreamTtftObserver {
                     now.duration_since(first_event).as_secs_f64(),
                 ));
             }
+            let native_deadline_expected = self
+                .feature_identity
+                .as_ref()
+                .or_else(|| {
+                    self.probe
+                        .as_ref()
+                        .and_then(|probe| probe.calibration.as_ref())
+                })
+                .is_some_and(|forecast| {
+                    forecast.native_hard_ttft_timeout_secs.is_some()
+                        && forecast.deadline_dispatch.is_some()
+                });
+            if native_deadline_expected
+                && value.get("error").is_some_and(|error| {
+                    error.get("type").and_then(|v| v.as_str()) == Some("native_ttft_deadline")
+                        && error
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|v| !v.is_empty())
+                })
+            {
+                self.native_deadline_pending = true;
+            }
         }
         None
     }
@@ -937,6 +1287,8 @@ impl StreamTtftObserver {
 
 impl Drop for StreamTtftObserver {
     fn drop(&mut self) {
+        self.transport_event("observer_dropped");
+        self.feature_outcome(FeatureOutcome::Unknown);
         self.finish_probe();
     }
 }
@@ -950,6 +1302,8 @@ struct Sample {
     // Latched on publication and dispatch, just like the static overload bit.
     // The request path only reads it and checks freshness.
     overloaded: Option<bool>,
+    pending_work_queue: Option<pending_work::Queue>,
+    pending_work_capacity_progress_source: Option<String>,
 }
 
 #[derive(Debug)]
@@ -957,6 +1311,7 @@ struct Entry {
     source: Weak<dyn Worker>,
     generation: Arc<()>,
     total_dispatched: u64,
+    total_dispatched_requests: u64,
     // Keep ordering even for failed polls, which must supersede older successes.
     last_published: Option<Instant>,
     sample: Option<Sample>,
@@ -975,6 +1330,16 @@ struct Entry {
     calibration_profile: Option<(bool, Option<u64>)>,
     calibration_empty_polls: u8,
     calibration_baseline: (Option<f64>, BaselineSource),
+    recovery: RecoveryTracker,
+    feature_activity: Activity,
+    feature_deadlines: Deadlines,
+    decision: decision::State,
+    basis_decision: basis::State,
+    survival: survival::State,
+    pending_work: pending_work::Inventory,
+    pending_work_profile: Option<u64>,
+    deadline_work: Arc<std::sync::Mutex<deadline_recovery::AcceptedWork>>,
+    native_deadline: native_deadline::State,
 }
 
 impl Entry {
@@ -983,6 +1348,7 @@ impl Entry {
             source: Arc::downgrade(worker),
             generation: Arc::new(()),
             total_dispatched: 0,
+            total_dispatched_requests: 0,
             last_published: None,
             sample: None,
             low_load_ttfts: VecDeque::new(),
@@ -1000,12 +1366,25 @@ impl Entry {
             calibration_profile: None,
             calibration_empty_polls: 0,
             calibration_baseline: (None, BaselineSource::Unknown),
+            recovery: RecoveryTracker::default(),
+            feature_activity: Activity::new(Instant::now()),
+            feature_deadlines: Deadlines::default(),
+            decision: decision::State::default(),
+            basis_decision: basis::State::default(),
+            survival: survival::State::default(),
+            pending_work: pending_work::Inventory::default(),
+            pending_work_profile: None,
+            deadline_work: Arc::new(std::sync::Mutex::new(
+                deadline_recovery::AcceptedWork::default(),
+            )),
+            native_deadline: native_deadline::State::default(),
         }
     }
 
     fn invalidate(&mut self) {
         self.generation = Arc::new(());
         self.total_dispatched = 0;
+        self.total_dispatched_requests = 0;
         self.last_published = None;
         self.sample = None;
         self.low_load_ttfts.clear();
@@ -1016,13 +1395,25 @@ impl Entry {
         self.backlog_peak_size = 0.0;
         self.pipeline_idle = true;
         self.reset_calibration(Instant::now(), "worker_invalidated");
+        self.deadline_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reset();
+        self.native_deadline = native_deadline::State::default();
         self.calibration_profile = None;
         self.calibration_empty_polls = 0;
         self.backlog_generation = self.backlog_generation.wrapping_add(1);
     }
 
     fn reset_calibration(&mut self, now: Instant, reason: &'static str) {
+        self.recovery.reset(reason);
         self.calibration = ExcessCalibration::new(now);
+        self.feature_activity = Activity::new(now);
+        self.feature_deadlines = Deadlines::default();
+        self.decision = decision::State::default();
+        self.basis_decision = basis::State::default();
+        self.survival = survival::State::default();
+        self.pending_work.reset();
         self.calibration_baseline = (None, BaselineSource::Unknown);
         self.calibration_generation = Arc::new(());
         self.calibration_epoch = self.calibration_epoch.wrapping_add(1);
@@ -1031,6 +1422,310 @@ impl Entry {
                 event = "calibration_reset", worker = worker.url(), reason,
                 calibration_epoch = self.calibration_epoch);
         }
+    }
+
+    fn feature_activity_context(&self, now: Instant, kv: Option<f64>) -> FeatureContext {
+        let mut context = self.feature_activity.context(now, kv);
+        context.deadline_untracked_pending = self.feature_deadlines.untracked;
+        if context.deadline_untracked_pending > 0 {
+            context.values[1] = None;
+        }
+        context
+    }
+
+    fn record_deadline_resolution(
+        &mut self,
+        worker: &str,
+        resolved: DeadlineResolution,
+        observed_at: Instant,
+        now: Instant,
+        source: &str,
+    ) {
+        if source == "poll" {
+            if let Some(label) = resolved.tracking_id.and_then(|id| {
+                self.decision.label(
+                    id,
+                    diagnostic_time(observed_at),
+                    diagnostic_time(now),
+                    false,
+                    false,
+                    Some(300.0),
+                )
+            }) {
+                self.log_decision_label(worker, &label, "poll_deadline", false);
+            }
+        }
+        self.feature_activity.record(now, resolved.outcome);
+        tracing::debug!(target:"smg::estimated_wait::observation", event="feature_deadline_resolution", feature_method=feature::METHOD,
+            worker, request_id=resolved.request_id.as_deref().unwrap_or(""), calibration_epoch=self.calibration_epoch,
+            resolution=resolved.outcome.name(), resolution_source=source, diagnostic_time_seconds=diagnostic_time(now),
+            observed_time_seconds=diagnostic_time(observed_at), request_started_time_seconds=diagnostic_time(resolved.started),
+            deadline_time_seconds=diagnostic_time(resolved.started+feature::TTFT_DEADLINE), deadline_seconds=feature::TTFT_DEADLINE.as_secs(),
+            elapsed_seconds=observed_at.saturating_duration_since(resolved.started).as_secs_f64(),
+            native_cancellation_acknowledgement="unavailable",
+            feature_json=%serde_json::json!({"activity":self.feature_activity_context(now,None),"counts":self.feature_activity_context(now,None).counts}));
+    }
+
+    fn advance_feature_deadlines(&mut self, worker: &str, now: Instant) {
+        for resolved in self.feature_deadlines.advance(now) {
+            self.record_deadline_resolution(worker, resolved, now, now, "poll");
+        }
+    }
+
+    fn feature_context(&self, now: Instant, fresh: bool) -> FeatureContext {
+        self.feature_activity_context(
+            now,
+            self.sample
+                .as_ref()
+                .filter(|_| fresh)
+                .and_then(|s| s.prepared.kv_usage),
+        )
+    }
+
+    fn decision_snapshot(
+        &self,
+        config: &EstimatedWaitConfig,
+        now: Instant,
+    ) -> Option<decision::Snapshot> {
+        let sample = self.sample.as_ref()?;
+        let fresh = now.saturating_duration_since(sample.started).as_secs_f64()
+            <= config.estimated_wait_max_snapshot_age_secs;
+        let baseline = self.calibration_baseline.0?;
+        let scalar = self
+            .calibration
+            .stats(sample.prepared.capacity_learned_ready, now)
+            .0;
+        let original = sample
+            .prepared
+            .queue_excess_seconds(self.total_dispatched.saturating_sub(sample.watermark));
+        let live = self
+            .recovery_forecast(config, now)
+            .filter(|r| r.available)
+            .map(|r| r.queue_extra);
+        let x = live.unwrap_or(original);
+        let context = self.decision.context(
+            diagnostic_time(now),
+            sample.prepared.timely_progress.filter(|_| fresh),
+            sample
+                .prepared
+                .capacity_learned_ready
+                .then_some(sample.prepared.progress_capacity)
+                .flatten(),
+            sample.prepared.has_backlog,
+        );
+        Some(decision::Snapshot {
+            size_basis: self.basis_decision.stamp(sample.prepared.size_basis),
+            at: diagnostic_time(now),
+            profile: sample.prepared.decision_profile,
+            baseline,
+            x,
+            source: if live.is_some() {
+                "live_n"
+            } else {
+                "original_n_fallback"
+            },
+            context,
+            original_queue_extra: original,
+            live_queue_extra: live,
+            scalar_gain: scalar,
+            fresh,
+            native_ready: sample.prepared.capacity_learned_ready,
+            native_waiting: sample.prepared.native_waiting,
+            poll_started: diagnostic_time(sample.started),
+            eligible: fresh
+                && sample.prepared.capacity_learned_ready
+                && sample.prepared.native_waiting > 0.0
+                && baseline.is_finite()
+                && x.is_finite()
+                && x >= 0.001,
+        })
+    }
+
+    fn pending_work_admission(
+        &self,
+        config: &EstimatedWaitConfig,
+        original: &decision::Admission,
+        now: Instant,
+    ) -> Option<pending_work::Admission> {
+        let sample = self.sample.as_ref()?;
+        let mut queue = sample.pending_work_queue?;
+        let snapshot = original.snapshot;
+        if queue.summary.generation != self.pending_work.generation() {
+            queue.applied = false;
+            queue.candidate_tokens = queue.original_tokens;
+            queue.reason = "inventory_generation_changed";
+        }
+        if !snapshot.fresh || !snapshot.native_ready {
+            queue.applied = false;
+            queue.candidate_tokens = queue.original_tokens;
+            queue.reason = if snapshot.fresh {
+                "capacity_unready"
+            } else {
+                "stale_native_sample"
+            };
+        }
+        let capacity = sample.prepared.native_prefill_capacity;
+        let debt = (snapshot.original_queue_extra - queue.original_tokens / capacity).max(0.0);
+        let available = snapshot.fresh && snapshot.native_ready;
+        let recovery_cap_seconds = if available && snapshot.source == "live_n" {
+            self.recovery_forecast(config, now)
+                .filter(|r| r.available)
+                .and_then(|r| r.population.zip(r.rate))
+                .and_then(|(population, rate)| {
+                    let cap = population / rate;
+                    (rate > 0.0 && cap.is_finite() && cap >= 0.0).then_some(cap)
+                })
+        } else {
+            None
+        };
+        let (control_x, recovery_fraction) =
+            pending_work::candidate_x(queue, capacity, debt, snapshot.x, recovery_cap_seconds);
+        // The source belongs to the same native poll as the queue and capacity.
+        // Request-start capacity does not measure the pending full-prompt cohort.
+        let capacity_progress_source = sample.pending_work_capacity_progress_source.clone();
+        let selected_pending_applied =
+            queue.applied && capacity_progress_source.as_deref() == Some("local_compute_tokens");
+        let source_gate_reason = if queue.applied {
+            match capacity_progress_source.as_deref() {
+                Some("local_compute_tokens") => "local_compute_tokens",
+                Some(_) => "capacity_progress_source_unsupported",
+                None => "capacity_progress_source_missing",
+            }
+        } else {
+            "pending_queue_fallback"
+        };
+        let candidate_x = if selected_pending_applied {
+            control_x
+        } else {
+            snapshot.x
+        };
+        let candidate = decision::Snapshot {
+            x: candidate_x,
+            ..snapshot
+        };
+        Some(pending_work::Admission {
+            method: pending_work::METHOD,
+            current_inventory_generation: self.pending_work.generation(),
+            queue,
+            capacity_progress_source,
+            selected_pending_applied,
+            source_gate_reason,
+            poll_started: diagnostic_time(sample.started),
+            at: snapshot.at,
+            debt_seconds: debt,
+            capacity,
+            recovery_fraction,
+            recovery_cap_seconds,
+            original_x: snapshot.x,
+            control_x,
+            candidate_x,
+            original_raw_total: snapshot.baseline + snapshot.x,
+            control_raw_total: snapshot.baseline + control_x,
+            candidate_raw_total: snapshot.baseline + candidate_x,
+            original_predictions: original.predictions.clone(),
+            control_predictions: self.decision.predictions(
+                decision::Snapshot {
+                    x: control_x,
+                    ..snapshot
+                },
+                diagnostic_time(now),
+                available,
+            ),
+            predictions: if selected_pending_applied {
+                self.decision
+                    .predictions(candidate, diagnostic_time(now), available)
+            } else {
+                original.predictions.clone()
+            },
+            available,
+        })
+    }
+
+    fn log_decision_label(
+        &mut self,
+        worker: &str,
+        label: &decision::Label,
+        reason: &str,
+        terminal: bool,
+    ) {
+        tracing::debug!(target:"smg::estimated_wait::observation",event="decision_label",decision_method=decision::METHOD,
+            worker,calibration_epoch=self.calibration_epoch,diagnostic_time_seconds=label.at,reason,decision_json=%serde_json::json!({"label":label}));
+        let accepted = self.basis_decision.label(label, terminal);
+        if accepted.is_some() {
+            let disposition = self.survival.label(label, terminal);
+            tracing::debug!(target:"smg::estimated_wait::observation",event="survival_decision_label",survival_method=survival::METHOD,
+                worker,calibration_epoch=self.calibration_epoch,diagnostic_time_seconds=label.at,
+                survival_json=%serde_json::json!({"id":label.id,"exact":label.exact,"terminal":terminal,"training_disposition":disposition}));
+        }
+        tracing::debug!(target:"smg::estimated_wait::observation",event="basis_decision_label",basis_method=basis::METHOD,
+            worker,calibration_epoch=self.calibration_epoch,diagnostic_time_seconds=label.at,reason,
+            basis_decision_json=%serde_json::json!({"label":accepted.as_ref().unwrap_or(label),
+                "accepted":accepted.is_some(),"basis_epoch":self.basis_decision.epoch,
+                "basis_reason":if accepted.is_some(){"same_admission_basis"}else{"untracked_or_changed_admission_basis"}}));
+    }
+
+    fn log_decision(
+        &self,
+        config: &EstimatedWaitConfig,
+        now: Instant,
+        event: &str,
+        worker: &str,
+        request_id: &str,
+        scoped: bool,
+    ) {
+        if !config.estimated_wait_feature_shadow {
+            return;
+        }
+        let snapshot = self.decision_snapshot(config, now);
+        let fresh = self.sample.as_ref().is_some_and(|s| {
+            now.saturating_duration_since(s.started).as_secs_f64()
+                <= config.estimated_wait_max_snapshot_age_secs
+        });
+        let available = scoped
+            && fresh
+            && self
+                .sample
+                .as_ref()
+                .is_some_and(|s| s.prepared.capacity_learned_ready)
+            && snapshot.is_some();
+        tracing::debug!(target:"smg::estimated_wait::observation",event,decision_method=decision::METHOD,worker,request_id,
+            calibration_epoch=self.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+            decision_json=%serde_json::json!({"snapshot":snapshot,"predictions":snapshot.map(|s|self.decision.predictions(s,diagnostic_time(now),available)),
+                "fresh":fresh,"profile":self.sample.as_ref().map(|s|s.prepared.decision_profile),
+                "max_gap":config.estimated_wait_max_snapshot_age_secs,
+                "available":available,"threshold":self.sample.as_ref().map(|s|s.threshold),"state":if event=="decision_poll"{Some(self.decision.diagnostics())}else{None}}));
+        if event == "decision_poll" {
+            tracing::debug!(target:"smg::estimated_wait::observation",event="basis_decision_poll",basis_method=basis::METHOD,
+                worker,calibration_epoch=self.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+                basis_decision_json=%serde_json::json!({"state":self.basis_decision.diagnostics(),
+                    "poll_started":self.sample.as_ref().map(|s|diagnostic_time(s.started)),"profile":self.sample.as_ref().map(|s|s.prepared.decision_profile)}));
+        }
+    }
+
+    fn recovery_forecast(
+        &self,
+        config: &EstimatedWaitConfig,
+        now: Instant,
+    ) -> Option<RecoveryForecast> {
+        if !config.estimated_wait_calibration_shadow {
+            return None;
+        }
+        let sample = self.sample.as_ref()?;
+        let dispatched = self.total_dispatched.saturating_sub(sample.watermark);
+        let queue = sample.prepared.queue_excess_seconds(0);
+        let debt = (sample.prepared.queue_excess_seconds(dispatched) - queue).max(0.0);
+        let gain = self
+            .calibration
+            .stats(sample.prepared.capacity_learned_ready, now)
+            .0;
+        Some(self.recovery.forecast(
+            now,
+            config.estimated_wait_max_snapshot_age_secs,
+            queue,
+            debt,
+            self.calibration_baseline.0,
+            gain,
+        ))
     }
 
     fn update_calibration_baseline(&mut self, config: &EstimatedWaitConfig, now: Instant) {
@@ -1165,6 +1860,17 @@ impl Entry {
             fitted_revision: self.calibration.fitted_revision
                 [usize::from(sample.prepared.capacity_learned_ready)],
             threshold: sample.threshold,
+            decision_admission: None,
+            basis_admission: None,
+            survival_admission: None,
+            pending_work_admission: None,
+            deadline_dispatch: None,
+            native_hard_ttft_timeout_secs: config.estimated_wait_native_hard_ttft_timeout_secs,
+            native_deadline_capability_valid_until: self
+                .native_deadline
+                .deadline_valid_until(now, config.estimated_wait_max_snapshot_age_secs),
+            prompt_work: pending_work::Estimate::default(),
+            feature_context: None,
         })
     }
 
@@ -1271,6 +1977,7 @@ impl EstimatedWaitAdmission {
             backlogged: sample.prepared.has_backlog,
             baseline: ttft_median(&entry.low_load_ttfts),
             observation_id: entry.next_observation_id,
+            pending_work: None,
             backlog_size: sample.prepared.backlog_size,
             calibration: None,
             request_id: None,
@@ -1281,6 +1988,228 @@ impl EstimatedWaitAdmission {
         Some(probe)
     }
 
+    fn register_feature_deadline(
+        &self,
+        worker: &str,
+        request_id: Option<&str>,
+        identity: &CalibrationForecast,
+        started: Instant,
+    ) -> Option<DeadlineHandle> {
+        if !self.config().estimated_wait_feature_shadow {
+            return None;
+        }
+        let mut entries = self.entries.lock();
+        let entry = entries.get_mut(worker);
+        let valid = entry.as_ref().is_some_and(|entry| {
+            Arc::ptr_eq(&entry.generation, &identity.generation)
+                && Arc::ptr_eq(
+                    &entry.calibration_generation,
+                    &identity.calibration_generation,
+                )
+        });
+        if !valid {
+            tracing::debug!(target:"smg::estimated_wait::observation", event="feature_deadline_ignored", feature_method=feature::METHOD,
+                worker,request_id=request_id.unwrap_or(""),admission_epoch=identity.epoch,
+                calibration_epoch=entry.as_ref().map(|e|e.calibration_epoch), reason="generation_changed_or_worker_missing",
+                diagnostic_time_seconds=diagnostic_time(Instant::now()));
+            return None;
+        }
+        let entry = entry?;
+        let handle = entry.feature_deadlines.register(started, request_id);
+        let now = Instant::now();
+        let tracking_id = match &handle {
+            DeadlineHandle::Tracked(id, _) => Some(*id),
+            DeadlineHandle::Untracked => None,
+        };
+        let tracked = entry.decision.register(
+            tracking_id,
+            diagnostic_time(started),
+            identity.decision_admission.as_ref().map(|a| a.snapshot),
+        );
+        let basis_tracked = entry.basis_decision.register(
+            tracking_id,
+            diagnostic_time(started),
+            identity.decision_admission.as_ref().map(|a| a.snapshot),
+        );
+        entry.survival.register(
+            tracking_id,
+            diagnostic_time(started),
+            identity.survival_admission.as_deref(),
+        );
+        let native_attempt_id = identity
+            .deadline_dispatch
+            .as_ref()
+            .map(|lease| lease.native_attempt());
+        entry.survival.native.register(
+            native_attempt_id,
+            diagnostic_time(now),
+            identity.prompt_work,
+        );
+        let scalar_total = identity.seconds();
+        let recorded_scalar_fallback = serde_json::json!({"method":"calibration_forecast",
+            "total":(scalar_total.is_finite()&&scalar_total>=0.0).then_some(scalar_total),
+            "baseline_available":identity.baseline.is_some(),"fresh":identity.fresh,
+            "native_capacity_ready":identity.native_capacity_ready,
+            "available":identity.baseline.is_some()&&identity.fresh&&scalar_total.is_finite()&&scalar_total>=0.0});
+        tracing::debug!(target:"smg::estimated_wait::observation",event="decision_admission",decision_method=decision::METHOD,
+            worker,request_id=request_id.unwrap_or(""),calibration_epoch=entry.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+            decision_json=%serde_json::json!({"id":tracking_id,"tracked":tracked,"started":diagnostic_time(started),"native_attempt_id":native_attempt_id,"snapshot":identity.decision_admission.as_ref().map(|a|a.snapshot),"predictions":identity.decision_admission.as_ref().map(|a|&a.predictions)}));
+        tracing::debug!(target:"smg::estimated_wait::observation",event="pending_work_admission",pending_work_method=pending_work::METHOD,
+            worker,request_id=request_id.unwrap_or(""),calibration_epoch=entry.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+            pending_work_json=%serde_json::json!({"id":tracking_id,"native_attempt_id":native_attempt_id,"recorded_scalar_fallback":recorded_scalar_fallback,"estimate":identity.prompt_work,"admission":identity.pending_work_admission}));
+        tracing::debug!(target:"smg::estimated_wait::observation",event="basis_decision_admission",basis_method=basis::METHOD,
+            worker,request_id=request_id.unwrap_or(""),calibration_epoch=entry.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+            basis_decision_json=%serde_json::json!({"id":tracking_id,"tracked":basis_tracked,"started":diagnostic_time(started),
+                "native_attempt_id":native_attempt_id,"recorded_scalar_fallback":recorded_scalar_fallback,"admission":identity.basis_admission}));
+        tracing::debug!(target:"smg::estimated_wait::observation",event="survival_decision_admission",survival_method=survival::METHOD,
+            worker,request_id=request_id.unwrap_or(""),calibration_epoch=entry.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+            survival_json=%serde_json::json!({"id":tracking_id,"native_attempt_id":native_attempt_id,"admission":identity.survival_admission,
+                "experimental":true,"policy_enforced":false,"scheduler_order":"gateway_admission_order_statistical_approximation"}));
+        tracing::debug!(target:"smg::estimated_wait::observation", event="feature_deadline_started", feature_method=feature::METHOD,
+            worker,request_id=request_id.unwrap_or(""),calibration_epoch=entry.calibration_epoch,
+            diagnostic_time_seconds=diagnostic_time(now), request_started_time_seconds=diagnostic_time(started),
+            deadline_time_seconds=diagnostic_time(started+feature::TTFT_DEADLINE), deadline_seconds=feature::TTFT_DEADLINE.as_secs(),
+            deadline_tracking_supported=matches!(handle,DeadlineHandle::Tracked(_, _)), pending_deadline_count=entry.feature_deadlines.pending_count(),
+            feature_json=%serde_json::json!({"activity":entry.feature_activity_context(now,None),"counts":entry.feature_activity_context(now,None).counts}));
+        Some(handle)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "outcome accounting requires worker identity and distinct admission/observation times"
+    )]
+    fn record_feature_outcome(
+        &self,
+        worker: &str,
+        request_id: Option<&str>,
+        identity: &CalibrationForecast,
+        outcome: FeatureOutcome,
+        deadline: Option<DeadlineHandle>,
+        started: Instant,
+        observed_at: Instant,
+    ) {
+        if !self.config().estimated_wait_feature_shadow {
+            return;
+        }
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.get_mut(worker) else {
+            tracing::debug!(target:"smg::estimated_wait::observation",event="feature_outcome_ignored",feature_method=feature::METHOD, worker,request_id=request_id.unwrap_or(""),outcome=outcome.name(),admission_epoch=identity.epoch,reason="worker_missing",diagnostic_time_seconds=diagnostic_time(Instant::now()));
+            return;
+        };
+        if !Arc::ptr_eq(&entry.generation, &identity.generation)
+            || !Arc::ptr_eq(
+                &entry.calibration_generation,
+                &identity.calibration_generation,
+            )
+        {
+            tracing::debug!(target:"smg::estimated_wait::observation",event="feature_outcome_ignored",feature_method=feature::METHOD,worker,request_id=request_id.unwrap_or(""),outcome=outcome.name(),admission_epoch=identity.epoch,calibration_epoch=entry.calibration_epoch,reason="generation_changed",diagnostic_time_seconds=diagnostic_time(Instant::now()));
+            return;
+        }
+        let now = Instant::now();
+        let id = deadline.as_ref().and_then(|h| match h {
+            DeadlineHandle::Tracked(id, _) => Some(*id),
+            DeadlineHandle::Untracked => None,
+        });
+        if matches!(outcome, FeatureOutcome::FirstText) {
+            entry.survival.native.first_text(
+                identity
+                    .deadline_dispatch
+                    .as_ref()
+                    .map(|lease| lease.native_attempt()),
+                diagnostic_time(observed_at),
+            );
+        }
+        if !matches!(outcome, FeatureOutcome::FirstText) {
+            if let Some(lease) = identity
+                .deadline_dispatch
+                .as_ref()
+                .filter(|lease| lease.before_send())
+            {
+                entry
+                    .survival
+                    .native
+                    .local_pre_send_rollback(lease.native_attempt());
+            }
+        }
+        let label = match outcome {
+            FeatureOutcome::FirstText
+            | FeatureOutcome::Timeout
+            | FeatureOutcome::Disconnect
+            | FeatureOutcome::NativeDeadline => id.and_then(|id| {
+                entry.decision.label(
+                    id,
+                    diagnostic_time(observed_at),
+                    diagnostic_time(now),
+                    matches!(outcome, FeatureOutcome::FirstText),
+                    true,
+                    None,
+                )
+            }),
+            _ => {
+                entry.decision.terminal_unknown(id);
+                None
+            }
+        };
+        if let Some(label) = label {
+            entry.log_decision_label(worker, &label, outcome.name(), true);
+        } else {
+            entry.basis_decision.terminal_unknown(id);
+            entry.survival.terminal_unknown(id);
+        }
+        tracing::debug!(target:"smg::estimated_wait::observation",event="decision_terminal",decision_method=decision::METHOD,worker,
+            calibration_epoch=entry.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+            decision_json=%serde_json::json!({"id":id,"observed_at":diagnostic_time(observed_at),"outcome":outcome.name()}));
+        if let Some(resolved) = deadline.and_then(|handle| {
+            entry
+                .feature_deadlines
+                .resolve(handle, started, request_id, observed_at, outcome)
+        }) {
+            entry.record_deadline_resolution(worker, resolved, observed_at, now, outcome.name());
+        }
+        entry.feature_activity.record(now, outcome);
+        tracing::debug!(target:"smg::estimated_wait::observation",event="feature_outcome",feature_method=feature::METHOD,
+            worker,request_id=request_id.unwrap_or(""),outcome=outcome.name(),calibration_epoch=entry.calibration_epoch,
+            diagnostic_time_seconds=diagnostic_time(now),native_cancellation_acknowledgement="unavailable",
+            feature_json=%serde_json::json!({"activity":entry.feature_activity_context(now,None),"counts":entry.feature_activity_context(now,None).counts}));
+    }
+
+    fn register_pending_work(&self, probe: &mut TtftProbe, forecast: Option<&CalibrationForecast>) {
+        if !self.config().estimated_wait_feature_shadow || probe.pending_work.is_some() {
+            return;
+        }
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries
+            .get_mut(&probe.worker_url)
+            .filter(|e| Arc::ptr_eq(&e.generation, &probe.generation))
+        else {
+            return;
+        };
+        let estimate = forecast
+            .filter(|f| {
+                Arc::ptr_eq(&entry.calibration_generation, &f.calibration_generation)
+                    && f.feature_context.is_some()
+            })
+            .map_or_else(pending_work::Estimate::default, |f| f.prompt_work);
+        let now = Instant::now();
+        probe.pending_work = Some(
+            entry
+                .pending_work
+                .register(probe.observation_id, now, estimate),
+        );
+        tracing::debug!(target:"smg::estimated_wait::observation",event="pending_work_registered",pending_work_method=pending_work::METHOD,
+            worker=probe.worker_url,request_id=probe.request_id.as_deref().unwrap_or(""),calibration_epoch=entry.calibration_epoch,
+            diagnostic_time_seconds=diagnostic_time(now),pending_work_json=%serde_json::json!({"id":probe.observation_id,"inventory_generation":entry.pending_work.generation(),"tracked":probe.pending_work.is_some_and(|h|h.tracked),"estimate":estimate}));
+    }
+
+    fn resolve_pending_work(entry: &mut Entry, probe: &TtftProbe) {
+        if let Some(handle) = probe.pending_work {
+            entry.pending_work.remove(handle);
+            tracing::debug!(target:"smg::estimated_wait::observation",event="pending_work_resolved",pending_work_method=pending_work::METHOD,
+                worker=probe.worker_url,request_id=probe.request_id.as_deref().unwrap_or(""),calibration_epoch=entry.calibration_epoch,
+                diagnostic_time_seconds=diagnostic_time(Instant::now()),pending_work_json=%serde_json::json!({"id":probe.observation_id,"inventory_generation":handle.generation,"tracked":handle.tracked}));
+        }
+    }
+
     fn finish_ttft_probe(&self, probe: &TtftProbe) {
         let mut entries = self.entries.lock();
         let Some(entry) = entries.get_mut(&probe.worker_url) else {
@@ -1289,7 +2218,9 @@ impl EstimatedWaitAdmission {
         if !Arc::ptr_eq(&entry.generation, &probe.generation) {
             return;
         }
-        entry.pending_first_text.remove(&probe.observation_id);
+        if entry.pending_first_text.remove(&probe.observation_id) {
+            Self::resolve_pending_work(entry, probe);
+        }
         Self::apply_observations(entry);
         if let Some(worker) = entry.source.upgrade() {
             entry.refresh(&worker, self.config());
@@ -1316,6 +2247,7 @@ impl EstimatedWaitAdmission {
         if !entry.pending_first_text.remove(&probe.observation_id) {
             return;
         }
+        Self::resolve_pending_work(entry, &probe);
         if let Some(forecast) = probe
             .calibration
             .as_ref()
@@ -1368,6 +2300,7 @@ impl EstimatedWaitAdmission {
                 target_scale_before = target_before, target_scale_after = entry.calibration.target(forecast.native_capacity_ready),
                 calibration_time_seconds = entry.calibration.time_seconds(now), admission_calibration_time_seconds = forecast.time_seconds,
                 feedback_age_seconds = now.saturating_duration_since(forecast.captured_at).as_secs_f64(),
+                diagnostic_time_seconds = diagnostic_time(now),
                 calibration_max_age_seconds = CALIBRATION_HISTORY_MAX_AGE.as_secs_f64(),
                 admission_native_waiting = forecast.native_waiting, admission_native_queue_visible = forecast.queue_visible(),
                 admission_native_capacity_ready = forecast.native_capacity_ready,
@@ -1478,6 +2411,136 @@ impl EstimatedWaitAdmission {
         self.config.get_or_init(EstimatedWaitConfig::default)
     }
 
+    pub(crate) fn pending_work_enabled(&self) -> bool {
+        self.config().estimated_wait_feature_shadow
+    }
+
+    pub(crate) fn native_deadline_enabled(&self) -> bool {
+        self.config().estimated_wait_feature_shadow
+    }
+
+    pub(crate) fn native_deadline_timeout_configured(&self) -> bool {
+        self.config()
+            .estimated_wait_native_hard_ttft_timeout_secs
+            .is_some()
+    }
+
+    /// A separate opt-in HTTP side channel cannot change raw load preparation,
+    /// estimator readiness, or dispatch watermarks.
+    pub(crate) fn publish_native_deadline(
+        &self,
+        worker: &Arc<dyn Worker>,
+        native: Option<&WorkerLoadResponse>,
+        watermark: Option<PollWatermark>,
+        raw_started: Instant,
+        native_started: Instant,
+    ) {
+        self.publish_native_deadline_observation(
+            worker,
+            native,
+            watermark,
+            raw_started,
+            native_started,
+            false,
+        );
+    }
+
+    pub(crate) fn publish_native_deadline_timeout(
+        &self,
+        worker: &Arc<dyn Worker>,
+        watermark: Option<PollWatermark>,
+        raw_started: Instant,
+        native_started: Instant,
+    ) {
+        self.publish_native_deadline_observation(
+            worker,
+            None,
+            watermark,
+            raw_started,
+            native_started,
+            true,
+        );
+    }
+
+    fn publish_native_deadline_observation(
+        &self,
+        worker: &Arc<dyn Worker>,
+        native: Option<&WorkerLoadResponse>,
+        watermark: Option<PollWatermark>,
+        raw_started: Instant,
+        native_started: Instant,
+        transport_timeout: bool,
+    ) {
+        if !self.native_deadline_enabled() {
+            return;
+        }
+        let Some(watermark) = watermark else {
+            return;
+        };
+        let mut entries = self.entries.lock();
+        let Some(entry) = entries.get_mut(worker.url()).filter(|entry| {
+            entry.source.ptr_eq(&Arc::downgrade(worker))
+                && Arc::ptr_eq(&entry.generation, &watermark.generation)
+                && entry
+                    .last_published
+                    .is_some_and(|published| published >= raw_started)
+        }) else {
+            return;
+        };
+        let mut ledger = entry
+            .deadline_work
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let received = Instant::now();
+        if transport_timeout {
+            entry.native_deadline.observe_transport_timeout(
+                received,
+                self.config().estimated_wait_max_snapshot_age_secs,
+            );
+        } else {
+            entry.native_deadline.observe(
+                native,
+                worker.dp_rank(),
+                native_started,
+                received,
+                self.config().estimated_wait_max_snapshot_age_secs,
+                &mut ledger,
+            );
+        }
+        drop(ledger);
+        entry.survival.native.observe(
+            native,
+            entry
+                .native_deadline
+                .available(received, self.config().estimated_wait_max_snapshot_age_secs),
+            diagnostic_time(native_started),
+            diagnostic_time(received),
+            diagnostic_time(raw_started),
+            self.config().estimated_wait_max_snapshot_age_secs,
+        );
+        tracing::debug!(target: "smg::estimated_wait::observation",
+            event="native_deadline_poll",worker=worker.url(),
+            diagnostic_time_seconds=diagnostic_time(Instant::now()),
+            native_poll_started_time_seconds=diagnostic_time(native_started),
+            native_receipt_time_seconds=diagnostic_time(received),
+            raw_poll_started_time_seconds=diagnostic_time(raw_started),
+            calibration_epoch=entry.calibration_epoch,
+            native_observation_transport_seconds=native_started.elapsed().as_secs_f64(),
+            native_transport_timeout=transport_timeout,
+            native_contract_reason=entry.native_deadline.reason,
+            native_deadline_boundary=entry.native_deadline.deadline_boundary(),
+            native_deadline_origin=entry.native_deadline.deadline_origin(),
+            native_ack_occurrence_clock="engine_monotonic_seconds",
+            native_inventory_json=%serde_json::json!({"wire":native,
+                "accepted_by_adapter":entry.native_deadline.available(received,self.config().estimated_wait_max_snapshot_age_secs),
+                "max_snapshot_age_seconds":self.config().estimated_wait_max_snapshot_age_secs}),
+            native_ack_json=%serde_json::json!({"applied_acknowledgements":&entry.native_deadline.applied_acknowledgements,
+                "native_confirmed_deadlines":&entry.native_deadline.confirmed_deadlines,
+                "acknowledged_requests":entry.native_deadline.acknowledged_requests,
+                "released_known_work":entry.native_deadline.released_known_work,
+                "journal_complete":entry.native_deadline.journal_complete}));
+    }
+
     pub(crate) fn enabled(&self) -> bool {
         self.config
             .get()
@@ -1533,6 +2596,9 @@ impl EstimatedWaitAdmission {
     }
 
     pub(crate) fn poll_started(&self, worker: &Arc<dyn Worker>) -> Option<PollWatermark> {
+        if tracing::enabled!(target: "smg::estimated_wait::observation", tracing::Level::DEBUG) {
+            diagnostic_time(Instant::now());
+        }
         if !self.needs_load(worker) {
             return None;
         }
@@ -1541,7 +2607,53 @@ impl EstimatedWaitAdmission {
         Some(PollWatermark {
             generation: Arc::clone(&entry.generation),
             dispatched: entry.total_dispatched,
+            dispatched_requests: entry.total_dispatched_requests,
+            pending_work: entry.pending_work.summary(Instant::now()),
         })
+    }
+
+    fn log_poll(
+        worker: &Arc<dyn Worker>,
+        entry: Option<&Entry>,
+        prepared: Option<PreparedWait>,
+        started: Instant,
+        outcome: &'static str,
+        fit_executed: [bool; 2],
+    ) {
+        if !tracing::enabled!(target: "smg::estimated_wait::observation", tracing::Level::DEBUG) {
+            return;
+        }
+        let now = Instant::now();
+        for native_ready in [false, true] {
+            let index = usize::from(native_ready);
+            let calibration = entry.map(|entry| &entry.calibration);
+            let feedback = calibration.and_then(|c| c.last_feedback[index]);
+            tracing::debug!(target: "smg::estimated_wait::observation",
+                event = "calibration_poll", worker = worker.url(), outcome,
+                diagnostic_time_seconds = diagnostic_time(now),
+                poll_started_time_seconds = diagnostic_time(started),
+                poll_age_seconds = now.saturating_duration_since(started).as_secs_f64(),
+                calibration_state = if native_ready { "capacity_ready" } else { "capacity_unready" },
+                fit_executed = fit_executed[index],
+                calibration_epoch = entry.map(|e| e.calibration_epoch),
+                calibration_time_seconds = calibration.map(|c| c.time_seconds(now)),
+                calibration_bank_index = calibration.map(|c| c.bank_index),
+                bank_age_seconds = calibration.and_then(|c| c.bank_started).map(|t| now.saturating_duration_since(t).as_secs_f64()),
+                last_accepted_feedback_age_seconds = feedback.map(|(t, _)| now.saturating_duration_since(t).as_secs_f64()),
+                last_accepted_admission_age_seconds = feedback.map(|(_, t)| now.saturating_duration_since(t).as_secs_f64()),
+                sample_count = calibration.map(|c| c.samples[index].len()),
+                observation_sequence = calibration.map(|c| c.accepted[index]),
+                fit_sequence = calibration.map(|c| c.fitted[index]),
+                history_revision = calibration.map(|c| c.history_revision[index]),
+                fitted_revision = calibration.map(|c| c.fitted_revision[index]),
+                scale = calibration.map(|c| c.stats(native_ready, now).0),
+                target_scale = calibration.map(|c| c.target(native_ready)),
+                native_waiting = prepared.map(|p| p.native_waiting),
+                native_running = prepared.map(|p| p.native_running),
+                pending_engine = prepared.map(|p| p.pending_engine),
+                pending_first_text = entry.map(|e| e.pending_first_text.len()),
+                total_dispatched = entry.map(|e| e.total_dispatched));
+        }
     }
 
     pub(crate) fn publish(
@@ -1552,6 +2664,7 @@ impl EstimatedWaitAdmission {
         started: Instant,
     ) {
         let Some(watermark) = watermark else {
+            Self::log_poll(worker, None, None, started, "untracked", [false; 2]);
             return;
         };
         // Rank aggregation, validation and the queue/KV formula are report work,
@@ -1561,19 +2674,49 @@ impl EstimatedWaitAdmission {
         let threshold = config.threshold(worker);
         let mut entries = self.entries.lock();
         let Some(entry) = entries.get_mut(worker.url()) else {
+            Self::log_poll(
+                worker,
+                None,
+                prepared,
+                started,
+                "worker_removed",
+                [false; 2],
+            );
             return;
         };
+        let outcome = poll_outcome(
+            Arc::ptr_eq(&entry.generation, &watermark.generation),
+            entry.last_published,
+            started,
+            Instant::now(),
+            load.is_some(),
+            prepared.is_some(),
+            config.estimated_wait_max_snapshot_age_secs,
+        );
+        let mut fit_executed = [false; 2];
         if !Arc::ptr_eq(&entry.generation, &watermark.generation)
-            || entry.last_published.is_some_and(|last| last > started)
+            || entry.last_published.is_some_and(|last| last >= started)
         {
+            Self::log_poll(
+                worker,
+                Some(entry),
+                prepared,
+                started,
+                outcome,
+                fit_executed,
+            );
             return;
         }
         let new_poll = entry.last_published.is_none_or(|last| started > last);
+        if config.estimated_wait_feature_shadow {
+            entry.advance_feature_deadlines(worker.url(), Instant::now());
+        }
         entry.last_published = Some(started);
         // Native capacity samples only shrink when the monitor resets its
         // counter/profile history. Do not let pre-reset responses train the
         // new profile, and leave all raw estimator state untouched.
-        if let Some(new) = prepared.filter(|_| config.estimated_wait_calibration_shadow) {
+        if let Some(new) = prepared.filter(|_| config.estimated_wait_calibration_shadow && new_poll)
+        {
             if entry
                 .calibration_profile
                 .is_some_and(|(old_ready, old_count)| {
@@ -1592,6 +2735,20 @@ impl EstimatedWaitAdmission {
                 new.capacity_learned_ready,
                 new.capacity_profile_sample_count,
             ));
+        }
+        if config.estimated_wait_calibration_shadow && new_poll {
+            if outcome == "success" {
+                if let Some(load) = load {
+                    entry.recovery.observe(
+                        load,
+                        started,
+                        config.estimated_wait_max_snapshot_age_secs,
+                        watermark.dispatched_requests,
+                    );
+                }
+            } else {
+                entry.recovery.reset(outcome);
+            }
         }
         if config.estimated_wait_calibration_shadow && new_poll {
             // Two consecutive fresh queue-empty reports, with no local pre-text
@@ -1625,6 +2782,7 @@ impl EstimatedWaitAdmission {
                     let target_before = entry.calibration.target(native_ready);
                     let fitted_before = entry.calibration.fitted[index];
                     if entry.calibration.fit_on_poll(native_ready, now) {
+                        fit_executed[index] = true;
                         tracing::debug!(target: "smg::estimated_wait::observation",
                             event = "calibration_update", calibration_method = CALIBRATION_METHOD,
                             calibration_bank_index = entry.calibration.bank_index,
@@ -1644,6 +2802,14 @@ impl EstimatedWaitAdmission {
                 }
             }
         }
+        Self::log_poll(
+            worker,
+            Some(entry),
+            prepared,
+            started,
+            outcome,
+            fit_executed,
+        );
         // A verified idle worker begins a new queue epoch. Responses from the
         // preceding busy epoch cannot recalibrate a later workload after drain.
         if prepared.is_some_and(|prepared| prepared.low_load) && entry.pending_first_text.len() <= 1
@@ -1669,12 +2835,66 @@ impl EstimatedWaitAdmission {
                 }
             }
         }
+        if config.estimated_wait_feature_shadow {
+            if let Some(new) = prepared {
+                if entry
+                    .pending_work_profile
+                    .is_some_and(|old| old != new.decision_profile)
+                {
+                    entry.pending_work.reset();
+                }
+                entry.pending_work_profile = Some(new.decision_profile);
+            }
+        }
         entry.sample = prepared.zip(threshold).map(|(prepared, threshold)| Sample {
             prepared,
             started,
             watermark: watermark.dispatched,
             threshold,
             overloaded: None,
+            pending_work_capacity_progress_source: load
+                .filter(|l| l.loads.len() == 1)
+                .and_then(|l| l.loads[0].timely_prefill_progress_source.clone()),
+            pending_work_queue: config.estimated_wait_feature_shadow.then(|| {
+                let native_tokens = load.is_some_and(|l| {
+                    l.loads
+                        .iter()
+                        .all(|r| r.num_waiting_uncached_tokens_available != Some(false))
+                });
+                let eligible = load.is_some_and(|l| {
+                    l.loads.len() == 1
+                        && l.dp_rank_count == 1
+                        && l.loads[0].dp_rank == 0
+                        && l.loads[0].native_request_counts_available == Some(true)
+                        && l.loads[0].native_request_counts_profile.is_some()
+                        && l.loads[0].num_running_reqs >= 0
+                });
+                let same_generation =
+                    watermark.pending_work.generation == entry.pending_work.generation();
+                let mut queue = pending_work::Queue::new(
+                    watermark.pending_work,
+                    prepared.native_estimate.queued_work(),
+                    prepared.native_waiting,
+                    prepared.native_running,
+                    prepared.blended_prompt_size,
+                    eligible && same_generation,
+                    native_tokens,
+                );
+                if native_tokens
+                    && load.is_some_and(|l| {
+                        l.loads
+                            .iter()
+                            .any(|r| r.num_waiting_uncached_tokens_available.is_none())
+                    })
+                {
+                    // Preserve the legacy numeric path without claiming exact
+                    // native-token provenance when availability is unspecified.
+                    queue.reason = "native_token_availability_unknown";
+                } else if !same_generation && !native_tokens {
+                    queue.reason = "inventory_generation_changed";
+                }
+                queue
+            }),
         });
         Self::apply_observations(entry);
         if let Some(sample) = &entry.sample {
@@ -1698,6 +2918,98 @@ impl EstimatedWaitAdmission {
                 .set(entry.observed_delays.len() as f64);
         }
         entry.refresh(worker, config);
+        if config.estimated_wait_feature_shadow {
+            let now = Instant::now();
+            let profile = entry.sample.as_ref().map(|s| s.prepared.decision_profile);
+            let fresh = outcome == "success"
+                && entry.sample.as_ref().is_some_and(|s| {
+                    now.saturating_duration_since(s.started).as_secs_f64()
+                        <= config.estimated_wait_max_snapshot_age_secs
+                });
+            tracing::debug!(target:"smg::estimated_wait::observation",event="decision_native_poll",decision_method=decision::METHOD,
+                worker=worker.url(),calibration_epoch=entry.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+                poll_started_time_seconds=diagnostic_time(started),outcome,
+                decision_json=%serde_json::json!({"expected_rank_count":load.map(|l|l.dp_rank_count),
+                    "ranks":load.map(|l|l.loads.iter().map(|r|serde_json::json!({
+                        "dp_rank":r.dp_rank,"native_request_counts_available":r.native_request_counts_available,
+                        "native_request_counts_profile":r.native_request_counts_profile,
+                        "timely_prefill_progress":r.timely_prefill_progress,
+                        "timely_prefill_progress_source":r.timely_prefill_progress_source,
+                        "timely_prefill_progress_interval":r.timely_prefill_progress_interval,
+                        "learned_prefill_capacity":r.learned_prefill_capacity,
+                        "prefill_capacity_sample_count":r.prefill_capacity_sample_count,
+                        "num_waiting_reqs":r.num_waiting_reqs,"num_running_reqs":r.num_running_reqs,
+                        "num_waiting_uncached_tokens":r.num_waiting_uncached_tokens,
+                        "num_waiting_uncached_tokens_available":r.num_waiting_uncached_tokens_available,
+                        "prefill_capacity_learning_active":r.prefill_capacity_learning_active
+                        ,"prefill_metric_provenance":r.prefill_metric_provenance
+                        ,"avg_request_prefill_kv_computed_tokens":r.avg_request_prefill_kv_computed_tokens
+                        ,"median_request_prefill_kv_computed_tokens":r.median_request_prefill_kv_computed_tokens
+                        ,"prefill_size_sample_count":r.prefill_size_sample_count
+                    })).collect::<Vec<_>>())}));
+            entry.decision.poll(
+                diagnostic_time(now),
+                profile,
+                fresh,
+                config.estimated_wait_max_snapshot_age_secs,
+            );
+            entry.basis_decision.poll(
+                diagnostic_time(now),
+                profile,
+                entry.sample.as_ref().and_then(|s| s.prepared.size_basis),
+                fresh,
+                config.estimated_wait_max_snapshot_age_secs,
+            );
+            entry.survival.poll(
+                diagnostic_time(now),
+                profile,
+                entry.basis_decision.epoch,
+                fresh
+                    && entry
+                        .sample
+                        .as_ref()
+                        .is_some_and(|s| s.prepared.size_basis.is_some()),
+                config.estimated_wait_max_snapshot_age_secs,
+            );
+            entry
+                .survival
+                .native
+                .raw_poll(load, diagnostic_time(started), outcome == "success");
+            entry.log_decision(config, now, "decision_poll", worker.url(), "", true);
+            tracing::debug!(target:"smg::estimated_wait::observation",event="pending_work_poll",pending_work_method=pending_work::METHOD,
+                worker=worker.url(),calibration_epoch=entry.calibration_epoch,diagnostic_time_seconds=diagnostic_time(now),
+                pending_work_json=%serde_json::json!({"poll_started":diagnostic_time(started),"outcome":outcome,"current_inventory_generation":entry.pending_work.generation(),"frozen_summary":watermark.pending_work,"queue":entry.sample.as_ref().and_then(|s|s.pending_work_queue)}));
+        }
+        if config.estimated_wait_calibration_shadow {
+            let now = Instant::now();
+            let candidate = entry.recovery_forecast(config, now);
+            tracing::debug!(target: "smg::estimated_wait::observation", event = "recovery_poll",
+                worker = worker.url(), diagnostic_time_seconds = diagnostic_time(now),
+                poll_started_time_seconds = diagnostic_time(started), outcome,
+                recovery_method = recovery::METHOD,
+                poll_request_watermark = watermark.dispatched_requests,
+                total_dispatched_requests = entry.total_dispatched_requests,
+                requests_since_previous_poll = candidate.and_then(|c| c.requests_since_previous_poll),
+                rebound_allowance_requests = candidate.map(|c| c.rebound_allowance),
+                rebound_retained = candidate.is_some_and(|c| c.rebound_retained),
+                calibration_epoch = entry.calibration_epoch,
+                native_counts_profile = candidate.and_then(|c| c.profile),
+                window_started_time_seconds = candidate.and_then(|c| c.window_started).map(diagnostic_time),
+                latest_poll_started_time_seconds = candidate.and_then(|c| c.latest_poll).map(diagnostic_time),
+                original_queue_excess_seconds = entry.sample.as_ref().map(|s| s.prepared.queue_excess_seconds(entry.total_dispatched.saturating_sub(s.watermark))),
+                queue_excess_seconds = candidate.map(|c| c.queue_extra),
+                dispatch_debt_seconds = candidate.map(|c| c.debt),
+                baseline_seconds = entry.calibration_baseline.0,
+                legacy_calibration_scale = candidate.map(|c| c.gain),
+                predicted_ttft_seconds = candidate.and_then(|c| c.total),
+                legacy_gain_ablation_ttft_seconds = candidate.and_then(|c| c.legacy_gain_total),
+                available = candidate.is_some_and(|c| c.available),
+                reason = candidate.map_or(entry.recovery.reason, |c| c.reason),
+                native_population = candidate.and_then(|c| c.population),
+                native_waiting = candidate.and_then(|c| c.waiting),
+                net_population_depletion_per_second = candidate.and_then(|c| c.rate),
+                window_seconds = candidate.map(|c| c.horizon), window_poll_count = candidate.map(|c| c.points));
+        }
     }
 
     pub(crate) fn evict(&self, worker: &Arc<dyn Worker>) {
@@ -1734,9 +3046,12 @@ impl EstimatedWaitAdmission {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct PollWatermark {
     generation: Arc<()>,
     dispatched: u64,
+    dispatched_requests: u64,
+    pending_work: pending_work::Summary,
 }
 
 pub(crate) struct AdmissionGuard<'a> {
@@ -1745,6 +3060,129 @@ pub(crate) struct AdmissionGuard<'a> {
 }
 
 impl AdmissionGuard<'_> {
+    pub(crate) fn feature_scope(
+        candidates: &[Arc<dyn Worker>],
+        enabled_path: bool,
+    ) -> Option<&Arc<dyn Worker>> {
+        // Scope is a single-worker pool, not a transient availability snapshot:
+        // health changes must not attribute a cohort rejection to one worker.
+        if !enabled_path || candidates.len() != 1 {
+            return None;
+        }
+        candidates[0].is_available().then_some(&candidates[0])
+    }
+
+    pub(crate) fn attach_feature_context(
+        &mut self,
+        worker: &Arc<dyn Worker>,
+        forecast: &mut Option<CalibrationForecast>,
+    ) -> bool {
+        if !self.config.estimated_wait_feature_shadow {
+            return false;
+        }
+        if let (Some(entry), Some(forecast)) = (
+            self.entries
+                .get_mut(worker.url())
+                .filter(|e| e.source.ptr_eq(&Arc::downgrade(worker))),
+            forecast.as_mut(),
+        ) {
+            forecast.decision_admission = entry
+                .decision_snapshot(self.config, forecast.captured_at)
+                .map(|snapshot| {
+                    Box::new(decision::Admission {
+                        snapshot,
+                        predictions: entry.decision.predictions(
+                            snapshot,
+                            diagnostic_time(forecast.captured_at),
+                            forecast.fresh && forecast.native_capacity_ready,
+                        ),
+                    })
+                });
+            forecast.pending_work_admission = forecast
+                .decision_admission
+                .as_ref()
+                .and_then(|original| {
+                    entry.pending_work_admission(self.config, original, forecast.captured_at)
+                })
+                .map(Box::new);
+            forecast.basis_admission =
+                forecast.decision_admission.as_ref().map(|original| {
+                    let control = forecast.pending_work_admission.as_ref().map(|pending| {
+                        decision::Admission {
+                            snapshot: decision::Snapshot {
+                                x: pending.candidate_x,
+                                ..original.snapshot
+                            },
+                            predictions: pending.predictions.clone(),
+                        }
+                    });
+                    Box::new(entry.basis_decision.admission(
+                        original,
+                        control.as_ref().unwrap_or(original),
+                        if control.is_some() {
+                            pending_work::METHOD
+                        } else {
+                            decision::METHOD
+                        },
+                        diagnostic_time(forecast.captured_at),
+                        forecast.fresh && forecast.native_capacity_ready,
+                    ))
+                });
+            forecast.survival_admission = forecast.basis_admission.as_ref().map(|basis| {
+                let total = forecast.seconds();
+                let scalar = (forecast.baseline.is_some()
+                    && forecast.fresh
+                    && total.is_finite()
+                    && total >= 0.0)
+                    .then_some(total);
+                Box::new(entry.survival.admission(
+                    basis,
+                    forecast.pending_work_admission.as_deref(),
+                    scalar,
+                ))
+            });
+            forecast.feature_context =
+                Some(entry.feature_context(forecast.captured_at, forecast.fresh));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn record_feature_decision(
+        &mut self,
+        worker: &Arc<dyn Worker>,
+        request_id: Option<&str>,
+        rejected: bool,
+        outcome_tracking_supported: bool,
+    ) {
+        if !self.config.estimated_wait_feature_shadow {
+            return;
+        }
+        let Some(entry) = self
+            .entries
+            .get_mut(worker.url())
+            .filter(|e| e.source.ptr_eq(&Arc::downgrade(worker)))
+        else {
+            return;
+        };
+        let now = Instant::now();
+        let outcome = if rejected {
+            FeatureOutcome::Rejected
+        } else if outcome_tracking_supported {
+            FeatureOutcome::Admitted
+        } else {
+            FeatureOutcome::UntrackedAdmitted
+        };
+        if matches!(outcome, FeatureOutcome::UntrackedAdmitted) {
+            entry.decision.mark_incomplete();
+        }
+        entry.feature_activity.record(now, outcome);
+        tracing::debug!(target:"smg::estimated_wait::observation", event="feature_admission_decision", feature_method=feature::METHOD,
+            worker=worker.url(),request_id=request_id.unwrap_or(""),decision=outcome.name(),outcome_tracking_supported,calibration_epoch=entry.calibration_epoch,
+            diagnostic_time_seconds=diagnostic_time(now),feature_json=%serde_json::json!({"activity":entry.feature_activity_context(now,None),"counts":entry.feature_activity_context(now,None).counts}));
+    }
+
     pub(crate) fn capture_calibration(
         &mut self,
         worker: &Arc<dyn Worker>,
@@ -1752,11 +3190,13 @@ impl AdmissionGuard<'_> {
     ) -> Option<CalibrationForecast> {
         let forecast = self
             .entries
-            .get_mut(worker.url())?
+            .get_mut(worker.url())
+            .filter(|e| e.source.ptr_eq(&Arc::downgrade(worker)))?
             .calibration_forecast(self.config, Instant::now())?;
         tracing::debug!(
             target: "smg::estimated_wait::observation", event = "calibration_forecast",
             request_id = request_id.unwrap_or(""), worker = worker.url(),
+            diagnostic_time_seconds = diagnostic_time(forecast.captured_at),
             calibration_enabled = true, calibration_state = forecast.state(),
             calibration_epoch = forecast.epoch,
             calibration_method = CALIBRATION_METHOD, calibration_fit_sequence = forecast.fit_sequence,
@@ -1787,10 +3227,42 @@ impl AdmissionGuard<'_> {
         Some(forecast)
     }
 
+    /// Separate accepted-work shadow. Keep raw dispatch watermarks untouched.
+    /// Only the regular HTTP feature-observation path owns the lifecycle lease.
+    pub(crate) fn register_deadline_dispatch(
+        &self,
+        worker: &Arc<dyn Worker>,
+        forecast: &mut Option<CalibrationForecast>,
+    ) {
+        if !self.config.estimated_wait_feature_shadow {
+            return;
+        }
+        let (Some(entry), Some(forecast)) = (
+            self.entries
+                .get(worker.url())
+                .filter(|e| e.source.ptr_eq(&Arc::downgrade(worker))),
+            forecast.as_mut().filter(|f| f.feature_context.is_some()),
+        ) else {
+            return;
+        };
+        if forecast.deadline_dispatch.is_none() {
+            forecast.deadline_dispatch = deadline_recovery::DispatchLease::with_native_attempt(
+                Arc::clone(&entry.deadline_work),
+                Instant::now(),
+                format!(
+                    "{}.{}",
+                    NATIVE_GATEWAY_EPOCH.get_or_init(uuid::Uuid::now_v7),
+                    uuid::Uuid::now_v7()
+                ),
+            );
+        }
+    }
+
     pub(crate) fn record_forecast(
         &mut self,
         candidates: &[Arc<dyn Worker>],
         request_id: Option<&str>,
+        feature_worker: Option<&Arc<dyn Worker>>,
     ) {
         let Some(request_id) = request_id else {
             return;
@@ -1800,10 +3272,92 @@ impl AdmissionGuard<'_> {
         }
         for worker in candidates.iter().filter(|worker| worker.is_available()) {
             let now = Instant::now();
-            let Some(entry) = self.entries.get_mut(worker.url()) else {
+            let Some(entry) = self
+                .entries
+                .get_mut(worker.url())
+                .filter(|e| e.source.ptr_eq(&Arc::downgrade(worker)))
+            else {
                 continue;
             };
             let calibration = entry.calibration_forecast(self.config, now);
+            if self.config.estimated_wait_feature_shadow {
+                let work = entry
+                    .deadline_work
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .summary();
+                let lifecycle_supported = feature_worker.is_some_and(|w| Arc::ptr_eq(w, worker));
+                tracing::debug!(target: "smg::estimated_wait::observation",
+                    event = "deadline_recovery_forecast", request_id, worker = worker.url(),
+                    deadline_recovery_method = deadline_recovery::METHOD,
+                    diagnostic_time_seconds = diagnostic_time(now),
+                    d1_scope = "accepted_regular_http_feature_streams",
+                    d1_lifecycle_tracking_available = lifecycle_supported,
+                    d1_tracked_remaining_work_complete = lifecycle_supported && !work.incomplete && work.unknown_work == 0,
+                    d1_native_queue_prediction_available = false,
+                    d1_reason = if !lifecycle_supported { "unsupported_observation_scope" }
+                        else if work.incomplete { "inventory_incomplete" }
+                        else if work.unknown_work > 0 { "native_remaining_work_unknown" }
+                        else { "accepted_request_lifecycle_tracked" },
+                    d1_pending_requests = work.pending, d1_forwarded_requests = work.forwarded,
+                    d1_known_remaining_work = work.known_work, d1_unknown_remaining_requests = work.unknown_work,
+                    d1_inventory_incomplete = work.incomplete,
+                    d2_available = entry.native_deadline.available(now, self.config.estimated_wait_max_snapshot_age_secs),
+                    d2_reason = entry.native_deadline.reason,
+                    d2_acknowledged_requests = entry.native_deadline.acknowledged_requests,
+                    d2_released_known_work = entry.native_deadline.released_known_work,
+                    d2_ack_journal_complete = entry.native_deadline.journal_complete,
+                    native_deadline_boundary = entry.native_deadline.deadline_boundary(),
+                    native_deadline_origin = entry.native_deadline.deadline_origin(),
+                    actual_engine_hard_ttft_deadline_available = entry.native_deadline.hard_deadlines_present(now, self.config.estimated_wait_max_snapshot_age_secs),
+                    native_deadline_enforcement_capability_available = entry.native_deadline.deadline_valid_until(now, self.config.estimated_wait_max_snapshot_age_secs).is_some(),
+                    admission_threshold_is_native_deadline = false,
+                    raw_estimator_and_enforcement = "unchanged");
+            }
+            entry.log_decision(
+                self.config,
+                now,
+                "decision_forecast",
+                worker.url(),
+                request_id,
+                feature_worker.is_some_and(|w| Arc::ptr_eq(w, worker)),
+            );
+            let recovery = entry.recovery_forecast(self.config, now);
+            if let Some(candidate) = recovery {
+                tracing::debug!(target: "smg::estimated_wait::observation",
+                    event = "recovery_forecast", request_id, worker = worker.url(),
+                    recovery_method = recovery::METHOD, available = candidate.available,
+                    poll_request_watermark = candidate.poll_request_watermark,
+                    total_dispatched_requests = entry.total_dispatched_requests,
+                    requests_since_previous_poll = candidate.requests_since_previous_poll,
+                    rebound_allowance_requests = candidate.rebound_allowance,
+                    rebound_retained = candidate.rebound_retained,
+                    diagnostic_time_seconds = diagnostic_time(now),
+                    legacy_calibration_scale = candidate.gain,
+                    calibration_epoch = entry.calibration_epoch,
+                    calibration_history_revision = entry.sample.as_ref().map(|s| entry.calibration.history_revision[usize::from(s.prepared.capacity_learned_ready)]),
+                    calibration_fit_sequence = entry.sample.as_ref().map(|s| entry.calibration.fitted[usize::from(s.prepared.capacity_learned_ready)]),
+                    native_counts_profile = candidate.profile,
+                    window_started_time_seconds = candidate.window_started.map(diagnostic_time),
+                    latest_poll_started_time_seconds = candidate.latest_poll.map(diagnostic_time),
+                    original_queue_excess_seconds = entry.sample.as_ref().map(|s| s.prepared.queue_excess_seconds(entry.total_dispatched.saturating_sub(s.watermark))),
+                    native_population = candidate.population, native_waiting = candidate.waiting,
+                    would_reject = entry.sample.as_ref().filter(|s| candidate.available && s.prepared.capacity_learned_ready).map(|s| candidate.queue_extra >= s.threshold),
+                    legacy_gain_ablation_would_reject = entry.sample.as_ref().filter(|s| candidate.available && s.prepared.capacity_learned_ready).map(|s| candidate.gain * candidate.queue_extra >= s.threshold),
+                    total_would_reject = entry.sample.as_ref().filter(|_| candidate.available).and_then(|s| candidate.total.map(|t| t >= s.threshold)),
+                    legacy_gain_ablation_total_would_reject = entry.sample.as_ref().filter(|_| candidate.available).and_then(|s| candidate.legacy_gain_total.map(|t| t >= s.threshold)),
+                    reason = candidate.reason, queue_excess_seconds = candidate.queue_extra,
+                    predicted_ttft_seconds = candidate.total,
+                    legacy_gain_ablation_ttft_seconds = candidate.legacy_gain_total,
+                    net_population_depletion_per_second = candidate.rate,
+                    window_seconds = candidate.horizon, window_poll_count = candidate.points,
+                    dispatch_debt_seconds = candidate.debt,
+                    threshold_seconds = entry.sample.as_ref().map(|s| s.threshold),
+                    baseline_seconds = entry.calibration_baseline.0,
+                    gain_training = "unchanged_original_queue_only",
+                    candidate_is_calibrated = false,
+                    native_cancellation_acknowledgement = "unavailable");
+            }
             let Some(sample) = &entry.sample else {
                 continue;
             };
@@ -1969,6 +3523,7 @@ impl AdmissionGuard<'_> {
             return;
         };
         entry.total_dispatched = entry.total_dispatched.saturating_add(count);
+        entry.total_dispatched_requests = entry.total_dispatched_requests.saturating_add(1);
         entry.refresh(worker, self.config);
     }
 }
@@ -1995,6 +3550,254 @@ mod tests {
             monitor::WorkerMonitor, BasicWorkerBuilder, ConnectionMode, WorkerRegistry, WorkerType,
         },
     };
+
+    #[derive(Clone)]
+    struct DiagnosticWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for DiagnosticWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn recovery_registry(shadow: bool) -> (Arc<WorkerRegistry>, Arc<dyn Worker>) {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.estimated_wait().configure(EstimatedWaitConfig {
+            max_estimated_wait_secs: Some(300.0),
+            estimated_wait_max_snapshot_age_secs: 60.0,
+            estimated_wait_calibration_shadow: true,
+            estimated_wait_shadow: shadow,
+            ..config()
+        });
+        let worker = worker("http://recovery:1");
+        registry.register(worker.clone()).unwrap();
+        let start = Instant::now() - Duration::from_secs(30);
+        for i in 0..7 {
+            let mut report = load(Some(100_000), 100 - i * 10, 100.0, 0.0);
+            report.loads[0].num_running_reqs = 10;
+            report.loads[0].native_request_counts_available = Some(true);
+            report.loads[0].low_load_ttft_seconds = Some(2.0);
+            let stamp = registry.estimated_wait().poll_started(&worker);
+            registry.estimated_wait().publish(
+                &worker,
+                Some(&report),
+                stamp,
+                start + Duration::from_secs(i as u64 * 5),
+            );
+        }
+        (registry, worker)
+    }
+
+    #[test]
+    fn live_recovery_keeps_original_fit_and_gate_and_preserves_post_snapshot_debt() {
+        let (registry, worker) = recovery_registry(false);
+        let admission = registry.estimated_wait();
+        {
+            let entry = &admission.entries.lock()[worker.url()];
+            assert_eq!(entry.calibration.stats(true, Instant::now()), (1.0, 0));
+            let f = entry
+                .recovery_forecast(admission.config(), Instant::now())
+                .unwrap();
+            assert!(f.available);
+            assert_eq!(f.queue_extra, 25.0);
+            assert_eq!(
+                entry
+                    .sample
+                    .as_ref()
+                    .unwrap()
+                    .prepared
+                    .queue_excess_seconds(0),
+                1000.0
+            );
+        }
+        let mut guard = admission.begin().unwrap();
+        assert!(guard.check(std::slice::from_ref(&worker), "m").is_err());
+        guard.credit(&worker, Some(&[0; 100]));
+        let entry = &guard.entries[worker.url()];
+        let f = entry
+            .recovery_forecast(admission.config(), Instant::now())
+            .unwrap();
+        assert_eq!(f.queue_extra, 26.0);
+        assert_eq!(f.debt, 1.0);
+        assert_eq!(entry.calibration.stats(true, Instant::now()), (1.0, 0));
+    }
+
+    #[test]
+    fn recovery_arrival_credit_is_one_request_and_frozen_at_poll_start() {
+        for credit_before_start in [false, true] {
+            let (registry, worker) = recovery_registry(false);
+            let admission = registry.estimated_wait();
+            if credit_before_start {
+                admission.begin().unwrap().credit(&worker, Some(&[0; 100]));
+            }
+            let stamp = admission.poll_started(&worker);
+            if !credit_before_start {
+                admission.begin().unwrap().credit(&worker, Some(&[0; 100]));
+            }
+            let mut report = load(Some(100_000), 41, 100.0, 0.0);
+            report.loads[0].num_running_reqs = 10;
+            report.loads[0].native_request_counts_available = Some(true);
+            report.loads[0].low_load_ttft_seconds = Some(2.0);
+            let at = admission.entries.lock()[worker.url()]
+                .last_published
+                .unwrap()
+                + Duration::from_secs(5);
+            admission.publish(&worker, Some(&report), stamp, at);
+            let entries = admission.entries.lock();
+            let entry = &entries[worker.url()];
+            assert_eq!(entry.total_dispatched_requests, 1);
+            assert_eq!(entry.total_dispatched, 100);
+            let f = entry.recovery_forecast(admission.config(), at).unwrap();
+            assert_eq!(f.available, credit_before_start);
+            assert_eq!(
+                f.poll_request_watermark,
+                Some(u64::from(credit_before_start))
+            );
+            assert_eq!(f.debt, if credit_before_start { 0.0 } else { 1.0 });
+        }
+    }
+
+    #[test]
+    fn recovery_request_counter_saturates_and_worker_invalidation_resets_it() {
+        let (registry, worker) = recovery_registry(false);
+        let admission = registry.estimated_wait();
+        admission
+            .entries
+            .lock()
+            .get_mut(worker.url())
+            .unwrap()
+            .total_dispatched_requests = u64::MAX;
+        admission.begin().unwrap().credit(&worker, Some(&[]));
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        assert_eq!(entry.total_dispatched_requests, u64::MAX);
+        entry.invalidate();
+        assert_eq!(entry.total_dispatched_requests, 0);
+    }
+
+    #[test]
+    fn live_recovery_failed_poll_resets_but_duplicates_and_older_reports_do_not_mix_inputs() {
+        let (registry, worker) = recovery_registry(false);
+        let admission = registry.estimated_wait();
+        let last = admission.entries.lock()[worker.url()]
+            .last_published
+            .unwrap();
+        for at in [last, last - Duration::from_secs(1)] {
+            let stamp = admission.poll_started(&worker);
+            admission.publish(&worker, Some(&load(Some(1), 1, 100.0, 0.0)), stamp, at);
+            let entries = admission.entries.lock();
+            let entry = &entries[worker.url()];
+            assert_eq!(
+                entry
+                    .sample
+                    .as_ref()
+                    .unwrap()
+                    .prepared
+                    .queue_excess_seconds(0),
+                1000.0
+            );
+            assert!(
+                entry
+                    .recovery_forecast(admission.config(), Instant::now())
+                    .unwrap()
+                    .available
+            );
+        }
+        let stamp = admission.poll_started(&worker);
+        admission.publish(&worker, None, stamp, Instant::now());
+        let entries = admission.entries.lock();
+        let entry = &entries[worker.url()];
+        assert!(entry.sample.is_none());
+        assert_eq!(entry.recovery.reason, "failed");
+    }
+
+    #[test]
+    fn diagnostic_poll_classification_and_monotonic_precision() {
+        let started = Instant::now();
+        let now = started + Duration::from_millis(100);
+        let outcome = |generation, previous, has_load, prepared, age| {
+            poll_outcome(generation, previous, started, now, has_load, prepared, age)
+        };
+        assert_eq!(outcome(true, None, true, true, 1.0), "success");
+        assert_eq!(outcome(true, None, false, false, 1.0), "failed");
+        assert_eq!(outcome(true, None, true, false, 1.0), "invalid_load");
+        assert_eq!(outcome(true, None, true, true, 0.05), "stale");
+        assert_eq!(outcome(true, Some(started), true, true, 1.0), "duplicate");
+        assert_eq!(outcome(true, Some(now), true, true, 1.0), "out_of_order");
+        assert_eq!(outcome(false, None, true, true, 1.0), "generation_changed");
+        let delta = diagnostic_time(now) - diagnostic_time(started);
+        assert!((delta - 0.1).abs() < 1e-8);
+    }
+
+    #[test]
+    fn diagnostic_poll_and_transport_json_preserve_numeric_fields_and_identity() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = DiagnosticWriter(Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let (registry, worker) = calibration_registry(true);
+            bytes.lock().clear();
+            let admission = registry.estimated_wait();
+            let started = Instant::now();
+            let stamp = admission.poll_started(&worker);
+            admission.publish(
+                &worker,
+                Some(&load(Some(100), 1, 100.0, 0.0)),
+                stamp,
+                started,
+            );
+            let duplicate = admission.poll_started(&worker);
+            admission.publish(
+                &worker,
+                Some(&load(Some(100), 1, 100.0, 0.0)),
+                duplicate,
+                started,
+            );
+            let mut observer = StreamTtftObserver::new(&registry, worker.url(), started)
+                .with_request_id(Some("diagnostic-request"));
+            observer.cancel(); // Identity must survive first-text probe removal.
+            observer.transport_event("downstream_receiver_closed");
+            observer.transport_event("upstream_stream_released");
+        });
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes.lock())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let polls: Vec<_> = events
+            .iter()
+            .map(|e| &e["fields"])
+            .filter(|e| e["event"] == "calibration_poll")
+            .collect();
+        assert_eq!(polls.len(), 4);
+        assert!(polls
+            .iter()
+            .all(|e| e["diagnostic_time_seconds"].is_number()
+                && e["calibration_epoch"].is_u64()
+                && e["fit_executed"] == false));
+        assert_eq!(polls[0]["outcome"], "success");
+        assert_eq!(polls[2]["outcome"], "duplicate");
+        assert!(polls[0]["native_waiting"].is_number());
+        assert_eq!(polls[0]["sample_count"], 0);
+        let transport: Vec<_> = events
+            .iter()
+            .map(|e| &e["fields"])
+            .filter(|e| e["event"] == "request_transport")
+            .collect();
+        assert_eq!(transport.len(), 3);
+        assert!(transport
+            .iter()
+            .all(|e| e["request_id"] == "diagnostic-request"
+                && e["engine_cancellation_acknowledgement"] == "unavailable"));
+    }
 
     fn config() -> EstimatedWaitConfig {
         EstimatedWaitConfig {
@@ -2048,6 +3851,1157 @@ mod tests {
         admission.publish(worker, Some(report), stamp, Instant::now());
     }
 
+    fn feature_registry() -> (Arc<WorkerRegistry>, Arc<dyn Worker>) {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.estimated_wait().configure(EstimatedWaitConfig {
+            estimated_wait_calibration_shadow: true,
+            estimated_wait_feature_shadow: true,
+            ..config()
+        });
+        let worker = worker("http://feature:1");
+        registry.register(worker.clone()).unwrap();
+        let mut report = load(Some(1000), 2, 100.0, 0.4);
+        report.dp_rank_count = 1;
+        report.loads[0].low_load_ttft_seconds = Some(0.2);
+        report.loads[0].prefill_capacity_learning_active = Some(false);
+        report.loads[0].prefill_capacity_sample_count = Some(8);
+        report.loads[0].native_kv_usage_available = Some(true);
+        report.loads[0].native_kv_usage_profile = Some(1);
+        publish_load(registry.estimated_wait(), &worker, &report);
+        (registry, worker)
+    }
+
+    fn deadline_shadow_placement(
+        registry: &Arc<WorkerRegistry>,
+        worker: &Arc<dyn Worker>,
+        supported: bool,
+    ) -> Result<Option<CalibrationForecast>, Response> {
+        let capture = Mutex::new(None);
+        placement::select_from(
+            registry,
+            &PolicyRegistry::new(PolicyConfig::RoundRobin),
+            "m",
+            std::slice::from_ref(worker),
+            PlacementInputs {
+                calibration: Some(&capture),
+                feature_context_supported: supported,
+                ..Default::default()
+            },
+        )?;
+        Ok(capture.into_inner())
+    }
+
+    #[test]
+    fn deadline_shadow_rejected_placement_does_not_register_or_credit() {
+        let (registry, worker) = feature_registry();
+        assert!(deadline_shadow_placement(&registry, &worker, true).is_err());
+        let entries = registry.estimated_wait().entries.lock();
+        let entry = &entries[worker.url()];
+        assert_eq!(entry.total_dispatched, 0);
+        assert_eq!(entry.total_dispatched_requests, 0);
+        assert_eq!(entry.deadline_work.lock().unwrap().summary().pending, 0);
+    }
+
+    #[test]
+    fn native_deadline_budget_defaults_validation_and_remaining_dispatch_time() {
+        assert!(EstimatedWaitConfig::default()
+            .estimated_wait_native_hard_ttft_timeout_secs
+            .is_none());
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, 86401.0] {
+            assert!(EstimatedWaitConfig {
+                estimated_wait_native_hard_ttft_timeout_secs: Some(invalid),
+                estimated_wait_feature_shadow: true,
+                estimated_wait_calibration_shadow: true,
+                ..config()
+            }
+            .validate()
+            .is_err());
+        }
+        assert!(EstimatedWaitConfig {
+            estimated_wait_native_hard_ttft_timeout_secs: Some(10.0),
+            ..config()
+        }
+        .validate()
+        .is_err());
+        let (registry, worker) = feature_registry();
+        publish(registry.estimated_wait(), &worker, 0);
+        let mut forecast = deadline_shadow_placement(&registry, &worker, true)
+            .unwrap()
+            .unwrap();
+        let now = Instant::now();
+        forecast.native_hard_ttft_timeout_secs = Some(10.0);
+        assert_eq!(
+            forecast.native_dispatch_headers(now, now),
+            Err("native_deadline_not_verified_or_stale")
+        );
+        forecast.native_deadline_capability_valid_until = Some(now + Duration::from_secs(5));
+        assert_eq!(
+            forecast
+                .native_dispatch_headers(now - Duration::from_secs(2), now)
+                .unwrap()
+                .unwrap()
+                .1,
+            Some(8000)
+        );
+        assert_eq!(
+            forecast.native_dispatch_headers(now - Duration::from_secs(10), now),
+            Err("native_deadline_budget_exhausted_before_dispatch")
+        );
+        forecast.deadline_dispatch = None;
+        assert_eq!(
+            forecast.native_dispatch_headers(now, now),
+            Err("native_deadline_request_not_tracked")
+        );
+    }
+
+    #[test]
+    fn native_restart_between_capability_and_send_never_confirms_requested_deadline() {
+        let (registry, worker) = feature_registry();
+        let admission = registry.estimated_wait();
+        let native: WorkerLoadResponse = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/native_deadline/sglang_active.json"
+        )))
+        .unwrap();
+        let raw = load(Some(0), 0, 100.0, 0.0);
+        let watermark = admission.poll_started(&worker);
+        let start = Instant::now();
+        admission.publish(&worker, Some(&raw), watermark.clone(), start);
+        admission.publish_native_deadline(&worker, Some(&native), watermark, start, Instant::now());
+        let mut forecast = deadline_shadow_placement(&registry, &worker, true)
+            .unwrap()
+            .unwrap();
+        forecast.native_hard_ttft_timeout_secs = Some(10.0);
+        let request_start = Instant::now();
+        assert!(forecast
+            .native_dispatch_headers(request_start, request_start)
+            .unwrap()
+            .unwrap()
+            .1
+            .is_some());
+        let mut observer = StreamTtftObserver::new(&registry, worker.url(), request_start)
+            .with_calibration(Some(forecast));
+        observer.transport_event("upstream_send_started");
+        let mut restarted = native;
+        let telemetry = restarted.loads[0].deadline_recovery.as_mut().unwrap();
+        telemetry.engine_epoch = "engine-restarted-before-dispatch".into();
+        telemetry.snapshot_seq = 1;
+        telemetry.native_population = 0;
+        telemetry.active_requests.clear();
+        telemetry.hard_ttft_deadline_supported = false;
+        telemetry.abort_enforcement_enabled = false;
+        let watermark = admission.poll_started(&worker);
+        let start = Instant::now();
+        admission.publish(&worker, Some(&raw), watermark.clone(), start);
+        admission.publish_native_deadline(
+            &worker,
+            Some(&restarted),
+            watermark,
+            start,
+            Instant::now(),
+        );
+        observer.downstream_disconnected();
+        drop(observer);
+        let entries = admission.entries.lock();
+        let entry = &entries[worker.url()];
+        assert_eq!(entry.deadline_work.lock().unwrap().summary().pending, 1);
+        assert_eq!(entry.native_deadline.acknowledged_requests, 0);
+        assert!(entry.native_deadline.confirmed_deadlines.is_empty());
+        assert!(!entry
+            .native_deadline
+            .hard_deadlines_present(Instant::now(), 30.0));
+    }
+
+    #[test]
+    fn deadline_shadow_local_failure_rolls_back_once_without_changing_raw_control() {
+        let (registry, worker) = feature_registry();
+        publish(registry.estimated_wait(), &worker, 0);
+        let forecast = deadline_shadow_placement(&registry, &worker, true)
+            .unwrap()
+            .unwrap();
+        let clone = forecast.clone();
+        let ledger =
+            Arc::clone(&registry.estimated_wait().entries.lock()[worker.url()].deadline_work);
+        assert_eq!(ledger.lock().unwrap().summary().pending, 1);
+        drop(forecast); // serialization/dispatch-time veto before any send
+        assert_eq!(ledger.lock().unwrap().summary().pending, 1);
+        drop(clone);
+        assert_eq!(ledger.lock().unwrap().summary().pending, 0);
+        let entries = registry.estimated_wait().entries.lock();
+        assert_eq!(entries[worker.url()].total_dispatched, 100);
+        assert_eq!(entries[worker.url()].total_dispatched_requests, 1);
+    }
+
+    #[test]
+    fn deadline_shadow_unsupported_observation_path_does_not_claim_tracking() {
+        let (registry, worker) = feature_registry();
+        publish(registry.estimated_wait(), &worker, 0);
+        // gRPC and nonstreaming callers do not provide feature_context_supported.
+        let forecast = deadline_shadow_placement(&registry, &worker, false).unwrap();
+        assert!(forecast
+            .as_ref()
+            .is_none_or(|f| f.deadline_dispatch.is_none()));
+        let entries = registry.estimated_wait().entries.lock();
+        assert_eq!(
+            entries[worker.url()]
+                .deadline_work
+                .lock()
+                .unwrap()
+                .summary()
+                .pending,
+            0
+        );
+        assert_eq!(entries[worker.url()].total_dispatched, 100);
+    }
+
+    #[test]
+    fn deadline_shadow_stream_timeout_disconnect_and_drop_require_native_release() {
+        for terminal in ["timeout", "disconnect", "drop", "first_text"] {
+            let (registry, worker) = feature_registry();
+            publish(registry.estimated_wait(), &worker, 0);
+            let forecast = deadline_shadow_placement(&registry, &worker, true).unwrap();
+            let ledger =
+                Arc::clone(&registry.estimated_wait().entries.lock()[worker.url()].deadline_work);
+            let mut observer = StreamTtftObserver::new(
+                &registry,
+                worker.url(),
+                Instant::now() - Duration::from_millis(1),
+            )
+            .with_calibration(forecast);
+            observer.transport_event("upstream_send_started");
+            assert_eq!(ledger.lock().unwrap().summary().forwarded, 1);
+            match terminal {
+                "timeout" => observer.upstream_timeout(),
+                "disconnect" => observer.downstream_disconnected(),
+                "first_text" => {
+                    observer.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n");
+                }
+                _ => {}
+            }
+            observer.cancel();
+            drop(observer);
+            let summary = ledger.lock().unwrap().summary();
+            assert_eq!(summary.pending, usize::from(terminal != "first_text"));
+            assert_eq!(summary.unknown_work, summary.pending);
+            assert_eq!(
+                registry.estimated_wait().entries.lock()[worker.url()].total_dispatched,
+                100
+            );
+        }
+    }
+
+    #[test]
+    fn deadline_shadow_runtime_diagnostics_report_ack_availability_without_unused_fifo_model() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = DiagnosticWriter(Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let (registry, worker) = feature_registry();
+            registry.estimated_wait().begin().unwrap().record_forecast(
+                std::slice::from_ref(&worker),
+                Some("deadline-shadow-test"),
+                Some(&worker),
+            );
+        });
+        let text = String::from_utf8(bytes.lock().clone()).unwrap();
+        let event = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|row| row["fields"]["event"] == "deadline_recovery_forecast")
+            .unwrap();
+        assert_eq!(event["fields"]["d2_available"], false);
+        assert!(event["fields"].get("d3_available").is_none());
+        assert_eq!(
+            event["fields"]["admission_threshold_is_native_deadline"],
+            false
+        );
+        assert_eq!(event["fields"]["d2_released_known_work"], 0.0);
+    }
+
+    fn feature_observer(
+        registry: &Arc<WorkerRegistry>,
+        worker: &Arc<dyn Worker>,
+    ) -> StreamTtftObserver {
+        let mut guard = registry.estimated_wait().begin().unwrap();
+        let mut forecast = guard.capture_calibration(worker, None);
+        guard.attach_feature_context(worker, &mut forecast);
+        drop(guard);
+        StreamTtftObserver::new(registry, worker.url(), Instant::now()).with_calibration(forecast)
+    }
+    fn pending_work_report() -> WorkerLoadResponse {
+        let mut report = load(None, 4, 100.0, 0.4);
+        report.dp_rank_count = 1;
+        let rank = &mut report.loads[0];
+        rank.num_running_reqs = 1;
+        rank.native_request_counts_available = Some(true);
+        rank.native_request_counts_profile = Some(7);
+        rank.timely_prefill_progress_source = Some("local_compute_tokens".to_owned());
+        rank.avg_request_prefill_kv_computed_tokens = Some(100.0);
+        rank.prefill_size_sample_count = Some(32);
+        rank.prefill_capacity_learning_active = Some(false);
+        rank.prefill_capacity_sample_count = Some(8);
+        rank.low_load_ttft_seconds = Some(0.2);
+        report
+    }
+
+    #[test]
+    fn explicit_size_basis_provenance_leaves_original_queue_and_capacity_arithmetic_unchanged() {
+        let cfg = config();
+        let mut report = pending_work_report();
+        let original = cfg.prepare(&report).unwrap();
+        report.loads[0].prefill_metric_provenance =
+            Some(openai_protocol::worker::PrefillMetricProvenance {
+                schema_version: 1,
+                progress_source: Some("local_compute_tokens".into()),
+                queue_size_observed_sample_count: Some(32),
+                ..Default::default()
+            });
+        let enriched = cfg.prepare(&report).unwrap();
+        assert!(original.size_basis.is_none());
+        assert_eq!(enriched.size_basis.unwrap().kind, basis::Kind::Observed);
+        assert_eq!(original.seconds(200), enriched.seconds(200));
+        assert_eq!(
+            original.queue_excess_seconds(200),
+            enriched.queue_excess_seconds(200)
+        );
+        assert_eq!(original.decision_profile, enriched.decision_profile);
+        assert_eq!(
+            original.effective_prefill_capacity,
+            enriched.effective_prefill_capacity
+        );
+        assert_eq!(original.capacity_ready, enriched.capacity_ready);
+    }
+
+    fn pending_work_observer(
+        registry: &Arc<WorkerRegistry>,
+        worker: &Arc<dyn Worker>,
+        bytes: usize,
+    ) -> StreamTtftObserver {
+        let mut guard = registry.estimated_wait().begin().unwrap();
+        let mut forecast = guard.capture_calibration(worker, None);
+        guard.attach_feature_context(worker, &mut forecast);
+        forecast
+            .as_mut()
+            .unwrap()
+            .set_prompt_work(openai_protocol::common::PromptWorkHint::TextBytes(bytes));
+        drop(guard);
+        StreamTtftObserver::new(registry, worker.url(), Instant::now()).with_calibration(forecast)
+    }
+
+    #[test]
+    fn pending_work_preserves_native_drain_cap_and_drops_it_after_rebound_or_staleness() {
+        let (registry, worker) = feature_registry();
+        let admission = registry.estimated_wait();
+        let mut report = pending_work_report();
+        publish_load(admission, &worker, &report);
+        let _observer = pending_work_observer(&registry, &worker, 400_000);
+        report.loads[0].num_waiting_reqs = 40;
+        publish_load(admission, &worker, &report);
+        let mut guard = admission.begin().unwrap();
+        let now = Instant::now();
+        {
+            let entry = guard.entries.get_mut(worker.url()).unwrap();
+            entry.recovery.reset("test_native_drain");
+            for i in 0..7 {
+                report.loads[0].num_waiting_reqs = 100 - i * 10;
+                entry.recovery.observe(
+                    &report,
+                    now - Duration::from_secs(30 - i as u64 * 5),
+                    60.0,
+                    entry.total_dispatched_requests,
+                );
+            }
+        }
+        guard.credit(&worker, Some(&[0; 100]));
+        let mut forecast = guard.capture_calibration(&worker, None);
+        guard.attach_feature_context(&worker, &mut forecast);
+        let candidate = forecast.unwrap().pending_work_admission.unwrap();
+        assert!(candidate.queue.applied);
+        assert_eq!(candidate.recovery_cap_seconds, Some(20.5));
+        assert!(candidate.debt_seconds > 0.0);
+        assert_eq!(candidate.candidate_x, 20.5 + candidate.debt_seconds);
+        assert_eq!(candidate.control_x, candidate.candidate_x);
+
+        let entry = guard.entries.get_mut(worker.url()).unwrap();
+        // An unsupported population rebound invalidates the existing drain evidence.
+        report.loads[0].num_waiting_reqs = 100;
+        entry.recovery.observe(
+            &report,
+            Instant::now(),
+            60.0,
+            entry.total_dispatched_requests,
+        );
+        let at = Instant::now();
+        let snapshot = entry.decision_snapshot(admission.config(), at).unwrap();
+        let original = decision::Admission {
+            snapshot,
+            predictions: entry
+                .decision
+                .predictions(snapshot, diagnostic_time(at), true),
+        };
+        let candidate = entry
+            .pending_work_admission(admission.config(), &original, at)
+            .unwrap();
+        assert_eq!(candidate.recovery_cap_seconds, None);
+        assert_eq!(candidate.candidate_x, candidate.control_x);
+        let mut stale = original;
+        stale.snapshot.fresh = false;
+        let candidate = entry
+            .pending_work_admission(admission.config(), &stale, at)
+            .unwrap();
+        assert_eq!(candidate.recovery_cap_seconds, None);
+        assert!(!candidate.queue.applied);
+        assert_eq!(candidate.candidate_x, stale.snapshot.x);
+    }
+
+    #[test]
+    fn pending_work_capacity_source_selects_same_poll_control_or_exact_historical() {
+        for source in [
+            Some("local_compute_tokens"),
+            Some("prefill_started_requests"),
+            Some("future_unknown_source"),
+            None,
+        ] {
+            let (registry, worker) = feature_registry();
+            let admission = registry.estimated_wait();
+            let mut report = pending_work_report();
+            report.loads[0].timely_prefill_progress_source = source.map(str::to_owned);
+            publish_load(admission, &worker, &report);
+            let _observer = pending_work_observer(&registry, &worker, 40000);
+            publish_load(admission, &worker, &report);
+            let mut guard = admission.begin().unwrap();
+            guard.credit(&worker, Some(&[0; 100]));
+            let mut forecast = guard.capture_calibration(&worker, None);
+            guard.attach_feature_context(&worker, &mut forecast);
+            let candidate = forecast.unwrap().pending_work_admission.unwrap();
+            assert!(candidate.queue.applied);
+            assert_eq!(candidate.capacity_progress_source.as_deref(), source);
+            assert!(candidate.control_x > candidate.original_x);
+            assert!(candidate.debt_seconds > 0.0);
+            assert_eq!(
+                candidate.selected_pending_applied,
+                source == Some("local_compute_tokens")
+            );
+            if candidate.selected_pending_applied {
+                assert_eq!(candidate.source_gate_reason, "local_compute_tokens");
+                assert_eq!(candidate.candidate_x, candidate.control_x);
+                assert_eq!(
+                    serde_json::to_value(&candidate.predictions).unwrap(),
+                    serde_json::to_value(&candidate.control_predictions).unwrap()
+                );
+            } else {
+                assert_eq!(
+                    candidate.source_gate_reason,
+                    if source.is_some() {
+                        "capacity_progress_source_unsupported"
+                    } else {
+                        "capacity_progress_source_missing"
+                    }
+                );
+                assert_eq!(candidate.candidate_x, candidate.original_x);
+                assert_eq!(candidate.candidate_raw_total, candidate.original_raw_total);
+                assert_eq!(
+                    serde_json::to_value(&candidate.predictions).unwrap(),
+                    serde_json::to_value(&candidate.original_predictions).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_work_source_change_resets_inventory_before_selecting_new_poll() {
+        let (registry, worker) = feature_registry();
+        let admission = registry.estimated_wait();
+        let mut report = pending_work_report();
+        publish_load(admission, &worker, &report);
+        let _old = pending_work_observer(&registry, &worker, 40000);
+        let watermark = admission.poll_started(&worker);
+        report.loads[0].timely_prefill_progress_source =
+            Some("prefill_started_requests".to_owned());
+        admission.publish(&worker, Some(&report), watermark, Instant::now());
+        let mut guard = admission.begin().unwrap();
+        let mut forecast = guard.capture_calibration(&worker, None);
+        guard.attach_feature_context(&worker, &mut forecast);
+        let candidate = forecast.unwrap().pending_work_admission.unwrap();
+        assert_eq!(
+            candidate.capacity_progress_source.as_deref(),
+            Some("prefill_started_requests")
+        );
+        assert!(!candidate.queue.applied);
+        assert!(!candidate.selected_pending_applied);
+        assert_eq!(candidate.source_gate_reason, "pending_queue_fallback");
+        assert_eq!(candidate.queue.reason, "inventory_generation_changed");
+        assert_eq!(candidate.candidate_x, candidate.original_x);
+        assert_eq!(candidate.control_x, candidate.original_x);
+    }
+
+    #[test]
+    fn pending_work_poll_freezes_inventory_and_preserves_control_and_saved_labels() {
+        let (registry, worker) = feature_registry();
+        let admission = registry.estimated_wait();
+        let report = pending_work_report();
+        publish_load(admission, &worker, &report);
+        let mut first = pending_work_observer(&registry, &worker, 4000);
+        let second = pending_work_observer(&registry, &worker, 12000);
+        let started = Instant::now();
+        let watermark = admission.poll_started(&worker);
+        first.cancel(); // Resolution during I/O affects only the next frozen summary.
+        admission.publish(&worker, Some(&report), watermark, started);
+        let mut guard = admission.begin().unwrap();
+        let before =
+            serde_json::to_value(guard.entries[worker.url()].decision.diagnostics()).unwrap();
+        let overloaded = guard.entries[worker.url()]
+            .sample
+            .as_ref()
+            .unwrap()
+            .overloaded;
+        let mut forecast = guard.capture_calibration(&worker, Some("candidate-current"));
+        guard.attach_feature_context(&worker, &mut forecast);
+        let saved = forecast
+            .as_ref()
+            .unwrap()
+            .pending_work_admission
+            .as_ref()
+            .unwrap();
+        assert_eq!(saved.queue.summary.known, 2);
+        assert_eq!(saved.queue.coverage, 0.4);
+        assert_eq!(saved.queue.candidate_tokens, 3440.0);
+        assert_eq!(saved.candidate_x, 34.4);
+        assert_eq!(saved.original_x, 4.0);
+        assert_eq!(
+            forecast
+                .as_ref()
+                .unwrap()
+                .decision_admission
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .x,
+            4.0
+        );
+        assert_eq!(forecast.as_ref().unwrap().queue_extra, 4.0);
+        for (old, new) in saved.original_predictions.iter().zip(&saved.predictions) {
+            assert_eq!(old.coefficients, new.coefficients);
+            assert_eq!(old.source_arm, new.source_arm);
+            assert!((new.extra / old.extra - 8.6).abs() < 1e-12);
+        }
+        assert_eq!(
+            serde_json::to_value(guard.entries[worker.url()].decision.diagnostics()).unwrap(),
+            before
+        );
+        assert_eq!(
+            guard.entries[worker.url()]
+                .sample
+                .as_ref()
+                .unwrap()
+                .overloaded,
+            overloaded
+        );
+        drop(guard);
+        let mut current = StreamTtftObserver::new(&registry, worker.url(), Instant::now())
+            .with_calibration(forecast);
+        current.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n");
+        current.cancel(); // First text then cancellation must not release another row.
+        drop(current);
+        drop(second);
+        publish_load(admission, &worker, &report);
+        assert_eq!(
+            admission.begin().unwrap().entries[worker.url()]
+                .sample
+                .as_ref()
+                .unwrap()
+                .pending_work_queue
+                .unwrap()
+                .summary
+                .pending,
+            0
+        );
+    }
+
+    #[test]
+    fn pending_work_generation_changes_during_poll_reject_frozen_sizes() {
+        let (registry, worker) = feature_registry();
+        let admission = registry.estimated_wait();
+        let report = pending_work_report();
+        publish_load(admission, &worker, &report);
+        let mut observer = pending_work_observer(&registry, &worker, 40000);
+        let started = Instant::now();
+        let watermark = admission.poll_started(&worker);
+        admission
+            .begin()
+            .unwrap()
+            .entries
+            .get_mut(worker.url())
+            .unwrap()
+            .reset_calibration(Instant::now(), "test_baseline_changed_during_io");
+        observer.cancel(); // Old handle cannot change the new inventory generation.
+        admission.publish(&worker, Some(&report), watermark, started);
+        let guard = admission.begin().unwrap();
+        let q = guard.entries[worker.url()]
+            .sample
+            .as_ref()
+            .unwrap()
+            .pending_work_queue
+            .unwrap();
+        assert_eq!(q.summary.known, 1);
+        assert!(!q.applied);
+        assert_eq!(q.reason, "inventory_generation_changed");
+        assert_eq!(q.original_tokens, q.candidate_tokens);
+        drop(guard);
+        // A reset after publication is independently fenced at admission capture.
+        let _fresh = pending_work_observer(&registry, &worker, 40000);
+        publish_load(admission, &worker, &report);
+        let mut guard = admission.begin().unwrap();
+        let mut forecast = guard.capture_calibration(&worker, None);
+        guard.attach_feature_context(&worker, &mut forecast);
+        let original = forecast.unwrap().decision_admission.unwrap();
+        assert!(
+            guard.entries[worker.url()]
+                .pending_work_admission(admission.config(), &original, Instant::now())
+                .unwrap()
+                .queue
+                .applied
+        );
+        let entry = guard.entries.get_mut(worker.url()).unwrap();
+        entry.reset_calibration(Instant::now(), "test_after_publication");
+        let candidate = entry
+            .pending_work_admission(admission.config(), &original, Instant::now())
+            .unwrap();
+        assert!(!candidate.queue.applied);
+        assert_eq!(candidate.queue.reason, "inventory_generation_changed");
+        assert_eq!(candidate.candidate_x, original.snapshot.x);
+    }
+
+    #[test]
+    fn pending_work_invalid_counts_stale_and_native_authoritative_are_fallbacks() {
+        let (registry, worker) = feature_registry();
+        let admission = registry.estimated_wait();
+        let report = pending_work_report();
+        publish_load(admission, &worker, &report);
+        let _observer = pending_work_observer(&registry, &worker, 40000);
+        for mode in 0..6 {
+            let mut report = report.clone();
+            if mode == 0 {
+                report.loads[0].num_running_reqs = -1;
+            }
+            if mode == 1 {
+                report.loads[0].native_request_counts_profile = None;
+            }
+            if mode == 2 {
+                report.loads[0].num_waiting_uncached_tokens_available = Some(true);
+                report.loads[0].num_waiting_uncached_tokens = 0;
+            }
+            if mode == 3 {
+                report.loads[0].num_waiting_uncached_tokens_available = None;
+                report.loads[0].num_waiting_uncached_tokens = 0;
+            }
+            if mode == 4 {
+                report.loads[0].dp_rank = 1;
+            }
+            publish_load(admission, &worker, &report);
+            let mut guard = admission.begin().unwrap();
+            let published_reason = guard.entries[worker.url()]
+                .sample
+                .as_ref()
+                .unwrap()
+                .pending_work_queue
+                .unwrap()
+                .reason;
+            let mut forecast = guard.capture_calibration(&worker, None);
+            guard.attach_feature_context(&worker, &mut forecast);
+            let original = forecast
+                .as_ref()
+                .unwrap()
+                .decision_admission
+                .as_ref()
+                .unwrap();
+            let candidate = forecast
+                .as_ref()
+                .unwrap()
+                .pending_work_admission
+                .as_ref()
+                .unwrap();
+            if mode < 5 {
+                assert!(!candidate.queue.applied);
+                assert_eq!(candidate.candidate_x, original.snapshot.x);
+            }
+            if mode == 2 {
+                assert_eq!(published_reason, "authoritative_native_tokens");
+            }
+            if mode == 3 {
+                assert_eq!(published_reason, "native_token_availability_unknown");
+            }
+            if mode == 5 {
+                let entry = guard.entries.get_mut(worker.url()).unwrap();
+                let mut stale = original.clone();
+                stale.snapshot.fresh = false;
+                let candidate = entry
+                    .pending_work_admission(admission.config(), &stale, Instant::now())
+                    .unwrap();
+                assert!(!candidate.available);
+                assert!(!candidate.queue.applied);
+                assert_eq!(candidate.candidate_x, stale.snapshot.x);
+                stale.snapshot.fresh = true;
+                stale.snapshot.native_ready = false;
+                assert!(
+                    !entry
+                        .pending_work_admission(admission.config(), &stale, Instant::now())
+                        .unwrap()
+                        .available
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn feature_outcomes_are_once_pretext_only_and_backpressure_is_unknown() {
+        let (registry, worker) = feature_registry();
+        {
+            let mut observer = feature_observer(&registry, &worker);
+            observer.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n");
+            observer.downstream_disconnected();
+            observer.upstream_timeout();
+        }
+        {
+            let mut observer = feature_observer(&registry, &worker);
+            observer.cancel();
+            observer.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n");
+            observer.downstream_disconnected();
+        }
+        {
+            let mut observer = feature_observer(&registry, &worker);
+            observer.downstream_disconnected();
+            observer.downstream_disconnected();
+        }
+        {
+            let mut observer = feature_observer(&registry, &worker);
+            observer.upstream_timeout();
+        }
+        let entries = registry.estimated_wait().entries.lock();
+        let c = entries[worker.url()]
+            .feature_activity
+            .context(Instant::now(), None)
+            .counts;
+        assert_eq!(c.first_text, 1);
+        assert_eq!(c.unknown_pretext_end, 1);
+        assert_eq!(c.pretext_downstream_disconnect, 1);
+        assert_eq!(c.upstream_timeout, 1);
+        assert_eq!(c.deadline_timely_first_text, 1);
+        assert_eq!(c.deadline_or_cutoff_adverse, 2);
+        assert_eq!(c.deadline_breach, 0);
+        assert_eq!(c.deadline_or_cutoff_unknown, 1);
+    }
+
+    #[test]
+    fn native_deadline_sse_is_measured_censor_only_after_done_without_ack() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = DiagnosticWriter(Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let (registry, worker) = feature_registry();
+            publish_load(
+                registry.estimated_wait(),
+                &worker,
+                &load(Some(100), 1, 100.0, 0.0),
+            );
+            let mut forecast = deadline_shadow_placement(&registry, &worker, true)
+                .unwrap()
+                .unwrap();
+            forecast.native_hard_ttft_timeout_secs = Some(300.0);
+            let ledger =
+                Arc::clone(&registry.estimated_wait().entries.lock()[worker.url()].deadline_work);
+            let mut observer = StreamTtftObserver::new(&registry, worker.url(), Instant::now())
+                .with_calibration(Some(forecast));
+            observer.transport_event("upstream_send_started");
+            observer.push(b"data: {\"error\":{\"type\":\"native_ttft_dead");
+            assert!(!observer.feature_resolved);
+            observer.push(b"line\",\"message\":\"expired\"}}\n\n");
+            assert!(!observer.feature_resolved);
+            observer.push(b"data: [DONE]\n\n");
+            assert!(observer.feature_resolved);
+            observer.upstream_timeout();
+            drop(observer);
+            assert_eq!(ledger.lock().unwrap().summary().pending, 1);
+            let entries = registry.estimated_wait().entries.lock();
+            let entry = &entries[worker.url()];
+            let counts = entry.feature_activity.context(Instant::now(), None).counts;
+            assert_eq!(counts.native_deadline_cutoff, 1);
+            assert_eq!(counts.first_text, 0);
+            assert_eq!(counts.unknown_pretext_end, 0);
+            assert_eq!(entry.native_deadline.acknowledged_requests, 0);
+        });
+        let text = String::from_utf8(bytes.lock().clone()).unwrap();
+        let label = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|row| {
+                row["fields"]["event"] == "decision_label"
+                    && row["fields"]["reason"] == "native_hard_ttft_deadline"
+            })
+            .map(|row| {
+                serde_json::from_str::<serde_json::Value>(
+                    row["fields"]["decision_json"].as_str().unwrap(),
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert_eq!(label["label"]["exact"], false);
+        let elapsed = label["label"]["elapsed"].as_f64().unwrap();
+        assert!(elapsed > 0.0 && elapsed < 300.0);
+    }
+
+    #[test]
+    fn malformed_interrupted_and_after_text_native_deadline_sse_preserve_truth() {
+        for mode in [
+            "missing_done",
+            "wrong_type",
+            "missing_message",
+            "after_text",
+            "not_configured",
+        ] {
+            let (registry, worker) = feature_registry();
+            publish(registry.estimated_wait(), &worker, 100);
+            let mut forecast = deadline_shadow_placement(&registry, &worker, true)
+                .unwrap()
+                .unwrap();
+            if mode != "not_configured" {
+                forecast.native_hard_ttft_timeout_secs = Some(300.0);
+            }
+            let mut observer = StreamTtftObserver::new(&registry, worker.url(), Instant::now())
+                .with_calibration(Some(forecast));
+            observer.transport_event("upstream_send_started");
+            if mode == "after_text" {
+                observer.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n");
+            }
+            let error = match mode {
+                "wrong_type" => b"data: {\"error\":{\"type\":\"native_ttft_deadline_extra\",\"message\":\"expired\"}}\n\n".as_slice(),
+                "missing_message" => b"data: {\"error\":{\"type\":\"native_ttft_deadline\"}}\n\n".as_slice(),
+                _ => b"data: {\"error\":{\"type\":\"native_ttft_deadline\",\"message\":\"expired\"}}\n\n".as_slice(),
+            };
+            observer.push(error);
+            if mode != "missing_done" {
+                observer.push(b"data: [DONE]\n\n");
+            }
+            drop(observer);
+            let entries = registry.estimated_wait().entries.lock();
+            let c = entries[worker.url()]
+                .feature_activity
+                .context(Instant::now(), None)
+                .counts;
+            assert_eq!(c.native_deadline_cutoff, 0, "{mode}");
+            assert_eq!(c.first_text, u64::from(mode == "after_text"), "{mode}");
+            assert_eq!(
+                c.unknown_pretext_end,
+                u64::from(mode != "after_text"),
+                "{mode}"
+            );
+        }
+    }
+    #[test]
+    fn feature_deadline_poll_and_real_terminal_are_separate_epoch_safe_observations() {
+        let (registry, worker) = feature_registry();
+        let mut guard = registry.estimated_wait().begin().unwrap();
+        let mut forecast = guard.capture_calibration(&worker, Some("deadline-test"));
+        guard.attach_feature_context(&worker, &mut forecast);
+        drop(guard);
+        let start = Instant::now() - Duration::from_secs(301);
+        let mut observer = StreamTtftObserver::new(&registry, worker.url(), start)
+            .with_request_id(Some("deadline-test"))
+            .with_calibration(forecast);
+        observer.push(b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n");
+        // A failed native fetch still advances local deadlines, with no fabricated text.
+        let poll_started = Instant::now();
+        let watermark = registry.estimated_wait().poll_started(&worker);
+        registry
+            .estimated_wait()
+            .publish(&worker, None, watermark, poll_started);
+        {
+            let mut entries = registry.estimated_wait().entries.lock();
+            let entry = entries.get_mut(worker.url()).unwrap();
+            let c = entry.feature_activity_context(Instant::now(), None).counts;
+            assert_eq!(c.deadline_breach, 1);
+            assert_eq!(c.deadline_or_cutoff_adverse, 1);
+            assert_eq!(c.first_text, 0);
+            assert_eq!(c.upstream_timeout, 0);
+        }
+        observer.cancel();
+        observer.downstream_disconnected();
+        {
+            let mut entries = registry.estimated_wait().entries.lock();
+            let entry = entries.get_mut(worker.url()).unwrap();
+            let c = entry.feature_activity_context(Instant::now(), None).counts;
+            assert_eq!(c.unknown_pretext_end, 1);
+            assert_eq!(c.deadline_or_cutoff_unknown, 0);
+            assert_eq!(c.deadline_or_cutoff_adverse, 1);
+            entry.reset_calibration(Instant::now(), "test");
+            assert_eq!(entry.feature_deadlines.pending_count(), 0);
+            assert_eq!(
+                entry
+                    .feature_activity_context(Instant::now(), None)
+                    .counts
+                    .deadline_breach,
+                0
+            );
+        }
+    }
+    #[test]
+    fn feature_deadline_pending_overflow_suppresses_union_until_resolved() {
+        let (registry, worker) = feature_registry();
+        let mut entries = registry.estimated_wait().entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        let now = Instant::now();
+        for _ in 0..16 {
+            entry
+                .feature_activity
+                .record(now, FeatureOutcome::DeadlineTimely);
+        }
+        assert_eq!(
+            entry.feature_activity_context(now, None).values[1],
+            Some(0.)
+        );
+        entry.feature_deadlines.untracked = 1;
+        assert_eq!(entry.feature_activity_context(now, None).values[1], None);
+        entry.feature_deadlines.resolve(
+            DeadlineHandle::Untracked,
+            now,
+            None,
+            now,
+            FeatureOutcome::Unknown,
+        );
+        assert_eq!(
+            entry.feature_activity_context(now, None).values[1],
+            Some(0.)
+        );
+    }
+
+    #[test]
+    fn feature_old_outcomes_and_wrong_worker_identity_cannot_mutate_replacement() {
+        let (registry, worker) = feature_registry();
+        let mut observer = feature_observer(&registry, &worker);
+        registry
+            .estimated_wait()
+            .entries
+            .lock()
+            .get_mut(worker.url())
+            .unwrap()
+            .reset_calibration(Instant::now(), "test");
+        observer.downstream_disconnected();
+        let mut guard = registry.estimated_wait().begin().unwrap();
+        let other = self::worker(worker.url());
+        guard.record_feature_decision(&other, None, true, false);
+        assert_eq!(
+            guard.entries[worker.url()]
+                .feature_activity
+                .context(Instant::now(), None)
+                .counts
+                .actual_rejected,
+            0
+        );
+        assert_eq!(
+            guard.entries[worker.url()]
+                .feature_activity
+                .context(Instant::now(), None)
+                .counts
+                .pretext_downstream_disconnect,
+            0
+        );
+        assert!(AdmissionGuard::feature_scope(std::slice::from_ref(&worker), false).is_none());
+        assert!(AdmissionGuard::feature_scope(&[worker.clone(), other], true).is_none());
+    }
+    #[test]
+    fn feature_context_is_saved_before_own_decision_and_never_changes_scalar_fit() {
+        let (registry, worker) = feature_registry();
+        let mut guard = registry.estimated_wait().begin().unwrap();
+        for _ in 0..16 {
+            guard.record_feature_decision(&worker, None, false, true);
+        }
+        let mut forecast = guard.capture_calibration(&worker, None);
+        guard.attach_feature_context(&worker, &mut forecast);
+        let forecast = forecast.unwrap();
+        assert_eq!(
+            forecast.feature_context.unwrap().values,
+            [Some(0.4), None, Some(0.0)]
+        );
+        guard.record_feature_decision(&worker, None, true, false);
+        assert_eq!(forecast.feature_context.unwrap().counts.actual_rejected, 0);
+        let entry = guard.entries.get_mut(worker.url()).unwrap();
+        let now = Instant::now();
+        for i in 0..40 {
+            let mut f = forecast.clone();
+            f.feature_context.as_mut().unwrap().values[0] = Some(i as f64 / 40.0);
+            assert_eq!(entry.calibration.observe(&f, 20.2, now), "accepted");
+        }
+        entry.calibration.fit_on_poll(true, now);
+        assert_eq!(entry.calibration.target(true), 2.0);
+        assert_eq!(entry.calibration.samples[1].len(), 32);
+        entry.calibration.rotate(now + Duration::from_secs(600));
+        assert!(entry.calibration.samples[1].is_empty());
+    }
+    #[test]
+    fn decision_progress_requires_complete_timely_rank_evidence() {
+        let cfg = config();
+        let mut report = load(Some(1000), 2, 100.0, 0.4);
+        report.dp_rank_count = 1;
+        let rank = &mut report.loads[0];
+        rank.native_request_counts_available = Some(true);
+        rank.native_request_counts_profile = Some(7);
+        rank.timely_prefill_progress = Some(0.0);
+        rank.timely_prefill_progress_source = Some("local_compute_tokens".to_owned());
+        rank.timely_prefill_progress_interval = Some(1.0);
+        assert_eq!(cfg.prepare(&report).unwrap().timely_progress, Some(0.0));
+        report.loads[0].timely_prefill_progress_interval = Some(1000.0);
+        assert_eq!(cfg.prepare(&report).unwrap().timely_progress, None);
+        report.loads[0].timely_prefill_progress_interval = Some(1.0);
+        report.loads[0].timely_prefill_progress_source = Some("completed_uncached".to_owned());
+        assert_eq!(cfg.prepare(&report).unwrap().timely_progress, None);
+        report.loads[0].timely_prefill_progress_source = Some("local_compute_tokens".to_owned());
+        report.dp_rank_count = 2;
+        assert!(cfg.prepare(&report).is_none());
+        report.loads.push(report.loads[0].clone());
+        assert_eq!(cfg.prepare(&report).unwrap().timely_progress, None);
+    }
+
+    #[test]
+    fn decision_saved_prediction_is_immutable_and_never_changes_admission() {
+        let (registry, worker) = feature_registry();
+        let mut guard = registry.estimated_wait().begin().unwrap();
+        let before = guard
+            .entries
+            .get(worker.url())
+            .unwrap()
+            .sample
+            .as_ref()
+            .unwrap()
+            .overloaded;
+        let mut forecast = guard.capture_calibration(&worker, None);
+        guard.attach_feature_context(&worker, &mut forecast);
+        let saved = forecast.unwrap();
+        let frozen = serde_json::to_value(&saved.decision_admission).unwrap();
+        let entry = guard.entries.get_mut(worker.url()).unwrap();
+        entry.decision.mark_incomplete();
+        assert_eq!(
+            serde_json::to_value(&saved.decision_admission).unwrap(),
+            frozen
+        );
+        assert_eq!(entry.sample.as_ref().unwrap().overloaded, before);
+        assert!(saved.decision_admission.unwrap().snapshot.context.complete);
+        assert!(
+            !entry
+                .decision
+                .context(saved.time_seconds, None, None, false)
+                .complete
+        );
+    }
+
+    #[test]
+    fn decision_snapshot_uses_uncalibrated_n_while_legacy_comparator_keeps_scalar() {
+        let (registry, worker) = recovery_registry(true);
+        let admission = registry.estimated_wait();
+        let mut entries = admission.entries.lock();
+        let entry = entries.get_mut(worker.url()).unwrap();
+        let now = Instant::now();
+        let ready = entry
+            .sample
+            .as_ref()
+            .unwrap()
+            .prepared
+            .capacity_learned_ready;
+        let overloaded = entry.sample.as_ref().unwrap().overloaded;
+        for scalar in [0.2, 2.0, 6.0] {
+            entry.calibration.trajectories[usize::from(ready)] = ScaleTrajectory {
+                anchor_scale: scalar,
+                target_scale: scalar,
+                anchor_time: now,
+            };
+            let snapshot = entry.decision_snapshot(admission.config(), now).unwrap();
+            let comparator = entry.recovery_forecast(admission.config(), now).unwrap();
+            assert!(comparator.available);
+            assert_eq!(snapshot.source, "live_n");
+            assert_eq!(snapshot.x, 25.0);
+            assert_eq!(snapshot.scalar_gain, scalar);
+            assert_eq!(comparator.gain, scalar);
+            assert_eq!(
+                comparator.legacy_gain_total,
+                Some(snapshot.baseline + scalar * snapshot.x)
+            );
+            assert_eq!(entry.sample.as_ref().unwrap().overloaded, overloaded);
+        }
+        entry.recovery.reset("test_original_queue_fallback");
+        let snapshot = entry.decision_snapshot(admission.config(), now).unwrap();
+        assert_eq!(snapshot.source, "original_n_fallback");
+        assert_eq!(snapshot.live_queue_extra, None);
+        assert_eq!(snapshot.x, snapshot.original_queue_extra);
+        assert_eq!(snapshot.x, 1000.0);
+        assert_eq!(snapshot.scalar_gain, 6.0);
+    }
+
+    #[test]
+    fn feature_kv_missing_duplicate_ranks_and_order() {
+        let mut report = load(Some(1000), 2, 100.0, 0.4);
+        report.dp_rank_count = 1;
+        assert!(config().prepare(&report).unwrap().kv_usage.is_none());
+        report.loads[0].native_kv_usage_available = Some(true);
+        assert_eq!(config().prepare(&report).unwrap().kv_usage, Some(0.4));
+        let mut second = report.loads[0].clone();
+        second.dp_rank = 1;
+        second.token_usage = 0.6;
+        report.loads.push(second);
+        report.dp_rank_count = 2;
+        let p = config().prepare(&report).unwrap();
+        report.loads.reverse();
+        assert_eq!(config().prepare(&report).unwrap().kv_usage, p.kv_usage);
+        assert_eq!(p.kv_usage, Some(0.5));
+        report.loads[0].dp_rank = 0;
+        assert!(config().prepare(&report).unwrap().kv_usage.is_none());
+    }
+
+    #[test]
+    fn feature_actual_hard_rejection_is_counted_but_shadow_would_reject_is_not() {
+        for shadow in [false, true] {
+            let registry = Arc::new(WorkerRegistry::new());
+            registry.estimated_wait().configure(EstimatedWaitConfig {
+                estimated_wait_calibration_shadow: true,
+                estimated_wait_feature_shadow: true,
+                estimated_wait_shadow: shadow,
+                ..config()
+            });
+            let worker = worker("http://feature-decision:1");
+            registry.register(worker.clone()).unwrap();
+            let mut report = load(Some(100_000), 20, 100.0, 0.5);
+            report.loads[0].prefill_capacity_learning_active = Some(false);
+            report.loads[0].prefill_capacity_sample_count = Some(8);
+            publish_load(registry.estimated_wait(), &worker, &report);
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            let capture = Mutex::new(None);
+            let result = placement::select_from(
+                &registry,
+                &policies,
+                "m",
+                std::slice::from_ref(&worker),
+                PlacementInputs {
+                    calibration: Some(&capture),
+                    feature_context_supported: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(result.is_err(), !shadow);
+            let entries = registry.estimated_wait().entries.lock();
+            let counts = entries[worker.url()]
+                .feature_activity
+                .context(Instant::now(), None)
+                .counts;
+            assert_eq!(counts.actual_rejected, u64::from(!shadow));
+            assert_eq!(counts.admitted, u64::from(shadow));
+        }
+    }
     fn calibration_registry(native_ready: bool) -> (Arc<WorkerRegistry>, Arc<dyn Worker>) {
         let registry = Arc::new(WorkerRegistry::new());
         registry.estimated_wait().configure(EstimatedWaitConfig {
@@ -3905,7 +6859,12 @@ mod tests {
             first_event: None,
             pending: Vec::new(),
             done: false,
+            worker_url: "http://observer-test".to_owned(),
             request_id: None,
+            feature_identity: None,
+            feature_resolved: false,
+            feature_deadline: None,
+            native_deadline_pending: false,
         };
         assert_eq!(
             observer.scan(
@@ -3944,7 +6903,12 @@ mod tests {
             first_event: None,
             pending: Vec::new(),
             done: false,
+            worker_url: "http://observer-test".to_owned(),
             request_id: None,
+            feature_identity: None,
+            feature_resolved: false,
+            feature_deadline: None,
+            native_deadline_pending: false,
         };
         observer.cancel();
         assert_eq!(

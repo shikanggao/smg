@@ -312,6 +312,15 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     estimated_wait_calibration_shadow: bool,
 
+    /// Experimental C2 native-survival candidate and paired control, shadow only.
+    #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
+    estimated_wait_feature_shadow: bool,
+
+    /// Opt-in native first-output budget for regular HTTP feature streams.
+    /// Requires an enforcing engine; independent of admission wait thresholds.
+    #[arg(long, help_heading = "Routing Policy")]
+    estimated_wait_native_hard_ttft_timeout_secs: Option<f64>,
+
     /// Same-model representative TTFT baseline for diagnostic calibration startup.
     /// Omit when unknown; measured low-load baseline takes precedence.
     #[arg(long, help_heading = "Routing Policy")]
@@ -1127,7 +1136,12 @@ struct CliArgs {
 
     // ==================== Control Plane Authentication ====================
     /// API key for worker authorization
-    #[arg(long, help_heading = "Control Plane Authentication")]
+    #[arg(
+        long,
+        env = "SMG_API_KEY",
+        hide_env_values = true,
+        help_heading = "Control Plane Authentication"
+    )]
     api_key: Option<String>,
 
     /// Per-tenant API keys for serving-path auth (format: tenant_id:key,
@@ -1916,6 +1930,9 @@ impl CliArgs {
                 max_estimated_wait_secs: self.max_estimated_wait_secs,
                 estimated_wait_shadow: self.estimated_wait_shadow,
                 estimated_wait_calibration_shadow: self.estimated_wait_calibration_shadow,
+                estimated_wait_feature_shadow: self.estimated_wait_feature_shadow,
+                estimated_wait_native_hard_ttft_timeout_secs: self
+                    .estimated_wait_native_hard_ttft_timeout_secs,
                 estimated_wait_provisional_baseline_secs: self
                     .estimated_wait_provisional_baseline_secs,
                 estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
@@ -2280,6 +2297,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_key_environment_child_check() {
+        let Ok(mode) = std::env::var("SMG_CLI_ENV_REGRESSION_MODE") else {
+            return;
+        };
+        let cli = if mode == "explicit" {
+            cli_args_from(&["--api-key", "test-cli-value"])
+        } else {
+            cli_args_from(&[])
+        };
+        let expected = match mode.as_str() {
+            "env" => Some("test-env-value"),
+            "explicit" => Some("test-cli-value"),
+            _ => None,
+        };
+        assert_eq!(cli.api_key.as_deref(), expected);
+        for argv in [
+            vec!["smg", "--help"],
+            vec!["smg", "--definitely-invalid-option"],
+        ] {
+            let rendered = Cli::try_parse_from(argv).err().unwrap().to_string();
+            assert!(!rendered.contains("test-env-value"));
+        }
+    }
+
+    #[test]
+    fn api_key_environment_alias_preserves_default_and_explicit_precedence() {
+        for mode in ["default", "env", "explicit"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "tests::api_key_environment_child_check"])
+                .env("SMG_CLI_ENV_REGRESSION_MODE", mode)
+                .env_remove("SMG_API_KEY");
+            if mode != "default" {
+                child.env("SMG_API_KEY", "test-env-value");
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     /// Parse top-level CLI args into the flattened `CliArgs` the binary uses.
     fn cli_args_from(args: &[&str]) -> CliArgs {
@@ -2654,12 +2716,21 @@ mod tests {
     }
 
     #[test]
+    fn estimated_wait_feature_shadow_requires_calibration() {
+        let cli = cli_args_from(&["--estimated-wait-feature-shadow"]);
+        assert!(cli.to_router_config(vec![], vec![]).is_err());
+    }
+
+    #[test]
     fn estimated_wait_options_flow_into_server_config() {
         let cli = cli_args_from(&[
             "--max-estimated-wait-secs",
             "12",
             "--estimated-wait-shadow",
             "--estimated-wait-calibration-shadow",
+            "--estimated-wait-feature-shadow",
+            "--estimated-wait-native-hard-ttft-timeout-secs",
+            "42",
             "--estimated-wait-provisional-baseline-secs",
             "0.25",
             "--estimated-wait-queue-tokens-per-request",
@@ -2683,12 +2754,22 @@ mod tests {
         assert_eq!(config.max_estimated_wait_secs, Some(12.0));
         assert!(config.estimated_wait_shadow);
         assert!(config.estimated_wait_calibration_shadow);
+        assert!(config.estimated_wait_feature_shadow);
+        assert_eq!(
+            config.estimated_wait_native_hard_ttft_timeout_secs,
+            Some(42.0)
+        );
+        assert_eq!(
+            cli_args_from(&[]).estimated_wait_native_hard_ttft_timeout_secs,
+            None
+        );
         assert_eq!(config.estimated_wait_provisional_baseline_secs, Some(0.25));
         assert_eq!(
             cli_args_from(&[]).estimated_wait_provisional_baseline_secs,
             None
         );
         assert!(!cli_args_from(&[]).estimated_wait_calibration_shadow);
+        assert!(!cli_args_from(&[]).estimated_wait_feature_shadow);
         assert!(!cli_args_from(&[]).estimated_wait_shadow);
         assert_eq!(config.estimated_wait_queue_tokens_per_request, 2048);
         assert_eq!(config.estimated_wait_fallback_prefill_throughput, 500.0);
@@ -2712,6 +2793,7 @@ mod tests {
 
     #[test]
     fn estimated_wait_removed_coefficients_are_not_cli_options() {
+        assert!(Cli::try_parse_from(["smg", "--estimated-wait-recovery-probes"]).is_err());
         for flag in [
             "--estimated-wait-base-overhead-secs",
             "--estimated-wait-queue-work-correction",

@@ -234,6 +234,19 @@ impl GenerationRequest for CompletionRequest {
         Some(&self.model)
     }
 
+    fn prompt_work_hint(&self) -> PromptWorkHint {
+        if self.n.is_some_and(|n| n != 1)
+            || self.best_of.is_some_and(|n| n > 1)
+            || self.suffix.is_some()
+        {
+            return PromptWorkHint::Unknown;
+        }
+        match &self.prompt {
+            StringOrArray::String(text) => PromptWorkHint::TextBytes(text.len()),
+            StringOrArray::Array(_) => PromptWorkHint::Unknown,
+        }
+    }
+
     fn extract_text_for_routing(&self) -> String {
         match &self.prompt {
             StringOrArray::String(s) => s.clone(),
