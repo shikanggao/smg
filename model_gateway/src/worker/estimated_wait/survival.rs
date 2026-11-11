@@ -587,10 +587,14 @@ impl Native {
         let sg_source = load
             .filter(|_| success)
             .and_then(started_capacity::source_key);
-        if self.sg_raw_basis.raw_source != sg_source
-            || !self.capacity_poll.is_some_and(|(_, valid, _)| valid)
-        {
+        if self.sg_raw_basis.raw_source != sg_source {
             self.invalidate_sg_raw();
+        } else if !self.capacity_poll.is_some_and(|(_, valid, _)| valid) {
+            if self.sg_zero_positive_evidence(started).is_some() {
+                self.sg_fence_certified_zero();
+            } else {
+                self.invalidate_sg_raw();
+            }
         }
         self.sg_raw_basis.raw_source = sg_source;
     }
