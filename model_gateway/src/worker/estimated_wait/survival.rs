@@ -9,13 +9,14 @@ use serde::Serialize;
 
 use super::{basis, decision, pending_work};
 
+mod joint_work_service;
 mod started_capacity;
 pub(super) use started_capacity::{
     source_key as started_source_key, SourceKey as StartedSourceKey,
 };
 
 pub(super) const METHOD: &str =
-    "stable_work_native_service_composition_C2_raw_fallback_same_poll_size_v3";
+    "stable_work_native_service_composition_C2_joint_native_work_service_v4";
 const LIMIT: usize = 8192;
 const LAG_WINDOW: f64 = 600.0;
 const ENGINEERING_PRIOR: f64 = 1.0;
@@ -174,6 +175,37 @@ pub(super) struct Projection {
     pub gain_applied_after_projection: bool,
     pub structural_binding_expiry_at_admission: bool,
     pub structural_expiry_rows: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub joint_native_work_service: Option<JointProjection>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct JointProjection {
+    pub selected: bool,
+    pub reason: &'static str,
+    /// The selected window replaces fitted Ceff. Projection.gain remains the
+    /// legacy fitted diagnostic/eligibility value; it is not applied to the
+    /// completed-work rate or again after projection.
+    pub fitted_capacity_tokens_per_second: f64,
+    pub selected_capacity_tokens_per_second: Option<f64>,
+    pub native_full_prompt_rows: usize,
+    service_window: joint_work_service::Selection,
+    /// Exact same-admission native reference before joint work/rate selection.
+    /// This is not the internal bound_early fit, a separately executed router,
+    /// or a counterfactual with unchanged old learning over future admissions.
+    pub original_native_projection: Option<JointNativeReference>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct JointNativeReference {
+    pub total_ttft_seconds: f64,
+    pub input_work_tokens: f64,
+    pub served_tokens: f64,
+    pub statistically_forecast_removed_tokens: f64,
+    pub predecessors: usize,
+    pub structural_binding_expiry_at_admission: bool,
+    pub structural_expiry_rows: usize,
+    pub overdue_retained_rows: usize,
+    pub overdue_retained_work_tokens: f64,
 }
 #[derive(Debug, Default)]
 pub(super) struct State {
@@ -188,11 +220,14 @@ impl State {
     /// the monitor's independent capacity window.
     pub fn reset_calibration_preserving_started_history(&mut self) {
         let history = std::mem::take(&mut self.native.started_requests);
+        let completed = std::mem::take(&mut self.native.joint_work_service);
         *self = Self::default();
         self.native.started_requests = history;
+        self.native.joint_work_service = completed;
     }
     pub fn clear_started_history(&mut self) {
         self.native.started_requests = started_capacity::History::default();
+        self.native.joint_work_service = joint_work_service::History::default();
     }
     #[cfg(test)]
     pub fn started_history_selection_for_test(
@@ -435,6 +470,7 @@ pub(super) struct Native {
     capacity_reason: &'static str,
     capacity_poll: Option<(f64, bool, Option<f64>)>,
     started_requests: started_capacity::History,
+    joint_work_service: joint_work_service::History,
 }
 impl Native {
     fn identity(&self) -> Option<(String, String)> {
@@ -510,8 +546,16 @@ impl Native {
                 self.lags.clear();
                 self.valid = false;
                 self.reason = "capacity_source_or_profile_reset";
+                self.joint_work_service = joint_work_service::History::default();
             }
             self.capacity_key = Some(key.clone());
+        }
+        if load
+            .and_then(|l| l.loads.first())
+            .and_then(|r| r.prefill_metric_provenance.as_ref())
+            .is_some_and(|p| p.counter_reset)
+        {
+            self.joint_work_service = joint_work_service::History::default();
         }
         self.capacity_reason = if load.and_then(|l| l.loads.first()).is_some_and(|r| {
             r.timely_prefill_progress_source.as_deref() == Some("prefill_started_requests")
@@ -654,10 +698,18 @@ impl Native {
         // not leave an earlier ACK/lag mutation available to the next poll.
         let mut next = self.clone();
         match next.observe_inner(load, accepted, started, received, raw_poll, max_age) {
-            Ok(()) => *self = next,
+            Ok(()) => {
+                // Both endpoints must pass C2's complete inventory/ACK/rebound
+                // validation. Reset/rebound observations are deliberately not
+                // usable endpoints even when the shared native adapter accepts.
+                next.joint_work_service
+                    .observe(load, accepted && next.valid, received);
+                *self = next;
+            }
             Err(reason) => {
                 self.valid = false;
                 self.reason = reason;
+                self.joint_work_service.observe(None, false, received);
             }
         }
     }
@@ -724,7 +776,7 @@ impl Native {
             if lane.snapshot_seq == previous.lane.snapshot_seq {
                 let mut comparable = lane.clone();
                 comparable.snapshot_age_seconds = previous.lane.snapshot_age_seconds;
-                if comparable != previous.lane
+                if !comparable.legacy_snapshot_eq(&previous.lane)
                     || lane.snapshot_age_seconds + 1e-6 < previous.last_age
                 {
                     return Err("changed_or_rejuvenated_native_duplicate");
@@ -735,6 +787,32 @@ impl Native {
                 previous.expiry = previous
                     .expiry
                     .min(previous.started + max_age - previous.lane.snapshot_age_seconds);
+                if previous.lane.joint_work_service_capability != lane.joint_work_service_capability
+                    || previous.lane.engine_work_progress != lane.engine_work_progress
+                    || previous
+                        .lane
+                        .active_requests
+                        .iter()
+                        .zip(&lane.active_requests)
+                        .any(|(old, new)| {
+                            old.original_full_prompt_tokens != new.original_full_prompt_tokens
+                        })
+                {
+                    self.joint_work_service.reject_duplicate(lane);
+                }
+                // Refresh only the optional envelope. Missing/invalid evidence
+                // is a negative barrier, never a reason to retain an older
+                // usable work/rate pair under an otherwise valid duplicate.
+                previous.lane.joint_work_service_capability = lane.joint_work_service_capability;
+                previous.lane.engine_work_progress = lane.engine_work_progress.clone();
+                for (old, new) in previous
+                    .lane
+                    .active_requests
+                    .iter_mut()
+                    .zip(&lane.active_requests)
+                {
+                    old.original_full_prompt_tokens = new.original_full_prompt_tokens;
+                }
                 self.valid = true;
                 self.reason = "duplicate_retains_original_expiry";
                 return Ok(());
@@ -927,6 +1005,22 @@ impl Native {
         }
         let identity = (lane.engine_epoch.clone(), lane.profile_id.clone());
         let mut rows = Vec::with_capacity(lane.active_requests.len());
+        let mut joint = self
+            .joint_work_service
+            .selection(lane)
+            .map(|window| JointProjection {
+                selected: false,
+                reason: window.reason,
+                fitted_capacity_tokens_per_second: capacity,
+                selected_capacity_tokens_per_second: None,
+                native_full_prompt_rows: 0,
+                service_window: window,
+                original_native_projection: None,
+            });
+        let mut joint_rows = joint
+            .as_ref()
+            .filter(|j| j.service_window.capacity_tokens_per_second.is_some())
+            .map(|_| Vec::with_capacity(lane.active_requests.len()));
         let mut active = HashSet::new();
         for row in &lane.active_requests {
             if let Some(attempt) = row.attempt_id.as_deref() {
@@ -964,6 +1058,15 @@ impl Native {
                 out.full_prompt_proxy_rows += 1;
                 prompt(known.estimate)?
             };
+            let joint_work = if row.remaining_prefill_work_tokens.is_some_and(nonnegative) {
+                Some(work)
+            } else {
+                row.original_full_prompt_tokens
+                    .filter(|n| {
+                        *n > 0 && *n <= openai_protocol::native_deadline::MAX_EXACT_PROMPT_WORK
+                    })
+                    .map(|n| n as f64)
+            };
             out.native_confirmed_deadline_rows +=
                 usize::from(row.hard_ttft_deadline_monotonic_secs.is_some());
             let remaining = row.hard_ttft_deadline_monotonic_secs.map(|deadline| {
@@ -973,6 +1076,20 @@ impl Native {
                     - (at - s.received)
             });
             rows.push((known.ordinal, work, remaining));
+            if let Some(candidate) = joint_rows.as_mut() {
+                if let Some(work) = joint_work {
+                    candidate.push((known.ordinal, work, remaining));
+                    if row
+                        .remaining_prefill_work_tokens
+                        .is_none_or(|v| !nonnegative(v))
+                    {
+                        joint.as_mut().unwrap().native_full_prompt_rows += 1;
+                    }
+                } else {
+                    joint_rows = None;
+                    joint.as_mut().unwrap().reason = "native_full_prompt_evidence_unavailable";
+                }
+            }
         }
         for (attempt, known) in &self.admissions {
             if known.at > at
@@ -989,6 +1106,9 @@ impl Native {
             out.unseen_admitted_rows += 1;
             out.full_prompt_proxy_rows += 1;
             rows.push((known.ordinal, prompt(known.estimate)?, None));
+            if let Some(candidate) = joint_rows.as_mut() {
+                candidate.push((known.ordinal, prompt(known.estimate)?, None));
+            }
         }
         rows.sort_unstable_by_key(|r| r.0);
         let samples: Vec<_> = self
@@ -998,6 +1118,46 @@ impl Native {
             .collect();
         let measured = samples.iter().map(|(_, v)| *v).reduce(f64::max);
         let lag = measured.map_or(ENGINEERING_PRIOR, |v| v.max(ENGINEERING_PRIOR));
+        let selected_capacity = if let Some(mut candidate) = joint_rows {
+            candidate.sort_unstable_by_key(|r| r.0);
+            let mut original = Projection::default();
+            // Preserve the original arithmetic guards and expose the exact
+            // same-admission control only for an actually selected joint path.
+            project_rows(
+                rows.iter().map(|(_, w, d)| (*w, *d)),
+                capacity,
+                baseline,
+                lag,
+                &mut original,
+            )?;
+            let j = joint.as_mut().unwrap();
+            let rate = j.service_window.capacity_tokens_per_second.unwrap();
+            j.original_native_projection = Some(JointNativeReference {
+                total_ttft_seconds: original.total_ttft_seconds.unwrap(),
+                input_work_tokens: original.input_work_tokens,
+                served_tokens: original.served_tokens,
+                statistically_forecast_removed_tokens: original
+                    .statistically_forecast_removed_tokens,
+                predecessors: original.predecessors,
+                structural_binding_expiry_at_admission: original
+                    .structural_binding_expiry_at_admission,
+                structural_expiry_rows: original.structural_expiry_rows,
+                overdue_retained_rows: original.overdue_retained_rows,
+                overdue_retained_work_tokens: original.overdue_retained_work_tokens,
+            });
+            rows = candidate;
+            j.selected = true;
+            j.reason = "joint_native_full_prompt_and_completed_prefill_window";
+            j.selected_capacity_tokens_per_second = Some(rate);
+            out.effective_capacity_tokens_per_second = Some(rate);
+            rate
+        } else {
+            if let Some(j) = joint.as_mut() {
+                j.native_full_prompt_rows = 0;
+            }
+            capacity
+        };
+        out.joint_native_work_service = joint;
         out.observed_cleanup_lag_samples = samples.len();
         out.observed_past_max_cleanup_seconds = measured;
         out.newest_cleanup_sample_age_seconds = samples.last().map(|(t, _)| at - t);
@@ -1008,7 +1168,7 @@ impl Native {
         out.native_original_freshness_expiry = Some(s.expiry);
         project_rows(
             rows.iter().map(|(_, work, deadline)| (*work, *deadline)),
-            capacity,
+            selected_capacity,
             baseline,
             lag,
             out,
@@ -1130,11 +1290,252 @@ mod tests {
             queue_position: None,
             state: "prefill".into(),
             first_text_emitted: Some(false),
+            original_full_prompt_tokens: None,
         }
     }
     fn observe(n: &mut Native, load: &WorkerLoadResponse, received: f64, raw: f64) {
         n.raw_poll(Some(load), raw, true);
         n.observe(Some(load), true, received - 0.01, received, raw, 5.0);
+    }
+    fn joint_load(seq: u64) -> WorkerLoadResponse {
+        let mut load = load(seq);
+        let lane = lane(&mut load);
+        lane.joint_work_service_capability = Some(openai_protocol::native_deadline::NativeJointWorkServiceCapability::VllmOriginalFullPromptCompletedPrefillV1);
+        lane.engine_work_progress = Some(serde_json::from_value(serde_json::json!({
+            "schema_version":1,"engine_epoch":"engine-a","profile_id":"profile-a","dp_rank":0,
+            "source_commit":"2a69949bdadf0e8942b7a1619b229cb475beef20",
+            "completion_boundary":"scheduler_update_from_output_after_native_model_future",
+            "snapshot_monotonic_secs":100.0+seq as f64,"counters_available":true,"completion_sequence":seq,
+            "cumulative":{"completed_batches":seq,"completed_uncached_prefill_tokens":seq*20,
+                "completed_generation_context_tokens":seq,"completed_generation_context_attention_tokens":seq}
+        })).unwrap());
+        load
+    }
+    #[test]
+    fn joint_rejected_middle_point_and_duplicate_negative_do_not_seed_or_retain_service() {
+        let mut n = Native::default();
+        observe(&mut n, &joint_load(1), 1.0, 0.9);
+        let mut bad = joint_load(2);
+        lane(&mut bad).active_requests = vec![row("a", 2, None, 150.0)];
+        lane(&mut bad).native_population = 1;
+        lane(&mut bad).cancellation_acks = vec![NativeCancellationAck {
+            attempt_id: "a".into(),
+            native_request_id: Some("native-a".into()),
+            event_seq: 2,
+            ack_monotonic_secs: 102.0,
+            reason: "hard_ttft_deadline".into(),
+        }];
+        observe(&mut n, &bad, 2.0, 1.9);
+        assert!(!n.valid);
+        assert_eq!(n.reason, "ack_before_inventory_release");
+        observe(&mut n, &joint_load(3), 3.0, 2.9);
+        let p = project(&n, 3.1, 2.9).unwrap();
+        assert!(!p.joint_native_work_service.as_ref().unwrap().selected);
+        assert_eq!(
+            p.joint_native_work_service.as_ref().unwrap().reason,
+            "first_valid_point"
+        );
+        let good = joint_load(4);
+        observe(&mut n, &good, 4.0, 3.9);
+        assert!(
+            project(&n, 4.1, 3.9)
+                .unwrap()
+                .joint_native_work_service
+                .unwrap()
+                .selected
+        );
+        let mut duplicate = good.clone();
+        lane(&mut duplicate).engine_work_progress = None;
+        observe(&mut n, &duplicate, 4.2, 3.9);
+        assert!(n.valid); // Optional negatives cannot change legacy acceptance.
+        let p = project(&n, 4.3, 3.9).unwrap();
+        assert!(!p.joint_native_work_service.unwrap().selected);
+        assert!(n
+            .snapshot
+            .as_ref()
+            .unwrap()
+            .lane
+            .engine_work_progress
+            .is_none());
+        observe(&mut n, &joint_load(5), 5.0, 4.9);
+        assert!(
+            !project(&n, 5.1, 4.9)
+                .unwrap()
+                .joint_native_work_service
+                .unwrap()
+                .selected
+        );
+    }
+    #[test]
+    fn joint_changed_optional_duplicates_keep_legacy_valid_but_block_until_new_publication() {
+        for kind in 0..3 {
+            let mut n = Native::default();
+            n.register(Some("a"), 0.0, pending_work::Estimate::default());
+            let make = |seq| {
+                let mut load = joint_load(seq);
+                lane(&mut load).active_requests = vec![row("a", 1, Some(0.0), 150.0)];
+                lane(&mut load).active_requests[0].original_full_prompt_tokens = Some(100);
+                lane(&mut load).native_population = 1;
+                load
+            };
+            observe(&mut n, &make(1), 1.0, 0.9);
+            let good = make(2);
+            observe(&mut n, &good, 2.0, 1.9);
+            assert!(
+                project(&n, 2.1, 1.9)
+                    .unwrap()
+                    .joint_native_work_service
+                    .unwrap()
+                    .selected
+            );
+            let expiry = n.snapshot.as_ref().unwrap().expiry;
+            let mut changed = good.clone();
+            match kind {
+                0 => {
+                    lane(&mut changed)
+                        .engine_work_progress
+                        .as_mut()
+                        .unwrap()
+                        .cumulative
+                        .completed_uncached_prefill_tokens = 0
+                }
+                1 => lane(&mut changed).active_requests[0].original_full_prompt_tokens = Some(101),
+                _ => lane(&mut changed).joint_work_service_capability = None,
+            }
+            observe(&mut n, &changed, 2.2, 1.9);
+            observe(&mut n, &changed, 2.3, 1.9);
+            assert!(n.valid);
+            near(n.snapshot.as_ref().unwrap().expiry, expiry);
+            assert!(n.acks.is_empty());
+            assert!(n.lags.is_empty());
+            assert!(project(&n, 2.4, 1.9)
+                .unwrap()
+                .joint_native_work_service
+                .is_none_or(|j| !j.selected));
+            // Restoring the old metadata under the same base is still not a
+            // new publication and cannot rehabilitate the blocked endpoint.
+            observe(&mut n, &good, 2.5, 1.9);
+            assert!(project(&n, 2.6, 1.9)
+                .unwrap()
+                .joint_native_work_service
+                .is_none_or(|j| !j.selected));
+            observe(&mut n, &make(3), 3.0, 2.9);
+            assert_eq!(
+                project(&n, 3.1, 2.9)
+                    .unwrap()
+                    .joint_native_work_service
+                    .unwrap()
+                    .reason,
+                "first_valid_point"
+            );
+            observe(&mut n, &make(4), 4.0, 3.9);
+            assert!(
+                project(&n, 4.1, 3.9)
+                    .unwrap()
+                    .joint_native_work_service
+                    .unwrap()
+                    .selected
+            );
+        }
+    }
+    #[test]
+    fn joint_work_and_service_select_together_and_preserve_known_unseen_and_guards() {
+        let mut n = Native::default();
+        for id in ["proxy", "known", "unseen"] {
+            n.register(
+                Some(id),
+                0.0,
+                pending_work::Estimate::from_hint(PromptWorkHint::BodyTokenIds(100)),
+            );
+        }
+        let mut a = joint_load(1);
+        lane(&mut a).active_requests = vec![
+            row("proxy", 1, None, 1000.0),
+            row("known", 1, Some(40.0), 1000.0),
+        ];
+        lane(&mut a).active_requests[0].original_full_prompt_tokens = Some(200);
+        lane(&mut a).native_population = 2;
+        observe(&mut n, &a, 1.0, 0.9);
+        let mut b = joint_load(2);
+        lane(&mut b).active_requests = lane(&mut a).active_requests.clone();
+        lane(&mut b).native_population = 2;
+        observe(&mut n, &b, 2.0, 1.9);
+        let p = project(&n, 2.1, 1.9).unwrap();
+        near(p.input_work_tokens, 340.0); // 200 native full + 40 uncached +100 unseen proxy.
+        near(p.total_ttft_seconds.unwrap(), 19.0); // B2 +340/20, no second fitted gain.
+        assert_eq!(p.native_known_remaining_rows, 1);
+        assert_eq!(p.unseen_admitted_rows, 1);
+        let joint = p.joint_native_work_service.unwrap();
+        assert!(joint.selected);
+        let reference = joint.original_native_projection.unwrap();
+        near(reference.input_work_tokens, 240.0);
+        near(reference.total_ttft_seconds, 26.0);
+        let mut missing = b.clone();
+        lane(&mut missing).snapshot_seq = 3;
+        lane(&mut missing).captured_at_monotonic_secs = 103.0;
+        let progress = lane(&mut missing).engine_work_progress.as_mut().unwrap();
+        progress.snapshot_monotonic_secs = 103.0;
+        progress.completion_sequence = 3;
+        progress.cumulative.completed_batches = 3;
+        progress.cumulative.completed_uncached_prefill_tokens = 60;
+        lane(&mut missing).active_requests[0].original_full_prompt_tokens = None;
+        observe(&mut n, &missing, 3.0, 2.9);
+        let p = project(&n, 3.1, 2.9).unwrap();
+        near(p.input_work_tokens, 240.0);
+        near(p.total_ttft_seconds.unwrap(), 26.0);
+        assert_eq!(
+            p.joint_native_work_service.unwrap().reason,
+            "native_full_prompt_evidence_unavailable"
+        );
+        assert_eq!(
+            project(&n, 3.1, 2.8).unwrap_err(),
+            "native_raw_admission_poll_mismatch"
+        );
+    }
+    #[test]
+    fn joint_history_survives_calibration_reset_but_not_entry_invalidation_or_rebound() {
+        let mut state = State::default();
+        observe(&mut state.native, &joint_load(1), 1.0, 0.9);
+        state.reset_calibration_preserving_started_history();
+        observe(&mut state.native, &joint_load(2), 2.0, 1.9);
+        assert!(
+            project(&state.native, 2.1, 1.9)
+                .unwrap()
+                .joint_native_work_service
+                .unwrap()
+                .selected
+        );
+        state.clear_started_history();
+        observe(&mut state.native, &joint_load(3), 3.0, 2.9);
+        assert!(
+            !project(&state.native, 3.1, 2.9)
+                .unwrap()
+                .joint_native_work_service
+                .unwrap()
+                .selected
+        );
+        let mut active = joint_load(4);
+        lane(&mut active).active_requests = vec![row("a", 4, Some(10.0), 150.0)];
+        lane(&mut active).native_population = 1;
+        state
+            .native
+            .register(Some("a"), 3.0, pending_work::Estimate::default());
+        observe(&mut state.native, &active, 4.0, 3.9);
+        let mut rebound = joint_load(5);
+        lane(&mut rebound).active_requests = vec![row("a", 5, Some(20.0), 150.0)];
+        lane(&mut rebound).native_population = 1;
+        observe(&mut state.native, &rebound, 5.0, 4.9);
+        assert!(!state.native.valid);
+        assert_eq!(state.native.reason, "native_remaining_work_rebound");
+        let mut later = joint_load(6);
+        lane(&mut later).active_requests = lane(&mut rebound).active_requests.clone();
+        lane(&mut later).native_population = 1;
+        observe(&mut state.native, &later, 6.0, 5.9);
+        let p = project(&state.native, 6.1, 5.9).unwrap();
+        assert_eq!(
+            p.joint_native_work_service.unwrap().reason,
+            "first_valid_point"
+        );
     }
     fn project(n: &Native, at: f64, poll: f64) -> Result<Projection, &'static str> {
         let mut p = Projection {

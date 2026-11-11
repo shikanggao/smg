@@ -200,6 +200,63 @@ class VllmCompletedWorkTests(unittest.TestCase):
         self.assertEqual(envelope["native_population"],1)
         self.assertFalse(envelope["active_requests"][0]["engine_work_state"]["available"])
 
+    def test_joint_native_full_prompt_uses_pinned_request_shape_and_same_snapshot_clock(self):
+        root = Path(os.environ["SMG_VLLM_019_SOURCE"])
+        init = source_method(root, "vllm.v1.request", "Request", "__init__")
+        # Execute the pinned constructor and encoder properties. These CPU
+        # substitutes only avoid unrelated runtime imports/hash/cache helpers;
+        # the IDs, native count, MM fields and property bodies are upstream.
+        init.__globals__.update(
+            StructuredOutputRequest=NS(from_sampling_params=lambda _: None),
+            RequestStatus=NS(WAITING=0), ConstantList=lambda values: values,
+            length_from_prompt_token_ids_or_embeds=lambda ids, embeds: len(ids),
+        )
+        cls = type("PinnedRequest", (), {
+            "__init__":init,
+            "num_encoder_inputs":source_method(root,"vllm.v1.request","Request","num_encoder_inputs"),
+            "has_encoder_inputs":source_method(root,"vllm.v1.request","Request","has_encoder_inputs"),
+            "num_output_tokens":source_method(root,"vllm.v1.request","Request","num_output_tokens"),
+            "update_block_hashes":lambda _:None,
+            "get_skip_reading_prefix_cache":lambda _:False,
+            "is_finished":lambda _:False,
+        })
+        r = cls("r", [7, 8, 9], NS(max_tokens=20, extra_args=None), None, arrival_time=1.0)
+        s = self.scheduler
+        s.vllm_config = NS(model_config=NS(runner_type="generate", is_encoder_decoder=False),
+            compute_hash=lambda:"test-config")
+        signals = native.SchedulerSignals(s, self.store, 0)
+        s.requests={"r":r};s.running=[];s.waiting=[r]
+        self.assertEqual(signals.original_full_prompt_tokens(r), 3)
+        before = dict(vars(r))
+        signals.publish()
+        envelope = self.store.loads(100)["loads"][0]["deadline_recovery"]
+        self.assertEqual(envelope["joint_work_service_capability"], "vllm_original_full_prompt_completed_prefill_v1")
+        self.assertEqual(envelope["captured_at_monotonic_secs"], envelope["engine_work_progress"]["snapshot_monotonic_secs"])
+        self.assertEqual(envelope["active_requests"][0]["original_full_prompt_tokens"], 3)
+        self.assertEqual(vars(r), before)
+        for name, value in [("mm_features", [object()]), ("prompt_embeds", object()),
+                            ("pooling_params", object()), ("sampling_params", None),
+                            ("num_prompt_tokens", True), ("num_prompt_tokens", 2**53+1),
+                            ("num_prompt_tokens", 4), ("prompt_token_ids", None), ("resumable", True)]:
+            old = getattr(r, name)
+            setattr(r, name, value)
+            self.assertIsNone(signals.original_full_prompt_tokens(r), name)
+            setattr(r, name, old)
+        for name, value in [("runner_type", "pooling"), ("is_encoder_decoder", True)]:
+            old = getattr(s.vllm_config.model_config, name)
+            setattr(s.vllm_config.model_config, name, value)
+            unsupported = native.SchedulerSignals(s, self.store, 0)
+            self.assertIsNone(unsupported.original_full_prompt_tokens(r))
+            unsupported.publish()
+            self.assertIsNone(self.store.loads(100)["loads"][0]["deadline_recovery"]["joint_work_service_capability"])
+            setattr(s.vllm_config.model_config, name, old)
+        with patch.dict(os.environ,{"SMG_NATIVE_ENGINE_WORK_DIAGNOSTICS":"0"}):
+            off = native.SchedulerSignals(s, self.store, 0)
+        off.publish()
+        envelope = self.store.loads(100)["loads"][0]["deadline_recovery"]
+        self.assertNotIn("joint_work_service_capability", envelope)
+        self.assertNotIn("original_full_prompt_tokens", envelope["active_requests"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

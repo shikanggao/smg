@@ -236,6 +236,14 @@ class SchedulerSignals:
             getattr(config, name, None) is not None
             for name in ("kv_transfer_config", "ec_transfer_config", "speculative_config")
         )
+        model = getattr(config, "model_config", None)
+        self.joint_supported = (
+            self.supported
+            and rank == 0
+            and model is not None
+            and getattr(model, "runner_type", None) == "generate"
+            and getattr(model, "is_encoder_decoder", True) is False
+        )
         config_hash = config.compute_hash() if config is not None else "source-test"
         profile = {
             "upstream_commit": UPSTREAM_COMMIT,
@@ -247,6 +255,7 @@ class SchedulerSignals:
         diagnostic_work = os.environ.get("SMG_NATIVE_ENGINE_WORK_DIAGNOSTICS") == "1"
         if diagnostic_work:
             profile["engine_work_diagnostics_schema"] = 1
+            profile["joint_native_full_prompt_service_evidence_schema"] = 1
         self.profile = hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest()
         self.work_progress = None
         self.work_batches = {}
@@ -401,6 +410,32 @@ class SchedulerSignals:
         self.sequence += 1
         return self.sequence
 
+    def original_full_prompt_tokens(self, request):
+        """Native tokenized full prompt, never uncached/remaining work."""
+        if self.work_progress is None or not self.joint_supported:
+            return None
+        try:
+            if (
+                getattr(request, "has_encoder_inputs", False)
+                or getattr(request, "mm_features", None)
+                or getattr(request, "prompt_embeds", None) is not None
+                or getattr(request, "pooling_params", None) is not None
+                or getattr(request, "sampling_params", None) is None
+                or getattr(request, "resumable", True) is not False
+                or getattr(
+                    getattr(getattr(self.scheduler, "vllm_config", None), "model_config", None),
+                    "is_encoder_decoder", False,
+                )
+            ):
+                return None
+            count = request.num_prompt_tokens
+            ids = request.prompt_token_ids
+            if type(count) is int and 0 < count <= 2**53 and isinstance(ids, list) and len(ids) == count:
+                return count
+            return None
+        except Exception:
+            return None
+
     def expire(self):
         if not self.supported:
             return
@@ -511,7 +546,10 @@ class SchedulerSignals:
                     "state": state,
                     "first_text_emitted": first_text,
                     **(
-                        {"engine_work_state": self.request_engine_work_state(request, rid, attempt)}
+                        {
+                            "engine_work_state": self.request_engine_work_state(request, rid, attempt),
+                            "original_full_prompt_tokens": self.original_full_prompt_tokens(request),
+                        }
                         if self.work_progress is not None
                         else {}
                     ),
@@ -545,7 +583,14 @@ class SchedulerSignals:
                 "active_requests": rows,
                 "cancellation_acks": list(self.acks),
                 **(
-                    {"engine_work_progress": self.engine_work_snapshot(now)}
+                    {
+                        "engine_work_progress": self.engine_work_snapshot(now),
+                        "joint_work_service_capability": (
+                            "vllm_original_full_prompt_completed_prefill_v1"
+                            if self.joint_supported and self.work_progress.available
+                            else None
+                        ),
+                    }
                     if self.work_progress is not None
                     else {}
                 ),

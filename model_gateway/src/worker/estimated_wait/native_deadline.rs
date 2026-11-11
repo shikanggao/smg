@@ -186,7 +186,7 @@ impl State {
             {
                 let mut same_snapshot = telemetry.clone();
                 same_snapshot.snapshot_age_seconds = previous.telemetry.snapshot_age_seconds;
-                if same_snapshot != previous.telemetry {
+                if !same_snapshot.legacy_snapshot_eq(&previous.telemetry) {
                     return Err("native_snapshot_changed_without_sequence");
                 }
                 // An unchanged scheduler state is not new progress or an ACK.
