@@ -60,6 +60,9 @@ pub(crate) struct SgRawEvidence {
     positive_evidence_for_zero_interval: Option<PositiveEvidence>,
     capacity: started_capacity::Selection,
 }
+impl SgRawEvidence {
+    pub fn original_expiry(&self) -> f64 { self.raw_expiry }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct Bundle {
@@ -102,7 +105,7 @@ pub(crate) struct SgProjection {
     legacy_projection_supported: bool,
     legacy_projection_reason: &'static str,
     legacy_selected_total_seconds: Option<f64>,
-    projection: Projection,
+    pub projection: Projection,
     interpretation: &'static str,
 }
 
@@ -325,7 +328,16 @@ impl Native {
     pub fn select_sg_raw_basis(&self, admission: &mut Admission, calibration_epoch: u64) {
         // Failure preserves the ENTIRE original control/fallback and its
         // training/label-exclusion fields. No direct-readiness or cold bypass.
-        admission.sg_raw_basis_deadline = self.sg_projection(admission, calibration_epoch).ok();
+        match self.sg_projection(admission, calibration_epoch) {
+            Ok(projection) => {
+                admission.sg_raw_basis_deadline = Some(projection);
+                admission.sg_raw_basis_rejection_reason = None;
+            }
+            Err(reason) => {
+                admission.sg_raw_basis_deadline = None;
+                admission.sg_raw_basis_rejection_reason = Some(reason);
+            }
+        }
     }
 
     fn sg_projection(
@@ -703,6 +715,8 @@ mod tests {
                 ..Default::default()
             },
             sg_raw_basis_deadline: None,
+            sg_raw_basis_rejection_reason: None,
+            paired_native_candidate: None,
         };
         (native, admission)
     }

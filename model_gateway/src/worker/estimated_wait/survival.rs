@@ -13,6 +13,7 @@ mod joint_work_service;
 mod sg_raw_basis;
 mod started_capacity;
 pub(crate) use sg_raw_basis::SgRawEvidence;
+pub(super) use sg_raw_basis::SgProjection;
 pub(super) use started_capacity::{
     source_key as started_source_key, SourceKey as StartedSourceKey,
 };
@@ -54,6 +55,10 @@ pub(super) struct Admission {
     /// unchanged, including own-admission structural-expiry label exclusion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sg_raw_basis_deadline: Option<sg_raw_basis::SgProjection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sg_raw_basis_rejection_reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paired_native_candidate: Option<super::coherent_pair::Diagnostic>,
 }
 #[derive(Clone, Copy, Debug, Serialize)]
 pub(super) struct RawFallback {
@@ -66,7 +71,7 @@ pub(super) struct RawFallback {
 }
 
 /// Frozen with CalibrationForecast, before a later poll can replace Entry.sample.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub(super) struct FrozenRawWork {
     pub poll_started: f64,
     pub source: Option<&'static str>,
@@ -260,9 +265,44 @@ impl State {
         pending: Option<&pending_work::Admission>,
         scalar: Option<f64>,
     ) -> Admission {
+        let normalization = self.normalize(basis, pending);
+        self.project_admission(basis, scalar, normalization, &self.native)
+    }
+    /// Read-only query of the existing fit/reference. Paired inputs never
+    /// initialize a reference or enter the training/expiry-credit trajectory.
+    pub fn paired_admission(
+        &self,
+        basis: &basis::Admission,
+        pending: &pending_work::Admission,
+        scalar: Option<f64>,
+        native: &Native,
+    ) -> Option<Admission> {
+        let s = basis.prediction_snapshot;
+        let stamp = s.size_basis?;
+        let reference = self.reference?;
+        let p = stamp.provenance;
+        if !pending.available || !s.fresh || !s.native_ready || !positive(pending.capacity)
+            || pending.capacity_progress_source.as_deref() != Some(p.progress_source)
+            || self.basis_epoch != Some(stamp.epoch)
+            || reference.basis_epoch != stamp.epoch || reference.counter_epoch != p.counter_epoch
+            || reference.dp_rank != p.dp_rank || reference.progress_source != p.progress_source
+            || reference.reference_created_at > s.at
+        { return None; }
+        let n = Normalization {
+            z: s.x * pending.capacity / reference.capacity_reference,
+            selected_x: s.x, admission_capacity: pending.capacity, ..reference
+        };
+        nonnegative(n.z).then(|| self.project_admission(basis, scalar, Some(n), native))
+    }
+    fn project_admission(
+        &self,
+        basis: &basis::Admission,
+        scalar: Option<f64>,
+        normalization: Option<Normalization>,
+        native: &Native,
+    ) -> Admission {
         let mut training = basis.training_snapshot;
         training.scalar_gain = 1.0;
-        let normalization = self.normalize(basis, pending);
         let reason = if normalization.is_some() {
             "fixed_reference_own_x"
         } else {
@@ -297,7 +337,7 @@ impl State {
             let capacity = n.capacity_reference / gain;
             if positive(n.z) && positive(gain) && positive(capacity) {
                 projection.effective_capacity_tokens_per_second = Some(capacity);
-                if let Err(reason) = self.native.project(
+                if let Err(reason) = native.project(
                     training.at,
                     basis.prediction_snapshot.poll_started,
                     training.baseline,
@@ -319,6 +359,8 @@ impl State {
             predictions,
             projection,
             sg_raw_basis_deadline: None,
+            sg_raw_basis_rejection_reason: None,
+            paired_native_candidate: None,
         }
     }
     fn normalize(
@@ -463,6 +505,16 @@ struct Snapshot {
     expiry: f64,
     last_age: f64,
 }
+/// Only raw-side proofs travel on the bounded native task. No request, ACK or
+/// deadline vectors are copied on raw publication.
+#[derive(Clone, Debug)]
+pub(super) struct CandidateRawState {
+    capacity_key: Option<(u64, u64, String)>,
+    capacity_reason: &'static str,
+    capacity_poll: Option<(f64, bool, Option<f64>)>,
+    started_requests: started_capacity::History,
+    sg_raw_basis: sg_raw_basis::State,
+}
 #[derive(Clone, Debug, Default)]
 pub(super) struct Native {
     snapshot: Option<Snapshot>,
@@ -483,6 +535,91 @@ pub(super) struct Native {
     sg_raw_basis: sg_raw_basis::State,
 }
 impl Native {
+    pub fn candidate_raw_eligible(&self, load: Option<&WorkerLoadResponse>, started: f64, max_age: f64) -> bool {
+        let Some(l) = load.filter(|l| l.dp_rank_count == 1 && l.loads.len() == 1) else { return false; };
+        let r = &l.loads[0];
+        let Some(p) = r.prefill_metric_provenance.as_ref() else { return false; };
+        let Some(source) = r.timely_prefill_progress_source.as_deref() else { return false; };
+        let Some(profile) = r.native_request_counts_profile else { return false; };
+        let current_key = (profile,p.counter_epoch,source.to_owned());
+        let counters = p.raw_counter.zip(p.previous_raw_counter).zip(p.raw_rate).zip(p.interval_seconds)
+            .zip(p.interval_started_time_seconds.zip(p.interval_ended_time_seconds))
+            .is_some_and(|((((counter,previous),rate),interval),(begin,end))|
+                nonnegative(counter) && nonnegative(previous) && counter >= previous && nonnegative(rate)
+                    && positive(interval) && positive(max_age) && interval <= max_age
+                    && nonnegative(begin) && end.is_finite() && end > begin
+                    && (end-begin-interval).abs() <= 1e-6_f64.max(1e-9*interval)
+                    && (counter-previous-rate*interval).abs() <= 1e-6_f64.max(1e-9*counter));
+        let zero = p.raw_counter.zip(p.previous_raw_counter).is_some_and(|(a,b)| a == b)
+            && p.raw_rate == Some(0.0) && !p.capacity_interval_eligible;
+        let matched_capacity = self.capacity_poll.is_some_and(|(poll,valid,cap)| poll == started
+            && cap.is_some_and(positive) && (valid || self.sg_zero_positive_evidence(started).is_some()));
+        r.dp_rank == 0 && r.native_request_counts_available == Some(true)
+            && r.num_waiting_reqs >= 0 && r.num_running_reqs >= 0
+            && p.schema_version == 1 && !p.counter_reset && p.progress_source.as_deref() == Some(source)
+            && matches!(source,"local_compute_tokens"|"prefill_started_requests")
+            && self.capacity_key.as_ref() == Some(&current_key)
+            && r.learned_prefill_capacity.is_some_and(positive) && r.prefill_capacity_sample_count.unwrap_or(0)>0
+            && counters && matched_capacity && (p.capacity_interval_eligible || zero)
+    }
+    pub fn candidate_duplicate_facts_changed(&self, load: Option<&WorkerLoadResponse>) -> bool {
+        self.snapshot.as_ref().zip(load.and_then(|l| l.loads.first())
+            .and_then(|r| r.deadline_recovery.as_ref())).is_some_and(|(old,new)| {
+                old.lane.engine_epoch == new.engine_epoch && old.lane.profile_id == new.profile_id
+                    && old.lane.dp_rank == new.dp_rank && old.lane.snapshot_seq == new.snapshot_seq
+                    && old.lane.captured_at_monotonic_secs == new.captured_at_monotonic_secs
+                    && old.lane.active_requests.iter().zip(&new.active_requests)
+                        .any(|(a,b)| a.original_prefill_observation != b.original_prefill_observation)
+            })
+    }
+    pub fn candidate_raw_state(&self) -> CandidateRawState {
+        CandidateRawState {
+            capacity_key: self.capacity_key.clone(),
+            capacity_reason: self.capacity_reason,
+            capacity_poll: self.capacity_poll,
+            started_requests: self.started_requests.clone(),
+            sg_raw_basis: self.sg_raw_basis.clone(),
+        }
+    }
+    pub fn replace_candidate_raw_state(&mut self, raw: CandidateRawState) -> CandidateRawState {
+        let old = self.candidate_raw_state();
+        self.capacity_key = raw.capacity_key;
+        self.capacity_reason = raw.capacity_reason;
+        self.capacity_poll = raw.capacity_poll;
+        self.started_requests = raw.started_requests;
+        self.sg_raw_basis = raw.sg_raw_basis;
+        old
+    }
+    pub fn candidate_native_stamp(&self) -> Option<(u64, f64, f64, f64)> {
+        let s = self.snapshot.as_ref()?;
+        (self.valid && !self.incomplete).then_some((s.lane.snapshot_seq, s.raw_poll, s.received, s.expiry))
+    }
+    pub fn candidate_native_reason(&self) -> &'static str { self.reason }
+    pub fn candidate_native_waiting(&self) -> Option<f64> {
+        let s = self.snapshot.as_ref()?;
+        (self.valid && !self.incomplete).then_some(s.lane.active_requests.iter()
+            .filter(|r| r.state == "waiting" && r.first_text_emitted != Some(true)).count() as f64)
+    }
+    pub fn candidate_native_population(&self) -> Option<f64> {
+        let s = self.snapshot.as_ref()?;
+        (self.valid && !self.incomplete).then_some(s.lane.active_requests.len() as f64)
+    }
+    pub fn candidate_unseen_local_count(&self, at: f64) -> usize {
+        let active: HashSet<_> = self.snapshot.as_ref().into_iter().flat_map(|s|
+            s.lane.active_requests.iter().filter_map(|r| r.attempt_id.as_deref())).collect();
+        let identity = self.identity();
+        self.admissions.iter().filter(|(attempt,k)| k.at <= at && !active.contains(attempt.as_str())
+            && !self.acks.contains_key(attempt.as_str()) && !k.seen_native
+            && !k.first_text_at.is_some_and(|t| t <= at)
+            && k.identity.as_ref().is_none_or(|old| Some(old) == identity.as_ref())).count()
+    }
+    pub fn candidate_with_live_ledger(&self, raw: CandidateRawState) -> Self {
+        // This query clone contains the current live ledger, never a ledger
+        // frozen at raw publication or an old numeric prediction.
+        let mut native = self.clone();
+        native.replace_candidate_raw_state(raw);
+        native
+    }
     fn identity(&self) -> Option<(String, String)> {
         self.snapshot
             .as_ref()
