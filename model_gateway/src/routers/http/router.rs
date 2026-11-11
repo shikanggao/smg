@@ -30,6 +30,7 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
+use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -76,8 +77,9 @@ use crate::{
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        estimated_wait::StreamTtftObserver, AttachedBody, ConnectionMode, RoutingPool, Worker,
-        WorkerLoadGuard, WorkerRegistry, WorkerType,
+        estimated_wait::{CalibrationForecast, StreamTtftObserver},
+        AttachedBody, ConnectionMode, RoutingPool, Worker, WorkerLoadGuard, WorkerRegistry,
+        WorkerType,
     },
 };
 
@@ -239,11 +241,7 @@ impl Router {
     fn select_worker_for_model(
         &self,
         model_id: &str,
-        text: Option<&str>,
-        tokens: Option<&[u32]>,
-        headers: Option<&HeaderMap>,
-        rid_key: Option<&str>,
-        cache_namespace: Option<CacheNamespace>,
+        inputs: PlacementInputs<'_>,
     ) -> Result<Option<Arc<dyn Worker>>, Response> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
@@ -253,13 +251,7 @@ impl Router {
             model_id,
             RoutingPool::HttpRegular,
             None,
-            PlacementInputs {
-                text,
-                tokens,
-                headers,
-                rid_key,
-                cache_namespace,
-            },
+            inputs,
         )
     }
 
@@ -491,14 +483,18 @@ impl Router {
         canonical_model: Option<&str>,
         is_stream: bool,
     ) -> Response {
+        let calibration = Mutex::new(None);
         let worker = match lease.with_view(|view| {
             self.select_worker_for_model(
                 model_id,
-                view.text,
-                view.tokens,
-                headers,
-                view.rid_key,
-                view.cache_namespace,
+                PlacementInputs {
+                    text: view.text,
+                    tokens: view.tokens,
+                    headers,
+                    rid_key: view.rid_key,
+                    cache_namespace: view.cache_namespace,
+                    calibration: is_stream.then_some(&calibration),
+                },
             )
         }) {
             Err(shed) => return shed,
@@ -565,6 +561,7 @@ impl Router {
                     worker.as_ref(),
                     is_stream,
                     load_guard,
+                    calibration.into_inner(),
                 )
                 .await
             }
@@ -803,6 +800,7 @@ impl Router {
             record_pre_send_error(&resp);
             return resp;
         }
+        let calibration = Mutex::new(None);
         let selection = placement::select_from(
             &self.worker_registry,
             &self.policy_registry,
@@ -814,6 +812,7 @@ impl Router {
                 headers,
                 rid_key: None,
                 cache_namespace: None,
+                calibration: is_stream.then_some(&calibration),
             },
         );
         let worker = match selection {
@@ -889,11 +888,13 @@ impl Router {
         );
 
         let ttft_observer = is_stream.then(|| {
-            StreamTtftObserver::new(&self.worker_registry, worker.url(), start).with_request_id(
-                headers
-                    .and_then(|headers| headers.get("opc-request-id"))
-                    .and_then(|value| value.to_str().ok()),
-            )
+            StreamTtftObserver::new(&self.worker_registry, worker.url(), start)
+                .with_calibration(calibration.into_inner())
+                .with_request_id(
+                    headers
+                        .and_then(|headers| headers.get("opc-request-id"))
+                        .and_then(|value| value.to_str().ok()),
+                )
         });
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
@@ -1170,6 +1171,7 @@ impl Router {
         worker: &dyn Worker,
         is_stream: bool,
         load_guard: WorkerLoadGuard,
+        calibration: Option<CalibrationForecast>,
     ) -> Response {
         let started = Instant::now();
         let api_key = worker.api_key().cloned();
@@ -1190,11 +1192,13 @@ impl Router {
         );
 
         let ttft_observer = is_stream.then(|| {
-            StreamTtftObserver::new(&self.worker_registry, worker.url(), started).with_request_id(
-                headers
-                    .and_then(|headers| headers.get("opc-request-id"))
-                    .and_then(|value| value.to_str().ok()),
-            )
+            StreamTtftObserver::new(&self.worker_registry, worker.url(), started)
+                .with_calibration(calibration)
+                .with_request_id(
+                    headers
+                        .and_then(|headers| headers.get("opc-request-id"))
+                        .and_then(|value| value.to_str().ok()),
+                )
         });
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
@@ -1342,6 +1346,7 @@ impl Router {
         route: &'static str,
         worker: &dyn Worker,
         load_guard: WorkerLoadGuard,
+        calibration: Option<CalibrationForecast>,
     ) -> Response {
         let started = Instant::now();
         let api_key = worker.api_key().cloned();
@@ -1421,7 +1426,16 @@ impl Router {
             .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
             .is_some_and(|ct| ct.starts_with("text/event-stream"));
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard, started, None)
+        let observer = is_stream.then(|| {
+            StreamTtftObserver::new(&self.worker_registry, worker.url(), started)
+                .with_calibration(calibration)
+                .with_request_id(
+                    headers
+                        .get("opc-request-id")
+                        .and_then(|value| value.to_str().ok()),
+                )
+        });
+        self.forward_worker_response(res, is_stream, worker.url(), load_guard, started, observer)
             .await
     }
 
@@ -1702,13 +1716,15 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
+        let calibration = Mutex::new(None);
         let selection = self.select_worker_for_model(
             model_id,
-            None,
-            hinted_tokens.as_deref(),
-            Some(req.headers()),
-            None,
-            None,
+            PlacementInputs {
+                tokens: hinted_tokens.as_deref(),
+                headers: Some(req.headers()),
+                calibration: Some(&calibration),
+                ..Default::default()
+            },
         );
         let worker = match selection {
             Err(shed) => return Ok(shed),
@@ -1760,6 +1776,7 @@ impl Router {
                 route,
                 worker.as_ref(),
                 load_guard,
+                calibration.into_inner(),
             )
             .await;
 
@@ -2372,14 +2389,7 @@ mod tests {
         let router = create_test_unhealthy_router();
 
         let selected = router
-            .select_worker_for_model(
-                crate::worker::UNKNOWN_MODEL_ID,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, PlacementInputs::default())
             .unwrap()
             .unwrap();
         assert!(selected.is_available());
@@ -2388,14 +2398,7 @@ mod tests {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
         }
         assert!(router
-            .select_worker_for_model(
-                crate::worker::UNKNOWN_MODEL_ID,
-                None,
-                None,
-                None,
-                None,
-                None
-            )
+            .select_worker_for_model(crate::worker::UNKNOWN_MODEL_ID, PlacementInputs::default(),)
             .unwrap()
             .is_none());
     }
