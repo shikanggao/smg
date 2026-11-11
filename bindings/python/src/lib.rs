@@ -547,6 +547,8 @@ struct Router {
     estimated_wait_prompt_size_prior_samples: u32,
     estimated_wait_fallback_prefill_throughput: Option<f64>,
     estimated_wait_calibration_shadow: bool,
+    estimated_wait_feature_shadow: bool,
+    estimated_wait_native_hard_ttft_timeout_secs: Option<f64>,
     estimated_wait_provisional_baseline_secs: Option<f64>,
 }
 
@@ -869,6 +871,9 @@ impl Router {
                 max_estimated_wait_secs: self.max_estimated_wait_secs,
                 estimated_wait_shadow: self.estimated_wait_shadow,
                 estimated_wait_calibration_shadow: self.estimated_wait_calibration_shadow,
+                estimated_wait_feature_shadow: self.estimated_wait_feature_shadow,
+                estimated_wait_native_hard_ttft_timeout_secs: self
+                    .estimated_wait_native_hard_ttft_timeout_secs,
                 estimated_wait_provisional_baseline_secs: self
                     .estimated_wait_provisional_baseline_secs,
                 estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
@@ -1164,6 +1169,8 @@ impl Router {
         estimated_wait_fallback_prefill_throughput = None,
         estimated_wait_calibration_shadow = false,
         estimated_wait_provisional_baseline_secs = None,
+        estimated_wait_feature_shadow = false,
+        estimated_wait_native_hard_ttft_timeout_secs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1336,6 +1343,8 @@ impl Router {
         estimated_wait_fallback_prefill_throughput: Option<f64>,
         estimated_wait_calibration_shadow: bool,
         estimated_wait_provisional_baseline_secs: Option<f64>,
+        estimated_wait_feature_shadow: bool,
+        estimated_wait_native_hard_ttft_timeout_secs: Option<f64>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1519,6 +1528,8 @@ impl Router {
             estimated_wait_prompt_size_prior_samples,
             estimated_wait_fallback_prefill_throughput,
             estimated_wait_calibration_shadow,
+            estimated_wait_feature_shadow,
+            estimated_wait_native_hard_ttft_timeout_secs,
             estimated_wait_provisional_baseline_secs,
         })
     }

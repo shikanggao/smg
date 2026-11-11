@@ -271,6 +271,8 @@ class RouterArgs:
     estimated_wait_fallback_prefill_throughput: float | None = None
     estimated_wait_calibration_shadow: bool = False
     estimated_wait_provisional_baseline_secs: float | None = None
+    estimated_wait_feature_shadow: bool = False
+    estimated_wait_native_hard_ttft_timeout_secs: float | None = None
 
     @staticmethod
     def add_cli_args(
@@ -662,6 +664,18 @@ class RouterArgs:
             type=float,
             default=RouterArgs.estimated_wait_provisional_baseline_secs,
             help="Same-model TTFT baseline for diagnostic calibration; measured baseline takes precedence",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-native-hard-ttft-timeout-secs",
+            type=float,
+            default=RouterArgs.estimated_wait_native_hard_ttft_timeout_secs,
+            help="Opt-in remaining native first-output budget for regular HTTP feature streams; requires enforcing engine; independent of admission threshold",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-feature-shadow",
+            action="store_true",
+            default=RouterArgs.estimated_wait_feature_shadow,
+            help="Experimental C2 native-survival candidate; requires calibration shadow, never changes admission",
         )
         routing_group.add_argument(
             f"--{prefix}estimated-wait-calibration-shadow",

@@ -667,6 +667,9 @@ class TestParseRouterArgs:
                 [
                     f"--{prefix}estimated-wait-shadow",
                     f"--{prefix}estimated-wait-calibration-shadow",
+                    f"--{prefix}estimated-wait-feature-shadow",
+                    f"--{prefix}estimated-wait-native-hard-ttft-timeout-secs",
+                    "42",
                     f"--{prefix}estimated-wait-provisional-baseline-secs",
                     "0.25",
                     f"--{prefix}max-estimated-wait-secs",
@@ -693,6 +696,8 @@ class TestParseRouterArgs:
             assert args.max_estimated_wait_secs == 12.0
             assert args.estimated_wait_shadow is True
             assert args.estimated_wait_calibration_shadow is True
+            assert args.estimated_wait_feature_shadow is True
+            assert args.estimated_wait_native_hard_ttft_timeout_secs == 42.0
             assert args.estimated_wait_provisional_baseline_secs == 0.25
             assert args.estimated_wait_queue_tokens_per_request == 2048
             assert args.estimated_wait_default_throughput == 500.0
@@ -705,6 +710,8 @@ class TestParseRouterArgs:
         assert RouterArgs().max_estimated_wait_secs is None
         assert RouterArgs().estimated_wait_shadow is False
         assert RouterArgs().estimated_wait_calibration_shadow is False
+        assert RouterArgs().estimated_wait_feature_shadow is False
+        assert RouterArgs().estimated_wait_native_hard_ttft_timeout_secs is None
         assert RouterArgs().estimated_wait_provisional_baseline_secs is None
         assert RouterArgs().estimated_wait_queue_tokens_per_request == 0
         assert RouterArgs().estimated_wait_dispatch_blocking_factor == 0.05
@@ -1544,6 +1551,8 @@ class TestRouterArgsFieldOrder:
         "estimated_wait_fallback_prefill_throughput",
         "estimated_wait_calibration_shadow",
         "estimated_wait_provisional_baseline_secs",
+        "estimated_wait_feature_shadow",
+        "estimated_wait_native_hard_ttft_timeout_secs",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
