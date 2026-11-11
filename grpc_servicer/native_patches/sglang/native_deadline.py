@@ -427,6 +427,7 @@ class SchedulerDeadlineState:
         if engine_work_enabled():
             profile["engine_work_diagnostics_version"] = 1
             profile["original_prefill_diagnostics_version"] = 1
+            profile["scheduler_decision_diagnostics_version"] = 1
         self.profile_id = (
             "sglang-c9e5799:"
             + hashlib.sha256(json.dumps(profile, sort_keys=True, default=str).encode()).hexdigest()
@@ -434,6 +435,7 @@ class SchedulerDeadlineState:
         self.enforce = enforcement_enabled() and self.supported
         self.engine_work = None
         self.engine_work_supported = False
+        self.scheduler_receipt = None
         self.original_units_failed = None
         self.original_units_batches = self.original_units_guarded_batches = 0
         self.original_units_contributors = 0
@@ -457,6 +459,12 @@ class SchedulerDeadlineState:
                 supported=work_supported,
             )
             self.engine_work_supported = work_supported
+            if work_supported:
+                from sglang.srt.managers.smg_scheduler_receipt import SchedulerDecisionReceipt
+
+                self.scheduler_receipt = SchedulerDecisionReceipt(
+                    self.epoch, self.profile_id, scheduler.dp_rank or 0
+                )
 
     def begin_engine_work(self, batch):
         if self.engine_work is None or not self.engine_work_supported:
@@ -797,6 +805,19 @@ class SchedulerDeadlineState:
             cancellation_acks=list(self.journal),
         )
         if self.engine_work is not None:
+            if self.scheduler_receipt is not None:
+                try:
+                    output["scheduler_decision_receipt"] = self.scheduler_receipt.snapshot(output["captured_at_monotonic_secs"])
+                except Exception:
+                    try:
+                        self.scheduler_receipt.error("observer_failure")
+                    except Exception:
+                        pass
+                    output["scheduler_decision_receipt"] = dict(
+                        schema_version=1, diagnostic_only=True, method="sg_scheduler_decision_receipt_v1",
+                        source_commit=SG_PREFILL_SOURCE, engine_epoch=self.epoch,
+                        profile_id=self.profile_id, dp_rank=self.scheduler.dp_rank or 0,
+                        available=False, counters_available=False, unavailable_reason="observer_failure")
             output["engine_work_progress"] = self.observe_engine_work("snapshot") or dict(
                 schema_version=1,
                 engine_epoch=self.epoch,
@@ -826,8 +847,44 @@ def install_scheduler(cls):
     def init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         self._smg_deadline = SchedulerDeadlineState(self)
+        self._smg_scheduler_receipt = self._smg_deadline.scheduler_receipt
 
     cls.__init__ = init
+
+    if engine_work_enabled():
+        from sglang.srt.managers.smg_scheduler_receipt import observer_failed
+
+    if engine_work_enabled() and hasattr(cls, "get_next_batch_to_run"):
+        from sglang.srt.managers.smg_scheduler_receipt import install_adder
+
+        original_choose = cls.get_next_batch_to_run
+        adder = original_choose.__globals__.get("PrefillAdder")
+        if adder is not None:
+            install_adder(adder)
+
+        def choose(self, *args, **kwargs):
+            recorder = self._smg_scheduler_receipt
+            if recorder is None:
+                return original_choose(self, *args, **kwargs)
+            try:
+                recorder.begin()
+            except Exception:
+                observer_failed(self, abandon=True)
+            try:
+                batch = original_choose(self, *args, **kwargs)
+            except BaseException:
+                try:
+                    recorder.raised()
+                except Exception:
+                    observer_failed(self, abandon=True)
+                raise
+            try:
+                recorder.finish(batch)
+            except Exception:
+                observer_failed(self, abandon=True)
+            return batch
+
+        cls.get_next_batch_to_run = choose
 
     original_generate = cls.handle_generate_request
 
@@ -884,6 +941,11 @@ def install_scheduler(cls):
 
     def run(self, batch):
         work_record = self._smg_deadline.begin_engine_work(batch)
+        if self._smg_scheduler_receipt is not None:
+            try:
+                self._smg_scheduler_receipt.link_submission(batch, work_record)
+            except Exception:
+                observer_failed(self)
         if batch.forward_mode.is_extend():
             for req, prefix in zip(batch.reqs, batch.prefix_lens):
                 req._smg_matched_prefix = max(getattr(req, "_smg_matched_prefix", 0), prefix)
