@@ -33,6 +33,12 @@ helper = load(
 )
 
 
+receipt = load(
+    "sglang.srt.managers.smg_scheduler_receipt",
+    ROOT / "native_patches/sglang/scheduler_receipt.py",
+)
+
+
 class Mode:
     def __init__(self, value):
         self.value = value
@@ -79,7 +85,7 @@ def batch(reqs, ends, prefixes=None, mode="extend", decoding=None):
     return value
 
 
-def scheduler_class(process_result=None):
+def scheduler_class(process_result=None, choose=None):
     class Scheduler:
         def __init__(self):
             self.server_args = SimpleNamespace(tp_size=1, pp_size=1, dp_size=1)
@@ -121,6 +127,8 @@ def scheduler_class(process_result=None):
 
     if process_result is not None:
         Scheduler.process_batch_result = process_result
+    if choose is not None:
+        Scheduler.get_next_batch_to_run = choose
     native.install_scheduler(Scheduler)
     return Scheduler
 

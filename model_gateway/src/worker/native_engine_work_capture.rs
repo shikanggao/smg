@@ -2,6 +2,8 @@
 //!
 //! This module neither changes the typed load response nor interprets work as
 //! physical GPU progress, accepted tokens, present allocation, or free capacity.
+mod scheduler_receipt;
+
 use std::collections::{BTreeMap, HashSet};
 
 use serde::Serialize;
@@ -244,13 +246,41 @@ impl Capture {
             );
         }
         // An independent final bound remains even if schema overhead changes.
-        if serde_json::to_vec(&out).map_or(true, |bytes| bytes.len() > MAX_CAPTURE_BYTES) {
+        let captured_bytes = serde_json::to_vec(&out).ok().map(|bytes| bytes.len());
+        if captured_bytes.is_none_or(|bytes| bytes > MAX_CAPTURE_BYTES) {
             out.ranks.clear();
             out.ranks_retained = 0;
             out.ranks_dropped = out.ranks_seen;
             out.requests_retained = 0;
             out.requests_dropped = out.requests_seen;
             out.mark("capture_byte_limit");
+        } else if loads.len() == 1 && out.ranks.len() == 1 {
+            // Optional SG receipt uses only headroom AFTER legacy retention.
+            // Invalid/oversized receipt cannot evict rows or mark work unavailable.
+            if let Some(lane) = loads[0].get("deadline_recovery").and_then(Value::as_object) {
+                if let (Some(identity), Some(value)) = (
+                    Identity::read(lane, 0),
+                    lane.get("scheduler_decision_receipt"),
+                ) {
+                    if identity.profile.starts_with("sglang-c9e5799:") {
+                        let receipt = scheduler_receipt::sanitize(
+                            value,
+                            &identity.epoch,
+                            &identity.profile,
+                            identity.rank,
+                            identity.captured,
+                        );
+                        const KEY: &str = "scheduler_decision_receipt";
+                        let extra = encoded_len(&receipt) + KEY.len() + 4;
+                        if extra <= scheduler_receipt::MAX_BYTES + KEY.len() + 4
+                            && captured_bytes
+                                .is_some_and(|bytes| bytes + extra <= MAX_CAPTURE_BYTES)
+                        {
+                            out.ranks[0][KEY] = receipt;
+                        }
+                    }
+                }
+            }
         }
         out
     }
@@ -1151,6 +1181,19 @@ mod tests {
             .extend(row.as_object().unwrap().clone());
         let before: WorkerLoadResponse = serde_json::from_value(value.clone()).unwrap();
         assert!(before.loads[0].deadline_recovery.is_some());
+        for receipt in [
+            scheduler_receipt::fixture(),
+            Value::Null,
+            json!({"available":true,"malformed":"payload"}),
+        ] {
+            let mut changed = value.clone();
+            lane(&mut changed)["scheduler_decision_receipt"] = receipt;
+            let after: WorkerLoadResponse = serde_json::from_value(changed).unwrap();
+            assert_eq!(
+                serde_json::to_value(&before.loads[0].deadline_recovery).unwrap(),
+                serde_json::to_value(&after.loads[0].deadline_recovery).unwrap()
+            );
+        }
         lane(&mut value)["active_requests"][0]["original_prefill_observation"] =
             sg_original_facts();
         lane(&mut value)["original_prefill_service_provenance"] = json!({"available":false});
@@ -1241,6 +1284,49 @@ mod tests {
 
     fn lane(value: &mut Value) -> &mut Value {
         &mut value["loads"][0]["deadline_recovery"]
+    }
+
+    #[test]
+    fn scheduler_receipt_never_changes_legacy_work_capture_availability_or_rows() {
+        let mut value = fixture(true);
+        lane(&mut value)["engine_epoch"] = json!("e");
+        lane(&mut value)["profile_id"] = json!("sglang-c9e5799:p");
+        lane(&mut value)["engine_work_progress"]["engine_epoch"] = json!("e");
+        lane(&mut value)["engine_work_progress"]["profile_id"] = json!("sglang-c9e5799:p");
+        let baseline = capture(&value);
+        for (receipt, valid) in [
+            (scheduler_receipt::fixture(), true),
+            (Value::Null, false),
+            (
+                json!({"available":true,"oversized":"x".repeat(100_000)}),
+                false,
+            ),
+        ] {
+            let mut changed = value.clone();
+            lane(&mut changed)["scheduler_decision_receipt"] = receipt;
+            let out = capture(&changed);
+            for key in [
+                "available",
+                "failure_reason_counts",
+                "requests_retained",
+                "requests_dropped",
+            ] {
+                assert_eq!(out[key], baseline[key]);
+            }
+            for key in [
+                "active_requests",
+                "engine_work_progress",
+                "available",
+                "unavailable_reason",
+            ] {
+                assert_eq!(out["ranks"][0][key], baseline["ranks"][0][key]);
+            }
+            assert_eq!(
+                out["ranks"][0]["scheduler_decision_receipt"]["available"],
+                valid
+            );
+            assert!(serde_json::to_vec(&out).unwrap().len() <= MAX_CAPTURE_BYTES);
+        }
     }
 
     #[test]
