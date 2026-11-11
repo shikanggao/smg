@@ -1021,6 +1021,7 @@ async fn zmq_update_preserves_transport_state_and_the_live_client() {
             .overload(OverloadUpdate {
                 waiting_requests: Some(8),
                 token_usage: None,
+                ..Default::default()
             })
             .status(WorkerStatus::Ready)
             .build(),

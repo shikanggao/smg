@@ -382,6 +382,7 @@ fn overload_update_of(overload: Overload) -> OverloadUpdate {
         token_usage: overload
             .kv_usage_permille
             .map(|permille| f64::from(permille) / 1_000.0),
+        ..Default::default()
     }
 }
 

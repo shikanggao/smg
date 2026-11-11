@@ -1269,7 +1269,7 @@ impl HttpPoolConfig {
 }
 
 /// Per-worker absolute overload threshold overrides.
-/// All fields optional — `None` means "use gateway default". Either field set
+/// All fields optional — `None` means "use gateway default". Any field set
 /// enables overload protection for this worker even when the gateway leaves
 /// it off. Mirrors `HealthCheckUpdate` pattern for PATCH-style config.
 #[serde_with::skip_serializing_none]
@@ -1281,12 +1281,17 @@ pub struct OverloadUpdate {
     /// Mean KV-cache token usage across DP ranks at or above which this worker
     /// is considered overloaded. Must be in `(0.0, 1.0]`.
     pub token_usage: Option<f64>,
+    /// Estimated-wait budget in seconds. Must be finite and > 0.
+    /// Enables calibrated admission for this worker without a gateway budget.
+    pub max_estimated_wait_secs: Option<f64>,
 }
 
 impl OverloadUpdate {
     /// Returns `true` if all fields are `None` (no overrides specified).
     pub fn is_empty(&self) -> bool {
-        self.waiting_requests.is_none() && self.token_usage.is_none()
+        self.waiting_requests.is_none()
+            && self.token_usage.is_none()
+            && self.max_estimated_wait_secs.is_none()
     }
 }
 
@@ -1503,13 +1508,62 @@ pub struct StopProfileRequest {
     pub url: Option<String>,
 }
 
-/// Per-DP-rank load snapshot from a backend.
-///
-/// Contains core metrics from the engine's `/v1/loads` endpoint or the `GetLoads` gRPC RPC.
-/// Each snapshot represents one data-parallel rank's scheduler state.
+/// Same-poll diagnostic inputs for the queue-size and capacity estimators.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct PrefillMetricProvenance {
+    pub schema_version: u32,
+    pub counter_epoch: u64,
+    pub progress_source: Option<String>,
+    pub raw_counter: Option<f64>,
+    pub previous_raw_counter: Option<f64>,
+    pub interval_seconds: Option<f64>,
+    /// Endpoints on the gateway's diagnostic monotonic clock, not engine time.
+    pub interval_started_time_seconds: Option<f64>,
+    pub interval_ended_time_seconds: Option<f64>,
+    pub raw_rate: Option<f64>,
+    pub previous_conversion_size_mean: Option<f64>,
+    pub current_unshrunk_size_mean: Option<f64>,
+    /// The explicit observed sample count usable by the queue's size blend.
+    /// Some(0) means the observed component contributes no samples; missing is
+    /// unknown and must not be inferred from a mean equal to the prior.
+    pub queue_size_observed_sample_count: Option<u64>,
+    pub native_size_counter_count: Option<f64>,
+    pub capacity_interval_eligible: bool,
+    pub counter_reset: bool,
+}
+
+fn optional_prefill_metric_provenance<'de, D>(
+    deserializer: D,
+) -> Result<Option<PrefillMetricProvenance>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .filter(serde_json::Value::is_object)
+        .and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// Per-DP-rank load snapshot from a backend's HTTP endpoint or gRPC RPC.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SchedulerLoadSnapshot {
+    /// Same-poll diagnostic provenance; absent on older/native RPC producers.
+    #[serde(
+        default,
+        deserialize_with = "optional_prefill_metric_provenance",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prefill_metric_provenance: Option<PrefillMetricProvenance>,
+    /// Native per-request cancellation/deadline side channel. Missing or
+    /// malformed telemetry grants no recovery credit and leaves raw load intact.
+    #[serde(
+        default,
+        deserialize_with = "crate::native_deadline::optional_telemetry",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deadline_recovery: Option<crate::native_deadline::NativeDeadlineTelemetry>,
     /// URL of the worker this rank belongs to. Set by a gateway serving a
     /// fleet-wide `/loads`; engines reporting their own load leave it unset.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1520,9 +1574,22 @@ pub struct SchedulerLoadSnapshot {
     pub dp_rank: i32,
     pub num_running_reqs: i32,
     pub num_waiting_reqs: i32,
-    /// Queued token-work: waiting-queue tokens not yet served from cache. 0 when
-    /// the backend does not report it — callers degrade gracefully.
+    /// Explicit native gauge provenance for experimental recovery tracking.
+    /// Missing is unknown, never an inferred empty queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_request_counts_available: Option<bool>,
+    /// Opaque signature of native count series; changes invalidate recovery history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_request_counts_profile: Option<u64>,
+    /// Queued uncached token-work. Kept required for wire compatibility with
+    /// existing generated clients; use the companion flag to distinguish an
+    /// unavailable signal from an exact empty queue.
     pub num_waiting_uncached_tokens: i32,
+    /// Whether `num_waiting_uncached_tokens` is reported by the backend.
+    /// Missing keeps the legacy interpretation that the required numeric field
+    /// is usable; backends that cannot report it set this to `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_waiting_uncached_tokens_available: Option<bool>,
     pub num_total_reqs: i32,
     pub num_used_tokens: i32,
     pub max_total_num_tokens: i32,
@@ -1540,6 +1607,54 @@ pub struct SchedulerLoadSnapshot {
     /// Actual non-cached input tokens per active prefill second; unknown/stale is None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_throughput: Option<f64>,
+    /// Explicit presence and validity of the native KV gauge for experimental
+    /// calibration. Missing is unknown; a default numeric zero is not evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_kv_usage_available: Option<bool>,
+    /// Opaque KV source/series signature. Changes invalidate feature-fit history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_kv_usage_profile: Option<u64>,
+    /// Timely prefill progress only (local compute or started-prefill counter).
+    /// Zero is observed zero progress; None is unknown. Never uses completion counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timely_prefill_progress: Option<f64>,
+    /// Source identity, paired with native_request_counts_profile for reset provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timely_prefill_progress_source: Option<String>,
+    /// Counter interval in seconds. Long/cold/reset intervals are not live evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timely_prefill_progress_interval: Option<f64>,
+    /// Recent mean uncached prefill tokens per completed request. Gauge-only
+    /// backends use this to turn waiting-request counts into queued token-work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_request_prefill_kv_computed_tokens: Option<f64>,
+    /// Rolling median uncached prefill tokens per completed request, derived
+    /// from backend histogram deltas when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_request_prefill_kv_computed_tokens: Option<f64>,
+    /// Number of completed requests represented by the rolling uncached
+    /// prefill-size observations. Used to blend observed work with a prior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_size_sample_count: Option<u64>,
+    /// Conservative prefill capacity learned from saturated intervals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned_prefill_capacity: Option<f64>,
+    /// Number of saturated intervals in the capacity-learning window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_capacity_sample_count: Option<u32>,
+    /// Whether the current interval qualified for capacity learning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_capacity_learning_active: Option<bool>,
+    /// Rolling low-load engine TTFT, learned only while the queue is empty
+    /// and at most one request is running. Added once to the backlog estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_load_ttft_seconds: Option<f64>,
+    /// Mean engine-reported queue time for requests reported since the last poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_queue_delay_seconds: Option<f64>,
+    /// Number of requests supporting the recent queue-delay mean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_queue_delay_sample_count: Option<u64>,
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,
@@ -1711,7 +1826,7 @@ impl WorkerLoadResponse {
     pub fn total_waiting_uncached_tokens(&self) -> i64 {
         self.loads
             .iter()
-            .map(|l| l.num_waiting_uncached_tokens as i64)
+            .map(|l| i64::from(l.num_waiting_uncached_tokens))
             .sum()
     }
 
@@ -1738,6 +1853,13 @@ impl WorkerLoadResponse {
     /// Total generation throughput (tokens/s) summed across all DP ranks.
     pub fn total_gen_throughput(&self) -> f64 {
         self.loads.iter().map(|l| l.gen_throughput).sum()
+    }
+
+    /// Total prefill throughput when every rank that reports load supplies it.
+    pub fn total_prefill_throughput(&self) -> Option<f64> {
+        self.loads
+            .iter()
+            .try_fold(0.0, |sum, load| load.prefill_throughput.map(|v| sum + v))
     }
 
     /// Whether these ranks are one engine's DP ranks rather than a
@@ -2042,7 +2164,20 @@ mod overload_update_tests {
     }
 
     #[test]
-    fn is_empty_tracks_both_fields() {
+    fn estimated_wait_override_round_trips_without_static_thresholds() {
+        let spec: WorkerSpec = serde_json::from_value(json!({
+            "url": "http://w:1",
+            "overload": {"max_estimated_wait_secs": 2.5}
+        }))
+        .unwrap();
+        assert!(!spec.overload.is_empty());
+        assert_eq!(spec.overload.max_estimated_wait_secs, Some(2.5));
+        let out = serde_json::to_value(&spec).unwrap();
+        assert_eq!(out["overload"], json!({"max_estimated_wait_secs": 2.5}));
+    }
+
+    #[test]
+    fn is_empty_tracks_all_fields() {
         let mut update = OverloadUpdate::default();
         assert!(update.is_empty());
         update.waiting_requests = Some(1);
@@ -2050,6 +2185,7 @@ mod overload_update_tests {
         update = OverloadUpdate {
             waiting_requests: None,
             token_usage: Some(1.0),
+            max_estimated_wait_secs: None,
         };
         assert!(!update.is_empty());
     }

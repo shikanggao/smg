@@ -291,6 +291,32 @@ impl GenerationRequest for GenerateRequest {
         String::new()
     }
 
+    fn prompt_work_hint(&self) -> super::common::PromptWorkHint {
+        use super::common::PromptWorkHint;
+        if self
+            .sampling_params
+            .as_ref()
+            .and_then(|p| p.n)
+            .is_some_and(|n| n != 1)
+            || self.input_embeds.is_some()
+            || self.image_data.is_some()
+            || self.video_data.is_some()
+            || self.audio_data.is_some()
+            || self.session_params.is_some()
+        {
+            return PromptWorkHint::Unknown;
+        }
+        match &self.input_ids {
+            Some(InputIds::Single(ids)) if !ids.is_empty() && ids.iter().all(|id| *id >= 0) => {
+                PromptWorkHint::BodyTokenIds(ids.len())
+            }
+            Some(_) => PromptWorkHint::Unknown,
+            None => self.text.as_ref().map_or(PromptWorkHint::Unknown, |text| {
+                PromptWorkHint::TextBytes(text.len())
+            }),
+        }
+    }
+
     fn routing_tokens(&self) -> Option<&[i32]> {
         // Token ids win over text: they key routing on what the backend KV
         // cache keys on. Empty ids fall back to text.
