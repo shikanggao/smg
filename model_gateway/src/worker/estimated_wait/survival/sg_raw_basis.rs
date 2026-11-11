@@ -25,9 +25,24 @@ impl NativeKey {
     }
 }
 
+/// Original expiry of an actually issued positive-rate SG raw proof. Zero
+/// intervals cannot refresh this anchor, even while the positive window persists.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(super) struct PositiveEvidence {
+    raw_poll: f64,
+    raw_expiry: f64,
+    source: started_capacity::SourceKey,
+}
+
 /// Owned at raw publication and carried on the existing bounded native task.
-/// This is historical estimated native UNCACHED-token capacity, not completed
-/// service, full-original-token/s, cache-hit proof or physical GPU capacity.
+/// This is estimated native UNCACHED-token capacity, not completed GPU service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CapacityEligibility {
+    PositiveCurrentInterval,
+    CertifiedZeroInterval,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct SgRawEvidence {
     calibration_epoch: u64,
@@ -40,6 +55,9 @@ pub(crate) struct SgRawEvidence {
     selected_capacity: f64,
     native_waiting: f64,
     raw_queue_estimate: f64,
+    capacity_eligibility: CapacityEligibility,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    positive_evidence_for_zero_interval: Option<PositiveEvidence>,
     capacity: started_capacity::Selection,
 }
 
@@ -56,6 +74,7 @@ pub(super) struct State {
     revision: u64,
     pub(super) bundle: Option<Bundle>,
     blocked_publication: Option<NativeKey>,
+    positive_evidence: Option<PositiveEvidence>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -67,6 +86,7 @@ pub(crate) struct SgProjection {
     pub total_ttft_seconds: f64,
     capacity_tokens_per_second: f64,
     selected_capacity_basis: &'static str,
+    current_capacity_eligibility: CapacityEligibility,
     raw_evidence: SgRawEvidence,
     native_tuple: NativeKey,
     original_native_receipt: f64,
@@ -94,14 +114,47 @@ impl Native {
         if self.sg_raw_basis.raw_source.is_none()
             && self.sg_raw_basis.bundle.is_none()
             && self.sg_raw_basis.revision == 0
+            && self.sg_raw_basis.positive_evidence.is_none()
         {
             return;
         }
         self.sg_raw_basis.revision = self.sg_raw_basis.revision.saturating_add(1);
         self.sg_raw_basis.bundle = None;
+        self.sg_raw_basis.positive_evidence = None;
         if let Some(snapshot) = &self.snapshot {
             self.sg_raw_basis.blocked_publication = Some(NativeKey::of(&snapshot.lane));
         }
+    }
+
+    pub(super) fn sg_zero_positive_evidence(&self, started: f64) -> Option<PositiveEvidence> {
+        let evidence = self.sg_raw_basis.positive_evidence?;
+        let source = self.sg_raw_basis.raw_source?;
+        (started.is_finite()
+            && source == evidence.source
+            && evidence.raw_poll <= started
+            && started < evidence.raw_expiry
+            && self
+                .started_requests
+                .certified_zero_interval(started, Some(source)))
+        .then_some(evidence)
+    }
+
+    pub(super) fn sg_fence_certified_zero(&mut self) {
+        let positive = self.sg_raw_basis.positive_evidence;
+        // Preserve baec's zero-poll pair invalidation and late-task fence. Only
+        // the existing positive freshness anchor survives, never its bundle.
+        self.invalidate_sg_raw();
+        if self.sg_raw_basis.revision < u64::MAX {
+            self.sg_raw_basis.positive_evidence = positive;
+        }
+    }
+
+    fn sg_capacity_poll_matches(&self, started: f64, capacity: f64) -> bool {
+        self.capacity_poll.is_some_and(|(poll, valid, cap)| {
+            poll == started
+                && cap.is_some_and(|c| positive(c) && close(c, capacity))
+                && (valid || self.sg_zero_positive_evidence(started).is_some())
+        })
     }
 
     pub fn sg_raw_evidence(
@@ -124,9 +177,7 @@ impl Native {
                 || !positive(max_age)
                 || self.sg_raw_basis.revision == u64::MAX
                 || source.2 != "prefill_started_requests"
-                || !self.capacity_poll.is_some_and(|(poll, valid, cap)| {
-                    poll == started && valid && cap.is_some_and(|c| close(c, original))
-                })
+                || !self.sg_capacity_poll_matches(started, original)
                 || !matches!(size.kind, basis::Kind::Observed)
                 || size.progress_source != "prefill_started_requests"
                 || size.counter_epoch != source_key.counter_epoch
@@ -153,8 +204,21 @@ impl Native {
             }
             let selected = current.used_capacity.filter(|v| positive(*v))?;
             let queue = waiting * size.blended_queue_tokens_per_request;
-            let expiry = started + max_age;
-            if !nonnegative(queue) || !expiry.is_finite() {
+            let zero_evidence = if self.capacity_poll.is_some_and(|(_, valid, _)| valid) {
+                None
+            } else {
+                Some(self.sg_zero_positive_evidence(started)?)
+            };
+            let mut expiry =
+                zero_evidence.map_or(started + max_age, |e| (started + max_age).min(e.raw_expiry));
+            if let Some(old) = self
+                .sg_raw_basis
+                .positive_evidence
+                .filter(|e| e.raw_poll == started && e.source == source_key)
+            {
+                expiry = expiry.min(old.raw_expiry); // An exact repeat cannot renew its original expiry.
+            }
+            if !nonnegative(queue) || !expiry.is_finite() || expiry <= started {
                 return None;
             }
             Some(SgRawEvidence {
@@ -168,10 +232,24 @@ impl Native {
                 selected_capacity: selected,
                 native_waiting: waiting,
                 raw_queue_estimate: queue,
+                capacity_eligibility: if zero_evidence.is_some() {
+                    CapacityEligibility::CertifiedZeroInterval
+                } else {
+                    CapacityEligibility::PositiveCurrentInterval
+                },
+                positive_evidence_for_zero_interval: zero_evidence,
                 capacity,
             })
         })();
-        if proof.is_none() {
+        if let Some(raw) = &proof {
+            if raw.positive_evidence_for_zero_interval.is_none() {
+                self.sg_raw_basis.positive_evidence = Some(PositiveEvidence {
+                    raw_poll: raw.raw_poll,
+                    raw_expiry: raw.raw_expiry,
+                    source: self.sg_raw_basis.raw_source.unwrap(),
+                });
+            }
+        } else {
             self.invalidate_sg_raw();
         }
         proof
@@ -315,14 +393,16 @@ impl Native {
             || n.counter_epoch != raw.size.counter_epoch
             || n.dp_rank != raw.size.dp_rank
             || n.progress_source != raw.size.progress_source
-            || !self.capacity_poll.is_some_and(|(poll, valid, cap)| {
-                poll == snap.poll_started
-                    && valid
-                    && cap.is_some_and(|c| close(c, n.admission_capacity))
-            })
+            || !self.sg_capacity_poll_matches(snap.poll_started, n.admission_capacity)
         {
             return Err("sg_pair_or_current_guard_unavailable");
         }
+        let current_capacity_eligibility = if self.capacity_poll.is_some_and(|(_, valid, _)| valid)
+        {
+            CapacityEligibility::PositiveCurrentInterval
+        } else {
+            CapacityEligibility::CertifiedZeroInterval
+        };
         if s.lane
             .active_requests
             .iter()
@@ -390,7 +470,7 @@ impl Native {
         projection.native_known_remaining_rows -= waiting + stage_zero;
         projection.full_prompt_proxy_rows += waiting;
         Ok(SgProjection { method: METHOD, selected: true, supported: true, available: true, total_ttft_seconds: total,
-            capacity_tokens_per_second: capacity, selected_capacity_basis: capacity_basis, raw_evidence: raw.clone(),
+            capacity_tokens_per_second: capacity, selected_capacity_basis: capacity_basis, current_capacity_eligibility, raw_evidence: raw.clone(),
             native_tuple: bundle.native.clone(), original_native_receipt: s.received,
             original_native_expiry: s.expiry,
             pair_available_at_gateway_seconds: bundle.available,
@@ -534,6 +614,8 @@ mod tests {
             selected_capacity: 10.0,
             native_waiting: 2.0,
             raw_queue_estimate: 60.0,
+            capacity_eligibility: CapacityEligibility::PositiveCurrentInterval,
+            positive_evidence_for_zero_interval: None,
             capacity: started_capacity::Selection {
                 status: "available",
                 reason: "complete_current_conversion_basis",
@@ -625,6 +707,426 @@ mod tests {
         (native, admission)
     }
 
+    fn capacity_frame(
+        at: f64,
+        previous_at: Option<f64>,
+        previous: Option<f64>,
+        counter: f64,
+        eligible: bool,
+        count: u32,
+    ) -> WorkerLoadResponse {
+        let interval = previous_at.map(|before| at - before);
+        let rate = previous
+            .zip(interval)
+            .map(|(before, dt)| (counter - before) / dt);
+        serde_json::from_value(json!({"dp_rank_count":1,"loads":[{
+            "dp_rank":0,"native_request_counts_available":true,"native_request_counts_profile":1,
+            "timely_prefill_progress_source":"prefill_started_requests",
+            "prefill_capacity_learning_active":eligible,"prefill_capacity_sample_count":count,
+            "learned_prefill_capacity":(count>=8).then_some(50.0),
+            "avg_request_prefill_kv_computed_tokens":50.0,"prefill_size_sample_count":8,
+            "prefill_metric_provenance":{"schema_version":1,"counter_epoch":0,
+                "progress_source":"prefill_started_requests","counter_reset":false,
+                "raw_counter":counter,"previous_raw_counter":previous,"interval_seconds":interval,
+                "interval_started_time_seconds":previous_at,"interval_ended_time_seconds":at,"raw_rate":rate,
+                "previous_conversion_size_mean":50.0,"current_unshrunk_size_mean":50.0,
+                "queue_size_observed_sample_count":8,"capacity_interval_eligible":eligible}}]})).unwrap()
+    }
+
+    fn positive_capacity_fixture() -> (Native, Admission) {
+        let (mut n, mut a) = fixture();
+        for i in 0..=8 {
+            let at = f64::from(i);
+            let load = capacity_frame(
+                at,
+                (i > 0).then_some(at - 1.0),
+                (i > 0).then_some(at - 1.0),
+                at,
+                i > 0,
+                i,
+            );
+            n.raw_poll(Some(&load), at, true);
+        }
+        let positive = n
+            .sg_raw_evidence(8.0, 30.0, 1, Some(size()), Some(50.0), Some(2.0), 2.0)
+            .unwrap();
+        assert!(positive.positive_evidence_for_zero_interval.is_none());
+        assert_eq!(n.sg_raw_basis.positive_evidence.unwrap().raw_expiry, 38.0);
+        a.normalization.as_mut().unwrap().admission_capacity = 50.0;
+        (n, a)
+    }
+
+    fn commit_zero(n: &mut Native, at: f64, previous_at: f64) -> Option<SgRawEvidence> {
+        let mut load = capacity_frame(at, Some(previous_at), Some(8.0), 8.0, false, 8);
+        n.raw_poll(Some(&load), at, true);
+        let proof = n.sg_raw_evidence(at, 30.0, 1, Some(size()), Some(50.0), Some(2.0), 2.0);
+        let mut lane = n.snapshot.as_ref().unwrap().lane.clone();
+        lane.snapshot_seq += 1;
+        lane.captured_at_monotonic_secs += 1.0;
+        load.loads[0].deadline_recovery = Some(lane);
+        n.observe(Some(&load), true, at + 0.01, at + 0.02, at, 30.0);
+        n.commit_sg_raw(proof.clone(), at, 1, at + 0.02);
+        proof
+    }
+
+    #[test]
+    fn certified_zero_uses_original_positive_expiry_and_preserves_legacy_control() {
+        let (mut n, mut a) = positive_capacity_fixture();
+        let raw = commit_zero(&mut n, 9.0, 8.0).unwrap();
+        assert_eq!(raw.raw_expiry, 38.0);
+        assert_eq!(
+            raw.positive_evidence_for_zero_interval.unwrap().raw_poll,
+            8.0
+        );
+        assert!(n.valid);
+        a.training_snapshot.at = 9.1;
+        a.training_snapshot.poll_started = 9.0;
+        let mut old = Projection::default();
+        assert_eq!(
+            n.project(9.1, 9.0, 2.0, 10.0, 50.0, &mut old),
+            Err("request_start_capacity_conversion_missing_or_nonpositive")
+        );
+        a.projection.reason = "request_start_capacity_conversion_missing_or_nonpositive";
+        a.projection.stable_work_fallback_seconds = Some(777.0);
+        let before = serde_json::to_value(&a).unwrap();
+        n.select_sg_raw_basis(&mut a, 1);
+        let selected = a.sg_raw_basis_deadline.as_ref().unwrap();
+        assert_eq!(selected.total_ttft_seconds, 2.6);
+        assert_eq!(
+            selected.current_capacity_eligibility,
+            CapacityEligibility::CertifiedZeroInterval
+        );
+        assert_eq!(
+            selected.raw_evidence.capacity_eligibility,
+            CapacityEligibility::CertifiedZeroInterval
+        );
+        assert_eq!(
+            selected.legacy_selected_total_seconds,
+            before["projection"]["total_ttft_seconds"].as_f64()
+        );
+        assert_eq!(selected.legacy_selected_total_seconds, Some(100.0));
+        assert_eq!(
+            selected.legacy_projection_reason,
+            "request_start_capacity_conversion_missing_or_nonpositive"
+        );
+        assert_eq!(selected.raw_evidence.raw_expiry, 38.0);
+        let wire = serde_json::to_value(selected).unwrap();
+        assert_eq!(
+            wire["raw_evidence"]["positive_evidence_for_zero_interval"]["raw_expiry"],
+            38.0
+        );
+        if let Ok(path) = std::env::var("SMG_SG_ZERO_SELECTION_FIXTURE_PATH") {
+            std::fs::write(path, serde_json::to_vec_pretty(selected).unwrap()).unwrap();
+        }
+        a.sg_raw_basis_deadline = None;
+        assert_eq!(serde_json::to_value(&a).unwrap(), before);
+    }
+
+    #[test]
+    fn repeated_zero_never_renews_anchor_and_expires_at_original_boundary() {
+        let (mut n, mut a) = positive_capacity_fixture();
+        let first = commit_zero(&mut n, 9.0, 8.0).unwrap();
+        let later = commit_zero(&mut n, 37.0, 9.0).unwrap();
+        assert_eq!(first.raw_expiry, later.raw_expiry);
+        assert_eq!(n.sg_raw_basis.positive_evidence.unwrap().raw_poll, 8.0);
+        a.training_snapshot.poll_started = 37.0;
+        a.training_snapshot.at = 38.0;
+        n.select_sg_raw_basis(&mut a, 1);
+        assert!(
+            a.sg_raw_basis_deadline.is_some(),
+            "existing inclusive expiry boundary"
+        );
+        a.training_snapshot.at = 38.000001;
+        n.select_sg_raw_basis(&mut a, 1);
+        assert!(a.sg_raw_basis_deadline.is_none());
+        assert!(commit_zero(&mut n, 38.0, 37.0).is_none());
+        assert!(n.sg_raw_basis.positive_evidence.is_none());
+        assert!(n.sg_raw_basis.bundle.is_none());
+        assert!(
+            n.started_requests
+                .selection(38.0, n.sg_raw_basis.raw_source, 2.0)
+                .status
+                == "available",
+            "old positive window still exists but cannot extend freshness"
+        );
+    }
+
+    #[test]
+    fn zero_without_positive_proof_or_after_negative_reset_rebound_is_unavailable() {
+        for mode in 0..4 {
+            let (mut n, _) = positive_capacity_fixture();
+            match mode {
+                0 => n.sg_raw_basis.positive_evidence = None,
+                1 => n.raw_poll(None, 8.5, false),
+                2 => {
+                    let mut load = capacity_frame(9.0, Some(8.0), Some(8.0), 8.0, false, 8);
+                    load.loads[0]
+                        .prefill_metric_provenance
+                        .as_mut()
+                        .unwrap()
+                        .counter_reset = true;
+                    n.raw_poll(Some(&load), 9.0, true);
+                }
+                _ => {
+                    n.valid = false;
+                    n.reason = "native_remaining_work_rebound";
+                    n.invalidate_sg_raw();
+                }
+            }
+            assert!(
+                commit_zero(&mut n, 10.0, if mode == 2 { 9.0 } else { 8.0 }).is_none(),
+                "mode {mode}"
+            );
+            assert!(n.sg_raw_basis.bundle.is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_zero_interval_never_borrows_positive_history() {
+        for mode in 0..5 {
+            let (mut n, _) = positive_capacity_fixture();
+            let mut load = capacity_frame(9.0, Some(8.0), Some(8.0), 8.0, false, 8);
+            let p = load.loads[0].prefill_metric_provenance.as_mut().unwrap();
+            match mode {
+                0 => p.raw_rate = None,
+                1 => p.raw_rate = Some(f64::NAN),
+                2 => p.raw_rate = Some(-1.0),
+                3 => p.interval_seconds = Some(0.0),
+                _ => p.previous_raw_counter = Some(7.0),
+            }
+            n.raw_poll(Some(&load), 9.0, true);
+            assert!(
+                n.sg_raw_evidence(9.0, 30.0, 1, Some(size()), Some(50.0), Some(2.0), 2.0)
+                    .is_none(),
+                "mode {mode}"
+            );
+            assert!(n.sg_raw_basis.positive_evidence.is_none());
+        }
+    }
+
+    #[test]
+    fn zero_fences_positive_bundle_and_negative_late_callback_blocks_zero_recovery() {
+        let (mut n, mut a) = positive_capacity_fixture();
+        let positive = n
+            .sg_raw_evidence(8.0, 30.0, 1, Some(size()), Some(50.0), Some(2.0), 2.0)
+            .unwrap();
+        let mut initial_positive = capacity_frame(8.0, Some(7.0), Some(7.0), 8.0, true, 8);
+        let mut positive_lane = n.snapshot.as_ref().unwrap().lane.clone();
+        positive_lane.snapshot_seq += 1;
+        positive_lane.captured_at_monotonic_secs += 1.0;
+        initial_positive.loads[0].deadline_recovery = Some(positive_lane);
+        n.observe(Some(&initial_positive), true, 8.01, 8.02, 8.0, 30.0);
+        assert!(n.valid);
+        n.commit_sg_raw(Some(positive.clone()), 8.0, 1, 8.02);
+        assert!(n.sg_raw_basis.bundle.is_some());
+        let mut load = capacity_frame(9.0, Some(8.0), Some(8.0), 8.0, false, 8);
+        n.raw_poll(Some(&load), 9.0, true);
+        let zero = n
+            .sg_raw_evidence(9.0, 30.0, 1, Some(size()), Some(50.0), Some(2.0), 2.0)
+            .unwrap();
+        assert!(n.sg_raw_basis.bundle.is_none());
+        a.training_snapshot.at = 9.1;
+        a.training_snapshot.poll_started = 9.0;
+        n.select_sg_raw_basis(&mut a, 1);
+        assert!(
+            a.sg_raw_basis_deadline.is_none(),
+            "no old bundle before zero callback"
+        );
+        let mut late_positive = capacity_frame(8.0, Some(7.0), Some(7.0), 8.0, true, 8);
+        late_positive.loads[0].deadline_recovery = Some(n.snapshot.as_ref().unwrap().lane.clone());
+        n.observe(Some(&late_positive), true, 8.01, 9.12, 8.0, 30.0);
+        assert!(
+            n.valid,
+            "legacy may accept duplicate while SG task revision is fenced"
+        );
+        n.commit_sg_raw(Some(positive), 8.0, 1, 9.12);
+        assert!(
+            n.sg_raw_basis.bundle.is_none(),
+            "old positive callback fenced"
+        );
+        let mut lane = n.snapshot.as_ref().unwrap().lane.clone();
+        lane.snapshot_seq += 1;
+        lane.captured_at_monotonic_secs += 1.0;
+        load.loads[0].deadline_recovery = Some(lane);
+        n.observe(Some(&load), true, 9.15, 9.2, 9.0, 30.0);
+        n.commit_sg_raw(Some(zero), 9.0, 1, 9.2);
+        a.training_snapshot.at = 9.3;
+        n.select_sg_raw_basis(&mut a, 1);
+        assert!(
+            a.sg_raw_basis_deadline.is_none(),
+            "rejected callback remains a negative barrier"
+        );
+        assert!(n.sg_raw_basis.positive_evidence.is_none());
+    }
+
+    #[test]
+    fn actual_native_reset_and_rebound_clear_positive_anchor_and_zero_token() {
+        for reset in [false, true] {
+            let (mut n, _) = positive_capacity_fixture();
+            n.snapshot.as_mut().unwrap().lane.active_requests[0].remaining_prefill_work_tokens =
+                Some(10.0);
+            let mut load = capacity_frame(9.0, Some(8.0), Some(8.0), 8.0, false, 8);
+            n.raw_poll(Some(&load), 9.0, true);
+            let token = n
+                .sg_raw_evidence(9.0, 30.0, 1, Some(size()), Some(50.0), Some(2.0), 2.0)
+                .unwrap();
+            let mut lane = n.snapshot.as_ref().unwrap().lane.clone();
+            lane.snapshot_seq += 1;
+            lane.captured_at_monotonic_secs += 1.0;
+            if reset {
+                lane.engine_epoch = "new-engine".into();
+            } else {
+                lane.active_requests[0].remaining_prefill_work_tokens = Some(20.0);
+            }
+            load.loads[0].deadline_recovery = Some(lane);
+            n.observe(Some(&load), true, 9.01, 9.02, 9.0, 30.0);
+            assert!(!n.valid);
+            assert_eq!(
+                n.reason,
+                if reset {
+                    "native_identity_reset"
+                } else {
+                    "native_remaining_work_rebound"
+                }
+            );
+            assert!(n.sg_raw_basis.positive_evidence.is_none());
+            n.commit_sg_raw(Some(token), 9.0, 1, 9.02);
+            assert!(n.sg_raw_basis.bundle.is_none());
+        }
+    }
+
+    #[test]
+    fn positive_duplicate_and_source_transition_cannot_extend_or_borrow_anchor() {
+        let (mut n, _) = positive_capacity_fixture();
+        let same = n
+            .sg_raw_evidence(8.0, 60.0, 1, Some(size()), Some(50.0), Some(2.0), 2.0)
+            .unwrap();
+        assert_eq!(same.raw_expiry, 38.0);
+        assert_eq!(n.sg_raw_basis.positive_evidence.unwrap().raw_expiry, 38.0);
+        let mut load = capacity_frame(9.0, Some(8.0), Some(8.0), 8.0, false, 8);
+        load.loads[0].native_request_counts_profile = Some(2);
+        n.raw_poll(Some(&load), 9.0, true);
+        assert!(n
+            .sg_raw_evidence(9.0, 30.0, 1, Some(size()), Some(50.0), Some(2.0), 2.0)
+            .is_none());
+        assert!(n.sg_raw_basis.positive_evidence.is_none());
+    }
+
+    #[test]
+    fn conflicting_duplicate_zero_cannot_restore_bounded_positive_anchor() {
+        let (mut n, _) = positive_capacity_fixture();
+        commit_zero(&mut n, 9.0, 8.0).unwrap();
+        let mut load = capacity_frame(9.0, Some(8.0), Some(8.0), 8.0, false, 8);
+        load.loads[0]
+            .prefill_metric_provenance
+            .as_mut()
+            .unwrap()
+            .interval_seconds = Some(0.5);
+        n.raw_poll(Some(&load), 9.0, true);
+        assert!(n
+            .sg_raw_evidence(9.0, 30.0, 1, Some(size()), Some(50.0), Some(2.0), 2.0)
+            .is_none());
+        assert!(n.sg_raw_basis.positive_evidence.is_none());
+        let restored = capacity_frame(9.0, Some(8.0), Some(8.0), 8.0, false, 8);
+        n.raw_poll(Some(&restored), 9.0, true);
+        assert!(n
+            .sg_raw_evidence(9.0, 30.0, 1, Some(size()), Some(50.0), Some(2.0), 2.0)
+            .is_none());
+        assert!(n.sg_raw_basis.bundle.is_none());
+    }
+
+    #[test]
+    fn positive_raw_after_zero_pair_keeps_zero_attribution_until_positive_callback() {
+        let (mut n, mut a) = positive_capacity_fixture();
+        commit_zero(&mut n, 9.0, 8.0).unwrap();
+        let mut positive = capacity_frame(10.0, Some(9.0), Some(8.0), 9.0, true, 9);
+        n.raw_poll(Some(&positive), 10.0, true);
+        let token = n
+            .sg_raw_evidence(10.0, 30.0, 1, Some(size()), Some(50.0), Some(2.0), 2.0)
+            .unwrap();
+        assert_eq!(n.sg_raw_basis.positive_evidence.unwrap().raw_expiry, 40.0);
+        a.training_snapshot.at = 10.1;
+        a.training_snapshot.poll_started = 10.0;
+        n.select_sg_raw_basis(&mut a, 1);
+        let old_pair = a.sg_raw_basis_deadline.as_ref().unwrap();
+        assert_eq!(
+            old_pair.raw_evidence.capacity_eligibility,
+            CapacityEligibility::CertifiedZeroInterval
+        );
+        assert_eq!(
+            old_pair.current_capacity_eligibility,
+            CapacityEligibility::PositiveCurrentInterval
+        );
+        // The raw donor kind alone does not certify the current zero guard.
+        assert_eq!(
+            old_pair.raw_evidence.raw_expiry, 38.0,
+            "new positive evidence cannot renew old zero proof"
+        );
+        assert_eq!(
+            old_pair.legacy_selected_total_seconds,
+            a.projection.total_ttft_seconds
+        );
+        let mut lane = n.snapshot.as_ref().unwrap().lane.clone();
+        lane.snapshot_seq += 1;
+        lane.captured_at_monotonic_secs += 1.0;
+        positive.loads[0].deadline_recovery = Some(lane);
+        n.observe(Some(&positive), true, 10.11, 10.2, 10.0, 30.0);
+        n.commit_sg_raw(Some(token), 10.0, 1, 10.2);
+        a.training_snapshot.at = 10.3;
+        n.select_sg_raw_basis(&mut a, 1);
+        let current = a.sg_raw_basis_deadline.as_ref().unwrap();
+        assert_eq!(
+            current.raw_evidence.capacity_eligibility,
+            CapacityEligibility::PositiveCurrentInterval
+        );
+        assert_eq!(
+            current.total_ttft_seconds, 2.6,
+            "unchanged SG formula after positive pair"
+        );
+        assert_ne!(
+            current.total_ttft_seconds,
+            current.legacy_selected_total_seconds.unwrap(),
+            "positive prior-baec arm is SG, not original C2 fallback"
+        );
+    }
+
+    #[test]
+    fn positive_duplicate_after_zero_is_not_a_complete_baec_selector_reference() {
+        let (mut n, mut a) = positive_capacity_fixture();
+        commit_zero(&mut n, 9.0, 8.0).unwrap();
+        let zero_key = NativeKey::of(&n.snapshot.as_ref().unwrap().lane);
+        let mut positive = capacity_frame(10.0, Some(9.0), Some(8.0), 9.0, true, 9);
+        n.raw_poll(Some(&positive), 10.0, true);
+        let token = n
+            .sg_raw_evidence(10.0, 30.0, 1, Some(size()), Some(50.0), Some(2.0), 2.0)
+            .unwrap();
+        let mut duplicate = n.snapshot.as_ref().unwrap().lane.clone();
+        duplicate.snapshot_age_seconds = 1.0;
+        positive.loads[0].deadline_recovery = Some(duplicate);
+        n.observe(Some(&positive), true, 10.1, 10.2, 10.0, 30.0);
+        assert_eq!(NativeKey::of(&n.snapshot.as_ref().unwrap().lane), zero_key);
+        n.commit_sg_raw(Some(token), 10.0, 1, 10.2);
+        a.training_snapshot.poll_started = 10.0;
+        a.training_snapshot.at = 10.3;
+        n.select_sg_raw_basis(&mut a, 1);
+        let selected = a.sg_raw_basis_deadline.unwrap();
+        assert_eq!(
+            selected.raw_evidence.capacity_eligibility,
+            CapacityEligibility::PositiveCurrentInterval
+        );
+        assert_eq!(
+            selected.current_capacity_eligibility,
+            CapacityEligibility::PositiveCurrentInterval
+        );
+        assert_eq!(selected.total_ttft_seconds, 2.6);
+        // baec's rejected zero callback blocks zero_key. Positive enums certify
+        // unchanged arithmetic, not that prior private selector would accept it.
+        assert_ne!(
+            selected.total_ttft_seconds,
+            selected.legacy_selected_total_seconds.unwrap()
+        );
+    }
+
     #[test]
     fn stage_zero_preserves_abort_owner_and_original_training_and_aggregate() {
         let (n, mut a) = fixture();
@@ -632,6 +1134,10 @@ mod tests {
         n.select_sg_raw_basis(&mut a, 1);
         let selected = a.sg_raw_basis_deadline.as_ref().unwrap();
         assert_eq!(selected.total_ttft_seconds, 5.0);
+        assert_eq!(
+            selected.raw_evidence.capacity_eligibility,
+            CapacityEligibility::PositiveCurrentInterval
+        );
         assert_eq!(selected.waiting_proxy_work_tokens, 30.0);
         assert_eq!(selected.original_prefill_zero_rows, 1);
         assert_eq!(selected.projection.input_work_tokens, 30.0);

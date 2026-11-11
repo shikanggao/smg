@@ -361,6 +361,24 @@ impl History {
             }
         }
     }
+    /// The current interval was fully checked by observe, but adds no sample.
+    /// This says nothing about GPU idleness or the age of the positive window.
+    pub(super) fn certified_zero_interval(&self, started: f64, key: Option<SourceKey>) -> bool {
+        self.complete
+            && self.reason == "complete_original_window"
+            && self.samples.len() >= MIN_SAMPLES
+            && self.latest.is_some_and(|p| {
+                p.started == started
+                    && Some(p.key) == key
+                    && !p.reset
+                    && !p.eligible
+                    && p.raw_rate == Some(0.0)
+                    && p.previous == Some(p.anchor.counter)
+                    && p.size.is_some_and(positive)
+                    && p.learned.is_some_and(positive)
+            })
+    }
+
     pub fn selection(&self, started: f64, key: Option<SourceKey>, floor: f64) -> Selection {
         let mut result = Selection {
             status: "unavailable",
