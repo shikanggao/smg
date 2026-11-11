@@ -2369,13 +2369,14 @@ async fn group_monitor_loop(
             // Admission aggregates ranks here and latches a compact verdict;
             // request handling only updates credit and checks freshness.
             if monitor.worker_registry.is_current_ready(&worker) {
-                let native_watermark = watermark.clone();
-                monitor.worker_registry.estimated_wait().publish(
-                    &worker,
-                    response.as_ref(),
-                    watermark,
-                    started,
-                );
+                let mut native_watermark = watermark.clone();
+                let sg_raw_evidence = monitor
+                    .worker_registry
+                    .estimated_wait()
+                    .publish_with_sg_raw(&worker, response.as_ref(), watermark, started);
+                if let Some(watermark) = native_watermark.as_mut() {
+                    watermark.sg_raw_evidence = sg_raw_evidence;
+                }
                 if group_key.connection_mode == ConnectionMode::Http {
                     monitor.schedule_native_deadline(
                         Arc::clone(&worker),

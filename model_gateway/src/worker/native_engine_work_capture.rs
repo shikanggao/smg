@@ -1130,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn new_sg_raw_facts_are_ignored_by_legacy_typed_payload_and_equality() {
+    fn optional_sg_stage_facts_preserve_legacy_typed_equality() {
         use openai_protocol::worker::WorkerLoadResponse;
         let mut value = fixture(true);
         let base = json!({"snapshot_age_seconds":0.0,"active_inventory_complete":true,"native_population":1,
@@ -1160,10 +1160,15 @@ mod tests {
             .as_ref()
             .unwrap()
             .legacy_snapshot_eq(after.loads[0].deadline_recovery.as_ref().unwrap()));
-        assert_eq!(
-            serde_json::to_value(before).unwrap(),
-            serde_json::to_value(after).unwrap()
-        );
+        assert!(after.loads[0]
+            .deadline_recovery
+            .as_ref()
+            .unwrap()
+            .active_requests[0]
+            .original_prefill_observation
+            .is_some());
+        // Only the separate SG shadow can consume this optional evidence.
+        // Existing deadline/ACK equality deliberately excludes it.
     }
 
     #[test]

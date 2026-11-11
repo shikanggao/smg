@@ -43,7 +43,7 @@ use std::{
 };
 
 use axum::response::Response;
-use openai_protocol::worker::WorkerLoadResponse;
+use openai_protocol::worker::{RuntimeType, WorkerLoadResponse};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +68,7 @@ mod native_deadline;
 mod pending_work;
 mod recovery;
 mod survival;
+pub(crate) use survival::SgRawEvidence;
 static NATIVE_GATEWAY_EPOCH: OnceLock<uuid::Uuid> = OnceLock::new();
 
 struct NativeDeadlineObservation<'a> {
@@ -2610,6 +2611,16 @@ impl EstimatedWaitAdmission {
             diagnostic_time(raw_started),
             self.config().estimated_wait_max_snapshot_age_secs,
         );
+        if worker.metadata().spec.runtime_type == RuntimeType::Sglang {
+            // A newer native commit replaces or invalidates the pair, including
+            // callbacks without a usable proof. Local ledger state stays live.
+            entry.survival.native.commit_sg_raw(
+                watermark.sg_raw_evidence,
+                diagnostic_time(raw_started),
+                entry.calibration_epoch,
+                diagnostic_time(received),
+            );
+        }
         tracing::debug!(target: "smg::estimated_wait::observation",
             event="native_deadline_poll",worker=worker.url(),
             diagnostic_time_seconds=diagnostic_time(Instant::now()),
@@ -2717,6 +2728,7 @@ impl EstimatedWaitAdmission {
             dispatched: entry.total_dispatched,
             dispatched_requests: entry.total_dispatched_requests,
             pending_work: entry.pending_work.summary(Instant::now()),
+            sg_raw_evidence: None,
         })
     }
 
@@ -2764,6 +2776,7 @@ impl EstimatedWaitAdmission {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn publish(
         &self,
         worker: &Arc<dyn Worker>,
@@ -2771,9 +2784,19 @@ impl EstimatedWaitAdmission {
         watermark: Option<PollWatermark>,
         started: Instant,
     ) {
+        let _ = self.publish_with_sg_raw(worker, load, watermark, started);
+    }
+
+    pub(crate) fn publish_with_sg_raw(
+        &self,
+        worker: &Arc<dyn Worker>,
+        load: Option<&WorkerLoadResponse>,
+        watermark: Option<PollWatermark>,
+        started: Instant,
+    ) -> Option<SgRawEvidence> {
         let Some(watermark) = watermark else {
             Self::log_poll(worker, None, None, started, "untracked", [false; 2]);
-            return;
+            return None;
         };
         // Rank aggregation, validation and the queue/KV formula are report work,
         // outside the admission transaction lock.
@@ -2790,7 +2813,7 @@ impl EstimatedWaitAdmission {
                 "worker_removed",
                 [false; 2],
             );
-            return;
+            return None;
         };
         let outcome = poll_outcome(
             Arc::ptr_eq(&entry.generation, &watermark.generation),
@@ -2805,6 +2828,8 @@ impl EstimatedWaitAdmission {
         if !Arc::ptr_eq(&entry.generation, &watermark.generation)
             || entry.last_published.is_some_and(|last| last >= started)
         {
+            // Superseded/duplicate publications preserve the existing state.
+            // Only admitted later negatives may invalidate the SG pair.
             Self::log_poll(
                 worker,
                 Some(entry),
@@ -2813,7 +2838,7 @@ impl EstimatedWaitAdmission {
                 outcome,
                 fit_executed,
             );
-            return;
+            return None;
         }
         let new_poll = entry.last_published.is_none_or(|last| started > last);
         if config.estimated_wait_feature_shadow {
@@ -3118,6 +3143,26 @@ impl EstimatedWaitAdmission {
                 net_population_depletion_per_second = candidate.and_then(|c| c.rate),
                 window_seconds = candidate.map(|c| c.horizon), window_poll_count = candidate.map(|c| c.points));
         }
+        // Freeze the successful raw evidence in the same transaction as its
+        // publication. The bounded native task carries this exact proof; its
+        // callback must never reconstruct a rate from a newer raw sample.
+        if config.estimated_wait_feature_shadow
+            && worker.metadata().spec.runtime_type == RuntimeType::Sglang
+            && outcome == "success"
+        {
+            let prepared = entry.sample.as_ref().map(|sample| sample.prepared);
+            entry.survival.native.sg_raw_evidence(
+                diagnostic_time(started),
+                config.estimated_wait_max_snapshot_age_secs,
+                entry.calibration_epoch,
+                prepared.and_then(|p| p.size_basis),
+                prepared.map(|p| p.effective_prefill_capacity),
+                prepared.map(|p| p.native_waiting),
+                config.estimated_wait_fallback_prefill_throughput,
+            )
+        } else {
+            None
+        }
     }
 
     pub(crate) fn evict(&self, worker: &Arc<dyn Worker>) {
@@ -3160,6 +3205,7 @@ pub(crate) struct PollWatermark {
     dispatched: u64,
     dispatched_requests: u64,
     pending_work: pending_work::Summary,
+    pub(crate) sg_raw_evidence: Option<SgRawEvidence>,
 }
 
 pub(crate) struct AdmissionGuard<'a> {
@@ -3254,6 +3300,14 @@ impl AdmissionGuard<'_> {
                     forecast.raw_fallback_work,
                     self.config.estimated_wait_fallback_prefill_throughput,
                 );
+                if worker.metadata().spec.runtime_type == RuntimeType::Sglang {
+                    // This optional output preserves the original projection
+                    // and its training/expiry bookkeeping as the control.
+                    entry
+                        .survival
+                        .native
+                        .select_sg_raw_basis(&mut admission, entry.calibration_epoch);
+                }
                 Box::new(admission)
             });
             forecast.feature_context =
@@ -4091,6 +4145,130 @@ mod tests {
                 "raw_rate":(second>0).then_some(2.0),"previous_conversion_size_mean":1000.0,
                 "capacity_interval_eligible":second>0,"counter_reset":false}
         }]})).unwrap()
+    }
+
+    #[test]
+    fn sg_raw_proof_is_frozen_only_for_successful_opted_in_sglang_polls() {
+        for (runtime, feature_enabled) in [
+            (RuntimeType::Sglang, true),
+            (RuntimeType::Vllm, true),
+            (RuntimeType::Sglang, false),
+        ] {
+            let registry = Arc::new(WorkerRegistry::new());
+            registry.estimated_wait().configure(EstimatedWaitConfig {
+                estimated_wait_calibration_shadow: true,
+                estimated_wait_feature_shadow: feature_enabled,
+                ..config()
+            });
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("http://sg-pair-publication:1")
+                    .status(WorkerStatus::Ready)
+                    .runtime_type(runtime)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Http)
+                    .build(),
+            );
+            registry.register(worker.clone()).unwrap();
+            let admission = registry.estimated_wait();
+            let mut proof = None;
+            for second in 0..=8 {
+                let mut report = entry_started_history_load(second);
+                let rank = &mut report.loads[0];
+                rank.num_waiting_reqs = 1;
+                rank.num_waiting_uncached_tokens_available = Some(false);
+                rank.avg_request_prefill_kv_computed_tokens = Some(1000.0);
+                rank.prefill_size_sample_count = Some(8);
+                let provenance = rank.prefill_metric_provenance.as_mut().unwrap();
+                provenance.queue_size_observed_sample_count = Some(8);
+                provenance.current_unshrunk_size_mean = Some(1000.0);
+                let watermark = admission.poll_started(&worker);
+                proof = admission.publish_with_sg_raw(
+                    &worker,
+                    Some(&report),
+                    watermark,
+                    Instant::now(),
+                );
+            }
+            assert_eq!(
+                proof.is_some(),
+                runtime == RuntimeType::Sglang && feature_enabled
+            );
+            if proof.is_some() {
+                let (last, before) = {
+                    let entries = admission.entries.lock();
+                    let entry = entries.get(worker.url()).unwrap();
+                    (
+                        entry.last_published.unwrap(),
+                        format!("{:?}", entry.survival.native),
+                    )
+                };
+                let watermark = admission.poll_started(&worker);
+                assert!(admission
+                    .publish_with_sg_raw(
+                        &worker,
+                        Some(&entry_started_history_load(8)),
+                        watermark,
+                        last - Duration::from_millis(1)
+                    )
+                    .is_none());
+                let entries = admission.entries.lock();
+                assert_eq!(
+                    format!("{:?}", entries.get(worker.url()).unwrap().survival.native),
+                    before
+                );
+                drop(entries);
+
+                // Keep rate/counter history coherent on genuinely newer polls.
+                // Current-size proof is independent of the previous conversion
+                // mean and must not be filled from that historical value.
+                for (second, current_mean) in [(9, None), (10, Some(999.0)), (11, Some(1000.0))] {
+                    let mut report = entry_started_history_load(second);
+                    let rank = &mut report.loads[0];
+                    rank.num_waiting_reqs = 1;
+                    rank.num_waiting_uncached_tokens_available = Some(false);
+                    rank.avg_request_prefill_kv_computed_tokens = Some(1000.0);
+                    rank.prefill_size_sample_count = Some(8);
+                    let provenance = rank.prefill_metric_provenance.as_mut().unwrap();
+                    provenance.queue_size_observed_sample_count = Some(8);
+                    provenance.current_unshrunk_size_mean = current_mean;
+                    let watermark = admission.poll_started(&worker);
+                    let started = Instant::now();
+                    assert!(
+                        admission.entries.lock()[worker.url()]
+                            .last_published
+                            .unwrap()
+                            < started
+                    );
+                    let proof =
+                        admission.publish_with_sg_raw(&worker, Some(&report), watermark, started);
+                    let entries = admission.entries.lock();
+                    let entry = &entries[worker.url()];
+                    assert_eq!(entry.last_published, Some(started));
+                    let capacity = entry.survival.started_history_selection_for_test(
+                        diagnostic_time(started),
+                        survival::started_source_key(&report),
+                    );
+                    assert_eq!(capacity.status, "available");
+                    assert!(capacity.history_complete);
+                    assert_eq!(capacity.history_samples, second as usize);
+                    let current = capacity.same_poll_observed_size.unwrap();
+                    let expected = current_mean == Some(1000.0);
+                    assert_eq!(proof.is_some(), expected);
+                    assert_eq!(
+                        current.reason,
+                        if expected {
+                            "same_poll_observed_completed_size"
+                        } else {
+                            "current_observed_size_mean_unavailable_or_mismatch"
+                        }
+                    );
+                }
+            }
+            let watermark = admission.poll_started(&worker);
+            assert!(admission
+                .publish_with_sg_raw(&worker, None, watermark, Instant::now())
+                .is_none());
+        }
     }
 
     #[test]
