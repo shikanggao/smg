@@ -11,6 +11,7 @@ import functools
 import hashlib
 import json
 import math
+import operator
 import os
 import re
 import sqlite3
@@ -30,6 +31,27 @@ def enabled():
 
 def enforcement_enabled():
     return enabled() and os.environ.get("SMG_NATIVE_HARD_TTFT_ENFORCEMENT") == "1"
+
+
+def engine_work_enabled():
+    return enabled() and os.environ.get("SMG_NATIVE_ENGINE_WORK_DIAGNOSTICS") == "1"
+
+
+def unavailable_engine_work_state(reason, native_request_id=None, attempt_id=None):
+    return dict(
+        schema_version=1,
+        diagnostic_only=True,
+        native_request_id=native_request_id,
+        attempt_id=attempt_id,
+        available=False,
+        unavailable_reason=reason,
+        output_token_count=None,
+        retraction_count=None,
+        preemption_count=None,
+        abort_pending=None,
+        abort_pending_source="req_to_finish_FINISH_ABORT",
+        cache_release_observed=None,
+    )
 
 
 def supported_args(args):
@@ -369,11 +391,120 @@ class SchedulerDeadlineState:
         profile["source_commit"] = "c9e5799bd12fd5fefb0fb375ac537a6b7d53892e"
         profile["signals_version"] = 1
         profile["hard_ttft_enforcement"] = enforcement_enabled()
+        if engine_work_enabled():
+            profile["engine_work_diagnostics_version"] = 1
         self.profile_id = (
             "sglang-c9e5799:"
             + hashlib.sha256(json.dumps(profile, sort_keys=True, default=str).encode()).hexdigest()
         )
         self.enforce = enforcement_enabled() and self.supported
+        self.engine_work = None
+        self.engine_work_supported = False
+        if engine_work_enabled():
+            from sglang.srt.managers.smg_engine_work_progress import CompletedWorkProgress
+
+            model = getattr(scheduler, "model_config", None)
+            work_supported = (
+                self.supported
+                and scheduler.dp_rank in (None, 0)
+                and getattr(scheduler, "is_generation", False)
+                and not getattr(model, "is_encoder_decoder", True)
+                and not getattr(model, "is_multimodal", True)
+            )
+            self.engine_work = CompletedWorkProgress(
+                self.epoch,
+                self.profile_id,
+                scheduler.dp_rank or 0,
+                "c9e5799bd12fd5fefb0fb375ac537a6b7d53892e",
+                "normal_process_batch_result_return_after_native_completion_wait",
+                supported=work_supported,
+            )
+            self.engine_work_supported = work_supported
+
+    def begin_engine_work(self, batch):
+        if self.engine_work is None or not self.engine_work_supported:
+            return None
+        try:
+            mode = batch.forward_mode
+            if mode.is_idle():
+                return None
+            if not (mode.is_decode() or mode.is_extend()):
+                raise ValueError("unsupported forward mode")
+            reqs = tuple(batch.reqs)
+            # Reading only CPU scheduling metadata adds no device synchronization.
+            cpu = batch.seq_lens_cpu
+            if getattr(getattr(cpu, "device", None), "type", "cpu") != "cpu":
+                raise ValueError("sequence lengths are not CPU metadata")
+            ends = tuple(operator.index(end) for end in cpu)
+            if len(ends) != len(reqs):
+                raise ValueError("incomplete sequence lengths")
+            decoding = {id(req) for req in (batch.decoding_reqs or [])}
+            if not decoding.issubset({id(req) for req in reqs}):
+                raise ValueError("mixed decode membership mismatch")
+            prefixes = tuple(batch.prefix_lens) if mode.is_extend() else ()
+            if mode.is_extend() and len(prefixes) != len(reqs):
+                raise ValueError("incomplete prefix lengths")
+            rows = tuple(
+                (
+                    end - 1 if mode.is_decode() or id(req) in decoding else operator.index(prefixes[i]),
+                    end,
+                    len(req.origin_input_ids),
+                )
+                for i, (req, end) in enumerate(zip(reqs, ends))
+            )
+            return self.observe_engine_work("begin", rows)
+        except Exception:
+            self.engine_work.invalidate("unsupported_or_incomplete_batch_work_metadata")
+            return None
+
+    def observe_engine_work(self, method, *args):
+        if self.engine_work is None:
+            return None
+        try:
+            return getattr(self.engine_work, method)(*args)
+        except Exception:
+            self.engine_work.invalidate("engine_work_diagnostic_observation_failed")
+            return None
+
+    def request_engine_work_state(self, req):
+        native_id = getattr(req, "rid", None)
+        attempt = getattr(req, "smg_attempt_id", None)
+        if not self.engine_work_supported:
+            return unavailable_engine_work_state(
+                "unsupported_engine_configuration", native_id, attempt
+            )
+        output = unavailable_engine_work_state(
+            "request_work_metadata_missing_or_invalid", native_id, attempt
+        )
+        ids = getattr(req, "output_ids", None)
+        if isinstance(ids, list):
+            output["output_token_count"] = len(ids)
+        retractions = getattr(req, "retraction_count", None)
+        if type(retractions) is int and retractions >= 0:
+            output["retraction_count"] = retractions
+        missing = object()
+        finish = getattr(req, "to_finish", missing)
+        if finish is not missing:
+            output["abort_pending"] = type(finish).__name__ == "FINISH_ABORT"
+        # The existing release observer creates this flag only after returning.
+        # Absence means no release callback observed, not no private allocation.
+        released = getattr(req, "_smg_cache_released", False)
+        if type(released) is bool:
+            output["cache_release_observed"] = released
+        output["available"] = (
+            isinstance(native_id, str)
+            and bool(native_id)
+            and (attempt is None or isinstance(attempt, str) and bool(attempt))
+            and all(
+                output[field] is not None
+                for field in (
+                    "output_token_count", "retraction_count", "abort_pending", "cache_release_observed"
+                )
+            )
+        )
+        if output["available"]:
+            output["unavailable_reason"] = None
+        return output
 
     def next_seq(self):
         self.seq += 1
@@ -477,22 +608,33 @@ class SchedulerDeadlineState:
             # original-prompt-only progress markers do not describe that work.
             if getattr(req, "retraction_count", 0) > 0:
                 remaining = None
-            rows.append(
-                dict(
-                    attempt_id=attempt,
-                    native_request_id=req.rid,
-                    state_seq=self.tracked[key][1],
-                    remaining_prefill_work_tokens=remaining,
-                    hard_ttft_deadline_monotonic_secs=getattr(req, "smg_deadline", None)
-                    if self.enforce
-                    else None,
-                    queue_position=None,
-                    state=state,
-                    first_text_emitted=first_text,
-                )
+            row = dict(
+                attempt_id=attempt,
+                native_request_id=req.rid,
+                state_seq=self.tracked[key][1],
+                remaining_prefill_work_tokens=remaining,
+                hard_ttft_deadline_monotonic_secs=getattr(req, "smg_deadline", None)
+                if self.enforce
+                else None,
+                queue_position=None,
+                state=state,
+                first_text_emitted=first_text,
             )
+            if self.engine_work is not None:
+                try:
+                    diagnostic = self.request_engine_work_state(req)
+                    if not isinstance(diagnostic, dict):
+                        raise ValueError("invalid request diagnostic record")
+                    row["engine_work_state"] = diagnostic
+                except Exception:
+                    row["engine_work_state"] = unavailable_engine_work_state(
+                        "request_work_metadata_observation_failed",
+                        row["native_request_id"],
+                        row["attempt_id"],
+                    )
+            rows.append(row)
         seq = self.next_seq()
-        return dict(
+        output = dict(
             schema_version=1,
             engine_epoch=self.epoch,
             profile_id=self.profile_id,
@@ -518,6 +660,16 @@ class SchedulerDeadlineState:
             active_requests=rows,
             cancellation_acks=list(self.journal),
         )
+        if self.engine_work is not None:
+            output["engine_work_progress"] = self.observe_engine_work("snapshot") or dict(
+                schema_version=1,
+                engine_epoch=self.epoch,
+                profile_id=self.profile_id,
+                dp_rank=self.scheduler.dp_rank or 0,
+                counters_available=False,
+                unavailable_reason="engine_work_diagnostic_observation_failed",
+            )
+        return output
 
 
 def install_scheduler(cls):
@@ -585,10 +737,24 @@ def install_scheduler(cls):
     original_run = cls.run_batch
 
     def run(self, batch):
+        work_record = self._smg_deadline.begin_engine_work(batch)
         if batch.forward_mode.is_extend():
             for req, prefix in zip(batch.reqs, batch.prefix_lens):
                 req._smg_matched_prefix = max(getattr(req, "_smg_matched_prefix", 0), prefix)
-        return original_run(self, batch)
+        try:
+            result = original_run(self, batch)
+        except Exception:
+            if work_record is not None:
+                self._smg_deadline.engine_work.invalidate("native_batch_execution_failed")
+            raise
+        if work_record is not None:
+            # The result object survives overlap's ScheduleBatch.copy; the
+            # mutable batch and Req fields do not define this completed work.
+            try:
+                result._smg_engine_work_record = work_record
+            except Exception:
+                self._smg_deadline.engine_work.invalidate("result_work_metadata_not_retained")
+        return result
 
     cls.run_batch = run
 
@@ -598,7 +764,26 @@ def install_scheduler(cls):
         # seq_lens_cpu survives ScheduleBatch.copy at this pin; it is the batch's
         # immutable committed prefix+chunk end, unlike mutable Req.fill_ids.
         ends = list(zip(batch.reqs, batch.seq_lens_cpu)) if batch.forward_mode.is_extend() else []
-        output = original_result(self, batch, result)
+        try:
+            work_record = getattr(result, "_smg_engine_work_record", None)
+        except Exception:
+            work_record = None
+            if self._smg_deadline.engine_work is not None:
+                self._smg_deadline.engine_work.invalidate("result_work_metadata_not_retained")
+        try:
+            output = original_result(self, batch, result)
+        except Exception:
+            if self._smg_deadline.engine_work is not None and work_record is not None:
+                self._smg_deadline.engine_work.invalidate("native_result_processing_failed")
+            raise
+        if self._smg_deadline.engine_work is not None and work_record is not None:
+            # The pinned normal output processor has already waited for its
+            # result/copy completion. Do not add another GPU synchronization.
+            self._smg_deadline.observe_engine_work("complete", work_record)
+        elif self._smg_deadline.engine_work_supported and (
+            batch.forward_mode.is_extend() or batch.forward_mode.is_decode()
+        ):
+            self._smg_deadline.engine_work.invalidate("completion_without_submission_record")
         for req, end in ends:
             req._smg_prefill_completed = max(
                 getattr(req, "_smg_prefill_completed", 0), min(len(req.origin_input_ids), int(end))

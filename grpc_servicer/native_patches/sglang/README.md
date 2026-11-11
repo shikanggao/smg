@@ -106,6 +106,66 @@ recompute context and original-prompt progress no longer describes that work. Co
 capacity and an abort-lag bound stay null, so this producer does not qualify a
 single-FIFO or D3 forecast oracle.
 
+Completed engine-work diagnostics
+---------------------------------
+
+An additional independent opt-in, `SMG_NATIVE_ENGINE_WORK_DIAGNOSTICS=1`, adds
+`engine_work_progress` to the native deadline envelope. It is absent by default
+and requires `SMG_NATIVE_DEADLINE_SIGNALS=1`. It does not change admission,
+capacity learning, remaining-work estimates, deadline enforcement, or the
+first-nonempty-text boundary. The installer copies the shared stdlib-only
+completion recorder into `managers/smg_engine_work_progress.py`.
+
+Before `Scheduler.run_batch`, the adapter freezes CPU input position ranges from
+`prefix_lens` and `seq_lens_cpu`; mixed-batch decode membership identifies the
+one-token decode ranges. The returned result carries this record because the
+pinned overlap loop copies only selected batch fields. Work is credited only
+after the normal `process_batch_result` returns, after its existing native
+result/copy completion wait. No new GPU synchronization or device reads are
+introduced. A launch without a successful result witness receives no credit.
+Duplicate callbacks do not credit the same result twice; execution of a new
+batch after retraction counts its actual repeated input ranges again.
+
+The cumulative counters are completed batches, uncached original-prompt input
+tokens, generated-context input tokens, and the sum of their logical causal
+attention lengths. Cached prefixes are excluded. Generated-context work includes
+decode and repeated generated context after retraction: it is not an accepted
+output-token count, a unique-progress estimate, physical KV occupancy, or an
+estimate of remaining work until visible text. In particular, hidden/no-text
+decode still has unknown remaining work in the deadline inventory.
+
+Each diagnostic includes the native engine epoch, config/source profile, rank,
+upstream source commit, completion sequence, monotonic snapshot time, and the
+last completed batch's frozen work mix and host observation timestamps. The
+launch-to-result-return span includes scheduling, overlap, result-copy waits and
+CPU processing. It is **not GPU execution time**, and overlapping spans must not
+be summed into physical elapsed time or throughput. Completed counters may lag
+physical execution until normal native result processing witnesses completion.
+
+The existing standalone generation scope applies. Encoder-decoder, multimodal,
+embedding, speculative and unsupported rank/topology configurations report
+unavailable counters. Missing/invalid metadata or a diagnostic observation
+failure also marks cumulative completeness unavailable, while preserving native
+execution, exceptions and response semantics. These diagnostics are not consumed
+by the gateway's predictor; a real engine test is still required to qualify
+overlap behavior and telemetry overhead.
+
+With the same flag, each existing active-request row also carries a diagnostic
+`engine_work_state`: native/attempt identity, output-token count, retraction count,
+pending `Req.to_finish` abort, and observation of the existing release-callback
+flag. Unsupported preemption count stays null. Missing or invalid metadata is
+null and marks that record unavailable; unsupported configurations and guarded
+metadata failures likewise produce unavailable records without changing native
+inventory. These fields are snapshot reads only: no new callbacks or history.
+
+Output IDs are previously observed sampled results, not a current GPU-progress
+claim. `abort_pending_source=req_to_finish_FINISH_ABORT` means only that the
+native finish reason is pending consumption by `Req.check_finished`; false does
+not prove that resources were released. `cache_release_observed` reports the
+existing callback-return flag (absence means no callback observed), not physical
+allocation state or a cancellation ACK. The first-text and unknown remaining-work
+rules are unchanged, including for retained or retracted decoders.
+
 CPU verification:
 
 ```sh
@@ -113,6 +173,10 @@ SGLANG_NATIVE_SOURCE=/path/to/exact/sglang \
 SGLANG_NATIVE_COMMUNICATOR_SOURCE=/path/to/exact/tokenizer_communicator_mixin.py \
   python -m unittest discover -s grpc_servicer/tests \
   -p 'test_sglang_native_*.py' -v
+
+SGLANG_NATIVE_SOURCE=/path/to/exact/sglang \
+  python -m unittest discover -s grpc_servicer/tests \
+  -p 'test_sglang_engine_work_progress.py' -v
 ```
 
 The component tests use explicit scheduler/cache/request context doubles. The
