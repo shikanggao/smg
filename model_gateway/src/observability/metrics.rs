@@ -1575,6 +1575,7 @@ pub(crate) fn init_metrics() {
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
     super::history_metrics::describe();
+    super::ttft::describe();
 
     // Initialize mesh metrics
     smg_mesh::init_mesh_metrics();
@@ -1804,6 +1805,10 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     let mm_per_request_matcher = Matcher::Full(String::from("smg_mm_media_per_request"));
 
     HashMap::from([
+        (
+            Matcher::Full(super::ttft::ERROR_METRIC.into()),
+            super::ttft::ERROR_BUCKETS.to_vec(),
+        ),
         (duration_matcher, duration_bucket.clone()),
         (ttft_matcher, duration_bucket.clone()),
         (tpot_matcher, duration_bucket),
