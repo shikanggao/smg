@@ -14,6 +14,7 @@ pub(crate) mod load_state;
 pub mod manager;
 pub mod metrics_aggregator;
 pub mod monitor;
+pub(crate) mod native_engine_work_capture;
 pub mod overload;
 pub mod pd_pair_index;
 pub mod pd_pairing;

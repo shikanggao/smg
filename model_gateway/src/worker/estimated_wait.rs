@@ -52,6 +52,7 @@ use super::{
         ExpectedWait, DEFAULT_DISPATCH_BLOCKING_FACTOR, DEFAULT_MEAN_PREFILL_TOKENS,
         DEFAULT_THROUGHPUT,
     },
+    native_engine_work_capture::Capture as NativeEngineWorkCapture,
     Worker, WorkerRegistry,
 };
 use crate::{
@@ -68,6 +69,11 @@ mod pending_work;
 mod recovery;
 mod survival;
 static NATIVE_GATEWAY_EPOCH: OnceLock<uuid::Uuid> = OnceLock::new();
+
+struct NativeDeadlineObservation<'a> {
+    transport_timeout: bool,
+    capture: Option<&'a NativeEngineWorkCapture>,
+}
 use feature::{
     Activity, Context as FeatureContext, DeadlineHandle, DeadlineResolution, Deadlines,
     Outcome as FeatureOutcome,
@@ -764,6 +770,17 @@ impl CalibrationForecast {
     fn seconds(&self) -> f64 {
         self.baseline
             .map_or(-1.0, |baseline| baseline + self.extra())
+    }
+
+    fn raw_total_for_fallback(&self) -> Option<survival::RawFallback> {
+        if !self.raw_ready || !self.fresh || !self.native_capacity_ready {
+            return None;
+        }
+        survival::RawFallback::new(
+            self.baseline?,
+            self.baseline_source.as_str(),
+            self.raw_extra,
+        )
     }
 
     fn would_reject(&self) -> bool {
@@ -2434,6 +2451,7 @@ impl EstimatedWaitAdmission {
         watermark: Option<PollWatermark>,
         raw_started: Instant,
         native_started: Instant,
+        capture: Option<&NativeEngineWorkCapture>,
     ) {
         self.publish_native_deadline_observation(
             worker,
@@ -2441,7 +2459,10 @@ impl EstimatedWaitAdmission {
             watermark,
             raw_started,
             native_started,
-            false,
+            NativeDeadlineObservation {
+                transport_timeout: false,
+                capture,
+            },
         );
     }
 
@@ -2451,6 +2472,7 @@ impl EstimatedWaitAdmission {
         watermark: Option<PollWatermark>,
         raw_started: Instant,
         native_started: Instant,
+        capture: Option<&NativeEngineWorkCapture>,
     ) {
         self.publish_native_deadline_observation(
             worker,
@@ -2458,7 +2480,10 @@ impl EstimatedWaitAdmission {
             watermark,
             raw_started,
             native_started,
-            true,
+            NativeDeadlineObservation {
+                transport_timeout: true,
+                capture,
+            },
         );
     }
 
@@ -2469,12 +2494,55 @@ impl EstimatedWaitAdmission {
         watermark: Option<PollWatermark>,
         raw_started: Instant,
         native_started: Instant,
-        transport_timeout: bool,
+        observation: NativeDeadlineObservation<'_>,
     ) {
+        // This optional companion is not passed to the typed native adapter,
+        // ledger, service model or predictor. Its clocks bind the original
+        // fetched response even when publication or diagnostics are unavailable.
+        let record_capture = |publication_reason: &'static str,
+                              native_contract_reason: Option<&'static str>,
+                              accepted_by_adapter: bool,
+                              received: Instant,
+                              calibration_epoch: Option<u64>| {
+            if let Some(capture) = observation.capture {
+                let encoded = serde_json::to_string(capture).unwrap_or_else(|_| {
+                    r#"{"schema_version":1,"diagnostic_only":true,"available":false,"unavailable_reason":"diagnostic_serialization_failed"}"#.to_owned()
+                });
+                tracing::debug!(target: "smg::estimated_wait::observation",
+                    event="native_engine_work_capture",worker=worker.url(),
+                    native_engine_work_method="router_native_response_counts_v1",
+                    diagnostic_only=true,
+                    diagnostic_time_seconds=diagnostic_time(Instant::now()),
+                    native_poll_started_time_seconds=diagnostic_time(native_started),
+                    native_receipt_time_seconds=diagnostic_time(received),
+                    raw_poll_started_time_seconds=diagnostic_time(raw_started),
+                    calibration_epoch,
+                    publication_reason,
+                    native_contract_reason=native_contract_reason.unwrap_or("not_observed"),
+                    accepted_by_adapter,
+                    typed_response_present=native.is_some(),
+                    native_transport_timeout=observation.transport_timeout,
+                    native_engine_work_json=%encoded);
+            }
+        };
         if !self.native_deadline_enabled() {
+            record_capture(
+                "native_deadline_disabled",
+                None,
+                false,
+                Instant::now(),
+                None,
+            );
             return;
         }
         let Some(watermark) = watermark else {
+            record_capture(
+                "missing_raw_poll_watermark",
+                None,
+                false,
+                Instant::now(),
+                None,
+            );
             return;
         };
         let mut entries = self.entries.lock();
@@ -2485,6 +2553,14 @@ impl EstimatedWaitAdmission {
                     .last_published
                     .is_some_and(|published| published >= raw_started)
         }) else {
+            drop(entries);
+            record_capture(
+                "stale_worker_or_raw_poll_watermark",
+                None,
+                false,
+                Instant::now(),
+                None,
+            );
             return;
         };
         let mut ledger = entry
@@ -2492,7 +2568,7 @@ impl EstimatedWaitAdmission {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let received = Instant::now();
-        if transport_timeout {
+        if observation.transport_timeout {
             entry.native_deadline.observe_transport_timeout(
                 received,
                 self.config().estimated_wait_max_snapshot_age_secs,
@@ -2526,7 +2602,7 @@ impl EstimatedWaitAdmission {
             raw_poll_started_time_seconds=diagnostic_time(raw_started),
             calibration_epoch=entry.calibration_epoch,
             native_observation_transport_seconds=native_started.elapsed().as_secs_f64(),
-            native_transport_timeout=transport_timeout,
+            native_transport_timeout=observation.transport_timeout,
             native_contract_reason=entry.native_deadline.reason,
             native_deadline_boundary=entry.native_deadline.deadline_boundary(),
             native_deadline_origin=entry.native_deadline.deadline_origin(),
@@ -2539,6 +2615,22 @@ impl EstimatedWaitAdmission {
                 "acknowledged_requests":entry.native_deadline.acknowledged_requests,
                 "released_known_work":entry.native_deadline.released_known_work,
                 "journal_complete":entry.native_deadline.journal_complete}));
+        let reason = entry.native_deadline.reason;
+        let available = entry
+            .native_deadline
+            .available(received, self.config().estimated_wait_max_snapshot_age_secs);
+        let calibration_epoch = entry.calibration_epoch;
+        // The original native event above retains its existing lock/clock
+        // semantics. Serialize the bounded companion only after releasing the
+        // admission lock; its copied receipt remains the original observation.
+        drop(entries);
+        record_capture(
+            "accepted_raw_poll_watermark",
+            Some(reason),
+            available,
+            received,
+            Some(calibration_epoch),
+        );
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -3135,11 +3227,13 @@ impl AdmissionGuard<'_> {
                     && total.is_finite()
                     && total >= 0.0)
                     .then_some(total);
-                Box::new(entry.survival.admission(
+                let mut admission = entry.survival.admission(
                     basis,
                     forecast.pending_work_admission.as_deref(),
                     scalar,
-                ))
+                );
+                admission.select_raw_fallback(forecast.raw_total_for_fallback());
+                Box::new(admission)
             });
             forecast.feature_context =
                 Some(entry.feature_context(forecast.captured_at, forecast.fresh));
@@ -3892,6 +3986,46 @@ mod tests {
     }
 
     #[test]
+    fn c2_raw_fallback_uses_current_calibration_baseline_and_uncalibrated_raw_extra() {
+        let (registry, worker) = feature_registry();
+        publish(registry.estimated_wait(), &worker, 0);
+        let mut forecast = deadline_shadow_placement(&registry, &worker, true)
+            .unwrap()
+            .unwrap();
+        forecast.baseline = Some(2.0);
+        forecast.baseline_source = BaselineSource::Provisional;
+        forecast.raw_baseline = Some(100.0);
+        forecast.raw_extra = 42.0;
+        forecast.queue_extra = 99.0;
+        forecast.scale = 8.0;
+        forecast.raw_ready = true;
+        forecast.fresh = true;
+        forecast.native_capacity_ready = true;
+        let raw = forecast.raw_total_for_fallback().unwrap();
+        assert_eq!(raw.total_ttft_seconds, 44.0);
+        assert_eq!(raw.baseline_source, "provisional");
+        forecast.baseline = Some(1.5);
+        forecast.baseline_source = BaselineSource::Measured;
+        assert_eq!(
+            forecast
+                .raw_total_for_fallback()
+                .unwrap()
+                .total_ttft_seconds,
+            43.5
+        );
+        for field in 0..4 {
+            let mut unavailable = forecast.clone();
+            match field {
+                0 => unavailable.raw_ready = false,
+                1 => unavailable.fresh = false,
+                2 => unavailable.native_capacity_ready = false,
+                _ => unavailable.baseline = None,
+            }
+            assert!(unavailable.raw_total_for_fallback().is_none());
+        }
+    }
+
+    #[test]
     fn deadline_shadow_rejected_placement_does_not_register_or_credit() {
         let (registry, worker) = feature_registry();
         assert!(deadline_shadow_placement(&registry, &worker, true).is_err());
@@ -3955,6 +4089,136 @@ mod tests {
     }
 
     #[test]
+    fn native_engine_work_capture_is_clock_bound_and_cannot_change_native_acceptance() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = DiagnosticWriter(Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        let body = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/native_deadline/vllm_active.json"
+        ));
+        let native: WorkerLoadResponse = serde_json::from_slice(body).unwrap();
+        // An old valid native response has no new diagnostics. That absence
+        // must remain diagnostic-only, never disable the existing capability.
+        let capture = NativeEngineWorkCapture::from_body(body, 200);
+        let mut observed = Vec::new();
+        tracing::subscriber::with_default(subscriber, || {
+            for enabled in [false, true] {
+                let (registry, worker) = feature_registry();
+                let admission = registry.estimated_wait();
+                let watermark = admission.poll_started(&worker);
+                let started = Instant::now();
+                admission.publish(
+                    &worker,
+                    Some(&load(Some(0), 0, 100.0, 0.0)),
+                    watermark.clone(),
+                    started,
+                );
+                admission.publish_native_deadline(
+                    &worker,
+                    Some(&native),
+                    watermark,
+                    started,
+                    Instant::now(),
+                    enabled.then_some(&capture),
+                );
+                {
+                    let entries = admission.entries.lock();
+                    let entry = &entries[worker.url()];
+                    observed.push((
+                        entry.native_deadline.reason,
+                        entry.native_deadline.acknowledged_requests,
+                        entry.native_deadline.confirmed_deadlines.len(),
+                        entry.native_deadline.available(Instant::now(), 30.0),
+                        entry
+                            .native_deadline
+                            .hard_deadlines_present(Instant::now(), 30.0),
+                    ));
+                }
+                if enabled {
+                    admission.publish_native_deadline(
+                        &worker,
+                        Some(&native),
+                        None,
+                        started,
+                        Instant::now(),
+                        Some(&capture),
+                    );
+                    let stale = admission.poll_started(&worker);
+                    admission
+                        .entries
+                        .lock()
+                        .get_mut(worker.url())
+                        .unwrap()
+                        .invalidate();
+                    admission.publish_native_deadline(
+                        &worker,
+                        Some(&native),
+                        stale,
+                        started,
+                        Instant::now(),
+                        Some(&capture),
+                    );
+                }
+            }
+        });
+        assert_eq!(observed[0], observed[1]);
+        assert!(observed[0].3);
+        // The fixture's native request has no matching gateway attempt in this
+        // fresh ledger. Diagnostic capture must not create a confirmation.
+        assert_eq!(observed[0].2, 0);
+        assert!(!observed[0].4);
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes.lock())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let polls: Vec<_> = events
+            .iter()
+            .map(|e| &e["fields"])
+            .filter(|e| e["event"] == "native_deadline_poll")
+            .collect();
+        let captures: Vec<_> = events
+            .iter()
+            .map(|e| &e["fields"])
+            .filter(|e| e["event"] == "native_engine_work_capture")
+            .collect();
+        assert_eq!(polls.len(), 2);
+        assert_eq!(captures.len(), 3); // Enabled publication plus two explicit drops.
+        for field in [
+            "native_poll_started_time_seconds",
+            "native_receipt_time_seconds",
+            "raw_poll_started_time_seconds",
+            "calibration_epoch",
+        ] {
+            assert_eq!(captures[0][field], polls[1][field], "{field}");
+        }
+        assert_eq!(captures[0]["accepted_by_adapter"], true);
+        assert_eq!(
+            captures[0]["native_contract_reason"],
+            polls[1]["native_contract_reason"]
+        );
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(captures[0]["native_engine_work_json"].as_str().unwrap()).unwrap();
+        assert_eq!(diagnostic["available"], false);
+        assert_eq!(diagnostic["response_complete"], true);
+        assert_eq!(
+            captures[1]["publication_reason"],
+            "missing_raw_poll_watermark"
+        );
+        assert_eq!(
+            captures[2]["publication_reason"],
+            "stale_worker_or_raw_poll_watermark"
+        );
+        assert_eq!(captures[1]["accepted_by_adapter"], false);
+        assert_eq!(captures[2]["accepted_by_adapter"], false);
+    }
+
+    #[test]
     fn native_restart_between_capability_and_send_never_confirms_requested_deadline() {
         let (registry, worker) = feature_registry();
         let admission = registry.estimated_wait();
@@ -3967,7 +4231,14 @@ mod tests {
         let watermark = admission.poll_started(&worker);
         let start = Instant::now();
         admission.publish(&worker, Some(&raw), watermark.clone(), start);
-        admission.publish_native_deadline(&worker, Some(&native), watermark, start, Instant::now());
+        admission.publish_native_deadline(
+            &worker,
+            Some(&native),
+            watermark,
+            start,
+            Instant::now(),
+            None,
+        );
         let mut forecast = deadline_shadow_placement(&registry, &worker, true)
             .unwrap()
             .unwrap();
@@ -3999,6 +4270,7 @@ mod tests {
             watermark,
             start,
             Instant::now(),
+            None,
         );
         observer.downstream_disconnected();
         drop(observer);

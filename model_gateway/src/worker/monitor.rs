@@ -71,6 +71,7 @@ use crate::{
     worker::{
         event::WorkerEvent,
         load_state::{LoadReceiver, LoadSnapshot, LoadState},
+        native_engine_work_capture::{self, Capture as NativeEngineWorkCapture},
         ConnectionMode, Worker, WorkerRegistry,
     },
 };
@@ -78,6 +79,83 @@ use crate::{
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_NATIVE_DEADLINE_POLLS: usize = 32;
 const MAX_NATIVE_DEADLINE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+struct NativeDeadlineFetch {
+    native: Option<WorkerLoadResponse>,
+    capture: Option<NativeEngineWorkCapture>,
+}
+
+#[derive(Debug)]
+struct NativeDeadlineFetchError {
+    error: reqwest::Error,
+    capture: Option<NativeEngineWorkCapture>,
+}
+
+impl NativeDeadlineFetchError {
+    fn new(error: reqwest::Error, enabled: bool, status: Option<u16>, observed: usize) -> Self {
+        let reason = match (status.is_some(), error.is_timeout()) {
+            (true, true) => "native_body_read_timeout",
+            (true, false) => "native_body_read_error",
+            (false, true) => "native_transport_timeout",
+            (false, false) => "native_transport_error",
+        };
+        Self {
+            error,
+            capture: enabled
+                .then(|| NativeEngineWorkCapture::unavailable(reason, status, observed)),
+        }
+    }
+
+    fn is_timeout(&self) -> bool {
+        self.error.is_timeout()
+    }
+}
+
+struct NativeCaptureTerminalGuard {
+    worker_url: String,
+    raw_started: Instant,
+    native_started: Instant,
+    completed: bool,
+}
+
+impl Drop for NativeCaptureTerminalGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let capture = NativeEngineWorkCapture::unavailable("native_poll_task_dropped", None, 0);
+            let mut value = serde_json::to_value(capture).unwrap_or(serde_json::Value::Null);
+            // Cancellation/panic can drop the fetch at an arbitrary await.
+            // Its unreturned prefix is unknown here; never claim zero bytes.
+            if let Some(value) = value.as_object_mut() {
+                value.insert("bytes_observed".into(), serde_json::Value::Null);
+            }
+            WorkerMonitor::log_native_capture_drop_json(
+                &self.worker_url,
+                self.raw_started,
+                self.native_started,
+                &value.to_string(),
+                false,
+                "poll_task_dropped_before_terminal_observation",
+                None,
+            );
+        }
+    }
+}
+
+impl NativeDeadlineFetch {
+    fn unavailable(
+        capture_enabled: bool,
+        reason: &'static str,
+        status: Option<u16>,
+        bytes_observed: usize,
+    ) -> Self {
+        Self {
+            native: None,
+            capture: capture_enabled
+                .then(|| NativeEngineWorkCapture::unavailable(reason, status, bytes_observed)),
+        }
+    }
+}
 
 /// Minimal Prometheus text-format scraper: metric name -> sample values
 /// (one per label-set). Only the flat `name{labels} value` / `name value`
@@ -1589,29 +1667,142 @@ impl WorkerMonitor {
 
     async fn fetch_http_native_deadline(
         worker: &Arc<dyn Worker>,
-    ) -> Result<Option<WorkerLoadResponse>, reqwest::Error> {
+        capture_enabled: bool,
+    ) -> Result<NativeDeadlineFetch, NativeDeadlineFetchError> {
         let url = format!("{}/v1/native_deadline_snapshot", worker.url());
         let mut response = Self::authed_request(worker, &url)
             .timeout(Duration::from_secs(2))
             .send()
-            .await?;
+            .await
+            .map_err(|error| NativeDeadlineFetchError::new(error, capture_enabled, None, 0))?;
         if !response.status().is_success() {
-            return Ok(None);
+            return Ok(NativeDeadlineFetch::unavailable(
+                capture_enabled,
+                "native_http_status_unavailable",
+                Some(response.status().as_u16()),
+                0,
+            ));
         }
         if response
             .content_length()
             .is_some_and(|length| length > MAX_NATIVE_DEADLINE_RESPONSE_BYTES as u64)
         {
-            return Ok(None);
+            return Ok(NativeDeadlineFetch::unavailable(
+                capture_enabled,
+                "native_response_size_limit",
+                Some(response.status().as_u16()),
+                0,
+            ));
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
+        let status = response.status().as_u16();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            NativeDeadlineFetchError::new(error, capture_enabled, Some(status), body.len())
+        })? {
             if chunk.len() > MAX_NATIVE_DEADLINE_RESPONSE_BYTES.saturating_sub(body.len()) {
-                return Ok(None);
+                return Ok(NativeDeadlineFetch::unavailable(
+                    capture_enabled,
+                    "native_response_size_limit",
+                    Some(response.status().as_u16()),
+                    body.len().saturating_add(chunk.len()),
+                ));
             }
             body.extend_from_slice(&chunk);
         }
-        Ok(serde_json::from_slice::<WorkerLoadResponse>(&body).ok())
+        // The existing typed parse remains authoritative for native capability.
+        // Diagnostics are separately bounded and never feed that typed value.
+        let native = serde_json::from_slice::<WorkerLoadResponse>(&body).ok();
+        let capture = capture_enabled
+            .then(|| NativeEngineWorkCapture::from_body(&body, response.status().as_u16()));
+        Ok(NativeDeadlineFetch { native, capture })
+    }
+
+    fn log_native_capture_drop_json(
+        worker_url: &str,
+        raw_started: Instant,
+        native_started: Instant,
+        capture: &str,
+        typed_response_present: bool,
+        publication_reason: &'static str,
+        native_transport_timeout: Option<bool>,
+    ) {
+        use super::estimated_wait::diagnostic_time;
+        let received = Instant::now();
+        tracing::debug!(target: "smg::estimated_wait::observation",
+            event="native_engine_work_capture",worker=worker_url,
+            native_engine_work_method="router_native_response_counts_v1",diagnostic_only=true,
+            diagnostic_time_seconds=diagnostic_time(Instant::now()),
+            native_poll_started_time_seconds=diagnostic_time(native_started),
+            native_receipt_time_seconds=diagnostic_time(received),
+            raw_poll_started_time_seconds=diagnostic_time(raw_started),
+            publication_reason,native_contract_reason="not_observed",accepted_by_adapter=false,
+            typed_response_present,native_transport_timeout,native_engine_work_json=capture);
+    }
+
+    fn finish_native_deadline_fetch(
+        monitor: Option<Arc<Self>>,
+        worker: &Arc<dyn Worker>,
+        watermark: Option<super::estimated_wait::PollWatermark>,
+        raw_started: Instant,
+        native_started: Instant,
+        response: Result<NativeDeadlineFetch, NativeDeadlineFetchError>,
+    ) {
+        let (native, capture) = match response.as_ref() {
+            Ok(response) => (response.native.as_ref(), response.capture.as_ref()),
+            Err(error) => (None, error.capture.as_ref()),
+        };
+        let transport_timeout = response
+            .as_ref()
+            .is_err_and(NativeDeadlineFetchError::is_timeout);
+        let reason = match monitor.as_ref() {
+            None => Some("monitor_disappeared"),
+            Some(monitor) if !monitor.worker_registry.is_current_ready(worker) => {
+                Some("worker_retired_or_not_ready")
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = reason {
+            if let Some(capture) = capture {
+                let encoded = serde_json::to_string(capture).unwrap_or_else(|_| {
+                    r#"{"available":false,"unavailable_reason":"diagnostic_serialization_failed"}"#.to_owned()
+                });
+                Self::log_native_capture_drop_json(
+                    worker.url(),
+                    raw_started,
+                    native_started,
+                    &encoded,
+                    native.is_some(),
+                    reason,
+                    Some(transport_timeout),
+                );
+            }
+            return;
+        }
+        let monitor = monitor.unwrap(); // The existing readiness fence above remains authoritative.
+        if transport_timeout {
+            monitor
+                .worker_registry
+                .estimated_wait()
+                .publish_native_deadline_timeout(
+                    worker,
+                    watermark,
+                    raw_started,
+                    native_started,
+                    capture,
+                );
+        } else {
+            monitor
+                .worker_registry
+                .estimated_wait()
+                .publish_native_deadline(
+                    worker,
+                    native,
+                    watermark,
+                    raw_started,
+                    native_started,
+                    capture,
+                );
+        }
     }
 
     fn schedule_native_deadline(
@@ -1641,32 +1832,24 @@ impl WorkerMonitor {
         )]
         let task = tokio::spawn(async move {
             let native_started = Instant::now();
-            let response = Self::fetch_http_native_deadline(&worker).await;
-            if let Some(monitor) = monitor.upgrade() {
-                if monitor.worker_registry.is_current_ready(&worker) {
-                    if response.as_ref().is_err_and(reqwest::Error::is_timeout) {
-                        monitor
-                            .worker_registry
-                            .estimated_wait()
-                            .publish_native_deadline_timeout(
-                                &worker,
-                                watermark,
-                                raw_started,
-                                native_started,
-                            );
-                        return;
-                    }
-                    monitor
-                        .worker_registry
-                        .estimated_wait()
-                        .publish_native_deadline(
-                            &worker,
-                            response.as_ref().ok().and_then(Option::as_ref),
-                            watermark,
-                            raw_started,
-                            native_started,
-                        );
-                }
+            let capture_enabled = native_engine_work_capture::enabled();
+            let mut terminal = capture_enabled.then(|| NativeCaptureTerminalGuard {
+                worker_url: worker.url().to_owned(),
+                raw_started,
+                native_started,
+                completed: false,
+            });
+            let response = Self::fetch_http_native_deadline(&worker, capture_enabled).await;
+            Self::finish_native_deadline_fetch(
+                monitor.upgrade(),
+                &worker,
+                watermark,
+                raw_started,
+                native_started,
+                response,
+            );
+            if let Some(terminal) = terminal.as_mut() {
+                terminal.completed = true;
             }
         });
         tasks.insert(url, task);
@@ -3572,6 +3755,20 @@ mod native_loads_tests {
     const NATIVE_BODY: &str = r#"{"loads":[{"dp_rank":0,"num_running_reqs":3,
         "num_waiting_reqs":4,"num_waiting_uncached_tokens":900,"token_usage":0.25}]}"#;
 
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     struct Stub {
         url: String,
         /// `/v1/loads` hits.
@@ -3761,12 +3958,341 @@ mod native_loads_tests {
                     .status(WorkerStatus::Ready)
                     .build(),
             );
-            let result = WorkerMonitor::fetch_http_native_deadline(&worker).await;
+            let result = WorkerMonitor::fetch_http_native_deadline(&worker, false).await;
             server.abort();
             if mode == "timeout" {
                 assert!(result.unwrap_err().is_timeout());
             } else {
-                assert!(result.unwrap().is_none());
+                let response = result.unwrap();
+                assert!(response.native.is_none());
+                assert!(response.capture.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_engine_work_capture_fetch_is_opt_in_and_cannot_change_typed_base() {
+        use sha2::{Digest, Sha256};
+
+        let mut wire: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/native_deadline/vllm_active.json"
+        )))
+        .unwrap();
+        // The diagnostic can be malformed while the authoritative native
+        // inventory remains valid. Unknown response content is never retained.
+        wire["loads"][0]["deadline_recovery"]["engine_work_progress"] = serde_json::Value::Null;
+        wire["prompt"] = "SECRET_PROMPT_MUST_NOT_BE_CAPTURED".into();
+        let body = serde_json::to_string(&wire).unwrap();
+        let expected: WorkerLoadResponse = serde_json::from_str(&body).unwrap();
+        let expected_sha = Sha256::digest(body.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        for enabled in [false, true] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let handler_hits = Arc::clone(&hits);
+            let response_body = body.clone();
+            let app = axum::Router::new().route(
+                "/v1/native_deadline_snapshot",
+                axum::routing::get(move || {
+                    let body = response_body.clone();
+                    handler_hits.fetch_add(1, Ordering::SeqCst);
+                    async move { body }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker = vllm_worker(&format!("http://{}", listener.local_addr().unwrap()));
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded loopback diagnostic test server aborted after fetch"
+            )]
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let response = WorkerMonitor::fetch_http_native_deadline(&worker, enabled)
+                .await
+                .unwrap();
+            server.abort();
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                serde_json::to_value(response.native.unwrap()).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(response.capture.is_some(), enabled);
+            if let Some(capture) = response.capture {
+                let value = serde_json::to_value(&capture).unwrap();
+                assert_eq!(value["response_sha256"], expected_sha);
+                assert_eq!(value["response_complete"], true);
+                assert_eq!(value["available"], false);
+                assert!(!serde_json::to_string(&capture)
+                    .unwrap()
+                    .contains("SECRET_PROMPT_MUST_NOT_BE_CAPTURED"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_engine_work_capture_http_and_size_failures_have_no_full_response_hash() {
+        for (status, body) in [
+            (StatusCode::UNAUTHORIZED, "rejected".to_owned()),
+            (
+                StatusCode::OK,
+                "x".repeat(MAX_NATIVE_DEADLINE_RESPONSE_BYTES + 1),
+            ),
+        ] {
+            let app = axum::Router::new().route(
+                "/v1/native_deadline_snapshot",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { (status, body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker = vllm_worker(&format!("http://{}", listener.local_addr().unwrap()));
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded loopback failure test server aborted after fetch"
+            )]
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let response = WorkerMonitor::fetch_http_native_deadline(&worker, true)
+                .await
+                .unwrap();
+            server.abort();
+            assert!(response.native.is_none());
+            let capture = serde_json::to_value(response.capture.unwrap()).unwrap();
+            assert_eq!(capture["response_complete"], false);
+            assert_eq!(capture["response_sha256"], serde_json::Value::Null);
+            assert_eq!(capture["response_bytes"], serde_json::Value::Null);
+            assert_eq!(capture["available"], false);
+            assert_eq!(capture["http_status"], status.as_u16());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_engine_work_capture_partial_body_error_and_timeout_preserve_prefix_metadata() {
+        const PREFIX: &[u8] = b"{\"loads\":";
+        for timeout in [false, true] {
+            let prefix_sent = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let handler_seen = Arc::clone(&prefix_sent);
+            let handler_release = Arc::clone(&release);
+            let app = axum::Router::new().route(
+                "/v1/native_deadline_snapshot",
+                axum::routing::get(move || {
+                    let seen = Arc::clone(&handler_seen);
+                    let release = Arc::clone(&handler_release);
+                    async move {
+                        let stream = futures::stream::unfold(0, move |step| {
+                            let seen = Arc::clone(&seen);
+                            let release = Arc::clone(&release);
+                            async move {
+                                match step {
+                                    0 => Some((
+                                        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                                            PREFIX,
+                                        )),
+                                        1,
+                                    )),
+                                    1 => {
+                                        seen.notify_one();
+                                        if timeout {
+                                            std::future::pending::<()>().await;
+                                        }
+                                        release.notified().await;
+                                        Some((Err(std::io::Error::other("SECRET_BODY_ERROR")), 2))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                        });
+                        axum::response::Response::builder()
+                            .status(200)
+                            .body(axum::body::Body::from_stream(stream))
+                            .unwrap()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker = vllm_worker(&format!("http://{}", listener.local_addr().unwrap()));
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded loopback body-error server aborted after test"
+            )]
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded local fetch awaited by this test"
+            )]
+            let fetch = tokio::spawn(async move {
+                WorkerMonitor::fetch_http_native_deadline(&worker, true).await
+            });
+            prefix_sent.notified().await;
+            tokio::task::yield_now().await;
+            if !timeout {
+                release.notify_one();
+            }
+            let error = fetch.await.unwrap().unwrap_err();
+            server.abort();
+            assert_eq!(error.is_timeout(), timeout);
+            let value = serde_json::to_value(error.capture.unwrap()).unwrap();
+            assert_eq!(value["http_status"], 200);
+            assert_eq!(value["bytes_observed"], PREFIX.len());
+            assert_eq!(value["response_complete"], false);
+            assert_eq!(value["response_bytes"], serde_json::Value::Null);
+            assert_eq!(value["response_sha256"], serde_json::Value::Null);
+            let reason = if timeout {
+                "native_body_read_timeout"
+            } else {
+                "native_body_read_error"
+            };
+            assert_eq!(value["unavailable_reason"], reason);
+            assert_eq!(value["failure_reason_counts"][reason], 1);
+            assert!(!value.to_string().contains("SECRET_BODY_ERROR"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_engine_work_capture_retirement_monitor_drop_and_task_abort_are_terminal() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter(Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let mut expected = Vec::new();
+        for mode in ["retired", "monitor_gone", "retired_timeout", "aborted"] {
+            let seen = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let hits = Arc::new(AtomicUsize::new(0));
+            let handler_seen = Arc::clone(&seen);
+            let handler_release = Arc::clone(&release);
+            let handler_hits = Arc::clone(&hits);
+            let app = axum::Router::new().route(
+                "/v1/native_deadline_snapshot",
+                axum::routing::get(move || {
+                    let seen = Arc::clone(&handler_seen);
+                    let release = Arc::clone(&handler_release);
+                    let hits = Arc::clone(&handler_hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        seen.notify_one();
+                        release.notified().await;
+                        include_str!(concat!(
+                            env!("CARGO_MANIFEST_DIR"),
+                            "/tests/fixtures/native_deadline/vllm_active.json"
+                        ))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded loopback held-response server aborted after fetch"
+            )]
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let registry = Arc::new(WorkerRegistry::new());
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(&url)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Http)
+                    .runtime_type(RuntimeType::Vllm)
+                    .model(ModelCard::new("a"))
+                    .status(WorkerStatus::Ready)
+                    .build(),
+            );
+            let id = registry.register(Arc::clone(&worker)).unwrap();
+            let monitor = Arc::new(WorkerMonitor::new(
+                Arc::clone(&registry),
+                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                1,
+                false,
+                false,
+            ));
+            let weak = Arc::downgrade(&monitor);
+            let original_worker = Arc::clone(&worker);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded held fetch tests terminal/drop behavior without monitor task ownership"
+            )]
+            let fetch = tokio::spawn(async move {
+                let raw_started = Instant::now();
+                let native_started = Instant::now();
+                let mut terminal = NativeCaptureTerminalGuard {
+                    worker_url: original_worker.url().to_owned(),
+                    raw_started,
+                    native_started,
+                    completed: false,
+                };
+                let response =
+                    WorkerMonitor::fetch_http_native_deadline(&original_worker, true).await;
+                WorkerMonitor::finish_native_deadline_fetch(
+                    weak.upgrade(),
+                    &original_worker,
+                    None,
+                    raw_started,
+                    native_started,
+                    response,
+                );
+                terminal.completed = true;
+            });
+            seen.notified().await;
+            match mode {
+                "monitor_gone" => {
+                    drop(monitor);
+                    release.notify_one();
+                    expected.push(("monitor_disappeared", false));
+                }
+                "aborted" => {
+                    fetch.abort();
+                    expected.push(("poll_task_dropped_before_terminal_observation", false));
+                }
+                _ => {
+                    registry.remove(&id);
+                    if mode != "retired_timeout" {
+                        release.notify_one();
+                    }
+                    expected.push(("worker_retired_or_not_ready", mode == "retired_timeout"));
+                }
+            }
+            if mode == "aborted" {
+                assert!(fetch.await.unwrap_err().is_cancelled());
+            } else {
+                fetch.await.unwrap();
+            }
+            server.abort();
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes.lock())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(events
+            .iter()
+            .all(|e| e["fields"]["event"] != "native_deadline_poll"));
+        let captures: Vec<_> = events
+            .iter()
+            .map(|e| &e["fields"])
+            .filter(|e| e["event"] == "native_engine_work_capture")
+            .collect();
+        assert_eq!(captures.len(), 4);
+        for (event, (reason, timeout)) in captures.iter().zip(expected) {
+            assert_eq!(event["publication_reason"], reason);
+            assert_eq!(event["accepted_by_adapter"], false);
+            if reason == "poll_task_dropped_before_terminal_observation" {
+                assert!(event
+                    .get("native_transport_timeout")
+                    .is_none_or(serde_json::Value::is_null));
+            } else {
+                assert_eq!(event["native_transport_timeout"], timeout);
+            }
+            let capture: serde_json::Value =
+                serde_json::from_str(event["native_engine_work_json"].as_str().unwrap()).unwrap();
+            if reason == "poll_task_dropped_before_terminal_observation" {
+                assert_eq!(capture["bytes_observed"], serde_json::Value::Null);
+                assert_eq!(capture["response_sha256"], serde_json::Value::Null);
             }
         }
     }
