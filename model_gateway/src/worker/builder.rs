@@ -608,11 +608,12 @@ mod tests {
             .overload(OverloadUpdate {
                 waiting_requests: None,
                 token_usage: Some(0.5),
-                ..Default::default()
+                max_estimated_wait_secs: None,
             })
             .overload_defaults(OverloadThresholds {
                 waiting_requests: Some(16),
                 token_usage: Some(0.9),
+                max_estimated_wait_secs: None,
             })
             .build();
         // Worker override wins its signal; the other keeps the gateway value.
@@ -621,6 +622,7 @@ mod tests {
             OverloadThresholds {
                 waiting_requests: Some(16),
                 token_usage: Some(0.5),
+                max_estimated_wait_secs: None,
             }
         );
         // The block itself rides the spec, so it survives spec-based rebuilds

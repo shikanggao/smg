@@ -15,6 +15,7 @@ use crate::{
     tenant::DEFAULT_TENANT_HEADER_NAME,
     worker::{
         endpoint::Endpoint,
+        estimated_wait::EstimatedWaitConfig,
         overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
         ConnectionMode, RuntimeType,
     },
@@ -70,6 +71,8 @@ impl ParserChoice {
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
+    #[serde(flatten)]
+    pub estimated_wait: EstimatedWaitConfig,
     pub mode: RoutingMode,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
@@ -2247,6 +2250,7 @@ impl Default for RouterConfig {
             worker_warmup_divert_every: default_worker_warmup_divert_every(),
             pd_admission_wait_secs: default_pd_admission_wait_secs(),
             disable_load_monitoring: false,
+            estimated_wait: Default::default(),
             worker_overload_protection: default_worker_overload_protection(),
             worker_overload_waiting_requests: default_worker_overload_waiting_requests(),
             worker_overload_token_usage: default_worker_overload_token_usage(),

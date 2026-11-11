@@ -837,6 +837,8 @@ impl PDRouter {
                     candidate_filter: None,
                     tried: &[],
                     sequence: None,
+
+                    ..Default::default()
                 },
                 sticky_key,
             )
@@ -2878,7 +2880,7 @@ impl RouterTrait for PDRouter {
         // and serialized once a worker is selected and admitted.
         let (request_text, body) =
             Self::count_tokens_routing_text(body, self.policies_need_request_text());
-        let Some(worker) = placement::select_single(
+        let Some(worker) = (match placement::select_single(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
@@ -2893,8 +2895,13 @@ impl RouterTrait for PDRouter {
                 candidate_filter: None,
                 tried: &[],
                 sequence: None,
+
+                ..Default::default()
             },
-        ) else {
+        ) {
+            Ok(worker) => worker,
+            Err(shed) => return shed,
+        }) else {
             return error::service_unavailable(
                 "no_prefill_servers",
                 "No available prefill servers to count tokens",

@@ -38,6 +38,7 @@ use openai_protocol::{
     systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
+use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -100,15 +101,17 @@ use crate::{
             },
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
-            stream_relay::{relay_streaming_body, ChunkMode, Relay},
+            stream_relay::{relay_streaming_body_observed, ChunkMode, Relay},
             tenant_rate_limit::{self, TenantCharge, TenantReservation},
         },
         BodyPolicy, RouterTrait,
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        endpoint::Endpoint, ConnectionMode, GuardedStream, RoutingPool, RuntimeType, Worker,
-        WorkerLoadGuard, WorkerRegistry, WorkerType,
+        endpoint::Endpoint,
+        estimated_wait::{CalibrationForecast, StreamTtftObserver},
+        ConnectionMode, GuardedStream, RoutingPool, RuntimeType, Worker, WorkerLoadGuard,
+        WorkerRegistry, WorkerType,
     },
 };
 
@@ -136,6 +139,7 @@ struct StreamRelayMode {
 /// every retry attempt reads the same one; the lease, the ledger and the
 /// tried list are the state the attempts share.
 struct TypedAttempt<'a, T> {
+    request_started: Instant,
     headers: Option<&'a HeaderMap>,
     /// The parsed request and its routing derivatives, held until the
     /// lease's release point.
@@ -152,7 +156,7 @@ struct TypedAttempt<'a, T> {
     ledger: &'a AttemptLedger,
     /// The engines a failed attempt of this request dispatched to; a retry
     /// re-selects away from them while another available worker is left.
-    tried: &'a parking_lot::Mutex<Vec<String>>,
+    tried: &'a Mutex<Vec<String>>,
 }
 
 /// Regular router that uses injected load balancing policies
@@ -334,7 +338,7 @@ impl Router {
         cache_namespace: Option<CacheNamespace>,
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Result<Option<Arc<dyn Worker>>, Response> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
         placement::select_single(
@@ -352,6 +356,7 @@ impl Router {
                 candidate_filter,
                 tried,
                 sequence: None,
+                ..Default::default()
             },
         )
     }
@@ -505,9 +510,10 @@ impl Router {
             let outcome = self.begin_route(route, model_id, is_stream);
             let (reservation, denial) = tenant_rate_limit::reserve(estimate, model_id).await;
             // The state the attempts share; `TypedAttempt` names each piece.
-            let tried = parking_lot::Mutex::new(Vec::new());
+            let tried = Mutex::new(Vec::new());
             let ledger = AttemptLedger::default();
             let attempt = TypedAttempt {
+                request_started: start,
                 headers,
                 lease: &lease,
                 route,
@@ -694,11 +700,24 @@ impl Router {
         &self,
         attempt: &TypedAttempt<'_, T>,
     ) -> Response {
-        let worker = match self.select_worker_for_attempt(attempt) {
+        let calibration = Mutex::new(None);
+        let worker = match self.select_worker_for_attempt(attempt, &calibration) {
             Ok(worker) => worker,
             Err(refusal) => return refusal,
         };
 
+        if let Some(forecast) = calibration.lock().as_mut() {
+            let work = if attempt.is_stream
+                && self.worker_registry.estimated_wait().pending_work_enabled()
+            {
+                attempt
+                    .lease
+                    .with_view(|view| view.request.prompt_work_hint())
+            } else {
+                openai_protocol::common::PromptWorkHint::Unknown
+            };
+            forecast.set_prompt_work(work);
+        }
         // Dispatch-time re-check of the one chosen worker: O(1), and the only
         // thing that closes the window between selection and dispatch in which
         // a load report can flip the veto.
@@ -717,7 +736,12 @@ impl Router {
             };
 
         let response = self
-            .dispatch_attempt(attempt, &worker, &mut decision_adapter)
+            .dispatch_attempt(
+                attempt,
+                &worker,
+                &mut decision_adapter,
+                calibration.into_inner(),
+            )
             .await;
 
         // A streamed head's success was recorded before its relay task was
@@ -746,6 +770,7 @@ impl Router {
     fn select_worker_for_attempt<T>(
         &self,
         attempt: &TypedAttempt<'_, T>,
+        calibration: &Mutex<Option<CalibrationForecast>>,
     ) -> Result<Arc<dyn Worker>, Response> {
         let model_id = attempt.model_id;
         let ledger = attempt.ledger;
@@ -755,19 +780,31 @@ impl Router {
             // A retry re-selects away from the engines this request already
             // tried, while another available worker is left to take it.
             let tried = attempt.tried.lock();
-            self.select_worker_for_model(
+            placement::select_single(
+                &self.worker_registry,
+                &self.policy_registry,
                 model_id,
-                view.text,
-                view.tokens,
-                attempt.headers,
-                view.rid_key,
-                view.cache_namespace,
-                Some(&admits),
-                &tried,
+                RoutingPool::HttpRegular,
+                None,
+                PlacementInputs {
+                    text: view.text,
+                    tokens: view.tokens,
+                    headers: attempt.headers,
+                    rid_key: view.rid_key,
+                    cache_namespace: view.cache_namespace,
+                    candidate_filter: Some(&admits),
+                    tried: &tried,
+                    calibration: attempt.is_stream.then_some(calibration),
+                    feature_context_supported: attempt.is_stream
+                        && matches!(attempt.route, "/v1/chat/completions" | "/v1/completions"),
+                    request_started: Some(attempt.request_started),
+                    ..Default::default()
+                },
             )
         }) {
-            Some(worker) => Ok(worker),
-            None => {
+            Err(shed) => Err(shed),
+            Ok(Some(worker)) => Ok(worker),
+            Ok(None) => {
                 // The verdict is judged from exactly the pool selection drew
                 // from, wildcard model included: that is what makes the shed
                 // fire for a model-less `/generate` and for a model that is
@@ -829,6 +866,7 @@ impl Router {
         attempt: &TypedAttempt<'_, T>,
         worker: &Arc<dyn Worker>,
         decision_adapter: &mut Option<SglangDecisionAdapter>,
+        calibration: Option<CalibrationForecast>,
     ) -> Response {
         let headers = attempt.headers;
         let lease = attempt.lease;
@@ -878,6 +916,8 @@ impl Router {
                     mode,
                     RelaySource::new(attempt.model_id, route, Arc::clone(worker)),
                     load_guard,
+                    calibration,
+                    attempt.request_started,
                 )
                 .await
             }
@@ -1268,8 +1308,11 @@ impl Router {
                 candidate_filter: None,
                 tried: &[],
                 sequence,
+
+                ..Default::default()
             },
-        ) else {
+        )?
+        else {
             // Judged from the same candidates whether the pre-filter emptied
             // or a self-filtering policy missed on an all-overloaded pool, so
             // a shed keeps its Retry-After, retryability and metric.
@@ -1406,6 +1449,10 @@ impl Router {
     // Send an already-serialized request body. The stale-connection resend
     // guard inside `send_with_stale_conn_retry` shares the body allocation by
     // refcount, so the bytes live exactly until the response head arrives.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "request metadata, load guard and admission-time forecast travel together"
+    )]
     async fn send_serialized_request(
         &self,
         headers: Option<&HeaderMap>,
@@ -1414,7 +1461,11 @@ impl Router {
         mode: StreamRelayMode,
         source: RelaySource,
         load_guard: WorkerLoadGuard,
+        calibration: Option<CalibrationForecast>,
+        request_started: Instant,
     ) -> Response {
+        let started = Instant::now();
+        let is_stream = mode.is_stream;
         let worker = source.worker();
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
@@ -1434,9 +1485,64 @@ impl Router {
         );
 
         Metrics::record_worker_request(worker.url(), worker.model_id());
+        // These internal headers are not on the caller-forwarding allowlist.
+        // Only a lease-generated UUID and explicitly configured remaining
+        // budget may reach a native engine.
+        if is_stream && matches!(route, "/v1/chat/completions" | "/v1/completions") {
+            let required = self
+                .worker_registry
+                .estimated_wait()
+                .native_deadline_timeout_configured();
+            let headers = calibration
+                .as_ref()
+                .map(|forecast| forecast.native_dispatch_headers(request_started, Instant::now()));
+            match headers {
+                None | Some(Ok(None)) if required => return error::service_unavailable("native_deadline_unavailable", "The request has no tracked native deadline dispatch context"),
+                None | Some(Ok(None)) => {},
+                Some(Ok(Some((_, None)))) if required => return error::service_unavailable("native_deadline_unavailable", "The request has no verified native deadline budget"),
+                Some(Ok(Some((attempt, timeout)))) => {
+                    tracing::debug!(target:"smg::estimated_wait::observation",event="native_deadline_dispatch_requested",
+                        worker=worker.url(),native_attempt_id=attempt,requested_native_timeout_ms=timeout,
+                        per_request_native_deadline_confirmed=false,
+                        confirmation_source="native_active_inventory_required",
+                        deadline_budget_origin="gateway_request_start_remaining_at_send",
+                        engine_deadline_origin="engine_http_receive_plus_remaining_budget; network_transit_not_zero");
+                    request_builder = request_builder.header("x-smg-attempt-id", attempt);
+                    if let Some(milliseconds) = timeout {
+                        request_builder = request_builder.header("x-smg-hard-ttft-timeout-ms", milliseconds.to_string());
+                    }
+                }
+                Some(Err("native_deadline_budget_exhausted_before_dispatch")) => return error::gateway_timeout("native_deadline_budget_exhausted", "Native first-output budget elapsed before upstream dispatch"),
+                Some(Err(_)) => return error::service_unavailable("native_deadline_unavailable", "The selected engine has no fresh verified native deadline enforcement capability"),
+            }
+        }
+
+        let mut ttft_observer = is_stream.then(|| {
+            StreamTtftObserver::new(&self.worker_registry, worker.url(), started)
+                .with_request_id(
+                    headers
+                        .and_then(|headers| headers.get("opc-request-id"))
+                        .and_then(|value| value.to_str().ok()),
+                )
+                .with_calibration(calibration)
+        });
+        if let Some(observer) = &ttft_observer {
+            observer.transport_event("upstream_send_started");
+        }
         let res = match send_with_stale_conn_retry(request_builder).await {
-            Ok(res) => res,
+            Ok(res) => {
+                if let Some(observer) = &ttft_observer {
+                    observer.transport_event("upstream_headers_received");
+                }
+                res
+            }
             Err(e) => {
+                if let Some(observer) = &mut ttft_observer {
+                    if e.is_timeout() {
+                        observer.upstream_timeout();
+                    }
+                    observer.transport_event("upstream_send_failed");
+                }
                 error!(
                     "Failed to send typed request worker_url={} route={} error={}",
                     Endpoint::redacted_str(worker.url()),
@@ -1448,7 +1554,7 @@ impl Router {
             }
         };
 
-        self.forward_worker_response(res, mode, source, load_guard)
+        self.forward_worker_response_observed(res, mode, source, load_guard, ttft_observer)
             .await
     }
 
@@ -1466,6 +1572,17 @@ impl Router {
         mode: StreamRelayMode,
         source: RelaySource,
         load_guard: WorkerLoadGuard,
+    ) -> Response {
+        self.forward_worker_response_observed(res, mode, source, load_guard, None)
+            .await
+    }
+    async fn forward_worker_response_observed(
+        &self,
+        res: reqwest::Response,
+        mode: StreamRelayMode,
+        source: RelaySource,
+        load_guard: WorkerLoadGuard,
+        ttft_observer: Option<StreamTtftObserver>,
     ) -> Response {
         let StreamRelayMode { is_stream, rechunk } = mode;
         let status = res.status();
@@ -1495,7 +1612,7 @@ impl Router {
             let rechunker = rechunk
                 .filter(|_| upstream_sse)
                 .map(|policy| SseRechunker::with_observer(policy, NoopObserver));
-            let mut response = relay_streaming_body(
+            let mut response = relay_streaming_body_observed(
                 res.bytes_stream(),
                 Relay {
                     status,
@@ -1507,6 +1624,7 @@ impl Router {
                         ChunkMode::Rechunk(Box::new(rechunker))
                     }),
                 },
+                ttft_observer,
             );
             mark_upstream_answer(&mut response);
             response
@@ -2267,7 +2385,7 @@ impl Router {
         // that needs partitioned affinity must take the buffered path.
         // Routing-key override is excluded by the body-path gate above.
         let hinted_tokens = header_utils::parse_routing_tokens_hint(Some(req.headers()));
-        let Some(worker) = self.select_worker_for_model(
+        let Some(worker) = (match self.select_worker_for_model(
             model_id,
             None,
             hinted_tokens.as_deref(),
@@ -2276,7 +2394,10 @@ impl Router {
             None,
             None,
             &[],
-        ) else {
+        ) {
+            Ok(worker) => worker,
+            Err(shed) => return Ok(shed),
+        }) else {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
             return Err(req);
         };
@@ -3323,7 +3444,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert!(selected.is_available());
+        assert!(selected.unwrap().is_available());
 
         for worker in router.worker_registry.get_all() {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
@@ -3339,6 +3460,7 @@ mod tests {
                 None,
                 &[],
             )
+            .unwrap()
             .is_none());
     }
 
@@ -6963,6 +7085,185 @@ mod tests {
             .expect("the error event is a frame of its own");
         assert_eq!(error["error"]["type"], "stream_error", "{body}");
         assert_eq!(events[2], "data: [DONE]");
+    }
+
+    #[tokio::test]
+    async fn native_deadline_http_headers_are_internal_opt_in_and_require_verified_engine() {
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+        for (timeout, verified, raw_available) in [
+            (None, false, true),
+            (Some(10.0), true, true),
+            (Some(10.0), false, true),
+            (Some(10.0), true, false),
+        ] {
+            let captured = Arc::new(Mutex::new(None::<HeaderMap>));
+            let sink = Arc::clone(&captured);
+            let app = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move |headers: HeaderMap| {
+                let sink = Arc::clone(&sink);
+                async move { *sink.lock() = Some(headers);
+                    ([(CONTENT_TYPE, "text/event-stream")], "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n") }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Loopback native contract test server is aborted after assertions"
+            )]
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let router = streaming_router(
+                PolicyConfig::RoundRobin,
+                1024 * 1024,
+                vec![plain_worker(&url)],
+            );
+            let admission = router.worker_registry.estimated_wait();
+            admission.configure(EstimatedWaitConfig {
+                max_estimated_wait_secs: Some(300.0),
+                estimated_wait_calibration_shadow: true,
+                estimated_wait_feature_shadow: true,
+                estimated_wait_native_hard_ttft_timeout_secs: timeout,
+                ..Default::default()
+            });
+            let worker = router.worker_registry.get_by_url(&url).unwrap();
+            let raw = WorkerLoadResponse {
+                dp_rank_count: 1,
+                loads: vec![SchedulerLoadSnapshot {
+                    learned_prefill_capacity: Some(2000.0),
+                    prefill_capacity_learning_active: Some(false),
+                    prefill_capacity_sample_count: Some(8),
+                    low_load_ttft_seconds: Some(0.1),
+                    num_waiting_uncached_tokens_available: Some(true),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let stamp = admission.poll_started(&worker);
+            let raw_started = Instant::now();
+            admission.publish(
+                &worker,
+                raw_available.then_some(&raw),
+                stamp.clone(),
+                raw_started,
+            );
+            if verified {
+                let native: WorkerLoadResponse = serde_json::from_str(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/native_deadline/sglang_active.json"
+                )))
+                .unwrap();
+                admission.publish_native_deadline(
+                    &worker,
+                    Some(&native),
+                    stamp,
+                    raw_started,
+                    Instant::now(),
+                    None,
+                );
+            }
+            let mut client_headers = HeaderMap::new();
+            client_headers.insert("x-smg-attempt-id", "forged-client-id".parse().unwrap());
+            client_headers.insert("x-smg-hard-ttft-timeout-ms", "999999999".parse().unwrap());
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({"model":"test","stream":true,"messages":[{"role":"user","content":"hello"}]})).unwrap();
+            let response = router
+                .route_typed_request(
+                    Some(&client_headers),
+                    None,
+                    request,
+                    "/v1/chat/completions",
+                    crate::worker::UNKNOWN_MODEL_ID,
+                )
+                .await;
+            if timeout.is_some() && (!verified || !raw_available) {
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert!(captured.lock().is_none());
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let headers = captured.lock().clone().unwrap();
+                let attempt = headers.get("x-smg-attempt-id").unwrap().to_str().unwrap();
+                let (gateway_epoch, nonce) = attempt.split_once('.').unwrap();
+                assert!(uuid::Uuid::parse_str(gateway_epoch).is_ok());
+                assert!(uuid::Uuid::parse_str(nonce).is_ok());
+                assert_eq!(headers.get_all("x-smg-attempt-id").iter().count(), 1);
+                if timeout.is_some() {
+                    let milliseconds = headers
+                        .get("x-smg-hard-ttft-timeout-ms")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap();
+                    assert!(milliseconds > 0 && milliseconds <= 10_000);
+                } else {
+                    assert!(headers.get("x-smg-hard-ttft-timeout-ms").is_none());
+                }
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn estimated_wait_returns_503_before_http_dispatch_without_internal_retry() {
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+        let router = create_test_regular_router();
+        router
+            .worker_registry
+            .estimated_wait()
+            .configure(EstimatedWaitConfig {
+                max_estimated_wait_secs: Some(1.0),
+                estimated_wait_shadow: false,
+                estimated_wait_provisional_baseline_secs: Some(0.001),
+                ..Default::default()
+            });
+        for worker in router.worker_registry.get_all() {
+            let stamp = router
+                .worker_registry
+                .estimated_wait()
+                .poll_started(&worker);
+            let load = WorkerLoadResponse {
+                loads: vec![SchedulerLoadSnapshot {
+                    num_waiting_uncached_tokens: 2000,
+                    gen_throughput: 2000.0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            router.worker_registry.estimated_wait().publish(
+                &worker,
+                Some(&load),
+                stamp,
+                Instant::now(),
+            );
+        }
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            router.route_typed_request(
+                None,
+                None,
+                DropProbeRequest {
+                    text: "shed".to_owned(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            ),
+        )
+        .await
+        .expect("must shed without contacting workers or waiting for retries");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "worker_overload_protection_shed"
+        );
+        assert!(!is_retryable_response(&response));
     }
 }
 

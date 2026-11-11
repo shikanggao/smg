@@ -488,6 +488,9 @@ impl HostStores {
                 .entry("max_running_requests".to_string())
                 .or_insert_with(|| window.to_string());
         }
+        let mut overload = overload_update_of(facts.overload);
+        overload.max_estimated_wait_secs =
+            carried.and_then(|worker| worker.metadata().spec.overload.max_estimated_wait_secs);
         builder = builder
             .worker_type(type_of(facts.role))
             .connection_mode(mode_of(facts.wire_modes))
@@ -495,7 +498,7 @@ impl HostStores {
             .health_config(health_config)
             .bootstrap_port(facts.bootstrap_port)
             .priority(u32::try_from(facts.priority).unwrap_or(0))
-            .overload(overload_update_of(facts.overload))
+            .overload(overload)
             .kv_block_size(
                 facts
                     .kv_block_size
@@ -615,7 +618,10 @@ impl WorkersStore for HostStores {
             builder = builder.priority(u32::try_from(priority).unwrap_or(0));
         }
         if let Some(overload) = patch.overload {
-            builder = builder.overload(overload_update_of(overload));
+            let mut overrides = overload_update_of(overload);
+            overrides.max_estimated_wait_secs =
+                worker.metadata().spec.overload.max_estimated_wait_secs;
+            builder = builder.overload(overrides);
         }
         let mut rebuilt = builder.build();
         if let Some(previous) = worker.as_any().downcast_ref::<BasicWorker>() {
@@ -1185,6 +1191,44 @@ mod tests {
 
     fn host(registry: &Arc<WorkerRegistry>) -> HostStores {
         HostStores::new(Arc::clone(registry), None, None)
+    }
+
+    #[test]
+    fn policy_overload_patch_and_upsert_preserve_ttft_override() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let host = host(&registry);
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://ttft:8000")
+                .model(ModelCard::new("m"))
+                .overload(OverloadUpdate {
+                    max_estimated_wait_secs: Some(2.5),
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(Arc::clone(&worker)).expect("registered");
+        let id = worker_id(worker.as_ref());
+        let row = WorkersStore::get(&host, id).unwrap();
+        let patch = WorkerPatch {
+            overload: Some(Overload {
+                waiting_requests: Some(9),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        host.patch(id, patch, row.revision).unwrap();
+        let successor = registry.get_by_url(worker.url()).unwrap();
+        assert_eq!(
+            successor.metadata().spec.overload.max_estimated_wait_secs,
+            Some(2.5)
+        );
+        assert_eq!(successor.metadata().overload.waiting_requests, Some(9));
+        host.upsert(facts_of(successor.as_ref()));
+        let successor = registry.get_by_url(worker.url()).unwrap();
+        assert_eq!(
+            successor.metadata().spec.overload.max_estimated_wait_secs,
+            Some(2.5)
+        );
     }
 
     #[test]

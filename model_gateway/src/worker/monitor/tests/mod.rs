@@ -547,6 +547,8 @@ async fn the_overload_vetos_edges_are_logged_with_their_figures() {
             .overload_defaults(OverloadThresholds {
                 waiting_requests: Some(8),
                 token_usage: Some(0.8),
+
+                ..Default::default()
             })
             .build();
         worker.set_status(WorkerStatus::Ready);
@@ -1034,4 +1036,17 @@ async fn the_liveness_sweep_follows_the_registrys_membership_tick_by_tick() {
         "the worker that stays is swept on the tick after the removal"
     );
     sweep.abort();
+}
+
+#[tokio::test]
+async fn stop_all_groups_clears_vllm_learning_history() {
+    let (_registry, monitor) = build_monitor();
+    monitor.engine_metrics_history.insert(
+        "http://w1:8080".to_string(),
+        EngineMetricsHistory::default(),
+    );
+
+    monitor.stop_all_groups();
+
+    assert!(monitor.engine_metrics_history.is_empty());
 }
