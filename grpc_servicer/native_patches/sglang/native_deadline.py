@@ -23,6 +23,39 @@ ATTEMPT_HEADER = b"x-smg-attempt-id"
 TIMEOUT_HEADER = b"x-smg-hard-ttft-timeout-ms"
 MAX_ATTEMPTS = 65536
 SUPPORTED_PATHS = {"/generate", "/v1/chat/completions", "/v1/completions"}
+SG_PREFILL_SOURCE = "c9e5799bd12fd5fefb0fb375ac537a6b7d53892e"
+
+
+def _diagnostic_uint(value):
+    return value if type(value) is int and 0 <= value < 2**64 else None
+
+
+def _original_input_facts(req):
+    missing = object()
+    original = getattr(req, "origin_input_ids_unpadded", missing)
+    current = getattr(req, "origin_input_ids", missing)
+    embeds, session = getattr(req, "input_embeds", missing), getattr(req, "session_id", missing)
+    multimodal = getattr(req, "multimodal_inputs", missing)
+    retracted = getattr(req, "is_retracted", None)
+    return dict(
+        original_alias_verified=(current is original) if isinstance(current, list) and isinstance(original, list) else None,
+        original_prompt_tokens=len(original) if isinstance(original, list) else None,
+        input_embeds_none=(embeds is None) if embeds is not missing else None,
+        session_none=(session is None) if session is not missing else None,
+        multimodal_inputs_none=(multimodal is None) if multimodal is not missing else None,
+        lifetime_retraction_count=_diagnostic_uint(getattr(req, "retraction_count", None)),
+        is_retracted=retracted if type(retracted) is bool else None,
+    )
+
+
+def _original_input_guard(facts):
+    return (
+        facts["original_alias_verified"] is True
+        and facts["original_prompt_tokens"] is not None and facts["original_prompt_tokens"] > 0
+        and facts["input_embeds_none"] is True and facts["session_none"] is True
+        and facts["multimodal_inputs_none"] is True
+        and facts["lifetime_retraction_count"] == 0 and facts["is_retracted"] is False
+    )
 
 
 def enabled():
@@ -393,6 +426,7 @@ class SchedulerDeadlineState:
         profile["hard_ttft_enforcement"] = enforcement_enabled()
         if engine_work_enabled():
             profile["engine_work_diagnostics_version"] = 1
+            profile["original_prefill_diagnostics_version"] = 1
         self.profile_id = (
             "sglang-c9e5799:"
             + hashlib.sha256(json.dumps(profile, sort_keys=True, default=str).encode()).hexdigest()
@@ -400,6 +434,9 @@ class SchedulerDeadlineState:
         self.enforce = enforcement_enabled() and self.supported
         self.engine_work = None
         self.engine_work_supported = False
+        self.original_units_failed = None
+        self.original_units_batches = self.original_units_guarded_batches = 0
+        self.original_units_contributors = 0
         if engine_work_enabled():
             from sglang.srt.managers.smg_engine_work_progress import CompletedWorkProgress
 
@@ -452,10 +489,100 @@ class SchedulerDeadlineState:
                 )
                 for i, (req, end) in enumerate(zip(reqs, ends))
             )
-            return self.observe_engine_work("begin", rows)
+            record = self.observe_engine_work("begin", rows)
+            try:
+                self.begin_original_units(record, reqs)
+            except Exception:
+                self.original_units_failed = self.original_units_failed or "submission_metadata_unavailable"
+            return record
         except Exception:
             self.engine_work.invalidate("unsupported_or_incomplete_batch_work_metadata")
+            self.original_units_failed = self.original_units_failed or "submission_metadata_unavailable"
             return None
+
+    def begin_original_units(self, record, reqs):
+        if record is None:
+            return
+        try:
+            # Integers/booleans only: no added Req/token-list owner references.
+            record._smg_original_units = tuple(
+                (id(req), id(getattr(req, "origin_input_ids_unpadded", None)),
+                 _original_input_facts(req)["original_prompt_tokens"],
+                 _original_input_guard(_original_input_facts(req))) for req in reqs
+            )
+        except Exception:
+            self.original_units_failed = self.original_units_failed or "submission_metadata_unavailable"
+
+    def complete_original_units(self, record, batch):
+        try:
+            if getattr(record, "_smg_original_units_complete", False):
+                return
+            record._smg_original_units_complete = True
+            if record.completed is not True or record.valid is not True:
+                raise ValueError("completion not credited")
+            self.original_units_batches += 1
+            self.original_units_contributors += record.request_count
+            before = getattr(record, "_smg_original_units", None)
+            after = tuple(
+                (id(req), id(getattr(req, "origin_input_ids_unpadded", None)),
+                 _original_input_facts(req)["original_prompt_tokens"],
+                 _original_input_guard(_original_input_facts(req))) for req in batch.reqs
+            )
+            if before is None or before != after or not all(row[3] for row in after):
+                self.original_units_failed = self.original_units_failed or "contributor_original_unit_guard_unavailable"
+            else:
+                self.original_units_guarded_batches += 1
+        except Exception:
+            self.original_units_failed = self.original_units_failed or "completion_metadata_unavailable"
+
+    def request_original_prefill(self, req, row, observed_at):
+        facts = _original_input_facts(req)
+        outputs = getattr(req, "output_ids", None)
+        frontier = _diagnostic_uint(getattr(req, "_smg_prefill_completed", None))
+        missing = object()
+        finish = getattr(req, "to_finish", missing)
+        abort = None if finish is missing else type(finish).__name__ == "FINISH_ABORT"
+        facts.update(
+            normal_return_frontier_tokens=frontier,
+            committed_output_tokens=len(outputs) if isinstance(outputs, list) else None,
+            abort_pending=abort,
+        )
+        available = all(value is not None for value in facts.values()) and type(row["first_text_emitted"]) is bool
+        qualified = None
+        reason = "request_metadata_unavailable"
+        if available:
+            qualified = bool(self.engine_work_supported and _original_input_guard(facts)
+                and facts["committed_output_tokens"] > 0
+                and frontier >= facts["original_prompt_tokens"] and abort is False
+                and row["remaining_prefill_work_tokens"] is None
+                and row["first_text_emitted"] is False and row["state"] in ("decode", "unknown"))
+            reason = "original_prefill_complete_witness" if qualified else "request_guard_not_satisfied"
+        return dict(schema_version=1, diagnostic_only=True, method="sg_original_prefill_observation_v1",
+            native_request_id=row["native_request_id"], attempt_id=row["attempt_id"], state_seq=row["state_seq"],
+            source_commit=SG_PREFILL_SOURCE, observed_at_monotonic_secs=observed_at,
+            supported_mode=self.engine_work_supported, available=available, qualified=qualified,
+            reason=reason, **facts)
+
+    def original_unit_snapshot(self, progress):
+        counted = progress.get("cumulative", {}).get("completed_batches")
+        if counted != self.original_units_batches:
+            self.original_units_failed = self.original_units_failed or "completed_counter_scope_gap"
+        reason = self.original_units_failed
+        if not self.engine_work_supported:
+            reason = reason or "unsupported_engine_configuration"
+        if progress.get("counters_available") is not True:
+            reason = reason or "legacy_completed_counters_unavailable"
+        available = False if reason else True if self.original_units_contributors else None
+        return dict(schema_version=1, diagnostic_only=True, method="sg_completed_prefill_original_unit_guards_v1",
+            source_commit=SG_PREFILL_SOURCE, engine_epoch=self.epoch, profile_id=self.profile_id,
+            dp_rank=self.scheduler.dp_rank or 0, observed_at_monotonic_secs=progress.get("snapshot_monotonic_secs"),
+            available=available, unavailable_reason=reason or (None if available else "no_counted_contributor_observation"),
+            completion_sequence=progress.get("completion_sequence"),
+            observed_completed_batches=self.original_units_batches,
+            guarded_completed_batches=self.original_units_guarded_batches,
+            counted_contributor_occurrences=self.original_units_contributors,
+            token_content_identity_verified=None,
+            scope="original_unpadded_alias_length_guards_only")
 
     def observe_engine_work(self, method, *args):
         if self.engine_work is None:
@@ -590,6 +717,7 @@ class SchedulerDeadlineState:
 
     def snapshot(self):
         active = self.reconcile()
+        facts_observed_at = time.monotonic() if self.engine_work is not None else None
         rows = []
         for key, (req, state) in active.items():
             attempt = getattr(req, "smg_attempt_id", None)
@@ -632,6 +760,14 @@ class SchedulerDeadlineState:
                         row["native_request_id"],
                         row["attempt_id"],
                     )
+                try:
+                    row["original_prefill_observation"] = self.request_original_prefill(req, row, facts_observed_at)
+                except Exception:
+                    row["original_prefill_observation"] = dict(
+                        schema_version=1, diagnostic_only=True, method="sg_original_prefill_observation_v1",
+                        native_request_id=row["native_request_id"], attempt_id=row["attempt_id"], state_seq=row["state_seq"],
+                        source_commit=SG_PREFILL_SOURCE, observed_at_monotonic_secs=facts_observed_at,
+                        available=False, qualified=None, reason="request_observation_failed")
             rows.append(row)
         seq = self.next_seq()
         output = dict(
@@ -669,6 +805,16 @@ class SchedulerDeadlineState:
                 counters_available=False,
                 unavailable_reason="engine_work_diagnostic_observation_failed",
             )
+            try:
+                output["original_prefill_service_provenance"] = self.original_unit_snapshot(output["engine_work_progress"])
+            except Exception:
+                output["original_prefill_service_provenance"] = dict(
+                    schema_version=1, diagnostic_only=True, method="sg_completed_prefill_original_unit_guards_v1",
+                    source_commit=SG_PREFILL_SOURCE, engine_epoch=self.epoch, profile_id=self.profile_id,
+                    dp_rank=self.scheduler.dp_rank or 0,
+                    observed_at_monotonic_secs=output["engine_work_progress"].get("snapshot_monotonic_secs"),
+                    available=False, unavailable_reason="service_observation_failed",
+                    token_content_identity_verified=None, scope="original_unpadded_alias_length_guards_only")
         return output
 
 
@@ -746,6 +892,7 @@ def install_scheduler(cls):
         except Exception:
             if work_record is not None:
                 self._smg_deadline.engine_work.invalidate("native_batch_execution_failed")
+                self._smg_deadline.original_units_failed = self._smg_deadline.original_units_failed or "native_batch_execution_failed"
             raise
         if work_record is not None:
             # The result object survives overlap's ScheduleBatch.copy; the
@@ -754,6 +901,7 @@ def install_scheduler(cls):
                 result._smg_engine_work_record = work_record
             except Exception:
                 self._smg_deadline.engine_work.invalidate("result_work_metadata_not_retained")
+                self._smg_deadline.original_units_failed = self._smg_deadline.original_units_failed or "submission_metadata_unavailable"
         return result
 
     cls.run_batch = run
@@ -780,6 +928,10 @@ def install_scheduler(cls):
             # The pinned normal output processor has already waited for its
             # result/copy completion. Do not add another GPU synchronization.
             self._smg_deadline.observe_engine_work("complete", work_record)
+            try:
+                self._smg_deadline.complete_original_units(work_record, batch)
+            except Exception:
+                self._smg_deadline.original_units_failed = self._smg_deadline.original_units_failed or "completion_metadata_unavailable"
         elif self._smg_deadline.engine_work_supported and (
             batch.forward_mode.is_extend() or batch.forward_mode.is_decode()
         ):

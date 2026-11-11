@@ -134,6 +134,15 @@ impl Capture {
                 "engine_work_progress":progress,"requests_seen":seen,
                 "requests_retained":0,"requests_dropped":seen,"active_requests":[]
             });
+            if let Some(value) = lane.get("original_prefill_service_provenance") {
+                let service = sanitize_sg_prefill(
+                    value,
+                    &identity,
+                    None,
+                    Some(&result["engine_work_progress"]),
+                );
+                result["original_prefill_service_provenance"] = service;
+            }
             let header_bytes = encoded_len(&result);
             if header_bytes > budget {
                 out.mark("capture_byte_limit");
@@ -192,8 +201,19 @@ impl Capture {
                 {
                     out.mark("source_request_unavailable");
                 }
-                let row = json!({"native_request_id":native_id,"attempt_id":attempt,
+                let original_prefill = row.get("original_prefill_observation").map(|value| {
+                    sanitize_sg_prefill(
+                        value,
+                        &identity,
+                        Some((&native_id, &attempt, state_seq)),
+                        None,
+                    )
+                });
+                let mut row = json!({"native_request_id":native_id,"attempt_id":attempt,
                     "state_seq":state_seq,"engine_work_state":state});
+                if let Some(value) = original_prefill {
+                    row["original_prefill_observation"] = value;
+                }
                 let bytes = encoded_len(&row) + 1;
                 if bytes > budget {
                     reason.get_or_insert("capture_byte_limit");
@@ -621,6 +641,185 @@ fn sanitize_progress(value: Option<&Value>, outer: &Identity) -> (Value, Option<
     )
 }
 
+/// These opt-in SG facts are outside native parsing/equality, remaining work,
+/// predictor input and ACK credit. Malformed new facts are rejected locally.
+/// Their bytes share existing response/capture caps and can reduce coverage.
+fn sanitize_sg_prefill(
+    value: &Value,
+    outer: &Identity,
+    request: Option<(&Option<String>, &Option<String>, u64)>,
+    progress: Option<&Value>,
+) -> Value {
+    let rejected = || {
+        json!({"schema_version":1,"diagnostic_only":true,"available":false,
+        "reason":"malformed_or_unassociated_sg_prefill_diagnostic"})
+    };
+    let Some(source) = value.as_object() else {
+        return rejected();
+    };
+    let method = if request.is_some() {
+        "sg_original_prefill_observation_v1"
+    } else {
+        "sg_completed_prefill_original_unit_guards_v1"
+    };
+    if source.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || source.get("diagnostic_only").and_then(Value::as_bool) != Some(true)
+        || source.get("method").and_then(Value::as_str) != Some(method)
+        || source.get("source_commit").and_then(Value::as_str)
+            != Some("c9e5799bd12fd5fefb0fb375ac537a6b7d53892e")
+    {
+        return rejected();
+    }
+    if let Some((native, attempt, seq)) = request {
+        if nullable_id(source.get("native_request_id")).as_ref() != Some(native)
+            || nullable_id(source.get("attempt_id")).as_ref() != Some(attempt)
+            || source.get("state_seq").and_then(Value::as_u64) != Some(seq)
+        {
+            return rejected();
+        }
+    } else if source.get("engine_epoch").and_then(Value::as_str) != Some(outer.epoch.as_str())
+        || source.get("profile_id").and_then(Value::as_str) != Some(outer.profile.as_str())
+        || source.get("dp_rank").and_then(Value::as_u64) != Some(outer.rank)
+    {
+        return rejected();
+    }
+    let mut bad = false;
+    let mut out = Map::new();
+    out.insert("schema_version".into(), json!(1));
+    out.insert("diagnostic_only".into(), json!(true));
+    out.insert("method".into(), json!(method));
+    out.insert("source_commit".into(), source["source_commit"].clone());
+    let observed = nullable_scalar(source.get("observed_at_monotonic_secs"), clock, &mut bad);
+    if let Some(t) = observed.as_f64() {
+        if request.is_some() && t > outer.captured || request.is_none() && t < outer.captured {
+            bad = true;
+        }
+    }
+    out.insert("observed_at_monotonic_secs".into(), observed);
+    out.insert(
+        "available".into(),
+        nullable_scalar(source.get("available"), boolean, &mut bad),
+    );
+    let (numbers, flags): (&[&str], &[&str]) = if let Some((native, attempt, seq)) = request {
+        out.insert("native_request_id".into(), json!(native));
+        out.insert("attempt_id".into(), json!(attempt));
+        out.insert("state_seq".into(), json!(seq));
+        (
+            &[
+                "original_prompt_tokens",
+                "normal_return_frontier_tokens",
+                "committed_output_tokens",
+                "lifetime_retraction_count",
+            ],
+            &[
+                "supported_mode",
+                "original_alias_verified",
+                "input_embeds_none",
+                "session_none",
+                "multimodal_inputs_none",
+                "is_retracted",
+                "abort_pending",
+                "qualified",
+            ],
+        )
+    } else {
+        out.insert("engine_epoch".into(), json!(outer.epoch));
+        out.insert("profile_id".into(), json!(outer.profile));
+        out.insert("dp_rank".into(), json!(outer.rank));
+        if source.get("scope").and_then(Value::as_str)
+            != Some("original_unpadded_alias_length_guards_only")
+            || source
+                .get("token_content_identity_verified")
+                .is_some_and(|v| !v.is_null())
+        {
+            bad = true;
+        }
+        out.insert(
+            "scope".into(),
+            json!("original_unpadded_alias_length_guards_only"),
+        );
+        out.insert("token_content_identity_verified".into(), Value::Null);
+        (
+            &[
+                "completion_sequence",
+                "observed_completed_batches",
+                "guarded_completed_batches",
+                "counted_contributor_occurrences",
+            ],
+            &[],
+        )
+    };
+    for field in numbers {
+        out.insert(
+            (*field).into(),
+            nullable_scalar(source.get(*field), unsigned, &mut bad),
+        );
+    }
+    for field in flags {
+        out.insert(
+            (*field).into(),
+            nullable_scalar(source.get(*field), boolean, &mut bad),
+        );
+    }
+    if request.is_none() {
+        // The SG producer copies these two values from this exact completed-
+        // work snapshot. SG's native timestamp is an earlier, separate read.
+        let progress = progress.filter(|p| {
+            p["engine_epoch"].as_str() == Some(outer.epoch.as_str())
+                && p["profile_id"].as_str() == Some(outer.profile.as_str())
+                && p["dp_rank"].as_u64() == Some(outer.rank)
+                && p["source_commit"].as_str() == Some("c9e5799bd12fd5fefb0fb375ac537a6b7d53892e")
+                && p["completion_boundary"].as_str()
+                    == Some("normal_process_batch_result_return_after_native_completion_wait")
+                && p["counters_available"].is_boolean()
+        });
+        if out["observed_at_monotonic_secs"].as_f64().is_some_and(|t| {
+            progress.and_then(|p| p["snapshot_monotonic_secs"].as_f64()) != Some(t)
+        }) || out["completion_sequence"].as_u64().is_some_and(|seq| {
+            progress.and_then(|p| p["completion_sequence"].as_u64()) != Some(seq)
+        }) || out["available"].as_bool() == Some(true)
+            && progress.and_then(|p| p["counters_available"].as_bool()) != Some(true)
+        {
+            bad = true;
+        }
+    }
+    let reason_key = if request.is_some() {
+        "reason"
+    } else {
+        "unavailable_reason"
+    };
+    let reason = source.get(reason_key).filter(|v| {
+        v.is_null()
+            || v.as_str().is_some_and(|s| {
+                matches!(
+                    s,
+                    "original_prefill_complete_witness"
+                        | "request_guard_not_satisfied"
+                        | "request_metadata_unavailable"
+                        | "request_observation_failed"
+                        | "submission_metadata_unavailable"
+                        | "completion_metadata_unavailable"
+                        | "contributor_original_unit_guard_unavailable"
+                        | "completed_counter_scope_gap"
+                        | "unsupported_engine_configuration"
+                        | "legacy_completed_counters_unavailable"
+                        | "no_counted_contributor_observation"
+                        | "native_batch_execution_failed"
+                        | "service_observation_failed"
+                )
+            })
+    });
+    if reason.is_none() {
+        bad = true;
+    }
+    out.insert(reason_key.into(), reason.cloned().unwrap_or(Value::Null));
+    if bad {
+        rejected()
+    } else {
+        Value::Object(out)
+    }
+}
+
 fn sanitize_state(
     value: Option<&Value>,
     native: &Option<String>,
@@ -735,6 +934,280 @@ fn sanitize_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sg_original_facts() -> Value {
+        json!({"schema_version":1,"diagnostic_only":true,"method":"sg_original_prefill_observation_v1",
+            "source_commit":"c9e5799bd12fd5fefb0fb375ac537a6b7d53892e",
+            "native_request_id":"native","attempt_id":"attempt","state_seq":2,
+            "observed_at_monotonic_secs":19.9,"available":true,"qualified":true,
+            "reason":"original_prefill_complete_witness","supported_mode":true,
+            "original_alias_verified":true,"original_prompt_tokens":100,"input_embeds_none":true,
+            "session_none":true,"multimodal_inputs_none":true,"lifetime_retraction_count":0,"is_retracted":false,
+            "normal_return_frontier_tokens":100,"committed_output_tokens":1,"abort_pending":false})
+    }
+
+    #[test]
+    fn sg_original_facts_preserve_legacy_capture_fields_within_budget() {
+        let old = fixture(true);
+        let baseline =
+            serde_json::to_value(Capture::from_body(&serde_json::to_vec(&old).unwrap(), 200))
+                .unwrap();
+        let mut changed = old;
+        let mut facts = sg_original_facts();
+        facts["prompt"] = json!("SECRET_CONTENT");
+        facts["output_ids"] = json!([1, 2, 3]);
+        lane(&mut changed)["active_requests"][0]["original_prefill_observation"] = facts;
+        let captured = serde_json::to_value(Capture::from_body(
+            &serde_json::to_vec(&changed).unwrap(),
+            200,
+        ))
+        .unwrap();
+        assert_eq!(captured["available"], baseline["available"]);
+        assert_eq!(
+            captured["failure_reason_counts"],
+            baseline["failure_reason_counts"]
+        );
+        assert_eq!(
+            captured["ranks"][0]["active_requests"][0]["engine_work_state"],
+            baseline["ranks"][0]["active_requests"][0]["engine_work_state"]
+        );
+        let retained = &captured["ranks"][0]["active_requests"][0]["original_prefill_observation"];
+        assert_eq!(retained["qualified"], true);
+        assert_eq!(retained["lifetime_retraction_count"], 0);
+        assert_eq!(retained["is_retracted"], false);
+        assert!(retained.get("prompt").is_none());
+        assert!(retained.get("output_ids").is_none());
+        assert!(!serde_json::to_string(retained)
+            .unwrap()
+            .contains("SECRET_CONTENT"));
+    }
+
+    #[test]
+    fn malformed_sg_facts_are_local_and_unknown_fields_remain_null() {
+        let identity = Identity {
+            epoch: "epoch".into(),
+            profile: "profile".into(),
+            rank: 0,
+            sequence: 3,
+            captured: 20.0,
+        };
+        let native = Some("native".into());
+        let attempt = Some("attempt".into());
+        let mut facts = sg_original_facts();
+        facts["is_retracted"] = Value::Null;
+        facts["lifetime_retraction_count"] = Value::Null;
+        facts["available"] = json!(false);
+        facts["qualified"] = Value::Null;
+        facts["reason"] = json!("request_metadata_unavailable");
+        let out = sanitize_sg_prefill(&facts, &identity, Some((&native, &attempt, 2)), None);
+        assert!(out["is_retracted"].is_null());
+        assert!(out["lifetime_retraction_count"].is_null());
+        for field in ["lifetime_retraction_count", "state_seq"] {
+            let mut bad = facts.clone();
+            bad[field] = json!(true);
+            assert_eq!(
+                sanitize_sg_prefill(&bad, &identity, Some((&native, &attempt, 2)), None)
+                    ["available"],
+                false
+            );
+        }
+        facts["attempt_id"] = json!("foreign");
+        assert_eq!(
+            sanitize_sg_prefill(&facts, &identity, Some((&native, &attempt, 2)), None)["available"],
+            false
+        );
+    }
+
+    #[test]
+    fn sg_service_guard_scope_retains_unproven_content_identity() {
+        let identity = Identity {
+            epoch: "epoch".into(),
+            profile: "profile".into(),
+            rank: 0,
+            sequence: 3,
+            captured: 20.0,
+        };
+        let value = json!({"schema_version":1,"diagnostic_only":true,
+            "method":"sg_completed_prefill_original_unit_guards_v1",
+            "source_commit":"c9e5799bd12fd5fefb0fb375ac537a6b7d53892e",
+            "engine_epoch":"epoch","profile_id":"profile","dp_rank":0,
+            "observed_at_monotonic_secs":20.1,"available":null,
+            "unavailable_reason":"no_counted_contributor_observation","completion_sequence":0,
+            "observed_completed_batches":0,"guarded_completed_batches":0,"counted_contributor_occurrences":0,
+            "token_content_identity_verified":null,"scope":"original_unpadded_alias_length_guards_only"});
+        let mut progress =
+            fixture(true)["loads"][0]["deadline_recovery"]["engine_work_progress"].clone();
+        progress["snapshot_monotonic_secs"] = json!(20.1);
+        progress["completion_sequence"] = json!(0);
+        let out = sanitize_sg_prefill(&value, &identity, None, Some(&progress));
+        assert!(out["available"].is_null());
+        assert!(out["token_content_identity_verified"].is_null());
+        let mut fabricated = value;
+        fabricated["token_content_identity_verified"] = json!(true);
+        assert_eq!(
+            sanitize_sg_prefill(&fabricated, &identity, None, Some(&progress))["available"],
+            false
+        );
+    }
+
+    #[test]
+    fn sg_service_clock_and_sequence_bind_to_same_lane_progress() {
+        let mut value = fixture(true);
+        lane(&mut value)["engine_work_progress"]["snapshot_monotonic_secs"] = json!(20.1);
+        lane(&mut value)["engine_work_progress"]["completion_sequence"] = json!(3);
+        let mut service = json!({"schema_version":1,"diagnostic_only":true,
+            "method":"sg_completed_prefill_original_unit_guards_v1",
+            "source_commit":"c9e5799bd12fd5fefb0fb375ac537a6b7d53892e",
+            "engine_epoch":"epoch","profile_id":"profile","dp_rank":0,
+            "observed_at_monotonic_secs":20.1,"completion_sequence":3,
+            "available":true,"unavailable_reason":null});
+        service.as_object_mut().unwrap().extend(
+            json!({"observed_completed_batches":3,"guarded_completed_batches":3,
+                "counted_contributor_occurrences":3,"token_content_identity_verified":null,
+                "scope":"original_unpadded_alias_length_guards_only"})
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        lane(&mut value)["original_prefill_service_provenance"] = service;
+        let baseline = capture(&value);
+        assert_eq!(baseline["available"], true);
+        assert_eq!(
+            baseline["ranks"][0]["original_prefill_service_provenance"]["available"],
+            true
+        );
+        // Native captured_at remains 20.0: SG uses separate same-event reads.
+        assert_eq!(baseline["ranks"][0]["captured_at_monotonic_secs"], 20.0);
+        for field in ["observed_at_monotonic_secs", "completion_sequence"] {
+            let mut bad = value.clone();
+            lane(&mut bad)["original_prefill_service_provenance"][field] = json!(999);
+            let out = capture(&bad);
+            assert_eq!(
+                out["ranks"][0]["original_prefill_service_provenance"]["available"],
+                false
+            );
+            assert_eq!(out["available"], baseline["available"]);
+            assert_eq!(
+                out["failure_reason_counts"],
+                baseline["failure_reason_counts"]
+            );
+            assert_eq!(
+                out["ranks"][0]["engine_work_progress"],
+                baseline["ranks"][0]["engine_work_progress"]
+            );
+        }
+        for missing in [false, true] {
+            let mut unknown = value.clone();
+            let service = &mut lane(&mut unknown)["original_prefill_service_provenance"];
+            service["available"] = Value::Null;
+            for field in ["observed_at_monotonic_secs", "completion_sequence"] {
+                if missing {
+                    service.as_object_mut().unwrap().remove(field);
+                } else {
+                    service[field] = Value::Null;
+                }
+            }
+            let out = capture(&unknown);
+            let retained = &out["ranks"][0]["original_prefill_service_provenance"];
+            assert!(retained["available"].is_null());
+            assert!(retained["observed_at_monotonic_secs"].is_null());
+            assert!(retained["completion_sequence"].is_null());
+        }
+        for field in ["source_commit", "completion_boundary"] {
+            let mut bad = value.clone();
+            lane(&mut bad)["engine_work_progress"][field] = if field == "source_commit" {
+                json!("2a69949d0833cd0d2fe5469a1c5f319185eba5f9")
+            } else {
+                json!("scheduler_update_from_output_after_native_model_future")
+            };
+            let out = capture(&bad);
+            assert_eq!(out["available"], true);
+            assert_eq!(
+                out["ranks"][0]["original_prefill_service_provenance"]["available"],
+                false
+            );
+        }
+    }
+
+    #[test]
+    fn new_sg_raw_facts_are_ignored_by_legacy_typed_payload_and_equality() {
+        use openai_protocol::worker::WorkerLoadResponse;
+        let mut value = fixture(true);
+        let base = json!({"snapshot_age_seconds":0.0,"active_inventory_complete":true,"native_population":1,
+            "scheduler_semantics":"continuous_batching","deadline_boundary":"first_nonempty_text",
+            "deadline_origin":"engine_http_receive_monotonic","remaining_work_source":"unknown",
+            "effective_capacity_tokens_per_sec":null,"capacity_source":null,
+            "hard_ttft_deadline_supported":true,"cancellation_ack_supported":true,
+            "abort_enforcement_enabled":true,"abort_max_lag_seconds":null,"ack_floor_seq":0,"cancellation_acks":[]});
+        lane(&mut value)
+            .as_object_mut()
+            .unwrap()
+            .extend(base.as_object().unwrap().clone());
+        let row = json!({"state":"decode","first_text_emitted":false,
+            "remaining_prefill_work_tokens":null,"hard_ttft_deadline_monotonic_secs":30.,"queue_position":null});
+        lane(&mut value)["active_requests"][0]
+            .as_object_mut()
+            .unwrap()
+            .extend(row.as_object().unwrap().clone());
+        let before: WorkerLoadResponse = serde_json::from_value(value.clone()).unwrap();
+        assert!(before.loads[0].deadline_recovery.is_some());
+        lane(&mut value)["active_requests"][0]["original_prefill_observation"] =
+            sg_original_facts();
+        lane(&mut value)["original_prefill_service_provenance"] = json!({"available":false});
+        let after: WorkerLoadResponse = serde_json::from_value(value).unwrap();
+        assert!(before.loads[0]
+            .deadline_recovery
+            .as_ref()
+            .unwrap()
+            .legacy_snapshot_eq(after.loads[0].deadline_recovery.as_ref().unwrap()));
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
+    }
+
+    #[test]
+    fn sg_extra_facts_share_existing_caps_and_fail_closed_without_overflow() {
+        let mut old = fixture(true);
+        let template = lane(&mut old)["active_requests"][0].clone();
+        let mut rows = Vec::new();
+        for index in 0..4000 {
+            let mut row = template.clone();
+            let native = format!("native-{index}");
+            let attempt = format!("attempt-{index}");
+            row["native_request_id"] = json!(native);
+            row["attempt_id"] = json!(attempt);
+            row["engine_work_state"]["native_request_id"] = row["native_request_id"].clone();
+            row["engine_work_state"]["attempt_id"] = row["attempt_id"].clone();
+            rows.push(row);
+        }
+        lane(&mut old)["active_requests"] = Value::Array(rows);
+        let mut added = old.clone();
+        for row in lane(&mut added)["active_requests"].as_array_mut().unwrap() {
+            let mut facts = sg_original_facts();
+            facts["native_request_id"] = row["native_request_id"].clone();
+            facts["attempt_id"] = row["attempt_id"].clone();
+            row["original_prefill_observation"] = facts;
+        }
+        let old_raw = serde_json::to_vec(&old).unwrap();
+        let added_raw = serde_json::to_vec(&added).unwrap();
+        assert!(added_raw.len() < MAX_RESPONSE_BYTES);
+        let baseline = serde_json::to_value(Capture::from_body(&old_raw, 200)).unwrap();
+        let captured = serde_json::to_value(Capture::from_body(&added_raw, 200)).unwrap();
+        assert!(serde_json::to_vec(&captured).unwrap().len() <= MAX_CAPTURE_BYTES);
+        assert!(
+            captured["requests_retained"].as_u64().unwrap()
+                < baseline["requests_retained"].as_u64().unwrap()
+        );
+        assert!(captured["requests_dropped"].as_u64().unwrap() > 0);
+        assert_eq!(captured["available"], false);
+        assert_eq!(captured["response_complete"], true);
+        let too_large = Capture::from_body(&vec![b' '; MAX_RESPONSE_BYTES + 1], 200);
+        let rejected = serde_json::to_value(too_large).unwrap();
+        assert_eq!(rejected["available"], false);
+        assert_eq!(rejected["response_complete"], false);
+        assert!(rejected["response_sha256"].is_null());
+    }
 
     fn fixture(sglang: bool) -> Value {
         let progress = json!({"schema_version":1,"engine_epoch":"epoch","profile_id":"profile","dp_rank":0,
