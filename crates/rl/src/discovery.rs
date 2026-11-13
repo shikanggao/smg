@@ -108,6 +108,8 @@ pub fn entry(info: &RlWorkerInfo, dp_ranks: usize) -> RlWorkerEntry {
         model_id: info.model_id.clone(),
         worker_type: enum_str(&info.worker_type),
         connection_mode: enum_str(&info.connection_mode),
+        control_url: info.control_url.clone(),
+        engine_control_calls: info.control_calls.is_some(),
         tp_size: int_label(&info.labels, "tp_size"),
         dp_size: int_label(&info.labels, "dp_size"),
         pp_size: int_label(&info.labels, "pp_size"),
@@ -166,7 +168,8 @@ mod tests {
 
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
-    use openai_protocol::worker::RuntimeType;
+    use openai_protocol::worker::{ConnectionMode, RuntimeType};
+    use serde_json::Value;
     use tower::ServiceExt;
 
     use super::*;
@@ -181,6 +184,10 @@ mod tests {
             Arc::new(FakeView(workers)),
             RlConfig::default(),
         ))
+    }
+
+    async fn json_body(resp: Response) -> Value {
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap()
     }
 
     #[test]
@@ -221,7 +228,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value =
+        let body: Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["dp_ranks"], 2);
 
@@ -230,7 +237,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value =
+        let body: Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["dp_ranks"], 1);
     }
@@ -258,7 +265,7 @@ mod tests {
             .oneshot(Request::get("/workers").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        let body: serde_json::Value =
+        let body: Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["protocol_version"], 1);
     }
@@ -276,18 +283,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value =
+        let body: Value =
             serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
         assert_eq!(body["total"], 1);
         let e = &body["workers"][0];
         assert_eq!(e["id"], "w1");
         assert_eq!(e["engine"], "sglang");
         assert_eq!(e["engine_version"], "0.5.15");
-        assert_eq!(
-            e["tp_size"],
-            serde_json::Value::Null,
-            "garbage label -> null"
-        );
+        assert_eq!(e["tp_size"], Value::Null, "garbage label -> null");
         assert_eq!(e["dp_size"], 1);
         assert_eq!(e["dp_ranks"], 1);
         assert_eq!(e["health"], "ready");
@@ -307,5 +310,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn entry_reports_the_control_url() {
+        let mut g = worker("g1", "grpc://a:1", RuntimeType::TokenSpeed);
+        g.connection_mode = ConnectionMode::Grpc;
+        g.control_url = Some("http://a:40100".to_string());
+        let mut n = worker("n1", "grpc://b:1", RuntimeType::TokenSpeed);
+        n.connection_mode = ConnectionMode::Grpc;
+        n.control_url = None;
+        let z = crate::testing::zmq_worker("z1", crate::testing::FakeCalls::succeeding(1));
+        let app = crate::router::<()>(state(vec![g, n, z]));
+        let resp = app
+            .oneshot(Request::get("/workers").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = json_body(resp).await;
+        let by_id = |id: &str| {
+            body["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(by_id("g1")["control_url"], "http://a:40100");
+        assert_eq!(by_id("n1")["control_url"], Value::Null);
+        assert_eq!(by_id("g1")["engine"], "tokenspeed");
+        // A worker controlled over its engine connection says so; the
+        // others leave the flag out.
+        assert_eq!(by_id("z1")["control_url"], Value::Null);
+        assert_eq!(by_id("z1")["engine_control_calls"], true);
+        assert_eq!(by_id("n1").get("engine_control_calls"), None);
     }
 }

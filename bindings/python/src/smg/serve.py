@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import errno
 import logging
 import os
 import random
@@ -30,6 +31,16 @@ logger = logging.getLogger("smg.serve")
 # created 0700 (single-owner) so a shared /tmp cannot leak another user's
 # sockets into this router. Override with SMG_ZMQ_SOCKET_DIR.
 _ZMQ_SOCKET_DIR = os.environ.get("SMG_ZMQ_SOCKET_DIR", f"/tmp/smg-zmq-{os.getuid()}")
+
+
+def _bracket_if_ipv6(host: str) -> str:
+    """Return ``host`` ready for a ``host:port`` join or a URL authority: an IPv6
+    literal in brackets; IPv4 addresses, hostnames and already-bracketed literals
+    as they are. ``--worker-host ::1`` otherwise yields ``grpc://::1:<port>`` (which
+    the router rejects) and ``::1:<port>`` (which grpc cannot dial)."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
 
 
 def _zmq_ipc_url(port: int) -> str:
@@ -71,7 +82,7 @@ _ZMQ_HANDSHAKE_PORT_SPAN = 10000
 def _zmq_handshake_port(ipc_url: str) -> int:
     """The tcp handshake port SMG derives from an ipc:// URL.
 
-    Mirrors `derive_handshake_port` in model_gateway/src/worker/worker.rs exactly
+    Mirrors `derive_handshake_port` in crates/engine_zmq_adapter/src/sockets.rs exactly
     (FNV-1a over the path after `ipc://`, mapped into 20000..=29999) so the engine
     can be launched with the matching `--data-parallel-rpc-port`.
     """
@@ -129,16 +140,16 @@ class WorkerLauncher(ABC):
             # host:port to probe. The router's own health checker gates
             # readiness, so the launcher just proceeds to start the router.
             return True
-        return _http_health_check(f"http://{host}:{port}/health", timeout)
+        return _http_health_check(f"http://{_bracket_if_ipv6(host)}:{port}/health", timeout)
 
     def worker_url(self, args: argparse.Namespace, host: str, port: int) -> str:
         """Return the URL used by the router to reach this worker."""
         mode = getattr(args, "connection_mode", "grpc")
         if mode == "grpc":
-            return f"grpc://{host}:{port}"
+            return f"grpc://{_bracket_if_ipv6(host)}:{port}"
         if mode == "zmq":
             return _zmq_ipc_url(port)
-        return f"http://{host}:{port}"
+        return f"http://{_bracket_if_ipv6(host)}:{port}"
 
     def _get_tp_size(self, args: argparse.Namespace) -> int:
         """Return tensor-parallel size for GPU assignment. Default 1."""
@@ -250,6 +261,8 @@ class SglangWorkerLauncher(WorkerLauncher):
             "--port",
             str(port),
         ]
+        if getattr(args, "connection_mode", "grpc") == "zmq":
+            return self._build_zmq_command(args, backend_args, port)
         if getattr(args, "connection_mode", "grpc") == "grpc":
             cmd.append("--grpc-mode")
 
@@ -261,9 +274,77 @@ class SglangWorkerLauncher(WorkerLauncher):
         cmd.extend(self._filter_backend_args(backend_args, ["--model-path", "--host", "--port"]))
         return cmd
 
+    def _build_zmq_command(
+        self, args: argparse.Namespace, backend_args: list[str], port: int
+    ) -> list[str]:
+        """Launch SGLang's scheduler headless behind SMG's ZMQ handshake.
+
+        SMG binds the tcp handshake + ipc data-plane sockets it derives from
+        the ipc:// worker URL; the scheduler dials in. The launcher is
+        ``smg_grpc_servicer.sglang.headless`` (this package's SGLang plugin
+        does the dialing inside the scheduler; SGLang itself is unchanged).
+        ``--port`` seeds SGLang's derived control-plane ports, so co-located
+        workers get distinct clusters.
+        """
+        # SGLang accepts both spellings of its DP flag.
+        engine_dp = max(
+            _backend_arg_int(backend_args, "--dp-size", 1),
+            _backend_arg_int(backend_args, "--data-parallel-size", 1),
+        )
+        if engine_dp > 1:
+            raise ValueError(
+                "--dp-size > 1 is not supported over the SGLang ZMQ wire yet; "
+                "use --connection-mode grpc for data parallelism"
+            )
+        rpc_port = _zmq_handshake_port(_zmq_ipc_url(port))
+        cmd = [
+            sys.executable,
+            "-m",
+            "smg_grpc_servicer.sglang.headless",
+            "--zmq-handshake-address",
+            f"tcp://127.0.0.1:{rpc_port}",
+            "--zmq-engine-index",
+            "0",
+            "--model-path",
+            getattr(args, "model_path", ""),
+            "--port",
+            str(port),
+        ]
+        cmd.extend(
+            self._filter_backend_args(
+                backend_args,
+                [
+                    "--model-path",
+                    "--host",
+                    "--port",
+                    "--zmq-handshake-address",
+                    "--zmq-engine-index",
+                    "--grpc-mode",
+                ],
+            )
+        )
+        return cmd
+
 
 class VllmWorkerLauncher(WorkerLauncher):
     """Launcher for vLLM inference workers."""
+
+    def gpu_env(self, args: argparse.Namespace, dp_rank: int, env: dict | None = None) -> dict:
+        env = super().gpu_env(args, dp_rank, env)
+        # The servicer implementation is a flag inside the smg servicer package
+        # (`SMG_VLLM_SERVICER_IMPL`), read by upstream vLLM's gRPC entrypoint
+        # before it builds an AsyncLLM; the worker command line stays upstream's.
+        # The package's default is the Rust servicer: an unset flag exports
+        # nothing and an inherited value stays (it is the operator's export);
+        # an explicit flag, python or rust, travels as it stands and overrides
+        # an inherited value.
+        impl = getattr(args, "servicer_impl", None)
+        if getattr(args, "connection_mode", "grpc") != "grpc":
+            # No servicer package on an HTTP worker's path.
+            env.pop("SMG_VLLM_SERVICER_IMPL", None)
+        elif impl in ("python", "rust"):
+            env["SMG_VLLM_SERVICER_IMPL"] = impl
+        return env
 
     def _get_tp_size(self, args: argparse.Namespace) -> int:
         return getattr(args, "tensor_parallel_size", 1)
@@ -567,7 +648,7 @@ def _grpc_health_check(host: str, port: int, timeout: float) -> bool:
         return False
 
     try:
-        channel = grpc.insecure_channel(f"{host}:{port}")
+        channel = grpc.insecure_channel(f"{_bracket_if_ipv6(host)}:{port}")
         try:
             stub = health_pb2_grpc.HealthStub(channel)
             request = health_pb2.HealthCheckRequest(service="")
@@ -579,7 +660,7 @@ def _grpc_health_check(host: str, port: int, timeout: float) -> bool:
         # vLLM doesn't implement gRPC health service — fall back to channel ready
         if hasattr(e, "code") and e.code() == grpc.StatusCode.UNIMPLEMENTED:
             try:
-                channel = grpc.insecure_channel(f"{host}:{port}")
+                channel = grpc.insecure_channel(f"{_bracket_if_ipv6(host)}:{port}")
                 try:
                     grpc.channel_ready_future(channel).result(timeout=timeout)
                     return True
@@ -625,13 +706,22 @@ def _find_available_ports(base_port: int, count: int) -> list[int]:
 
 
 def _is_port_available(port: int) -> bool:
-    """Return True if *port* is free on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    """Return True if *port* is free on localhost for both address families a
+    worker may bind: a port busy on ``[::1]`` is not free. A family without a
+    loopback address (IPv6 disabled) is skipped, not treated as busy."""
+    for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
         try:
-            s.bind(("127.0.0.1", port))
-            return True
+            s = socket.socket(family, socket.SOCK_STREAM)
         except OSError:
-            return False
+            continue
+        with s:
+            try:
+                s.bind((address, port))
+            except OSError as e:
+                if e.errno == errno.EADDRNOTAVAIL:
+                    continue
+                return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -752,7 +842,20 @@ def add_serve_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Connection mode for workers (default: grpc). Note: trtllm only "
             "supports grpc, tokenspeed only supports zmq, and zmq is otherwise "
-            "only supported for the vllm backend"
+            "supported for the vllm and sglang backends"
+        ),
+    )
+    group.add_argument(
+        "--servicer-impl",
+        default=None,
+        choices=["python", "rust"],
+        help=(
+            "gRPC servicer implementation for vllm workers (default: rust, the servicer "
+            "package's own default). rust serves the vLLM gRPC contract from Rust over a "
+            "same-host ZMQ engine connection; python is upstream's in-process servicer, "
+            "deprecated (the launcher logs so). An explicit value is "
+            "set as SMG_VLLM_SERVICER_IMPL in the worker's environment; requires "
+            "--backend vllm --connection-mode grpc"
         ),
     )
     # Router host/port - may be overridden by backend (e.g. sglang)
@@ -805,6 +908,27 @@ def _import_backend_args(backend: str, parser: argparse.ArgumentParser) -> None:
     BACKEND_ARG_ADDERS[backend](parser)
 
 
+def _require_rust_servicer_hook(explicit: bool = True) -> None:
+    """Fail fast when the installed vLLM cannot select the Rust servicer: the
+    servicer package's switch must bind on the installed launcher, or the
+    workers would run the Python servicer while the launch reads as Rust. An
+    explicit ``--servicer-impl rust`` needs the package importable here; on the
+    default (nothing chosen) a host without the package is left to the worker,
+    whose gRPC entrypoint needs the package for either servicer and says so.
+    The refusal names the choice as it was made (the variable, or the default)
+    and the deprecated Python servicer as the way out."""
+    try:
+        from smg_grpc_servicer.vllm.rust import require_upstream_hook
+    except ImportError as error:
+        if not explicit:
+            return
+        raise RuntimeError(
+            "servicer-impl rust needs the smg-grpc-servicer package importable by this "
+            "interpreter (it carries the Rust request path)"
+        ) from error
+    require_upstream_hook(explicit=explicit)
+
+
 def parse_serve_args(
     argv: list[str] | None = None,
 ) -> tuple[str, argparse.Namespace, list[str]]:
@@ -831,13 +955,45 @@ def parse_serve_args(
     serve_router_args, backend_args = pre_parser.parse_known_args(argv)
     backend = serve_router_args.backend
 
-    # ZMQ direct-backend is a same-host engine connection; only vLLM EngineCore
-    # and TokenSpeed speak a supported ZMQ wire protocol.
-    if serve_router_args.connection_mode == "zmq" and backend not in ("vllm", "tokenspeed"):
+    # ZMQ direct-backend is a same-host engine connection; vLLM EngineCore,
+    # TokenSpeed and SGLang speak a supported ZMQ wire protocol.
+    if serve_router_args.connection_mode == "zmq" and backend not in (
+        "vllm",
+        "tokenspeed",
+        "sglang",
+    ):
         pre_parser.error(
-            "connection-mode zmq is only supported for the vllm and tokenspeed "
+            "connection-mode zmq is only supported for the vllm, tokenspeed and sglang "
             f"backends, not {backend}"
         )
+    servicer_impl = getattr(serve_router_args, "servicer_impl", None)
+    if servicer_impl is not None and (
+        backend != "vllm" or serve_router_args.connection_mode != "grpc"
+    ):
+        pre_parser.error(
+            "servicer-impl is only available for --backend vllm with "
+            f"--connection-mode grpc, not {backend}/{serve_router_args.connection_mode}"
+        )
+    # The worker resolves its implementation as the servicer package does: the
+    # flag, else an inherited SMG_VLLM_SERVICER_IMPL (gpu_env leaves it alone
+    # when the flag is unset), else the package default (the Rust servicer);
+    # the hook check follows that same choice.
+    effective_impl = servicer_impl or (
+        os.environ.get("SMG_VLLM_SERVICER_IMPL", "").strip().lower() or None
+    )
+    if (
+        backend == "vllm"
+        and serve_router_args.connection_mode == "grpc"
+        and effective_impl != "python"
+    ):
+        # The Rust servicer (explicit, inherited, or the package default) is
+        # selected by the switch upstream vLLM's gRPC entrypoint loads from the
+        # servicer package; a vLLM without the hook would start Python workers
+        # while the launch reads as Rust ones.
+        try:
+            _require_rust_servicer_hook(explicit=effective_impl == "rust")
+        except RuntimeError as error:
+            pre_parser.error(str(error))
 
     # Pass 2: full parser with backend-specific args; resolve so backend can override
     parser = argparse.ArgumentParser(
@@ -967,12 +1123,12 @@ class ServeOrchestrator:
                 )
                 router_args.disable_circuit_breaker = True
             # A single backend has nothing to balance across, so force the
-            # passthrough policy (overriding any --policy). It skips load
-            # monitoring and KV-event subscription, dropping that overhead.
+            # passthrough policy (overriding any --policy). It keeps no KV
+            # index; the worker's load is read as under any policy (polled, or
+            # streamed by a servicer that pushes its records).
             if router_args.policy != "passthrough":
                 logger.info(
-                    "dp=%d: forcing router policy to passthrough (single backend; "
-                    "skips load monitoring and KV-event subscription)",
+                    "dp=%d: forcing router policy to passthrough (single backend; no KV index)",
                     self.args.data_parallel_size,
                 )
                 router_args.policy = "passthrough"

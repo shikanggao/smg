@@ -1,0 +1,123 @@
+//! Scripted gRPC worker for terminal-state contract tests.
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+
+use futures::stream;
+use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::{transport::Server, Request, Response, Status};
+use ts::generate_response::Response as GenResp;
+
+use crate::engine_answers::{TokenSpeedAnswers, TokenSpeedGenerateStream};
+
+pub struct ScriptedWorker {
+    pub output_tokens: u32,
+    /// One finish reason per generation, the last standing for the rest; `"unavailable"` in a
+    /// generation's place refuses that `Generate` with the gRPC status instead of answering, the
+    /// request recorded all the same.
+    pub finish_reasons: Vec<&'static str>,
+    pub generation: AtomicUsize,
+    /// Every generate request received, for a test to read what the gateway sent.
+    pub requests: Arc<Mutex<Vec<ts::GenerateRequest>>>,
+}
+
+impl ScriptedWorker {
+    #[expect(
+        clippy::expect_used,
+        reason = "test worker startup or serving failure must fail the fixture"
+    )]
+    pub async fn serve(self, listener: TcpListener) {
+        Server::builder()
+            .add_service(self.into_server())
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("scripted gRPC worker failed");
+    }
+}
+#[tonic::async_trait]
+impl TokenSpeedAnswers for ScriptedWorker {
+    async fn generate(
+        &self,
+        request: Request<ts::GenerateRequest>,
+    ) -> Result<Response<TokenSpeedGenerateStream>, Status> {
+        // Match ScriptedTokenizer: generated token IDs begin at 100.
+        let request = request.into_inner();
+        if let Ok(mut requests) = self.requests.lock() {
+            requests.push(request.clone());
+        }
+        let finish_reason = self
+            .finish_reasons
+            .get(self.generation.fetch_add(1, Ordering::SeqCst))
+            .or_else(|| self.finish_reasons.last())
+            .copied()
+            .unwrap_or("stop");
+        if finish_reason == "unavailable" {
+            return Err(Status::unavailable(
+                "scripted worker: unavailable this generation",
+            ));
+        }
+        let (request_id, return_logprob) = (request.request_id, request.return_logprob);
+        let top_logprobs = usize::try_from(request.top_logprobs_num).unwrap_or(0);
+        let ids: Vec<u32> = (0..self.output_tokens).map(|i| 100 + i).collect();
+        let count = ids.len();
+        // When asked, token `100 + i` reports logprob `-(i + 1)`; with
+        // `top_logprobs_num` candidates asked for, a row per token leads with
+        // the token itself, then the generated tokens after it in turn, each
+        // half a nat below the one before.
+        let logprobs = |ids: &[u32]| {
+            return_logprob.then(|| ts::OutputLogProbs {
+                token_logprobs: ids.iter().map(|id| 99.0 - *id as f32).collect(),
+                token_ids: ids.to_vec(),
+                top_logprobs: ids
+                    .iter()
+                    .filter(|_| top_logprobs > 0)
+                    .map(|id| {
+                        let (token_ids, values) = (0..top_logprobs.min(count))
+                            .map(|rank| {
+                                let candidate = 100 + (id - 100 + rank as u32) % count as u32;
+                                (candidate, 99.0 - *id as f32 - 0.5 * rank as f32)
+                            })
+                            .unzip();
+                        ts::TopLogProbs { values, token_ids }
+                    })
+                    .collect(),
+            })
+        };
+
+        let mut items: Vec<Result<ts::GenerateResponse, Status>> = Vec::new();
+        for id in &ids {
+            items.push(Ok(ts::GenerateResponse {
+                request_id: request_id.clone(),
+                response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                    token_ids: vec![*id],
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    cached_tokens: 0,
+                    output_logprobs: logprobs(&[*id]),
+                    weight_version: None,
+                    index: 0,
+                })),
+            }));
+        }
+        let output_logprobs = logprobs(&ids);
+        items.push(Ok(ts::GenerateResponse {
+            request_id,
+            response: Some(GenResp::Complete(ts::GenerateComplete {
+                output_ids: ids,
+                finish_reason: finish_reason.to_string(),
+                prompt_tokens: 1,
+                completion_tokens: self.output_tokens,
+                cached_tokens: 0,
+                output_logprobs,
+                matched_stop: None,
+                index: 0,
+                ..Default::default()
+            })),
+        }));
+
+        Ok(Response::new(Box::pin(stream::iter(items))))
+    }
+}

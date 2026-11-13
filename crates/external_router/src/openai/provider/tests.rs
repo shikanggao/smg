@@ -2,7 +2,9 @@
 //! content-part variants (`input_image`, `input_file`, `refusal`) to the
 //! upstream provider untouched. These tests lock that contract for both
 //! the default `OpenAIProvider` (pure pass-through) and the `XAIProvider`
-//! (which otherwise rewrites `output_text -> input_text`).
+//! (which otherwise rewrites `output_text -> input_text`). The `rid` tests at
+//! the end pin the other half of a transform: the gateway-only fields leave
+//! the payload before a third-party API reads it.
 
 use openai_protocol::{
     common::Detail,
@@ -14,7 +16,7 @@ use openai_protocol::{
 };
 use serde_json::{json, to_value, Value};
 
-use super::{OpenAIProvider, Provider, XAIProvider};
+use super::{GeminiProvider, OpenAIProvider, Provider, SGLangProvider, XAIProvider};
 
 /// Build a `ResponsesRequest` whose single input message carries every
 /// variant `ResponseContentPart` exposes after P1, including a `refusal`
@@ -67,17 +69,19 @@ fn first_content_array(payload: &Value) -> &Vec<Value> {
         .expect("content array present on first input item")
 }
 
+/// The first input message's content parts of `request_with_all_content_parts`
+/// after `provider` transformed the serialized request for `endpoint`.
+fn transformed_content(provider: impl Provider, endpoint: Endpoint) -> Vec<Value> {
+    let mut payload = to_value(request_with_all_content_parts()).expect("serialize request");
+    provider
+        .transform_request(&mut payload, endpoint)
+        .expect("the provider transform succeeds");
+    first_content_array(&payload).clone()
+}
+
 #[test]
 fn openai_provider_passes_input_image_untouched() {
-    let req = request_with_all_content_parts();
-    let mut payload = to_value(&req).expect("serialize request");
-    let provider = OpenAIProvider;
-
-    provider
-        .transform_request(&mut payload, Endpoint::Responses)
-        .expect("default OpenAI transform is infallible");
-
-    let content = first_content_array(&payload);
+    let content = transformed_content(OpenAIProvider, Endpoint::Responses);
     assert_eq!(content[1]["type"], json!("input_image"));
     assert_eq!(content[1]["detail"], json!("high"));
     assert_eq!(content[1]["file_id"], json!("file-abc"));
@@ -89,15 +93,7 @@ fn openai_provider_passes_input_image_untouched() {
 
 #[test]
 fn openai_provider_passes_input_file_untouched() {
-    let req = request_with_all_content_parts();
-    let mut payload = to_value(&req).expect("serialize request");
-    let provider = OpenAIProvider;
-
-    provider
-        .transform_request(&mut payload, Endpoint::Responses)
-        .expect("default OpenAI transform is infallible");
-
-    let content = first_content_array(&payload);
+    let content = transformed_content(OpenAIProvider, Endpoint::Responses);
     assert_eq!(content[2]["type"], json!("input_file"));
     assert_eq!(content[2]["detail"], json!("low"));
     assert_eq!(content[2]["file_data"], json!("JVBERi0xLjQK"));
@@ -111,30 +107,14 @@ fn openai_provider_passes_input_file_untouched() {
 
 #[test]
 fn openai_provider_passes_refusal_untouched() {
-    let req = request_with_all_content_parts();
-    let mut payload = to_value(&req).expect("serialize request");
-    let provider = OpenAIProvider;
-
-    provider
-        .transform_request(&mut payload, Endpoint::Responses)
-        .expect("default OpenAI transform is infallible");
-
-    let content = first_content_array(&payload);
+    let content = transformed_content(OpenAIProvider, Endpoint::Responses);
     assert_eq!(content[3]["type"], json!("refusal"));
     assert_eq!(content[3]["refusal"], json!("I can't help with that."));
 }
 
 #[test]
 fn openai_provider_preserves_typed_annotations_on_output_text() {
-    let req = request_with_all_content_parts();
-    let mut payload = to_value(&req).expect("serialize request");
-    let provider = OpenAIProvider;
-
-    provider
-        .transform_request(&mut payload, Endpoint::Responses)
-        .expect("default OpenAI transform is infallible");
-
-    let content = first_content_array(&payload);
+    let content = transformed_content(OpenAIProvider, Endpoint::Responses);
     assert_eq!(content[4]["type"], json!("output_text"));
     let annotations = content[4]["annotations"]
         .as_array()
@@ -148,15 +128,7 @@ fn openai_provider_preserves_typed_annotations_on_output_text() {
 
 #[test]
 fn xai_provider_passes_input_image_untouched() {
-    let req = request_with_all_content_parts();
-    let mut payload = to_value(&req).expect("serialize request");
-    let provider = XAIProvider;
-
-    provider
-        .transform_request(&mut payload, Endpoint::Responses)
-        .expect("xAI Responses transform succeeds");
-
-    let content = first_content_array(&payload);
+    let content = transformed_content(XAIProvider, Endpoint::Responses);
     assert_eq!(content[1]["type"], json!("input_image"));
     assert_eq!(content[1]["detail"], json!("high"));
     assert_eq!(content[1]["file_id"], json!("file-abc"));
@@ -168,15 +140,7 @@ fn xai_provider_passes_input_image_untouched() {
 
 #[test]
 fn xai_provider_passes_input_file_untouched() {
-    let req = request_with_all_content_parts();
-    let mut payload = to_value(&req).expect("serialize request");
-    let provider = XAIProvider;
-
-    provider
-        .transform_request(&mut payload, Endpoint::Responses)
-        .expect("xAI Responses transform succeeds");
-
-    let content = first_content_array(&payload);
+    let content = transformed_content(XAIProvider, Endpoint::Responses);
     assert_eq!(content[2]["type"], json!("input_file"));
     assert_eq!(content[2]["detail"], json!("low"));
     assert_eq!(content[2]["file_data"], json!("JVBERi0xLjQK"));
@@ -190,15 +154,7 @@ fn xai_provider_passes_input_file_untouched() {
 
 #[test]
 fn xai_provider_passes_refusal_untouched() {
-    let req = request_with_all_content_parts();
-    let mut payload = to_value(&req).expect("serialize request");
-    let provider = XAIProvider;
-
-    provider
-        .transform_request(&mut payload, Endpoint::Responses)
-        .expect("xAI Responses transform succeeds");
-
-    let content = first_content_array(&payload);
+    let content = transformed_content(XAIProvider, Endpoint::Responses);
     assert_eq!(content[3]["type"], json!("refusal"));
     assert_eq!(content[3]["refusal"], json!("I can't help with that."));
 }
@@ -209,15 +165,7 @@ fn xai_provider_still_rewrites_output_text_to_input_text_and_keeps_other_variant
     // are rewritten to `input_text` so xAI's Responses backend accepts
     // them. That rewrite MUST NOT touch `input_image`, `input_file`, or
     // `refusal` parts - this test pins both halves of the contract.
-    let req = request_with_all_content_parts();
-    let mut payload = to_value(&req).expect("serialize request");
-    let provider = XAIProvider;
-
-    provider
-        .transform_request(&mut payload, Endpoint::Responses)
-        .expect("xAI Responses transform succeeds");
-
-    let content = first_content_array(&payload);
+    let content = transformed_content(XAIProvider, Endpoint::Responses);
     assert_eq!(content[0]["type"], json!("input_text"));
     assert_eq!(content[1]["type"], json!("input_image"));
     assert_eq!(content[2]["type"], json!("input_file"));
@@ -234,16 +182,57 @@ fn xai_provider_still_rewrites_output_text_to_input_text_and_keeps_other_variant
 
 #[test]
 fn xai_provider_is_noop_for_chat_endpoint() {
-    let req = request_with_all_content_parts();
-    let mut payload = to_value(&req).expect("serialize request");
-    let provider = XAIProvider;
-
-    provider
-        .transform_request(&mut payload, Endpoint::Chat)
-        .expect("xAI Chat transform succeeds");
-
     // `input` field is untouched because the Responses-specific rewrite
     // only fires for `Endpoint::Responses`.
-    let content = first_content_array(&payload);
+    let content = transformed_content(XAIProvider, Endpoint::Chat);
     assert_eq!(content[4]["type"], json!("output_text"));
+}
+
+/// A chat request carrying the gateway's own `rid`, the field a client sets
+/// to name its request and no third-party API accepts.
+fn chat_request_with_rid() -> Value {
+    json!({
+        "model": "m",
+        "rid": "conv_1",
+        "messages": [{"role": "user", "content": "hi"}]
+    })
+}
+
+/// `chat_request_with_rid` after `provider` transformed it for the chat
+/// endpoint.
+fn transformed_chat(provider: impl Provider) -> Value {
+    let mut payload = chat_request_with_rid();
+    provider
+        .transform_request(&mut payload, Endpoint::Chat)
+        .expect("the provider transform succeeds");
+    payload
+}
+
+#[test]
+fn openai_provider_drops_the_gateway_rid() {
+    let payload = transformed_chat(OpenAIProvider);
+    assert!(payload.get("rid").is_none(), "{payload}");
+    assert_eq!(payload["messages"][0]["content"], json!("hi"));
+}
+
+#[test]
+fn gemini_provider_drops_the_gateway_rid() {
+    let payload = transformed_chat(GeminiProvider);
+    assert!(payload.get("rid").is_none(), "{payload}");
+    assert_eq!(payload["messages"][0]["content"], json!("hi"));
+}
+
+#[test]
+fn xai_provider_drops_the_gateway_rid() {
+    let payload = transformed_chat(XAIProvider);
+    assert!(payload.get("rid").is_none(), "{payload}");
+    assert_eq!(payload["messages"][0]["content"], json!("hi"));
+}
+
+/// The engine-shaped provider forwards the payload as sent: an engine reads
+/// `rid` for log correlation.
+#[test]
+fn sglang_provider_keeps_the_gateway_rid() {
+    let payload = transformed_chat(SGLangProvider);
+    assert_eq!(payload["rid"], json!("conv_1"));
 }

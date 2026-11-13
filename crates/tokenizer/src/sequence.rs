@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::traits::{TokenIdType, Tokenizer as TokenizerTrait};
+use crate::traits::{DecodeStep, IncrementalDecoder, TokenIdType, Tokenizer as TokenizerTrait};
 
 /// Maintains state for an ongoing sequence of tokens and their decoded text.
 ///
@@ -37,6 +37,13 @@ pub struct Sequence {
 
     /// Whether to skip special tokens when decoding
     skip_special_tokens: bool,
+    /// The backend's own per-stream decoder, when it has one. Then
+    /// `token_ids`, `prefix_index` and `cached_prefix` stay unused.
+    incremental: Option<Box<dyn IncrementalDecoder>>,
+    eager_stop_matching: bool,
+    /// Steps and finishes whose decode no longer started with the emitted text
+    /// and streamed a best-effort remainder instead (see [`DecodeStep`]).
+    prefix_mismatches: u32,
 }
 
 impl std::fmt::Debug for Sequence {
@@ -72,6 +79,9 @@ impl Sequence {
     /// Create a new empty sequence with skip_special_tokens option
     pub fn new_with_options(tokenizer: Arc<dyn TokenizerTrait>, skip_special_tokens: bool) -> Self {
         Self {
+            incremental: tokenizer.incremental_decoder(skip_special_tokens),
+            eager_stop_matching: false,
+            prefix_mismatches: 0,
             tokenizer,
             token_ids: Vec::new(),
             total_tokens: 0,
@@ -79,6 +89,15 @@ impl Sequence {
             cached_prefix: String::new(),
             skip_special_tokens,
         }
+    }
+
+    pub(crate) fn for_stop_matching(
+        tokenizer: Arc<dyn TokenizerTrait>,
+        skip_special_tokens: bool,
+    ) -> Self {
+        let mut sequence = Self::new_with_options(tokenizer, skip_special_tokens);
+        sequence.eager_stop_matching = true;
+        sequence
     }
 
     /// Create a sequence with initial tokens
@@ -93,11 +112,22 @@ impl Sequence {
         skip_special_tokens: bool,
     ) -> Self {
         let len = token_ids.len();
+        let mut incremental = tokenizer.incremental_decoder(skip_special_tokens);
+        if let Some(decoder) = incremental.as_mut() {
+            // Position the decoder after the seed tokens; their text is not
+            // emitted. Fall back to the generic path if the backend objects.
+            if token_ids.iter().any(|&id| decoder.step(id).is_err()) {
+                incremental = None;
+            }
+        }
         Self {
+            incremental,
+            eager_stop_matching: false,
+            prefix_mismatches: 0,
             tokenizer,
             token_ids,
             total_tokens: len,
-            prefix_index: 0,
+            prefix_index: len,
             cached_prefix: String::new(),
             skip_special_tokens,
         }
@@ -121,6 +151,10 @@ impl Sequence {
         self.total_tokens = 0;
         self.prefix_index = 0;
         self.cached_prefix.clear();
+        self.prefix_mismatches = 0;
+        if let Some(decoder) = self.incremental.as_mut() {
+            decoder.reset();
+        }
     }
 
     /// Append text to the sequence by encoding it.
@@ -142,24 +176,114 @@ impl Sequence {
 
     /// Append a single token to the sequence and return newly decoded text.
     ///
-    /// Delegates to `Decoder::decode_step` on the tokenizer trait. For HuggingFace
-    /// tokenizers this uses the native `step_decode_stream`; other backends use the
-    /// default double-decode fallback. Both paths handle token draining and prefix
-    /// caching internally.
+    /// When the tokenizer provides an [`IncrementalDecoder`] (HuggingFace
+    /// tokenizers with a plain `ByteLevel` decoder: Qwen, Llama 3, GPT-2 style
+    /// vocabularies; every tiktoken vocabulary), the token goes through it and
+    /// `token_ids()` / `text()` do not track a decode window. Otherwise this delegates to
+    /// `Decoder::decode_step`: HuggingFace's native `step_decode_stream` for
+    /// its other decoders, the default double-decode algorithm for the rest;
+    /// both drain the retained ids and cache the prefix internally.
     #[inline]
     pub fn append_token(&mut self, token_id: TokenIdType) -> Result<String> {
-        let result = self.tokenizer.decode_step(
+        if let Some(decoder) = self.incremental.as_mut() {
+            let text = decoder.step(token_id)?;
+            self.total_tokens += 1;
+            return Ok(text);
+        }
+        Ok(self.step_generic(token_id)?.into_text())
+    }
+
+    /// [`append_token`](Self::append_token), with the newly decoded text
+    /// appended to `out`; says whether there was any. A stream that collects
+    /// its text in one buffer takes each token's text without a string per
+    /// token: the backend's own decoder appends it, and so does the generic
+    /// step where the backend writes it from its tables
+    /// (`Decoder::decode_step_into`).
+    #[inline]
+    pub fn append_token_into(&mut self, token_id: TokenIdType, out: &mut String) -> Result<bool> {
+        if let Some(decoder) = self.incremental.as_mut() {
+            let appended = decoder.step_into(token_id, out)?;
+            self.total_tokens += 1;
+            return Ok(appended);
+        }
+        let step = self.tokenizer.decode_step_into(
             token_id,
             &mut self.token_ids,
             &mut self.cached_prefix,
             &mut self.prefix_index,
             self.skip_special_tokens,
+            self.eager_stop_matching,
+            out,
         )?;
         self.total_tokens += 1;
-        match result {
-            Some(text) => Ok(text),
-            None => Ok(String::new()),
+        if step.prefix_mismatch {
+            self.prefix_mismatches += 1;
         }
+        Ok(step.appended)
+    }
+
+    /// One token through the generic algorithm (`Decoder::decode_step`), with
+    /// the sequence's counters kept.
+    fn step_generic(&mut self, token_id: TokenIdType) -> Result<DecodeStep> {
+        let step = self.tokenizer.decode_step_reporting(
+            token_id,
+            &mut self.token_ids,
+            &mut self.cached_prefix,
+            &mut self.prefix_index,
+            self.skip_special_tokens,
+            self.eager_stop_matching,
+        )?;
+        self.total_tokens += 1;
+        if step.prefix_mismatch {
+            self.prefix_mismatches += 1;
+        }
+        Ok(step)
+    }
+
+    /// Finish incremental decoding without inventing an extra token: the
+    /// text the decoder still holds (a replacement character waiting for
+    /// text after it, a complete character held with the bytes after it, a
+    /// character the end cut short, its first bytes with no token to finish
+    /// it, as the replacement character), rendered as the full decode
+    /// renders the end of the same ids; the one exception is a ByteFallback
+    /// vocabulary's window, which keeps a cut character's byte tokens off
+    /// its end and releases nothing for them (see
+    /// [`IncrementalDecoder::finish_into`]). That holds whatever ended the
+    /// stream, a length limit or a stop token the stop decoder matched (the
+    /// stop token never goes through the decoder, and a visible stop's own
+    /// text follows the held text); a token the decoder does see after those
+    /// bytes closes the character at its step, as the reference stream does.
+    /// A seeded sequence that generated nothing releases nothing: what the
+    /// decoder holds is the seed's, and the seed is prompt text.
+    pub fn finish(&mut self) -> Result<String> {
+        if let Some(decoder) = self.incremental.as_mut() {
+            let mut text = String::new();
+            // In this mode `token_ids` holds the seed alone and
+            // `total_tokens` grows with every token appended after it.
+            if self.total_tokens > self.token_ids.len() {
+                decoder.finish_into(&mut text)?;
+            } else {
+                decoder.reset();
+            }
+            return Ok(text);
+        }
+        let step = self.tokenizer.finish_decode(
+            &mut self.token_ids,
+            &mut self.cached_prefix,
+            &mut self.prefix_index,
+            self.skip_special_tokens,
+        )?;
+        if step.prefix_mismatch {
+            self.prefix_mismatches += 1;
+        }
+        Ok(step.into_text())
+    }
+
+    /// How many steps or finishes of this sequence streamed a best-effort
+    /// remainder because the decoder had rewritten text already emitted.
+    #[inline]
+    pub fn prefix_mismatches(&self) -> u32 {
+        self.prefix_mismatches
     }
 
     /// Get a reference to the tokenizer
@@ -168,7 +292,9 @@ impl Sequence {
         &self.tokenizer
     }
 
-    /// Get the current token ids in the buffer (sliding window, not full history)
+    /// Get the current token ids in the buffer (sliding window, not full history).
+    /// Empty, apart from any seed tokens, when the tokenizer provides its own
+    /// incremental decoder (see [`append_token`](Self::append_token)).
     #[inline]
     pub fn token_ids(&self) -> &[TokenIdType] {
         &self.token_ids
@@ -177,7 +303,8 @@ impl Sequence {
     /// Decode the current buffer to text.
     ///
     /// WARNING: after `append_token()` calls, this only decodes the sliding
-    /// window (retained tokens), not the full sequence history. Use the
+    /// window (retained tokens), not the full sequence history, and nothing
+    /// at all when the tokenizer provides its own incremental decoder. Use the
     /// incremental return values from `append_token()` to build the full text.
     pub fn text(&self) -> Result<String> {
         self.tokenizer
@@ -229,6 +356,25 @@ mod tests {
         let text2 = seq.append_token(2).unwrap();
         // The incremental text should be " world" (with the space that the mock tokenizer adds)
         assert_eq!(text2, " world");
+    }
+
+    #[test]
+    fn append_token_into_takes_the_text_only_into_a_buffer_with_no_allocation() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let mut seq = Sequence::new(tokenizer);
+
+        // A fresh string has nothing to keep: the step's text is taken as it is.
+        let mut fresh = String::new();
+        assert!(seq.append_token_into(1, &mut fresh).unwrap());
+        assert_eq!(fresh, "Hello");
+
+        // A cleared buffer kept for reuse keeps its capacity across the
+        // tick's first token.
+        let mut reused = String::with_capacity(256);
+        reused.clear();
+        assert!(seq.append_token_into(2, &mut reused).unwrap());
+        assert_eq!(reused, " world");
+        assert!(reused.capacity() >= 256);
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! Shared, immutable worker-load snapshots.
 //!
-//! `WorkerMonitor`'s group loops publish per-worker load reports and routing
-//! hot paths read them. The publication contract:
+//! `WorkerMonitor` publishes per-worker load reports here (a group's poll
+//! tick, a window of pushed records) and the routing hot paths read them:
+//! this is the one feed the load-aware policies score on, next to the
+//! dispatch credit they book themselves. The publication contract:
 //!
 //! - **Readers** grab the current snapshot as one `Arc` clone and scan
 //!   immutable data: no channel lock is held while scanning, and no map is
@@ -22,6 +24,10 @@
 //! - **Evictions batch.** They queue here and the monitor's debounced
 //!   flusher applies the whole backlog in a single rebuild, so removing N
 //!   workers costs one publish, not N.
+//! - **Every report carries its sample instant.** An entry records when the
+//!   engine's state behind it was sampled (the report's own instant, else
+//!   the publish instant), so a policy that books dispatches locally can
+//!   release the ones a report already reflects when it reads the report.
 
 use std::{
     collections::HashMap,
@@ -29,6 +35,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Weak,
     },
+    time::Instant,
 };
 
 use openai_protocol::worker::{WorkerLoadResponse, WorkerStatus};
@@ -40,12 +47,16 @@ use super::{registry::WorkerRegistry, Worker};
 /// Subscription handle to the published load snapshots. `borrow().clone()`
 /// yields an `Arc<LoadSnapshot>`; the watch guard must not be held across a
 /// scan.
-pub(crate) type LoadReceiver = watch::Receiver<Arc<LoadSnapshot>>;
+pub type LoadReceiver = watch::Receiver<Arc<LoadSnapshot>>;
 
 /// One worker's published load and the incarnation that produced it.
 #[derive(Clone)]
 struct LoadEntry {
     load: Arc<WorkerLoadResponse>,
+    /// When the engine's state behind the report was sampled, on this
+    /// process's clock: the report's own instant, else the publish instant
+    /// (the latest the sample can have been taken).
+    sampled_at: Instant,
     /// The exact worker the report came from, so an eviction removes only
     /// its own incarnation's entry and never a same-URL replacement's fresh
     /// one.
@@ -54,7 +65,7 @@ struct LoadEntry {
 
 /// An immutable point-in-time view of every published worker load.
 #[derive(Default)]
-pub(crate) struct LoadSnapshot {
+pub struct LoadSnapshot {
     entries: HashMap<Arc<str>, LoadEntry>,
 }
 
@@ -67,8 +78,15 @@ impl std::fmt::Debug for LoadSnapshot {
 }
 
 impl LoadSnapshot {
-    pub(crate) fn get(&self, url: &str) -> Option<&WorkerLoadResponse> {
+    pub fn get(&self, url: &str) -> Option<&WorkerLoadResponse> {
         self.entries.get(url).map(|entry| &*entry.load)
+    }
+
+    /// A worker's report with the instant its sample was taken.
+    pub fn report(&self, url: &str) -> Option<(&WorkerLoadResponse, Instant)> {
+        self.entries
+            .get(url)
+            .map(|entry| (&*entry.load, entry.sampled_at))
     }
 
     #[cfg(test)]
@@ -86,14 +104,17 @@ impl LoadSnapshot {
         self.entries.is_empty()
     }
 
-    /// Test-only: a snapshot with the given loads and no live sources.
-    #[cfg(test)]
+    /// Test-only: a snapshot with the given loads and no live sources, each
+    /// report sampled now unless it says otherwise.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn from_loads_for_test(loads: Vec<(String, WorkerLoadResponse)>) -> Arc<Self> {
+        let published_at = Instant::now();
         let entries = loads
             .into_iter()
             .map(|(url, load)| {
-                let dangling: Weak<super::worker::BasicWorker> = Weak::new();
+                let dangling: Weak<super::basic::BasicWorker> = Weak::new();
                 let entry = LoadEntry {
+                    sampled_at: load.sampled_at.unwrap_or(published_at),
                     load: Arc::new(load),
                     source: dangling,
                 };
@@ -102,6 +123,74 @@ impl LoadSnapshot {
             .collect();
         Arc::new(Self { entries })
     }
+}
+
+/// Publisher standing in for the monitor in tests and benchmarks: hands a
+/// policy the feed and publishes each map of reports as the whole snapshot.
+#[cfg(any(test, feature = "test-util"))]
+pub struct TestFeed(watch::Sender<Arc<LoadSnapshot>>);
+
+#[cfg(any(test, feature = "test-util"))]
+impl TestFeed {
+    pub fn attached_to(policy: &dyn crate::policies::LoadBalancingPolicy) -> Self {
+        let (tx, rx) = watch::channel(Arc::new(LoadSnapshot::default()));
+        policy.set_load_receiver(Some(rx));
+        Self(tx)
+    }
+
+    /// A receiver of this feed for a second reader beside the policy it
+    /// was attached to (the engine's decider in a benchmark).
+    pub fn receiver(&self) -> LoadReceiver {
+        self.0.subscribe()
+    }
+
+    /// Publish `loads` as the current snapshot; a report without a sample
+    /// instant is sampled now.
+    pub fn publish(&self, loads: &HashMap<String, WorkerLoadResponse>) {
+        let loads = loads
+            .iter()
+            .map(|(url, load)| (url.clone(), load.clone()))
+            .collect();
+        self.0
+            .send_replace(LoadSnapshot::from_loads_for_test(loads));
+    }
+}
+
+/// One DP rank with the given queued uncached tokens, KV utilization and
+/// live throughput; one request is running, so a rate gauge counts.
+#[cfg(any(test, feature = "test-util"))]
+pub fn one_rank_load(
+    num_waiting_uncached_tokens: i32,
+    token_usage: f64,
+    gen_throughput: f64,
+) -> WorkerLoadResponse {
+    WorkerLoadResponse {
+        timestamp: String::new(),
+        dp_rank_count: 1,
+        loads: vec![openai_protocol::worker::SchedulerLoadSnapshot {
+            dp_rank: 0,
+            num_running_reqs: 1,
+            num_waiting_uncached_tokens,
+            token_usage,
+            gen_throughput,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// One DP rank reporting a queue depth with no token count for it: the shape
+/// of a backend scored from Prometheus gauges, which have no waiting-token
+/// equivalent.
+#[cfg(test)]
+pub(crate) fn one_rank_load_reqs_only(
+    num_waiting_reqs: i32,
+    token_usage: f64,
+    gen_throughput: f64,
+) -> WorkerLoadResponse {
+    let mut load = one_rank_load(0, token_usage, gen_throughput);
+    load.loads[0].num_waiting_reqs = num_waiting_reqs;
+    load
 }
 
 /// Publication side of the shared load view. Owned by `WorkerMonitor`.
@@ -152,11 +241,13 @@ impl LoadState {
         group_urls: &[String],
         fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)>,
     ) {
+        let published_at = Instant::now();
         let admitted: Vec<(Arc<str>, LoadEntry)> = fresh
             .into_iter()
             .filter(|(worker, _)| self.is_current_incarnation(worker))
             .map(|(worker, load)| {
                 let entry = LoadEntry {
+                    sampled_at: load.sampled_at.unwrap_or(published_at),
                     load,
                     source: Arc::downgrade(&worker),
                 };
@@ -271,27 +362,10 @@ impl LoadState {
 mod tests {
     use std::sync::Barrier;
 
-    use openai_protocol::{
-        model_card::ModelCard,
-        worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerType},
-    };
+    use openai_protocol::worker::SchedulerLoadSnapshot;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode};
-
-    fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
-        let worker = BasicWorkerBuilder::new(url)
-            .worker_type(WorkerType::Regular)
-            .connection_mode(ConnectionMode::Http)
-            .model(ModelCard::new(model))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        worker.set_status(WorkerStatus::Ready);
-        Arc::new(worker)
-    }
+    use crate::worker::test_support::ready_worker;
 
     /// A load report distinguishable by its waiting-token count.
     fn load(waiting: i32) -> Arc<WorkerLoadResponse> {

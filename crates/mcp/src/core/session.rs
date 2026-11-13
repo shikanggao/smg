@@ -648,7 +648,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::core::config::Tool as McpTool;
+    use crate::core::config::{test_support::sse_server, Tool as McpTool};
 
     #[test]
     fn test_session_creation_keeps_servers() {
@@ -725,14 +725,18 @@ mod tests {
         )
     }
 
+    /// Puts the test tool `name` of `server` into `orchestrator`'s inventory.
+    fn insert_test_tool(orchestrator: &McpOrchestrator, server: &str, name: &str) {
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(server, create_test_tool(name)));
+    }
+
     #[test]
     fn test_has_exposed_tool_with_inventory() {
         let orchestrator = McpOrchestrator::new_test();
 
-        // Insert a tool into the inventory
-        let tool = create_test_tool("test_tool");
-        let entry = ToolEntry::from_server_tool("server1", tool);
-        orchestrator.tool_inventory().insert_entry(entry);
+        insert_test_tool(&orchestrator, "server1", "test_tool");
 
         let mcp_servers = vec![McpServerBinding {
             label: "label1".to_string(),
@@ -749,9 +753,7 @@ mod tests {
     async fn test_execute_tool_result_preserves_pending_approval() {
         let orchestrator = McpOrchestrator::new_test();
 
-        let tool = create_test_tool("test_tool");
-        let entry = ToolEntry::from_server_tool("server1", tool);
-        orchestrator.tool_inventory().insert_entry(entry);
+        insert_test_tool(&orchestrator, "server1", "test_tool");
 
         let mut session = McpToolSession::new(
             &orchestrator,
@@ -791,9 +793,7 @@ mod tests {
     fn test_resolve_label_with_inventory() {
         let orchestrator = McpOrchestrator::new_test();
 
-        let tool = create_test_tool("test_tool");
-        let entry = ToolEntry::from_server_tool("server1", tool);
-        orchestrator.tool_inventory().insert_entry(entry);
+        insert_test_tool(&orchestrator, "server1", "test_tool");
 
         let mcp_servers = vec![McpServerBinding {
             label: "my_server".to_string(),
@@ -810,14 +810,8 @@ mod tests {
     fn test_exposed_names_are_unique_for_tool_name_collisions() {
         let orchestrator = McpOrchestrator::new_test();
 
-        let tool_a = create_test_tool("shared_tool");
-        let tool_b = create_test_tool("shared_tool");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool("server1", tool_a));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool("server2", tool_b));
+        insert_test_tool(&orchestrator, "server1", "shared_tool");
+        insert_test_tool(&orchestrator, "server2", "shared_tool");
 
         let session = McpToolSession::new(
             &orchestrator,
@@ -858,19 +852,9 @@ mod tests {
     fn test_exposed_names_handle_pre_suffixed_name_conflicts() {
         let orchestrator = McpOrchestrator::new_test();
 
-        let tool_base = create_test_tool("foo");
-        let tool_suffixed = create_test_tool("foo_1");
-        let tool_dup = create_test_tool("foo");
-
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool("s1", tool_base));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool("s2", tool_suffixed));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool("s3", tool_dup));
+        insert_test_tool(&orchestrator, "s1", "foo");
+        insert_test_tool(&orchestrator, "s2", "foo_1");
+        insert_test_tool(&orchestrator, "s3", "foo");
 
         let session = McpToolSession::new(
             &orchestrator,
@@ -905,38 +889,16 @@ mod tests {
     // --- Builtin server filtering tests ---
 
     fn create_builtin_orchestrator() -> McpOrchestrator {
-        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig, McpTransport};
+        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig};
 
         let config = McpConfig {
             servers: vec![
                 McpServerConfig {
-                    name: "brave-builtin".to_string(),
-                    transport: McpTransport::Sse {
-                        url: "http://localhost:8001/sse".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: None,
                     builtin_type: Some(BuiltinToolType::WebSearchPreview),
                     builtin_tool_name: Some("brave_web_search".to_string()),
-                    internal: false,
+                    ..sse_server("brave-builtin", "http://localhost:8001/sse")
                 },
-                McpServerConfig {
-                    name: "regular-server".to_string(),
-                    transport: McpTransport::Sse {
-                        url: "http://localhost:3000/sse".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: None,
-                    builtin_type: None,
-                    builtin_tool_name: None,
-                    internal: false,
-                },
+                sse_server("regular-server", "http://localhost:3000/sse"),
             ],
             ..Default::default()
         };
@@ -974,38 +936,24 @@ mod tests {
 
     #[test]
     fn test_is_builtin_tool_scoped_to_builtin_binding_only() {
-        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig, McpTransport};
+        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig};
 
         let orchestrator = McpOrchestrator::new_test_with_config(McpConfig {
             servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
                 builtin_type: Some(BuiltinToolType::WebSearchPreview),
                 builtin_tool_name: Some("brave_web_search".to_string()),
                 internal: true,
+                ..sse_server("internal-server", "http://localhost:3000/sse")
             }],
             ..Default::default()
         });
 
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                create_test_tool("brave_web_search"),
-            ));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                create_test_tool("internal_non_builtin_tool"),
-            ));
+        insert_test_tool(&orchestrator, "internal-server", "brave_web_search");
+        insert_test_tool(
+            &orchestrator,
+            "internal-server",
+            "internal_non_builtin_tool",
+        );
 
         let session = McpToolSession::new(
             &orchestrator,
@@ -1024,32 +972,18 @@ mod tests {
 
     #[test]
     fn test_is_builtin_tool_classifies_image_generation() {
-        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig, McpTransport};
+        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig};
 
         let orchestrator = McpOrchestrator::new_test_with_config(McpConfig {
             servers: vec![McpServerConfig {
-                name: "image-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
                 builtin_type: Some(BuiltinToolType::ImageGeneration),
                 builtin_tool_name: Some("generate_image".to_string()),
-                internal: false,
+                ..sse_server("image-server", "http://localhost:3000/sse")
             }],
             ..Default::default()
         });
 
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "image-server",
-                create_test_tool("generate_image"),
-            ));
+        insert_test_tool(&orchestrator, "image-server", "generate_image");
 
         let session = McpToolSession::new(
             &orchestrator,
@@ -1069,18 +1003,8 @@ mod tests {
     fn test_allowed_tools_filters_inventory_and_list_tools() {
         let orchestrator = McpOrchestrator::new_test();
 
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server1",
-                create_test_tool("brave_web_search"),
-            ));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server1",
-                create_test_tool("brave_local_search"),
-            ));
+        insert_test_tool(&orchestrator, "server1", "brave_web_search");
+        insert_test_tool(&orchestrator, "server1", "brave_local_search");
 
         let session = McpToolSession::new(
             &orchestrator,
@@ -1105,12 +1029,7 @@ mod tests {
     fn test_alias_tools_replace_target_tool_in_session_inventory() {
         let orchestrator = McpOrchestrator::new_test();
 
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server1",
-                create_test_tool("brave_web_search"),
-            ));
+        insert_test_tool(&orchestrator, "server1", "brave_web_search");
 
         orchestrator
             .register_alias(
@@ -1149,12 +1068,7 @@ mod tests {
     fn test_allowed_tools_accepts_alias_name() {
         let orchestrator = McpOrchestrator::new_test();
 
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server1",
-                create_test_tool("brave_web_search"),
-            ));
+        insert_test_tool(&orchestrator, "server1", "brave_web_search");
 
         orchestrator
             .register_alias("web_search", "server1", "brave_web_search", None)
@@ -1177,33 +1091,18 @@ mod tests {
 
     #[test]
     fn test_is_internal_tool_for_internal_server() {
-        use crate::core::config::{McpConfig, McpServerConfig, McpTransport};
+        use crate::core::config::{McpConfig, McpServerConfig};
 
         let config = McpConfig {
             servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
                 internal: true,
+                ..sse_server("internal-server", "http://localhost:3000/sse")
             }],
             ..Default::default()
         };
 
         let orchestrator = McpOrchestrator::new_test_with_config(config);
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                create_test_tool("internal_search"),
-            ));
+        insert_test_tool(&orchestrator, "internal-server", "internal_search");
 
         let session = McpToolSession::new(
             &orchestrator,
@@ -1222,33 +1121,18 @@ mod tests {
 
     #[test]
     fn test_is_internal_tool_for_alias_targeting_internal_server() {
-        use crate::core::config::{McpConfig, McpServerConfig, McpTransport};
+        use crate::core::config::{McpConfig, McpServerConfig};
 
         let config = McpConfig {
             servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
                 internal: true,
+                ..sse_server("internal-server", "http://localhost:3000/sse")
             }],
             ..Default::default()
         };
 
         let orchestrator = McpOrchestrator::new_test_with_config(config);
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
-                create_test_tool("internal_search"),
-            ));
+        insert_test_tool(&orchestrator, "internal-server", "internal_search");
 
         orchestrator
             .register_alias("alias_search", "internal-server", "internal_search", None)
@@ -1270,37 +1154,14 @@ mod tests {
 
     #[test]
     fn test_is_internal_server_label_checks_all_bindings_for_shared_label() {
-        use crate::core::config::{McpConfig, McpServerConfig, McpTransport};
+        use crate::core::config::{McpConfig, McpServerConfig};
 
         let config = McpConfig {
             servers: vec![
+                sse_server("public-server", "http://localhost:3000/sse"),
                 McpServerConfig {
-                    name: "public-server".to_string(),
-                    transport: McpTransport::Sse {
-                        url: "http://localhost:3000/sse".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: None,
-                    builtin_type: None,
-                    builtin_tool_name: None,
-                    internal: false,
-                },
-                McpServerConfig {
-                    name: "internal-server".to_string(),
-                    transport: McpTransport::Sse {
-                        url: "http://localhost:3001/sse".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: None,
-                    builtin_type: None,
-                    builtin_tool_name: None,
                     internal: true,
+                    ..sse_server("internal-server", "http://localhost:3001/sse")
                 },
             ],
             ..Default::default()
@@ -1335,32 +1196,12 @@ mod tests {
         let orchestrator = McpOrchestrator::new_test();
 
         // server1 has two tools
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server1",
-                create_test_tool("brave_web_search"),
-            ));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server1",
-                create_test_tool("brave_local_search"),
-            ));
+        insert_test_tool(&orchestrator, "server1", "brave_web_search");
+        insert_test_tool(&orchestrator, "server1", "brave_local_search");
 
         // server2 has two tools
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server2",
-                create_test_tool("deepwiki_search"),
-            ));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "server2",
-                create_test_tool("deepwiki_read"),
-            ));
+        insert_test_tool(&orchestrator, "server2", "deepwiki_search");
+        insert_test_tool(&orchestrator, "server2", "deepwiki_read");
 
         let session = McpToolSession::new(
             &orchestrator,

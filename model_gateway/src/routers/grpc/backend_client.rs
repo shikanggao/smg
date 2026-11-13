@@ -5,15 +5,19 @@
 //! same-host engine — vLLM EngineCore or TokenSpeed ([`ZmqEngineClient`]).
 //! `BackendClient` keeps those
 //! first-class siblings — `GrpcClient` stays pure gRPC — while the execution
-//! pipeline (which works against [`ProtoStream`]/[`ProtoGenerateRequest`]) is
+//! pipeline (which works against `ProtoStream`/`ProtoGenerateRequest`) is
 //! shared unchanged.
 
+use engine_zmq_adapter::admin::{flush_reply_wait, PROFILE_WAIT};
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, worker::WorkerLoadResponse,
 };
 use smg_grpc_client::{
-    common_proto, tokenizer_bundle::StreamBundle, tokenspeed_proto, vllm_proto,
+    common_proto, sglang_proto,
+    tokenizer_bundle::StreamBundle,
+    tokenspeed_encoder::{tokenspeed_encoder_proto as tokenspeed_encoder, TokenSpeedEncoderClient},
+    tokenspeed_proto, vllm_proto, OutputConstraint, SglangGenerateRequestOptions,
     SglangSchedulerClient, TokenSpeedSchedulerClient, VllmEngineClient,
 };
 
@@ -21,64 +25,53 @@ use crate::{
     routers::grpc::{
         client::{
             GenerateRequestBuildOptions, GrpcClient, HealthCheckResponse, ModelInfo, ServerInfo,
+            TokenSpeedMmBuilder, TokenSpeedPlainBuilder, VllmMmBuilder, VllmPlainBuilder,
         },
         common::stages::helpers,
         proto_wrapper::{
             finish_tokenspeed_request, finish_vllm_request, ProtoEmbedComplete, ProtoEmbedRequest,
             ProtoGenerateRequest, ProtoStream,
         },
-        zmq_client::{fold_tokenizer_eos_backstop, ZmqDialect, ZmqEngineClient},
+        zmq_client::{
+            self, fold_tokenizer_eos_backstop, EncodeRendezvous, SglangProfileStart, ZmqDialect,
+            ZmqEngineClient,
+        },
         MultimodalData,
     },
-    worker::RuntimeType,
+    worker::{RuntimeType, Worker},
 };
 
-/// A backend connection: gRPC (any engine) or direct ZMQ (vLLM EngineCore or
-/// TokenSpeed).
+/// A backend connection: gRPC (any engine) or direct ZMQ (vLLM EngineCore,
+/// TokenSpeed or SGLang).
 #[derive(Clone)]
 pub enum BackendClient {
     Grpc(GrpcClient),
     Zmq(ZmqEngineClient),
 }
 
-/// The native request builders of both ZMQ dialects for one request kind — the
+/// The native request builders of the ZMQ dialects for one request kind — the
 /// only thing that differs between the ZMQ build surfaces, so the dialect
 /// dispatch itself lives once in [`build_zmq_request`]/[`build_zmq_plain_request`].
-struct ZmqBuilders<V, T> {
+struct ZmqBuilders<V, T, S> {
     vllm: V,
     tokenspeed: T,
+    sglang: S,
 }
 
-/// A vLLM builder for a request kind carrying multimodal inputs and tool
-/// constraints (chat, messages).
-type VllmMmBuilder<B> = fn(
+/// The SGLang counterpart of [`VllmMmBuilder`] without a client; the
+/// `_parts` builders take the multimodal inputs and constraints bundled as
+/// options.
+type SglangMmBuilder<B> = fn(
     String,
     &B,
     String,
     Vec<u32>,
-    Option<vllm_proto::MultimodalInputs>,
-    Option<(String, String)>,
-) -> Result<vllm_proto::GenerateRequest, String>;
+    SglangGenerateRequestOptions,
+) -> Result<sglang_proto::GenerateRequest, String>;
 
-/// The TokenSpeed counterpart of [`VllmMmBuilder`].
-type TokenSpeedMmBuilder<B> = fn(
-    String,
-    &B,
-    String,
-    Vec<u32>,
-    Option<tokenspeed_proto::MultimodalInputs>,
-    Option<(String, String)>,
-) -> Result<tokenspeed_proto::GenerateRequest, String>;
-
-/// A vLLM builder for a request kind with neither multimodal inputs nor tool
-/// constraints (completion, plain generate); `T` is the builder's text
-/// parameter.
-type VllmPlainBuilder<B, T> =
-    fn(String, &B, T, Vec<u32>) -> Result<vllm_proto::GenerateRequest, String>;
-
-/// The TokenSpeed counterpart of [`VllmPlainBuilder`].
-type TokenSpeedPlainBuilder<B, T> =
-    fn(String, &B, T, Vec<u32>) -> Result<tokenspeed_proto::GenerateRequest, String>;
+/// The SGLang counterpart of [`VllmPlainBuilder`] without a client.
+type SglangPlainBuilder<B, T> =
+    fn(String, &B, T, Vec<u32>) -> Result<sglang_proto::GenerateRequest, String>;
 
 impl BackendClient {
     /// Runtime type backing this client.
@@ -93,6 +86,18 @@ impl BackendClient {
     /// and cannot match string stops itself).
     pub fn is_zmq(&self) -> bool {
         matches!(self, Self::Zmq(_))
+    }
+
+    /// The bootstrap rendezvous the engine behind a direct-ZMQ connection
+    /// declared at its handshake (`host`, `port`): where a prefill or encode
+    /// engine's bootstrap server listens. `None` on a gRPC backend, whose
+    /// worker's registration carries the rendezvous, and on an engine that
+    /// declared none.
+    pub fn declared_bootstrap(&self) -> Option<(&str, u16)> {
+        match self {
+            Self::Grpc(_) => None,
+            Self::Zmq(client) => client.ready_response()?.bootstrap_address(),
+        }
     }
 
     /// Finalize a built generate request for this backend's wire: resolve
@@ -127,6 +132,16 @@ impl BackendClient {
             fold_tokenizer_eos_backstop(request, tokenizer);
         }
         router_stops
+    }
+
+    /// Whether the backend answers the admin RPCs (cache flush, profiling):
+    /// a gRPC servicer does, a ZMQ engine when its wire carries control calls
+    /// (an SGLang scheduler, or a TokenSpeed one that declares them).
+    pub fn carries_admin_calls(&self) -> bool {
+        match self {
+            Self::Grpc(_) => true,
+            Self::Zmq(client) => client.carries_control_calls(),
+        }
     }
 
     /// Local liveness. gRPC has no cheap local flag (it uses a health RPC), so
@@ -167,14 +182,14 @@ impl BackendClient {
     pub async fn get_model_info(&self) -> Result<ModelInfo, tonic::Status> {
         match self {
             Self::Grpc(client) => client.get_model_info().await,
-            Self::Zmq(client) => Ok(client.get_model_info()),
+            Self::Zmq(client) => Ok(zmq_client::model_info(client)),
         }
     }
 
     pub async fn get_server_info(&self) -> Result<ServerInfo, tonic::Status> {
         match self {
             Self::Grpc(client) => client.get_server_info().await,
-            Self::Zmq(client) => Ok(client.get_server_info()),
+            Self::Zmq(client) => Ok(zmq_client::server_info(client)),
         }
     }
 
@@ -191,9 +206,13 @@ impl BackendClient {
     ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.flush_cache(timeout_s).await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "FlushCache not supported over ZMQ",
-            )),
+            // The reply wait is the servicers' rule, read from the adapter.
+            Self::Zmq(client) => {
+                let (success, message) = client
+                    .flush_cache_control(timeout_s, flush_reply_wait(timeout_s))
+                    .await?;
+                Ok(common_proto::FlushCacheResponse { success, message })
+            }
         }
     }
 
@@ -203,18 +222,22 @@ impl BackendClient {
     ) -> Result<common_proto::ProfileResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.start_profile(req).await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "StartProfile not supported over ZMQ",
-            )),
+            Self::Zmq(client) => {
+                let (success, message) = client
+                    .profile_control(Some(SglangProfileStart::from_request(req)), PROFILE_WAIT)
+                    .await?;
+                Ok(common_proto::ProfileResponse { success, message })
+            }
         }
     }
 
     pub async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.stop_profile().await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "StopProfile not supported over ZMQ",
-            )),
+            Self::Zmq(client) => {
+                let (success, message) = client.profile_control(None, PROFILE_WAIT).await?;
+                Ok(common_proto::ProfileResponse { success, message })
+            }
         }
     }
 
@@ -224,6 +247,19 @@ impl BackendClient {
     ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
         match self {
             Self::Grpc(client) => client.subscribe_kv_events(start_seq).await,
+            Self::Zmq(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents not supported over ZMQ",
+            )),
+        }
+    }
+
+    /// The worker's load records alone, no events; `Unimplemented` over ZMQ
+    /// (the engine pushes its scheduler stats on that wire already).
+    pub async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        match self {
+            Self::Grpc(client) => client.subscribe_load_records().await,
             Self::Zmq(_) => Err(tonic::Status::unimplemented(
                 "SubscribeKvEvents not supported over ZMQ",
             )),
@@ -247,7 +283,15 @@ impl BackendClient {
     ) -> Result<ProtoStream, tonic::Status> {
         match self {
             Self::Grpc(client) => client.generate(req).await,
-            Self::Zmq(client) => Ok(ProtoStream::Zmq(client.generate(req).await?)),
+            // The ZMQ submit future is boxed so that its state (the per-dialect
+            // encode dispatch, the trace headers, the sub-stream set-up) does not
+            // size this future, and with it every request's: an async block's
+            // state holds the largest of its awaited branches inline, and the gRPC
+            // backends, which never take this arm, were paying one jemalloc size
+            // class (10,240 -> 12,288 B per request) for the ZMQ arm's growth.
+            Self::Zmq(client) => Ok(ProtoStream::Zmq(
+                Box::pin(zmq_client::generate(client, req)).await?,
+            )),
         }
     }
 
@@ -288,6 +332,7 @@ impl BackendClient {
                 ZmqBuilders {
                     vllm: VllmEngineClient::build_generate_request_from_chat,
                     tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_chat,
+                    sglang: SglangSchedulerClient::build_generate_request_from_chat_parts,
                 },
             ),
         }
@@ -317,6 +362,7 @@ impl BackendClient {
                 ZmqBuilders {
                     vllm: VllmEngineClient::build_generate_request_from_messages,
                     tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_messages,
+                    sglang: SglangSchedulerClient::build_generate_request_from_messages_parts,
                 },
             ),
         }
@@ -342,6 +388,7 @@ impl BackendClient {
                 ZmqBuilders {
                     vllm: VllmEngineClient::build_generate_request_from_completion,
                     tokenspeed: TokenSpeedSchedulerClient::build_generate_request_from_completion,
+                    sglang: SglangSchedulerClient::build_generate_request_from_completion_parts,
                 },
             ),
         }
@@ -367,10 +414,61 @@ impl BackendClient {
                 ZmqBuilders {
                     vllm: VllmEngineClient::build_plain_generate_request,
                     tokenspeed: TokenSpeedSchedulerClient::build_plain_generate_request,
+                    sglang: SglangSchedulerClient::build_plain_generate_request_parts,
                 },
             ),
         }
     }
+}
+
+// The encode-worker wires of a rendezvous handoff (the EPD encode stage's
+// dispatch): the encoder RPC of a gRPC encode worker and the encode frame of
+// a TokenSpeed encode server on the direct ZMQ lane.
+
+/// Hand an encode request to a TokenSpeed encode server over its worker's
+/// ZMQ connection. Nothing answers it: the server ships the embedding to the
+/// prefill side over the transfer engine, as the gRPC encoder acks after its
+/// send.
+pub(crate) async fn send_tokenspeed_encode_frame(
+    worker: &dyn Worker,
+    rendezvous: &EncodeRendezvous,
+    request: tokenspeed_encoder::EncodeRequest,
+) -> Result<(), String> {
+    let url = worker.url();
+    let client = worker
+        .get_backend_client()
+        .await
+        .map_err(|e| format!("encode worker {url} is not connected: {e}"))?
+        .ok_or_else(|| format!("encode worker {url} has no ZMQ connection"))?;
+    let BackendClient::Zmq(client) = client.as_ref() else {
+        return Err(format!("encode worker {url} is not a direct-ZMQ worker"));
+    };
+    client
+        .encode_tokenspeed(request, rendezvous)
+        .await
+        .map_err(|status| format!("encode request to {url} failed: {}", status.message()))
+}
+
+/// Hand an encode request to a gRPC encode worker over its cached encoder
+/// channel. The worker acknowledges after shipping the embedding to the
+/// prefill side; a request it did not accept is an error.
+pub(crate) async fn send_tokenspeed_encode_rpc(
+    endpoint: String,
+    request: tokenspeed_encoder::EncodeRequest,
+) -> Result<(), String> {
+    let client = TokenSpeedEncoderClient::connect_cached(&endpoint)
+        .await
+        .map_err(|e| format!("connect to encode worker {endpoint} failed: {e}"))?;
+    let response = client
+        .encode(request)
+        .await
+        .map_err(|e| format!("encode RPC to {endpoint} failed: {}", e.message()))?;
+    if !response.accepted {
+        return Err(format!(
+            "encode worker {endpoint} did not accept the request"
+        ));
+    }
+    Ok(())
 }
 
 /// Build a multimodal-carrying request (chat, messages) for a ZMQ backend: one
@@ -383,22 +481,32 @@ fn build_zmq_request<B>(
     processed_text: String,
     token_ids: Vec<u32>,
     options: GenerateRequestBuildOptions,
-    builders: ZmqBuilders<VllmMmBuilder<B>, TokenSpeedMmBuilder<B>>,
+    builders: ZmqBuilders<VllmMmBuilder<B>, TokenSpeedMmBuilder<B>, SglangMmBuilder<B>>,
 ) -> Result<ProtoGenerateRequest, String> {
-    let ZmqBuilders { vllm, tokenspeed } = builders;
+    let ZmqBuilders {
+        vllm,
+        tokenspeed,
+        sglang,
+    } = builders;
     match dialect {
         ZmqDialect::Vllm => {
             let vllm_mm = zmq_vllm_mm(options.multimodal_inputs)?;
-            finish_vllm_request(vllm_mm, |mm| {
+            // The ZMQ wire carries one modality batch (see `zmq_vllm_mm`).
+            let mut request = finish_vllm_request(vllm_mm.map(|mm| (mm, Vec::new())), |mm| {
                 vllm(
                     request_id,
                     body,
                     processed_text,
                     token_ids,
                     mm,
-                    options.tool_constraints,
+                    OutputConstraint {
+                        tool: options.tool_constraints,
+                        set_aside: options.format_set_aside,
+                    },
                 )
-            })
+            })?;
+            request.set_grammar_from_first_token(options.first_token_grammar);
+            Ok(request)
         }
         ZmqDialect::TokenSpeed => {
             let tokenspeed_mm = zmq_tokenspeed_mm(options.multimodal_inputs)?;
@@ -409,12 +517,51 @@ fn build_zmq_request<B>(
                     processed_text,
                     token_ids,
                     mm,
-                    options.tool_constraints,
+                    OutputConstraint {
+                        tool: options.tool_constraints,
+                        set_aside: options.format_set_aside,
+                    },
                 )
             })
         }
+        // SGLang tensors ride inline (no SHM handles to release on failure).
+        // A grammar led with the thought for the first token needs no
+        // reasoning phase in front of it: the engine's grammar manager wraps
+        // its reasoner around a request's grammar only when the request asks
+        // for reasoning, and the gateway's own link cannot tell whether the
+        // engine runs one, so the request does not ask where the tag has the
+        // thought already. The engine's own reasoning-token count follows the
+        // flag; the gateway's parser fills in the count where it runs.
+        ZmqDialect::Sglang => {
+            let sglang_mm = zmq_sglang_mm(options.multimodal_inputs)?;
+            let (sglang_mm, extras) =
+                sglang_mm.map_or((None, Vec::new()), |(first, extras)| (Some(first), extras));
+            let mut req = sglang(
+                request_id,
+                body,
+                processed_text,
+                token_ids,
+                SglangGenerateRequestOptions {
+                    multimodal_inputs: sglang_mm,
+                    tool_call_constraint: options.tool_constraints,
+                    format_set_aside: options.format_set_aside,
+                    require_reasoning: options.require_reasoning && !options.first_token_grammar,
+                },
+            )?;
+            req.extra_mm_inputs = extras;
+            Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
+        }
+        ZmqDialect::Trtllm => Err(DIRECT_LANE_NOT_FOR_TRTLLM.to_string()),
     }
 }
+
+/// The direct ZMQ lane builds no request for a TensorRT-LLM engine: that
+/// engine is reached through its gRPC servicer (the Rust servicer speaks the
+/// engine's wire on its node), and the gateway's own link to the wire serves
+/// the other dialects only.
+pub(crate) const DIRECT_LANE_NOT_FOR_TRTLLM: &str =
+    "a TensorRT-LLM engine is served through its gRPC \
+                                          servicer, not the gateway's direct ZMQ lane";
 
 /// Build a request kind with no multimodal or tool inputs (completion, plain
 /// generate) for a ZMQ backend. `text` is the builders' shared text parameter
@@ -425,9 +572,17 @@ fn build_zmq_plain_request<B, T>(
     body: &B,
     text: T,
     token_ids: Vec<u32>,
-    builders: ZmqBuilders<VllmPlainBuilder<B, T>, TokenSpeedPlainBuilder<B, T>>,
+    builders: ZmqBuilders<
+        VllmPlainBuilder<B, T>,
+        TokenSpeedPlainBuilder<B, T>,
+        SglangPlainBuilder<B, T>,
+    >,
 ) -> Result<ProtoGenerateRequest, String> {
-    let ZmqBuilders { vllm, tokenspeed } = builders;
+    let ZmqBuilders {
+        vllm,
+        tokenspeed,
+        sglang,
+    } = builders;
     match dialect {
         ZmqDialect::Vllm => Ok(ProtoGenerateRequest::Vllm(Box::new(vllm(
             request_id, body, text, token_ids,
@@ -435,6 +590,10 @@ fn build_zmq_plain_request<B, T>(
         ZmqDialect::TokenSpeed => Ok(ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed(
             request_id, body, text, token_ids,
         )?))),
+        ZmqDialect::Sglang => Ok(ProtoGenerateRequest::Sglang(Box::new(sglang(
+            request_id, body, text, token_ids,
+        )?))),
+        ZmqDialect::Trtllm => Err(DIRECT_LANE_NOT_FOR_TRTLLM.to_string()),
     }
 }
 
@@ -446,7 +605,17 @@ fn zmq_vllm_mm(
 ) -> Result<Option<vllm_proto::MultimodalInputs>, String> {
     inputs
         .map(|mm| match mm {
-            MultimodalData::Vllm(data) => Ok(data.into_proto()),
+            MultimodalData::Vllm(data) => {
+                let (primary, extra) = data.into_protos();
+                if !extra.is_empty() {
+                    return Err(
+                        "the vLLM ZMQ backend takes one modality per request; mixed image and \
+                         video requests need the gRPC backend"
+                            .to_string(),
+                    );
+                }
+                Ok(primary)
+            }
             other => Err(mm_variant_mismatch("vLLM", &other)),
         })
         .transpose()
@@ -459,8 +628,29 @@ fn zmq_tokenspeed_mm(
 ) -> Result<Option<tokenspeed_proto::MultimodalInputs>, String> {
     inputs
         .map(|mm| match mm {
-            MultimodalData::TokenSpeed(data) => Ok(data.into_proto(true)),
+            // No RDMA staging: the ZMQ engine reads tensors inline off the wire
+            // and has no puller for `remote` payloads.
+            MultimodalData::TokenSpeed(data) => Ok(data.into_proto(false)),
             other => Err(mm_variant_mismatch("TokenSpeed", &other)),
+        })
+        .transpose()
+}
+
+/// Convert assembled multimodal data for an SGLang ZMQ backend. See
+/// [`zmq_vllm_mm`] for the mismatch semantics.
+fn zmq_sglang_mm(
+    inputs: Option<MultimodalData>,
+) -> Result<
+    Option<(
+        sglang_proto::MultimodalInputs,
+        Vec<sglang_proto::MultimodalInputs>,
+    )>,
+    String,
+> {
+    inputs
+        .map(|mm| match mm {
+            MultimodalData::Sglang(data) => Ok(data.into_protos()),
+            other => Err(mm_variant_mismatch("SGLang", &other)),
         })
         .transpose()
 }

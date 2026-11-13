@@ -13,7 +13,7 @@ use openai_protocol::worker::WorkerStatus;
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::workflow::data::WorkerRemovalWorkflowData;
+use crate::{worker::endpoint::Endpoint, workflow::data::WorkerRemovalWorkflowData};
 
 /// Step that transitions Ready workers to `Draining` and waits for the
 /// resolved drain settle window before downstream steps remove them.
@@ -51,26 +51,33 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
             // remove step runs.
             let url = snapshot.url();
             let Some(worker_id) = app_context.worker_registry.get_id_by_url(url) else {
-                debug!("Worker {} not in registry, skipping drain transition", url);
+                debug!(
+                    "Worker {} not in registry, skipping drain transition",
+                    Endpoint::redacted_str(url)
+                );
                 continue;
             };
             let Some(current) = app_context.worker_registry.get(&worker_id) else {
                 debug!(
                     "Worker {} disappeared from registry, skipping drain transition",
-                    url
+                    Endpoint::redacted_str(url)
                 );
                 continue;
             };
-            if current.status() != WorkerStatus::Ready {
-                continue;
-            }
             let revision = current.revision();
             let drain_secs = current.metadata().health_config.drain_settle_secs;
-            if app_context
+            // The Ready check is the closure's: it runs under the worker's
+            // mutation lock, in one step with the write, so a probe's
+            // demotion that lands after a check made outside the lock is
+            // not written over with `Draining`.
+            let drained = app_context
                 .worker_registry
-                .transition_status_if_revision(&worker_id, revision, WorkerStatus::Draining)
-                .is_some()
-            {
+                .apply_if_revision(&worker_id, revision, |worker| {
+                    let ready = worker.status() == WorkerStatus::Ready;
+                    ((), ready.then_some(WorkerStatus::Draining))
+                })
+                .is_some_and(|((), transition)| transition.is_some());
+            if drained {
                 transitioned += 1;
                 max_drain_secs = max_drain_secs.max(drain_secs);
             }
@@ -105,7 +112,6 @@ mod tests {
     use super::*;
     use crate::{
         app_context::AppContext,
-        middleware::AuthConfig,
         worker::{BasicWorkerBuilder, Worker, WorkerType},
         workflow::data::{WorkerList, WorkerRemovalWorkflowData},
     };
@@ -127,14 +133,8 @@ mod tests {
 
     fn make_app_context(workers: &[Arc<dyn Worker>]) -> Arc<AppContext> {
         use crate::{
-            config::RouterConfig,
-            middleware::TokenBucket,
-            observability::inflight_tracker::InFlightRequestTracker,
-            routers::{
-                common::{openai_bridge, realtime::RealtimeRegistry},
-                grpc::multimodal::MultimodalConfigRegistry,
-            },
-            worker::{WorkerRegistry, WorkerService},
+            app_context::testing::app_context_for_tests, config::RouterConfig,
+            worker::WorkerRegistry,
         };
 
         let router_config = RouterConfig::builder()
@@ -144,47 +144,7 @@ mod tests {
         for w in workers {
             registry.register(Arc::clone(w)).unwrap();
         }
-        let job_queue = Arc::new(std::sync::OnceLock::new());
-
-        Arc::new(AppContext {
-            gateway_auth: AuthConfig::new(None),
-            client: reqwest::Client::new(),
-            router_config: router_config.clone(),
-            rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
-            rate_limit_manager: None,
-            worker_registry: Arc::clone(&registry),
-            policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
-                router_config.policy.clone(),
-            )),
-            reasoning_parser_factory: None,
-            tool_parser_factory: None,
-            gateway: None,
-            response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            conversation_item_storage: Arc::new(
-                smg_data_connector::MemoryConversationItemStorage::new(),
-            ),
-            worker_monitor: None,
-            configured_reasoning_parser: None,
-            configured_tool_parser: None,
-            worker_job_queue: Arc::clone(&job_queue),
-            workflow_engines: Arc::new(std::sync::OnceLock::new()),
-            mcp_orchestrator: Arc::new(std::sync::OnceLock::new()),
-            mcp_format_registry: openai_bridge::FormatRegistry::new(),
-            tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
-            multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
-            wasm_manager: None,
-            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
-                &router_config,
-            )),
-            worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
-            inflight_tracker: InFlightRequestTracker::new(),
-            kv_event_monitor: None,
-            rl: None,
-            realtime_registry: Arc::new(RealtimeRegistry::new()),
-            webrtc_bind_addr: None,
-            webrtc_stun_server: None,
-        })
+        app_context_for_tests(router_config, registry, None)
     }
 
     fn make_context(
@@ -195,14 +155,14 @@ mod tests {
         let data = WorkerRemovalWorkflowData {
             config: super::super::find_workers_to_remove::WorkerRemovalRequest {
                 url: worker_urls.first().cloned().unwrap_or_default(),
-                dp_aware: false,
-                expected_revision: None,
+                expected_revisions: None,
             },
             workers_to_remove: Some(WorkerList::from_workers(&workers)),
             worker_urls,
             affected_models: std::collections::HashSet::new(),
             app_context: Some(app_context),
             actual_workers_to_remove: Some(workers),
+            removed_workers: Vec::new(),
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)
     }
@@ -342,5 +302,69 @@ mod tests {
         // Worker was still transitioned to Draining (so the policies stop
         // selecting it during the brief window before remove_from_*).
         assert_eq!(worker.status(), WorkerStatus::Draining);
+    }
+
+    /// The step's Ready check and its write are one step under the worker's
+    /// mutation lock, so a probe that demotes the worker after the step
+    /// looked at it and before it writes is not written over: the worker
+    /// stays NotReady, nothing is drained and no `Draining` is published.
+    /// Checked outside the lock, the step wrote `NotReady -> Draining` here.
+    #[tokio::test]
+    async fn test_drain_workers_step_keeps_a_demotion_written_between_its_read_and_its_write() {
+        use crate::worker::event::WorkerEvent;
+
+        let worker = build_worker("http://w1:8080", 0, WorkerStatus::Ready);
+        let app_ctx = make_app_context(&[Arc::clone(&worker)]);
+        let registry = &app_ctx.worker_registry;
+        let worker_id = registry
+            .get_id_by_url("http://w1:8080")
+            .expect("registered");
+        let revision = worker.revision();
+        let mut events = registry.subscribe_events();
+        let mut ctx = make_context(Arc::clone(&app_ctx), vec![Arc::clone(&worker)]);
+
+        // The step runs on its own thread and runtime so that, paused at the
+        // seam, it blocks neither this test nor the write placed in between.
+        let result = registry.with_another_write_before_the_lock(
+            |_| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the step")
+                    .block_on(DrainWorkersStep.execute(&mut ctx))
+            },
+            |registry| {
+                let ((), transition) = registry
+                    .apply_if_revision(&worker_id, revision, |_| ((), Some(WorkerStatus::NotReady)))
+                    .expect("the worker is there and current");
+                assert_eq!(
+                    transition,
+                    Some((WorkerStatus::Ready, WorkerStatus::NotReady))
+                );
+            },
+        );
+
+        assert_eq!(result.expect("the step succeeds"), StepResult::Success);
+        assert_eq!(
+            worker.status(),
+            WorkerStatus::NotReady,
+            "the demotion written in between stands"
+        );
+        match events.try_recv() {
+            Ok(WorkerEvent::StatusChanged {
+                old_status,
+                new_status,
+                ..
+            }) => assert_eq!(
+                (old_status, new_status),
+                (WorkerStatus::Ready, WorkerStatus::NotReady),
+                "the demotion's event"
+            ),
+            other => panic!("expected the demotion's StatusChanged, got {other:?}"),
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "the step published nothing: no Draining"
+        );
     }
 }

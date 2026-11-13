@@ -9,12 +9,13 @@ use uuid::Uuid;
 use crate::tenant::TenantKey;
 
 /// What a reservation attempt asks for. `model_id` is optional — when
-/// absent, model-rule scoping is skipped.
+/// absent, model-rule scoping is skipped; it is borrowed from the request
+/// for the reserve call, which reads it once against the tenant's rules.
 #[derive(Debug, Clone)]
-pub struct ReserveRequest {
+pub struct ReserveRequest<'a> {
     pub request_charge_id: Uuid,
     pub tenant_key: TenantKey,
-    pub model_id: Option<String>,
+    pub model_id: Option<&'a str>,
     pub estimated_input_tokens: u32,
 }
 
@@ -28,10 +29,21 @@ pub enum ReserveOutcome {
 /// Authoritative usage after a successful call, used to true up the
 /// reservation via `(actual_input_tokens + completion_tokens) -
 /// estimated_input_tokens`.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// `cached_input_tokens` and `reasoning_tokens` are the engine's own split
+/// of those two counts: the prompt tokens it served from its prefix cache
+/// and the completion tokens it spent on reasoning. They take no part in
+/// the true-up; they are carried for the consumers that price or report a
+/// settlement, and are zero where the engine reports none (a reasoning
+/// split the gateway's own parser made is not substituted here).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UsageSettlement {
     pub actual_input_tokens: u32,
     pub completion_tokens: u32,
+    /// Of `actual_input_tokens`, the tokens served from the engine's cache.
+    pub cached_input_tokens: u32,
+    /// Of `completion_tokens`, the tokens the engine counted as reasoning.
+    pub reasoning_tokens: u32,
 }
 
 /// Reserve-once-per-logical-request, settle/close/abandon-once lifecycle,
@@ -39,7 +51,7 @@ pub struct UsageSettlement {
 /// so retries reuse one reservation.
 #[async_trait]
 pub trait RateLimitBackend: Send + Sync {
-    async fn reserve(&self, request: ReserveRequest) -> ReserveOutcome;
+    async fn reserve(&self, request: ReserveRequest<'_>) -> ReserveOutcome;
 
     /// Settle from final, authoritative usage. Idempotent: a no-op if the
     /// reservation was already settled/closed/abandoned.

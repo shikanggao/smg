@@ -3,16 +3,27 @@
 //
 // Mirrors Python `vllm/v1/serial_utils.py` `encode_ndarray`/`encode_tensor`.
 
+//! Numpy arrays and tensors on the wire, laid out as the engine's `encode_ndarray` and
+//! `encode_tensor` write them: `WireNdArray`, its data inline or in an auxiliary frame once it
+//! reaches `TENSOR_AUX_MIN_BYTES`.
+
+use std::{borrow::Cow, cell::RefCell, collections::BTreeMap, fmt};
+
 use bytemuck::{cast_slice, Pod};
 use bytes::Bytes;
 use half::{bf16, f16};
-use rmpv::Value;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    de::{self, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
-use super::dtype::{
-    convert_to_u32, decode_error, decode_f32_vec, decode_i32_vec, decode_i64_vec, parse_dtype,
-    Endianness, ScalarType,
+use super::{
+    dtype::{
+        convert_to_u32, decode_error, decode_f32_vec, decode_float_vec, known_spelling,
+        parse_dtype, Endianness, ScalarType,
+    },
+    encode_msgpack_with_capacity,
 };
 use crate::error::Result;
 
@@ -57,12 +68,59 @@ impl Serialize for ByteSlice<'_> {
     }
 }
 
+/// Write `payload` as a msgpack extension value of type `code` (the
+/// `_ExtStruct` newtype is how `rmp_serde` spells one).
+pub(crate) fn serialize_ext<S>(
+    code: i8,
+    payload: &[u8],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    MsgpackExtRef((code, ByteSlice(payload))).serialize(serializer)
+}
+
 /// Python ndarray/tensor wire tuple encoded as `(dtype, shape, data)`.
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
 pub struct WireNdArray {
-    pub dtype: String,
+    /// The dtype as the wire spells it (`"float32"`, `"<i8"`). A spelling
+    /// this crate knows ([`known_spelling`]) is borrowed from its table at
+    /// the decode, so an array costs no string; any other is kept as written.
+    #[serde(deserialize_with = "deserialize_dtype")]
+    pub dtype: Cow<'static, str>,
     pub shape: Vec<usize>,
     pub data: WireArrayData,
+}
+
+/// A dtype spelling, borrowed from the known table when it is in it.
+fn deserialize_dtype<'de, D>(deserializer: D) -> std::result::Result<Cow<'static, str>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct SpellingVisitor;
+
+    impl Visitor<'_> for SpellingVisitor {
+        type Value = Cow<'static, str>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a dtype string")
+        }
+
+        fn visit_str<E: de::Error>(self, spelling: &str) -> std::result::Result<Self::Value, E> {
+            Ok(known_spelling(spelling)
+                .map_or_else(|| Cow::Owned(spelling.to_owned()), Cow::Borrowed))
+        }
+
+        fn visit_string<E: de::Error>(
+            self,
+            spelling: String,
+        ) -> std::result::Result<Self::Value, E> {
+            Ok(known_spelling(&spelling).map_or(Cow::Owned(spelling), Cow::Borrowed))
+        }
+    }
+
+    deserializer.deserialize_str(SpellingVisitor)
 }
 
 impl WireNdArray {
@@ -121,7 +179,7 @@ impl WireNdArray {
     pub fn from_bool(shape: Vec<usize>, data: Vec<bool>) -> std::result::Result<Self, String> {
         validate_element_count(&shape, data.len())?;
         Ok(Self {
-            dtype: "bool".to_string(),
+            dtype: Cow::Borrowed("bool"),
             shape,
             data: WireArrayData::RawView(Bytes::from(
                 data.into_iter().map(u8::from).collect::<Vec<_>>(),
@@ -130,7 +188,7 @@ impl WireNdArray {
     }
 
     /// Build from already-encoded raw-view bytes matching `dtype`/`shape`.
-    pub fn from_raw(dtype: impl Into<String>, shape: Vec<usize>, data: Vec<u8>) -> Self {
+    pub fn from_raw(dtype: impl Into<Cow<'static, str>>, shape: Vec<usize>, data: Vec<u8>) -> Self {
         Self::from_raw_bytes(dtype, shape, Bytes::from(data))
     }
 
@@ -171,7 +229,11 @@ impl WireNdArray {
     }
 
     /// Build from an owned immutable raw-view buffer.
-    pub fn from_raw_bytes(dtype: impl Into<String>, shape: Vec<usize>, data: Bytes) -> Self {
+    pub fn from_raw_bytes(
+        dtype: impl Into<Cow<'static, str>>,
+        shape: Vec<usize>,
+        data: Bytes,
+    ) -> Self {
         Self {
             dtype: dtype.into(),
             shape,
@@ -179,10 +241,9 @@ impl WireNdArray {
         }
     }
 
-    // NOTE: send-side aux-frame extraction (moving large inline tensors into
-    // ordered aux frames) is added with the typed multimodal module — text
-    // requests carry no tensors. The receive-side resolution below is used now
-    // (logprobs arrays may arrive as aux frames).
+    // The send side moves large tensors into aux frames through
+    // `encode_with_aux_frames`; the receive side resolves them with
+    // `resolve_array_bytes` (logprobs arrays may arrive as aux frames too).
 }
 
 /// Validate that the shape product matches the data length.
@@ -229,29 +290,162 @@ impl WireArrayData {
     }
 }
 
+thread_local! {
+    /// The primary frame of the message under decode ([`decode_within_frame`]),
+    /// so an inline raw view met in it shares the frame's buffer.
+    static DECODING_FRAME: RefCell<Option<Bytes>> = const { RefCell::new(None) };
+}
+
+/// Restores the frame an enclosing decode was reading when a scope ends.
+struct FrameScope(Option<Bytes>);
+
+impl Drop for FrameScope {
+    fn drop(&mut self) {
+        DECODING_FRAME.with(|current| *current.borrow_mut() = self.0.take());
+    }
+}
+
+/// Run `decode` as the decode of `frame`, a message's primary frame: every
+/// inline raw view it meets becomes a slice of that frame, shared by refcount
+/// as an auxiliary frame is ([`resolve_array_bytes`]), instead of a copy per
+/// array. A raw view decoded outside such a scope, or read out of another
+/// buffer, is copied as before.
+pub fn decode_within_frame<T>(frame: &Bytes, decode: impl FnOnce() -> T) -> T {
+    let _scope = FrameScope(DECODING_FRAME.with(|current| current.replace(Some(frame.clone()))));
+    decode()
+}
+
+/// Whether `view` lies inside `frame`'s buffer (a slice of it, or of a
+/// [`Bytes`] that shares it).
+pub(crate) fn lies_within(frame: &Bytes, view: &[u8]) -> bool {
+    let (frame, view) = (frame.as_ptr_range(), view.as_ptr_range());
+    frame.start <= view.start && view.end <= frame.end
+}
+
+/// `view` as [`Bytes`]: a slice of the frame under decode when it lies inside
+/// that frame's buffer, a copy otherwise.
+pub(crate) fn frame_view_bytes(view: &[u8]) -> Bytes {
+    DECODING_FRAME.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .filter(|frame| lies_within(frame, view))
+            .map_or_else(
+                || Bytes::copy_from_slice(view),
+                |frame| frame.slice_ref(view),
+            )
+    })
+}
+
+/// The payload of a raw-view ext as [`Bytes`], through [`frame_view_bytes`].
+struct RawViewPayload(Bytes);
+
+impl<'de> Deserialize<'de> for RawViewPayload {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = RawViewPayload;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("the raw view's bytes")
+            }
+
+            fn visit_borrowed_bytes<E: de::Error>(
+                self,
+                view: &'de [u8],
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(RawViewPayload(frame_view_bytes(view)))
+            }
+
+            fn visit_bytes<E: de::Error>(self, view: &[u8]) -> std::result::Result<Self::Value, E> {
+                Ok(RawViewPayload(Bytes::copy_from_slice(view)))
+            }
+
+            fn visit_byte_buf<E: de::Error>(
+                self,
+                view: Vec<u8>,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(RawViewPayload(Bytes::from(view)))
+            }
+        }
+
+        deserializer.deserialize_bytes(PayloadVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for WireArrayData {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let value = Value::deserialize(deserializer)?;
-        match value {
-            Value::Ext(tag, bytes) if tag == CUSTOM_TYPE_RAW_VIEW => {
-                Ok(Self::RawView(Bytes::from(bytes)))
+        struct DataVisitor;
+
+        impl<'de> Visitor<'de> for DataVisitor {
+            type Value = WireArrayData;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a raw-view ext or an aux frame index")
             }
-            Value::Ext(tag, _) => Err(serde::de::Error::custom(format!(
-                "unsupported extension type code {tag}"
-            ))),
-            Value::Integer(index) => index
-                .as_u64()
-                .map(|index| Self::AuxIndex(index as usize))
-                .ok_or_else(|| {
-                    serde::de::Error::custom("aux frame index must be a non-negative integer")
-                }),
-            other => Err(serde::de::Error::custom(format!(
-                "expected raw-view ext or aux frame index, got {other:?}"
-            ))),
+
+            fn visit_u64<E: de::Error>(self, index: u64) -> std::result::Result<Self::Value, E> {
+                usize::try_from(index)
+                    .map(WireArrayData::AuxIndex)
+                    .map_err(|_| E::custom("aux frame index does not fit usize"))
+            }
+
+            fn visit_i64<E: de::Error>(self, index: i64) -> std::result::Result<Self::Value, E> {
+                u64::try_from(index)
+                    .map_err(|_| E::custom("aux frame index must be a non-negative integer"))
+                    .and_then(|index| self.visit_u64(index))
+            }
+
+            /// An ext value, which `rmp_serde` hands over as a newtype around
+            /// the pair of its type code and its payload; the payload is
+            /// borrowed from the input when the input is a slice.
+            fn visit_newtype_struct<D>(
+                self,
+                deserializer: D,
+            ) -> std::result::Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                deserializer.deserialize_tuple(2, ExtVisitor)
+            }
         }
+
+        struct ExtVisitor;
+
+        impl<'de> Visitor<'de> for ExtVisitor {
+            type Value = WireArrayData;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an ext value's type code and payload")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let tag: i8 = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                if tag != CUSTOM_TYPE_RAW_VIEW {
+                    return Err(de::Error::custom(format!(
+                        "unsupported extension type code {tag}"
+                    )));
+                }
+                let RawViewPayload(bytes) = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                Ok(WireArrayData::RawView(bytes))
+            }
+        }
+
+        deserializer.deserialize_any(DataVisitor)
     }
 }
 
@@ -262,11 +456,134 @@ impl Serialize for WireArrayData {
     {
         match self {
             Self::AuxIndex(index) => serializer.serialize_u64(*index as u64),
-            Self::RawView(bytes) => {
-                MsgpackExtRef((CUSTOM_TYPE_RAW_VIEW, ByteSlice(bytes))).serialize(serializer)
-            }
+            Self::RawView(bytes) => serialize_ext(CUSTOM_TYPE_RAW_VIEW, bytes, serializer),
         }
     }
+}
+
+/// Tensors of at least this many bytes leave the primary msgpack payload and
+/// travel as auxiliary frames of the same message, sharing their [`Bytes`]
+/// storage ([`encode_with_aux_frames`]); smaller ones stay inline, where the
+/// copy into the payload costs less than the clone of the payload's metadata
+/// the extraction takes.
+pub const TENSOR_AUX_MIN_BYTES: usize = 32 * 1024;
+
+/// A wire value that carries tensors. A request payload implements it over
+/// its own shape (nested lists, maps, masks); the send side moves large
+/// tensors into auxiliary frames through it without knowing that shape.
+pub trait TensorFields {
+    /// Visit every tensor payload, in wire order.
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData));
+    /// Visit every tensor payload mutably, in the same order.
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData));
+}
+
+impl TensorFields for WireNdArray {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        visit(&self.data);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        visit(&mut self.data);
+    }
+}
+
+impl<T: TensorFields> TensorFields for Option<T> {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        if let Some(value) = self {
+            value.for_each_tensor(visit);
+        }
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        if let Some(value) = self {
+            value.for_each_tensor_mut(visit);
+        }
+    }
+}
+
+impl<T: TensorFields> TensorFields for Vec<T> {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        for value in self {
+            value.for_each_tensor(visit);
+        }
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        for value in self {
+            value.for_each_tensor_mut(visit);
+        }
+    }
+}
+
+impl<K, T: TensorFields> TensorFields for BTreeMap<K, T> {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        for value in self.values() {
+            value.for_each_tensor(visit);
+        }
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        for value in self.values_mut() {
+            value.for_each_tensor_mut(visit);
+        }
+    }
+}
+
+/// Where a payload's tensors go on the wire, decided by one scan before
+/// anything is cloned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorPlacement {
+    /// Every tensor stays inline: none reaches [`TENSOR_AUX_MIN_BYTES`], or
+    /// the payload already addresses auxiliary frames (a caller's own
+    /// indices, which a second extraction would rebase).
+    Inline,
+    /// At least one tensor leaves the payload as an auxiliary frame.
+    AuxFrames,
+}
+
+/// The placement of `payload`'s tensors.
+pub fn tensor_placement<T: TensorFields + ?Sized>(payload: &T) -> TensorPlacement {
+    let mut large = false;
+    let mut indexed = false;
+    payload.for_each_tensor(&mut |data| match data {
+        WireArrayData::AuxIndex(_) => indexed = true,
+        WireArrayData::RawView(bytes) => large |= bytes.len() >= TENSOR_AUX_MIN_BYTES,
+    });
+    if large && !indexed {
+        TensorPlacement::AuxFrames
+    } else {
+        TensorPlacement::Inline
+    }
+}
+
+/// Encode `payload` as msgpack with its large tensors as auxiliary frames, in
+/// visiting order and addressed one-based (frame 0 is the payload itself). A
+/// payload whose tensors stay inline ([`tensor_placement`]) is encoded as it
+/// is, without a clone; `payload` is never changed either way. The payload's
+/// buffer is reserved at `capacity` bytes before the write
+/// ([`encode_msgpack_with_capacity`]; [`super::add_request_capacity`] for an
+/// add-request).
+pub fn encode_with_aux_frames<T>(payload: &T, capacity: usize) -> Result<(Vec<u8>, Vec<Bytes>)>
+where
+    T: Serialize + Clone + TensorFields + fmt::Debug,
+{
+    if tensor_placement(payload) == TensorPlacement::Inline {
+        return Ok((encode_msgpack_with_capacity(payload, capacity)?, Vec::new()));
+    }
+    // Tensor storage is `Bytes`: the clone shares every buffer, and the
+    // frames below share them again.
+    let mut wire = payload.clone();
+    let mut frames = Vec::new();
+    wire.for_each_tensor_mut(&mut |data| {
+        if let WireArrayData::RawView(bytes) = data {
+            if bytes.len() >= TENSOR_AUX_MIN_BYTES {
+                frames.push(bytes.clone());
+                *data = WireArrayData::AuxIndex(frames.len());
+            }
+        }
+    });
+    Ok((encode_msgpack_with_capacity(&wire, capacity)?, frames))
 }
 
 /// A decoded rank-2 array with its dimensions.
@@ -395,6 +712,37 @@ pub fn decode_array2_f32(
     })
 }
 
+/// A floating-point tensor decoded to `f32`, flattened in row-major order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedFloatTensor {
+    pub shape: Vec<usize>,
+    pub data: Vec<f32>,
+}
+
+/// Decode a floating-point tensor of any rank (float32, float16, bfloat16 or
+/// float64 elements) to `f32` values.
+pub fn decode_tensor_f32(
+    value: WireNdArray,
+    field: &str,
+    frames: &[Bytes],
+) -> Result<DecodedFloatTensor> {
+    let (shape, bytes, scalar, endianness) = decode_array_metadata(
+        value,
+        field,
+        frames,
+        &[
+            ScalarType::F32,
+            ScalarType::F16,
+            ScalarType::BF16,
+            ScalarType::F64,
+        ],
+    )?;
+    let data = decode_float_vec(&bytes, scalar, endianness, field)?;
+    Ok(DecodedFloatTensor { shape, data })
+}
+
+/// `bytes` as `u32` values, read as `scalar` integers in `endianness` and
+/// converted one by one into one vector of their count.
 fn decode_int_as_u32(
     bytes: &[u8],
     scalar: ScalarType,
@@ -402,21 +750,135 @@ fn decode_int_as_u32(
     field: &str,
 ) -> Result<Vec<u32>> {
     match scalar {
-        ScalarType::I32 => decode_i32_vec(bytes, endianness, field)?
-            .into_iter()
-            .map(|value| convert_to_u32(value, field))
-            .collect(),
-        ScalarType::I64 => decode_i64_vec(bytes, endianness, field)?
-            .into_iter()
-            .map(|value| convert_to_u32(value, field))
-            .collect(),
-        ScalarType::F32 => Err(decode_error(field, "expected integer dtype, got f32")),
+        ScalarType::I32 => ints_as_u32(bytes, field, |chunk: [u8; 4]| match endianness {
+            Endianness::Little => i32::from_le_bytes(chunk),
+            Endianness::Big => i32::from_be_bytes(chunk),
+            Endianness::Native => i32::from_ne_bytes(chunk),
+        }),
+        ScalarType::I64 => ints_as_u32(bytes, field, |chunk: [u8; 8]| match endianness {
+            Endianness::Little => i64::from_le_bytes(chunk),
+            Endianness::Big => i64::from_be_bytes(chunk),
+            Endianness::Native => i64::from_ne_bytes(chunk),
+        }),
+        ScalarType::F16 | ScalarType::BF16 | ScalarType::F32 | ScalarType::F64 => Err(
+            decode_error(field, &format!("expected integer dtype, got {scalar:?}")),
+        ),
     }
+}
+
+/// `bytes` as `N`-byte integers through `read`, each converted to `u32`.
+fn ints_as_u32<const N: usize, I>(
+    bytes: &[u8],
+    field: &str,
+    read: impl Fn([u8; N]) -> I,
+) -> Result<Vec<u32>>
+where
+    I: TryInto<u32> + fmt::Display + Copy,
+{
+    let (chunks, rest) = bytes.as_chunks::<N>();
+    if !rest.is_empty() {
+        return Err(decode_error(
+            field,
+            &format!("byte length {} is not divisible by {N}", bytes.len()),
+        ));
+    }
+    let mut values = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        values.push(convert_to_u32(read(*chunk), field)?);
+    }
+    Ok(values)
 }
 
 #[cfg(test)]
 mod tests {
+    use rmpv::Value;
+
     use super::*;
+    use crate::codec::{encode_msgpack, hex};
+
+    /// A raw-view array decoded as part of its message's frame shares the
+    /// frame's buffer; decoded from a plain slice, it is copied.
+    #[test]
+    fn an_inline_raw_view_decoded_within_its_frame_shares_the_frame() {
+        let array = WireNdArray::from_raw("<i8", vec![2], 1_i64.to_le_bytes().repeat(2));
+        let frame = Bytes::from(encode_msgpack(&array).unwrap());
+        let is_within = |view: &Bytes, frame: &Bytes| lies_within(frame, view);
+
+        let shared: WireNdArray =
+            decode_within_frame(&frame, || rmp_serde::from_slice(&frame)).unwrap();
+        let view = shared.data.as_raw_view().unwrap();
+        assert!(is_within(view, &frame), "the view is a slice of the frame");
+        assert_eq!(view, array.data.as_raw_view().unwrap());
+
+        let copied: WireNdArray = rmp_serde::from_slice(&frame).unwrap();
+        let view = copied.data.as_raw_view().unwrap();
+        assert!(
+            !is_within(view, &frame),
+            "outside a scope the view is a copy"
+        );
+        assert_eq!(view, array.data.as_raw_view().unwrap());
+
+        // A scope over another buffer: the view is not in it, so it is copied.
+        let other = Bytes::from(vec![0_u8; frame.len()]);
+        let elsewhere: WireNdArray =
+            decode_within_frame(&other, || rmp_serde::from_slice(&frame)).unwrap();
+        let view = elsewhere.data.as_raw_view().unwrap();
+        assert!(!is_within(view, &frame) && !is_within(view, &other));
+        assert_eq!(elsewhere, array);
+    }
+
+    /// A known dtype spelling is borrowed from the table and an unknown one
+    /// kept as written; both encode back to the bytes they came from.
+    #[test]
+    fn a_dtype_spelling_is_borrowed_when_known_and_kept_otherwise() {
+        for (spelling, known) in [("<i8", true), ("float32", true), ("complex64", false)] {
+            let array = WireNdArray {
+                dtype: Cow::Owned(spelling.to_owned()),
+                shape: vec![1],
+                data: WireArrayData::AuxIndex(1),
+            };
+            let encoded = encode_msgpack(&array).unwrap();
+            let decoded: WireNdArray = rmp_serde::from_slice(&encoded).unwrap();
+            assert_eq!(decoded.dtype, spelling);
+            assert_eq!(
+                matches!(decoded.dtype, Cow::Borrowed(_)),
+                known,
+                "{spelling}"
+            );
+            assert_eq!(encode_msgpack(&decoded).unwrap(), encoded, "{spelling}");
+        }
+    }
+
+    /// The integer columns' conversion to `u32`: a negative value and a
+    /// length that is no whole number of elements are refused by name.
+    #[test]
+    fn integer_columns_convert_in_one_pass_and_refuse_what_is_not_u32() {
+        let ids = |values: &[i64]| {
+            WireNdArray::from_raw_bytes(
+                ">i8",
+                vec![values.len()],
+                Bytes::from(
+                    values
+                        .iter()
+                        .flat_map(|v| v.to_be_bytes())
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        };
+        assert_eq!(
+            decode_array1_u32(ids(&[0, 7, u32::MAX as i64]), "ids", &[]).unwrap(),
+            vec![0, 7, u32::MAX]
+        );
+        let negative = decode_array1_u32(ids(&[1, -2]), "ids", &[]).unwrap_err();
+        assert!(
+            negative.to_string().contains("ids: expected non-negative"),
+            "{negative}"
+        );
+
+        let ragged = WireNdArray::from_raw("<i4", vec![1], vec![1, 2, 3, 4, 5]);
+        let error = decode_array1_u32(ragged, "ids", &[]).unwrap_err();
+        assert!(error.to_string().contains("byte length"), "{error}");
+    }
 
     #[test]
     fn raw_view_serializes_as_msgpack_ext() {
@@ -504,6 +966,108 @@ mod tests {
         let resolved = resolve_array_bytes(WireArrayData::AuxIndex(1), "ids", &frames).unwrap();
         // Zero-copy: the resolved payload aliases the received frame.
         assert_eq!(resolved.as_ptr(), frame.as_ptr());
+    }
+
+    /// Golden bytes from vLLM's `MsgpackEncoder` (vLLM 0.30.1rc1) for
+    /// `torch.tensor([0.25, -1.5, 3.0])` in float32, bfloat16 and float16:
+    /// `(dtype, shape, raw-view ext)` with the dtype as the torch name.
+    #[test]
+    fn decode_tensor_f32_reads_vllm_encoded_torch_tensors() {
+        for (pin, dtype) in [
+            (
+                "93a7666c6f617433329103c70c030000803e0000c0bf00004040",
+                "float32",
+            ),
+            ("93a862666c6f617431369103c70603803ec0bf4040", "bfloat16"),
+            ("93a7666c6f617431369103c70603003400be0042", "float16"),
+        ] {
+            let bytes = hex(pin);
+            let wire: WireNdArray = rmp_serde::from_slice(&bytes).expect("wire tensor");
+            assert_eq!(wire.dtype, dtype);
+            assert_eq!(wire.shape, vec![3]);
+            let decoded = decode_tensor_f32(wire, "t", &[]).unwrap();
+            assert_eq!(decoded.shape, vec![3]);
+            assert_eq!(decoded.data, vec![0.25, -1.5, 3.0], "{dtype}");
+        }
+    }
+
+    /// A tensor over the inline threshold rides as an aux frame: the wire
+    /// tuple carries the frame index (`93 a7 float32 91 60 01`).
+    #[test]
+    fn decode_tensor_f32_follows_an_aux_frame_index() {
+        let wire: WireNdArray =
+            rmp_serde::from_slice(&hex("93a7666c6f61743332916001")).expect("wire tensor");
+        assert_eq!(wire.data, WireArrayData::AuxIndex(1));
+        let values: Vec<f32> = (0..96).map(|i| i as f32 / 8.0).collect();
+        let frame = Bytes::from(
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let decoded = decode_tensor_f32(wire, "t", &[Bytes::new(), frame]).unwrap();
+        assert_eq!(decoded.shape, vec![96]);
+        assert_eq!(decoded.data, values);
+    }
+
+    #[test]
+    fn decode_tensor_f32_rejects_integer_dtypes() {
+        let wire = WireNdArray::from_i64(vec![1], vec![7]).unwrap();
+        let error = decode_tensor_f32(wire, "t", &[]).unwrap_err();
+        assert!(error.to_string().contains("expected dtype in"), "{error}");
+    }
+
+    /// A tensor leaves the payload at the auxiliary size and not below it;
+    /// a payload that already addresses frames keeps every tensor where it
+    /// is; the frames come in visiting order and share the tensors' storage,
+    /// and the payload the caller holds is untouched.
+    #[test]
+    fn large_tensors_leave_the_payload_as_frames_in_order_without_a_copy() {
+        let tensor = |n: usize| WireNdArray::from_raw("uint8", vec![n], vec![n as u8; n]);
+        let small = vec![tensor(0), tensor(255), tensor(TENSOR_AUX_MIN_BYTES - 1)];
+        assert_eq!(tensor_placement(&small), TensorPlacement::Inline);
+        let (payload, frames) = encode_with_aux_frames(&small, 0).unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(payload, encode_msgpack(&small).unwrap());
+
+        let mixed = vec![
+            tensor(TENSOR_AUX_MIN_BYTES),
+            tensor(16),
+            tensor(2 * TENSOR_AUX_MIN_BYTES),
+        ];
+        assert_eq!(tensor_placement(&mixed), TensorPlacement::AuxFrames);
+        let inline = encode_msgpack(&mixed).unwrap();
+        let (payload, frames) = encode_with_aux_frames(&mixed, 0).unwrap();
+        assert_eq!(
+            frames.iter().map(Bytes::len).collect::<Vec<_>>(),
+            vec![TENSOR_AUX_MIN_BYTES, 2 * TENSOR_AUX_MIN_BYTES]
+        );
+        let storage = |array: &WireNdArray| array.data.as_raw_view().unwrap().as_ptr();
+        assert_eq!(frames[0].as_ptr(), storage(&mixed[0]));
+        assert_eq!(frames[1].as_ptr(), storage(&mixed[2]));
+        assert!(payload.len() < 64, "{} bytes", payload.len());
+        assert_eq!(
+            encode_msgpack(&mixed).unwrap(),
+            inline,
+            "the caller's value"
+        );
+        let decoded: Vec<WireNdArray> = rmp_serde::from_slice(&payload).unwrap();
+        assert_eq!(decoded[0].data, WireArrayData::AuxIndex(1));
+        assert_eq!(decoded[1].data, mixed[1].data);
+        assert_eq!(decoded[2].data, WireArrayData::AuxIndex(2));
+        let mut all = vec![Bytes::from(payload)];
+        all.extend(frames);
+        assert_eq!(
+            resolve_array_bytes(decoded[2].data.clone(), "t", &all).unwrap(),
+            *mixed[2].data.as_raw_view().unwrap()
+        );
+
+        let mut indexed = mixed.clone();
+        indexed[1].data = WireArrayData::AuxIndex(1);
+        assert_eq!(tensor_placement(&indexed), TensorPlacement::Inline);
+        let (payload, frames) = encode_with_aux_frames(&indexed, 0).unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(payload, encode_msgpack(&indexed).unwrap());
     }
 
     #[test]

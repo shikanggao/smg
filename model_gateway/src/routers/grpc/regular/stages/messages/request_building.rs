@@ -1,21 +1,29 @@
 //! Message request building stage: Build proto GenerateRequest for message requests
 
+use std::{borrow::Cow, sync::Arc};
+
 use async_trait::async_trait;
 use axum::response::Response;
-use openai_protocol::messages;
-use tracing::error;
+use openai_protocol::profile::ProviderProfile;
+use smg_grpc_client::FormatSetAside;
 
 use crate::routers::{
     error,
     grpc::{
-        client::GenerateRequestBuildOptions,
-        common::stages::{helpers, BuildStage},
+        common::stages::{
+            helpers::{self, TagForStart},
+            selection_context_length, BuildStage,
+        },
         context::{
-            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
+            stage_output, AttemptStamp, BuildOutput, ExecutionPlan, PlanSettings,
             PreparationOutput, RequestContext,
         },
-        multimodal::{assemble_multimodal_data, assemble_multimodal_data_after_encode},
-        spec::{MessagesResponseSpec, ResponseSpec},
+        proto_wrapper::MultimodalData,
+        regular::{
+            stages::{backed_plan, reading},
+            symphony,
+        },
+        spec::ResponseSpec,
         utils,
     },
 };
@@ -25,54 +33,82 @@ use crate::routers::{
 /// Builds a backend-specific proto GenerateRequest from the PreparationOutput
 /// and CreateMessageRequest sampling parameters.
 pub(crate) struct MessageRequestBuildingStage {
-    inject_pd_metadata: bool,
-    plan_kind: ExecutionPlanKind,
+    settings: PlanSettings,
 }
 
 impl MessageRequestBuildingStage {
-    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
-        Self {
-            inject_pd_metadata,
-            plan_kind,
-        }
+    pub fn new(settings: PlanSettings) -> Self {
+        Self { settings }
     }
+}
+
+/// Build the backend `GenerateRequest` from the Messages request through the
+/// sequence the chat and Messages stages share ([`backed_plan::build`]), with
+/// the Messages request's client builder, its id prefix and the sampling mask
+/// of its request type; returns the plan and the attempt stamp.
+#[expect(clippy::too_many_arguments)]
+fn build_messages_backed_plan(
+    ctx: &mut RequestContext,
+    messages_request: &openai_protocol::messages::CreateMessageRequest,
+    processed_text: String,
+    token_ids: Vec<u32>,
+    tool_constraints: Option<(String, String)>,
+    table_tag: Option<Arc<dyn TagForStart>>,
+    first_token_tag: bool,
+    require_reasoning: bool,
+    multimodal_data: Option<MultimodalData>,
+    settings: PlanSettings,
+) -> Result<(ExecutionPlan, AttemptStamp), Response> {
+    let sampling_mask = helpers::SamplingDefaultsMask::from_request_type(&ctx.input.request_type);
+    backed_plan::build(
+        ctx,
+        backed_plan::Inputs {
+            function: "MessageRequestBuildingStage::build",
+            id_prefix: "msg_",
+            model: &messages_request.model,
+            processed_text,
+            token_ids,
+            tool_constraints,
+            // A Messages body names no format of its own.
+            format_set_aside: FormatSetAside::default(),
+            table_tag,
+            first_token_tag,
+            require_reasoning,
+            multimodal_data,
+            sampling_mask,
+            settings,
+        },
+        |client, request_id, processed_text, token_ids, options| {
+            client.build_messages_request(
+                request_id,
+                messages_request,
+                processed_text,
+                token_ids,
+                options,
+            )
+        },
+    )
 }
 
 #[async_trait]
 impl BuildStage for MessageRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
-        // Take preparation state (last consumer — worker_selection already ran)
-        let prep = ctx.state.preparation.take().ok_or_else(|| {
-            error!(
-                function = "MessageRequestBuildingStage::build",
-                "Preparation not completed"
-            );
-            error::internal_error("preparation_not_completed", "Preparation not completed")
-        })?;
+        let multimodal_data =
+            helpers::assemble_prompt_media(ctx, "MessageRequestBuildingStage::build").await?;
 
-        let clients = ctx.state.clients.as_ref().ok_or_else(|| {
-            error!(
-                function = "MessageRequestBuildingStage::build",
-                "Client acquisition not completed"
-            );
-            error::internal_error(
-                "client_acquisition_not_completed",
-                "Client acquisition not completed",
-            )
-        })?;
+        // Take preparation state (last consumer — worker_selection already ran)
+        let prep = stage_output(
+            ctx.state.preparation.take(),
+            "MessageRequestBuildingStage::build",
+        )?;
 
         let messages_request = ctx.messages_request_arc();
-
-        // Get client for building request (use prefill client in disaggregated mode)
-        let builder_client = match clients {
-            ClientSelection::Single { client } => client,
-            ClientSelection::Disaggregated { prefill, .. } => prefill,
-        };
 
         let PreparationOutput::Messages {
             token_ids,
             processed_messages,
             tool_constraints,
+            mut spec,
         } = prep
         else {
             debug_assert!(false, "pipeline guarantees Messages variant");
@@ -82,110 +118,99 @@ impl BuildStage for MessageRequestBuildingStage {
             ));
         };
 
-        // Build message request
-        let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
-        let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
-            &ctx.input.request_type,
-            ctx.input.tenant_request_meta.as_ref(),
-            "msg_",
-            disaggregated,
-        );
-
-        // `encode_outputs` set by EncodeStage selects the pixel-drop assembly path.
-        let is_encode_routed = ctx.state.encode_outputs.is_some();
-
-        // Assemble backend-specific multimodal data now that the backend is known;
-        // take the intermediate here for the prefill serialization. When
-        // encode-routed, drop the prefill pixels.
-        let multimodal_data = if let Some(intermediate) = ctx.state.multimodal_intermediate.take() {
-            let assembled = if is_encode_routed {
-                assemble_multimodal_data_after_encode(
-                    intermediate,
-                    builder_client,
-                    ctx.state.workers.as_ref(),
+        let continued_final_message = processed_messages.continued_final_message;
+        let provider = ctx
+            .state
+            .provider
+            .unwrap_or_else(|| ProviderProfile::for_model(&messages_request.model));
+        let (require_reasoning, thought_closed) = reading::reasoning_decision(
+            ctx,
+            &messages_request.model,
+            &processed_messages.text,
+            |tokenizer| {
+                utils::messages_reasoning_starts_in_prefill_for(
+                    &messages_request,
+                    provider,
+                    continued_final_message,
+                    tokenizer,
                 )
-                .await
-            } else {
-                assemble_multimodal_data(intermediate, builder_client, ctx.state.workers.as_ref())
-                    .await
-            };
-            Some(assembled.map_err(|e| {
-                error!(function = "MessageRequestBuildingStage::build", error = %e, "Failed to assemble multimodal request");
-                error::bad_request("multimodal_not_supported", format!("{e}"))
-            })?)
-        } else {
-            None
-        };
-
-        let user_thinking = match &messages_request.thinking {
-            Some(messages::ThinkingConfig::Enabled { .. })
-            | Some(messages::ThinkingConfig::Adaptive { .. }) => Some(true),
-            Some(messages::ThinkingConfig::Disabled) => Some(false),
-            None => None,
-        };
-        let require_reasoning = ctx.tokenizer_arc().is_some_and(|tokenizer| {
-            utils::should_mark_reasoning_started(user_thinking, tokenizer.as_ref())
-        });
-
-        let mut proto_request = builder_client
-            .build_messages_request(
-                request_id,
-                &messages_request,
-                processed_messages.text,
-                token_ids,
-                GenerateRequestBuildOptions {
-                    multimodal_inputs: multimodal_data,
-                    tool_constraints,
-                    require_reasoning,
-                },
-            )
-            .map_err(|e| {
-                error!(function = "MessageRequestBuildingStage::build", error = %e, "Failed to build generate request");
-                error::bad_request("invalid_request_parameters", format!("Invalid request parameters: {e}"))
-            })?;
-
-        let sampling_mask =
-            helpers::SamplingDefaultsMask::from_request_type(&ctx.input.request_type);
-        let sampling_baseline = helpers::apply_sampling_defaults(
-            &mut proto_request,
-            sampling_mask,
-            ctx.state.workers.as_ref(),
+            },
         );
 
-        // The client resolves string `stop`s its engine can't match and
-        // reports the router's residual trim obligation; no transport
-        // knowledge needed here.
-        ctx.state.response.router_stop_obligations = builder_client
-            .finalize_generate_request(&mut proto_request, ctx.tokenizer_arc().as_ref());
-
-        if self.inject_pd_metadata {
-            if let Some(workers) = ctx.state.workers.as_ref() {
-                helpers::maybe_inject_pd_metadata(&mut proto_request, workers);
-            }
-        }
-
-        // EPD: inject the per-item encode bootstrap info into the prefill
-        // request; the dispatch plan stays on `encode_outputs` for request
-        // execution to take.
-        if let Some(outputs) = ctx.state.encode_outputs.as_mut() {
-            proto_request.set_encode_bootstrap_info(std::mem::take(&mut outputs.bootstrap_info));
-        }
-
-        // EPD: inject the prefill->decode KV rendezvous (mirrors the chat path).
-        // No-op unless the backend carries it in the request.
-        if let Some(workers) = ctx.state.workers.as_ref() {
-            helpers::maybe_inject_pd_rendezvous(&mut proto_request, workers);
-        }
-
-        Ok(BuildOutput {
-            plan: ExecutionPlan::generate(self.plan_kind, proto_request),
-            spec: ResponseSpec::Messages(MessagesResponseSpec::from(messages_request.as_ref())),
-            stamp: AttemptStamp {
-                id: id_stamp,
-                sampling_mask,
-                sampling_baseline,
-                inject_pd_metadata: self.inject_pd_metadata,
+        // What constrains the output on the selected worker, and Symphony's
+        // assignment, decided as for a chat request (`reading::decide`), in
+        // the order the chat builder has: the assignment takes the constraint
+        // as the request carries it, before the worker's shaping in the plan
+        // builder below. The `auto` tag derives for the request over the
+        // tools the template sees. The state records which parser reads the
+        // message, for the response's header.
+        let reading::Decided {
+            table_tag,
+            tool_constraints,
+            first_token,
+            assignment,
+            ..
+        } = reading::decide(
+            ctx,
+            symphony::Asks::Messages {
+                request: &messages_request,
+                continues: messages_request.continues_final_assistant(),
             },
+            &spec.chat_tools,
+            &processed_messages.text,
+            tool_constraints,
+            |_| {
+                // The tag shares the spec's tools where `tool_choice` narrows
+                // nothing (the common case): no copy of the schemas on the
+                // first attempt; a narrowed list is the one the narrowing owns.
+                let tools: Arc<[_]> = match utils::template_tools(
+                    &spec.chat_tools,
+                    messages_request.tool_choice.as_ref(),
+                ) {
+                    Cow::Owned(narrowed) => Arc::from(narrowed),
+                    Cow::Borrowed([]) => Arc::default(),
+                    Cow::Borrowed(_) => Arc::clone(&spec.chat_tools),
+                };
+                reading::Auto {
+                    request: symphony::AutoRequest::Messages {
+                        request: Arc::clone(&messages_request),
+                        tools,
+                        continues: continued_final_message,
+                    },
+                    reasoning_open: require_reasoning,
+                    thought_closed,
+                }
+            },
+        )?;
+
+        let prompt_tokens = u32::try_from(token_ids.len()).unwrap_or(u32::MAX);
+        let (plan, stamp) = build_messages_backed_plan(
+            ctx,
+            &messages_request,
+            processed_messages.text,
+            token_ids,
+            tool_constraints,
+            table_tag,
+            first_token,
+            require_reasoning,
+            multimodal_data,
+            self.settings,
+        )?;
+        spec.reasoning_in_prefill = require_reasoning;
+        spec.prompt_tokens = prompt_tokens;
+        // The selected worker's window, for the stop reason of a `length`
+        // finish (`MessagesResponseSpec::length_stop_reason`).
+        spec.context_window = ctx
+            .state
+            .workers
+            .as_ref()
+            .and_then(|workers| selection_context_length(workers, &ctx.input.model_id));
+        spec.symphony = assignment;
+        spec.parser_names.clone_from(&ctx.state.parser_names);
+        Ok(BuildOutput {
+            plan,
+            spec: ResponseSpec::Messages(spec),
+            stamp,
         })
     }
 
@@ -195,9 +220,64 @@ impl BuildStage for MessageRequestBuildingStage {
 
     #[cfg(test)]
     fn signature(&self) -> String {
-        format!(
-            "MessageRequestBuildingStage(inject_pd_metadata={}, {:?})",
-            self.inject_pd_metadata, self.plan_kind
+        format!("MessageRequestBuildingStage({})", self.settings.signature())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::messages::CreateMessageRequest;
+    use serde_json::json;
+
+    use super::*;
+    use crate::routers::grpc::{
+        context::{ClientSelection, ExecutionPlanKind},
+        regular::stages::testing::{
+            assert_fixed_request_plan, components, mock_backend_client, FORCED_CALL_TAG,
+        },
+    };
+
+    const MODEL: &str = "test-model";
+
+    /// The builder's sequence on the fixed request of
+    /// [`assert_fixed_request_plan`], asked as a Messages request with no
+    /// worker selected and the prompt's thought decided closed: the plan and
+    /// the stamp read as pinned there, with the id under the Messages prefix.
+    #[tokio::test]
+    async fn a_fixed_messages_request_builds_the_pinned_plan_and_stamp() {
+        let (client, engine) = mock_backend_client(MODEL).await;
+        let messages: Arc<CreateMessageRequest> = Arc::new(
+            serde_json::from_value(json!({
+                "model": MODEL, "temperature": 0.5, "max_tokens": 7,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .expect("a Messages request"),
+        );
+        let mut ctx = RequestContext::for_messages(
+            Arc::clone(&messages),
+            None,
+            MODEL.to_string(),
+            components(),
+        );
+        ctx.state.clients = Some(ClientSelection::Single { client });
+        let (plan, stamp) = build_messages_backed_plan(
+            &mut ctx,
+            &messages,
+            "<prompt>".to_string(),
+            vec![1, 2, 3],
+            Some(("structural_tag".to_string(), FORCED_CALL_TAG.to_string())),
+            None,
+            false,
+            false,
+            None,
+            PlanSettings {
+                inject_pd_metadata: false,
+                plan_kind: ExecutionPlanKind::Single,
+            },
         )
+        .map_err(|refusal| refusal.status())
+        .expect("built");
+        engine.abort();
+        assert_fixed_request_plan(&plan, &stamp, "msg_");
     }
 }

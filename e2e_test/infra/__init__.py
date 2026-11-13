@@ -12,6 +12,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     DEFAULT_STARTUP_TIMEOUT,
     ENV_BACKENDS,
     ENV_CONNECTION_MODE,
+    ENV_HOST,
     ENV_MODEL,
     ENV_MODELS,
     ENV_RUNTIME,
@@ -33,9 +34,19 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     ConnectionMode,
     Runtime,
     WorkerType,
+    default_host,
+    effective_parser,
+    effective_startup_timeout,
     get_connection_mode_override,
+    get_mm_processing,
+    get_mock_wire,
+    get_parser,
     get_runtime,
+    get_servicer_impl,
+    get_servicer_impl_setting,
+    get_startup_timeout,
     get_zmq_engine_count,
+    host_port,
     is_mlx,
     is_sglang,
     is_trtllm,
@@ -44,6 +55,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
 from .gateway import Gateway, WorkerInfo, launch_cloud_gateway
 from .gpu_monitor import GPUMonitor
 from .gpu_monitor import should_monitor as should_monitor_gpu
+from .mm_processing import assert_mm_processing
 from .model_specs import (  # Default model paths; Model groups
     CHAT_MODELS,
     DEFAULT_EMBEDDING_MODEL_PATH,
@@ -70,7 +82,7 @@ from .process_utils import (
     wait_for_workers_ready,
 )
 from .run_eval import run_eval
-from .worker import Worker, start_workers, stop_workers
+from .worker import Worker, start_workers, stop_workers, worker_startup_timeout
 from .worker_pool import WorkerPool, cleanup_pool, get_pool
 
 __all__ = [
@@ -89,6 +101,8 @@ __all__ = [
     # Defaults
     "DEFAULT_MODEL",
     "DEFAULT_HOST",
+    "default_host",
+    "host_port",
     "BRAVE_MCP_HOST",
     "BRAVE_MCP_PORT",
     "BRAVE_MCP_URL",
@@ -106,14 +120,24 @@ __all__ = [
     "ENV_MODEL",
     "ENV_RUNTIME",
     "ENV_CONNECTION_MODE",
+    "ENV_HOST",
     "ENV_STARTUP_TIMEOUT",
     "ENV_SKIP_MODEL_POOL",
     "ENV_SKIP_BACKEND_SETUP",
     "ENV_SHOW_ROUTER_LOGS",
     "ENV_SHOW_WORKER_LOGS",
     # Runtime helpers
+    "effective_startup_timeout",
     "get_runtime",
+    "get_startup_timeout",
     "get_connection_mode_override",
+    "get_mm_processing",
+    "get_mock_wire",
+    "get_parser",
+    "effective_parser",
+    "assert_mm_processing",
+    "get_servicer_impl",
+    "get_servicer_impl_setting",
     "get_zmq_engine_count",
     "is_vllm",
     "is_sglang",
@@ -135,6 +159,7 @@ __all__ = [
     "Worker",
     "start_workers",
     "stop_workers",
+    "worker_startup_timeout",
     # Session-scoped worker cache
     "WorkerPool",
     "get_pool",

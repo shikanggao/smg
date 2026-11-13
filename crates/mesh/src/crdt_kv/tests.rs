@@ -1,8 +1,16 @@
-use std::{sync::Once, thread, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, Once,
+    },
+    thread,
+    time::Duration,
+};
 
 use tracing::info;
 use tracing_subscriber::{
-    filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
+    filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
 
 use super::{
@@ -530,30 +538,7 @@ fn test_epoch_max_wins_snapshot_only_propagation_preserves_tombstone_boundary() 
     // Source: pre-tombstone high-epoch insert, then tombstone, then
     // post-tombstone lower-epoch insert. After merge+compact, the
     // log holds a single shard insert with tombstone_version=65.
-    let source = CrdtOrMap::new();
-    source.register_merge_strategy("rl:".to_string(), MergeStrategy::EpochMaxWins);
-    let mut source_log = OperationLog::new();
-    source_log.append(Operation::insert(
-        key.to_string(),
-        encode(7, 99).to_vec(),
-        60,
-        ReplicaId::new(),
-    ));
-    source_log.append(Operation::remove(key.to_string(), 65, ReplicaId::new()));
-    source_log.append(Operation::insert(
-        key.to_string(),
-        encode(6, 1).to_vec(),
-        70,
-        ReplicaId::new(),
-    ));
-    source.merge(&source_log);
-
-    let snapshot_log = source.get_operation_log();
-    assert_eq!(
-        snapshot_log.operations().len(),
-        1,
-        "compaction must reduce to a single shard insert",
-    );
+    let (snapshot_log, _) = compacted_post_tombstone_snapshot(key);
 
     // Receiver applies the snapshot — gets the shard with
     // tombstone_version embedded but no Remove op in its log.
@@ -590,22 +575,15 @@ fn test_epoch_max_wins_snapshot_only_propagation_preserves_tombstone_boundary() 
     );
 }
 
-#[test]
-fn test_epoch_max_wins_compacted_snapshot_applies_when_op_id_already_seen() {
-    // Receiver sees the post-tombstone raw insert first (op-id (70, c)),
-    // then the source's compacted snapshot that reuses that same op-id but
-    // carries the embedded tombstone_version. Without strategy-aware merge
-    // the op-id collision drops the richer payload, and a delayed
-    // pre-tombstone insert can resurrect the deleted shard.
-    init_test_logging();
-    let key = "rl:global:node-a";
-
+/// A source's compacted history of `key` under epoch-max-wins: an insert at
+/// version 60, a tombstone at 65 and an insert at 70, merged and compacted
+/// into the one insert that reuses the post-tombstone op-id and embeds the
+/// tombstone version. Returns the compacted log and the replica of the
+/// post-tombstone insert, the op-id a receiver may already have seen.
+fn compacted_post_tombstone_snapshot(key: &str) -> (OperationLog, ReplicaId) {
     let pre_tombstone_replica = ReplicaId::new();
     let tombstone_replica = ReplicaId::new();
     let post_tombstone_replica = ReplicaId::new();
-
-    // Source applies the full history and compacts into one Insert that
-    // embeds tombstone_version=65 and reuses the post-tombstone op-id.
     let source = CrdtOrMap::new();
     source.register_merge_strategy("rl:".to_string(), MergeStrategy::EpochMaxWins);
     let mut source_log = OperationLog::new();
@@ -623,8 +601,28 @@ fn test_epoch_max_wins_compacted_snapshot_applies_when_op_id_already_seen() {
         post_tombstone_replica,
     ));
     source.merge(&source_log);
-    let compacted_log = source.get_operation_log();
-    assert_eq!(compacted_log.operations().len(), 1);
+    let compacted = source.get_operation_log();
+    assert_eq!(
+        compacted.operations().len(),
+        1,
+        "compaction must reduce to a single shard insert",
+    );
+    (compacted, post_tombstone_replica)
+}
+
+#[test]
+fn test_epoch_max_wins_compacted_snapshot_applies_when_op_id_already_seen() {
+    // Receiver sees the post-tombstone raw insert first (op-id (70, c)),
+    // then the source's compacted snapshot that reuses that same op-id but
+    // carries the embedded tombstone_version. Without strategy-aware merge
+    // the op-id collision drops the richer payload, and a delayed
+    // pre-tombstone insert can resurrect the deleted shard.
+    init_test_logging();
+    let key = "rl:global:node-a";
+
+    // Source applies the full history and compacts into one Insert that
+    // embeds tombstone_version=65 and reuses the post-tombstone op-id.
+    let (compacted_log, post_tombstone_replica) = compacted_post_tombstone_snapshot(key);
 
     // Receiver already has the raw post-tombstone insert (same op-id as the
     // compacted snapshot will use), but no tombstone information yet.
@@ -682,31 +680,9 @@ fn test_epoch_max_wins_same_op_id_folds_within_single_batch() {
     init_test_logging();
     let key = "rl:global:node-a";
 
-    let pre_tombstone_replica = ReplicaId::new();
-    let tombstone_replica = ReplicaId::new();
-    let post_tombstone_replica = ReplicaId::new();
-
     // Produce the compacted snapshot op: a single Insert at op-id
     // (70, post_tombstone_replica) embedding tombstone_version=65.
-    let source = CrdtOrMap::new();
-    source.register_merge_strategy("rl:".to_string(), MergeStrategy::EpochMaxWins);
-    let mut source_log = OperationLog::new();
-    source_log.append(Operation::insert(
-        key.to_string(),
-        encode(7, 99).to_vec(),
-        60,
-        pre_tombstone_replica,
-    ));
-    source_log.append(Operation::remove(key.to_string(), 65, tombstone_replica));
-    source_log.append(Operation::insert(
-        key.to_string(),
-        encode(6, 1).to_vec(),
-        70,
-        post_tombstone_replica,
-    ));
-    source.merge(&source_log);
-    let compacted = source.get_operation_log();
-    assert_eq!(compacted.operations().len(), 1);
+    let (compacted, post_tombstone_replica) = compacted_post_tombstone_snapshot(key);
     let snapshot_op = compacted.operations()[0].clone();
 
     // Receiver gets BOTH the raw post-tombstone insert and the compacted
@@ -1497,4 +1473,126 @@ fn test_gc_tombstones_multiple_keys() {
     let removed = map.gc_tombstones_with_grace(Duration::ZERO);
     assert_eq!(removed, 2, "Two tombstoned keys should be GC'd");
     assert_eq!(map.get("key2"), Some(b"v2".to_vec()));
+}
+
+// ============================================================================
+// The op-log keeper both engines share
+// ============================================================================
+
+/// Counts the WARN events whose message carries `needle` and collects the
+/// `engine` field they name; a scoped subscriber for one test.
+struct WarnCounter {
+    needle: &'static str,
+    count: Arc<AtomicUsize>,
+    engines: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl<S: tracing::Subscriber> Layer<S> for WarnCounter {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        #[derive(Default)]
+        struct Fields {
+            message: String,
+            engine: Option<String>,
+        }
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.message = format!("{value:?}");
+                }
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "engine" {
+                    self.engine = Some(value.to_string());
+                }
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        if fields.message.contains(self.needle) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            if let Some(engine) = fields.engine {
+                self.engines.lock().unwrap().insert(engine);
+            }
+        }
+    }
+}
+
+/// Both engines keep their log through the one keeper: the compaction
+/// trigger (more than twice the live keys, min 64) and the memory backstop
+/// over 10,000 retained ops are the same for the LWW and the EpochMaxWins
+/// namespace, and the backstop warns once per overflow.
+#[test]
+fn both_engines_compact_at_one_trigger_and_warn_once_past_the_backstop() {
+    let warnings = Arc::new(AtomicUsize::new(0));
+    let engines = Arc::new(Mutex::new(BTreeSet::new()));
+    let subscriber = tracing_subscriber::registry().with(WarnCounter {
+        needle: "over threshold",
+        count: Arc::clone(&warnings),
+        engines: Arc::clone(&engines),
+    });
+    tracing::subscriber::with_default(subscriber, || {
+        let map = CrdtOrMap::new();
+        map.register_merge_strategy("rl:".to_string(), MergeStrategy::EpochMaxWins);
+        let ops_under = |prefix: &str| {
+            map.get_operation_log()
+                .operations()
+                .iter()
+                .filter(|op| op.key().starts_with(prefix))
+                .count()
+        };
+
+        // 40 keys per namespace: the trigger is 80 ops. Two versions per key
+        // fill each log to the trigger exactly; the 81st op compacts it to
+        // one op per key.
+        for round in 0..2u64 {
+            for k in 0..40 {
+                map.insert(format!("cfg:key{k}"), vec![round as u8]);
+                map.insert(format!("rl:key{k}"), encode(round + 1, 0).to_vec());
+            }
+        }
+        assert_eq!((ops_under("cfg:"), ops_under("rl:")), (80, 80));
+        map.insert("cfg:key0".to_string(), vec![9]);
+        map.insert("rl:key0".to_string(), encode(9, 0).to_vec());
+        assert_eq!(
+            (ops_under("cfg:"), ops_under("rl:")),
+            (40, 40),
+            "the op past the trigger compacts each namespace to one op per key"
+        );
+        assert_eq!(warnings.load(Ordering::Relaxed), 0);
+
+        // Past the backstop: 10,001 more keys with two versions each leave
+        // each log at 20,042 ops under a trigger of 20,082; the 41st of a
+        // hundred further writes crosses it, the compaction leaves 10,041
+        // ops, over the 10,000 backstop, so the oldest go down to 7,500 with
+        // one warning per engine, and the 59 writes after it append again.
+        for round in 1..=2u64 {
+            for k in 0..10_001 {
+                map.insert(format!("cfg:bulk{k}"), vec![round as u8]);
+                map.insert(format!("rl:bulk{k}"), encode(round, 1).to_vec());
+            }
+        }
+        assert_eq!((ops_under("cfg:"), ops_under("rl:")), (20_042, 20_042));
+        for k in 0..100 {
+            map.insert(format!("cfg:bulk{k}"), vec![3]);
+            map.insert(format!("rl:bulk{k}"), encode(3, 1).to_vec());
+        }
+        assert_eq!((ops_under("cfg:"), ops_under("rl:")), (7_559, 7_559));
+        assert_eq!(
+            warnings.load(Ordering::Relaxed),
+            2,
+            "one overflow warning per engine"
+        );
+        assert_eq!(
+            *engines.lock().unwrap(),
+            BTreeSet::from(["LwwEngine".to_string(), "RateLimitEngine".to_string()]),
+            "each engine names itself in its one warning"
+        );
+    });
 }

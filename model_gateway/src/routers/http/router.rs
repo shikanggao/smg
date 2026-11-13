@@ -1,95 +1,159 @@
 use std::{
+    borrow::Cow,
+    convert::Infallible,
     error::Error as _,
+    future::Future,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{Request, State},
+    extract::Request,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
-    middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use bytes::{Bytes, BytesMut};
-use futures_util::{stream, Stream, StreamExt};
+use futures_util::{
+    future::{BoxFuture, Either},
+    stream, Stream, StreamExt,
+};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     common::GenerationRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
-    messages::CreateMessageRequest,
+    messages::{CountMessageTokensRequest, CreateMessageRequest},
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
     },
-    rerank::{RerankRequest, RerankResponse, RerankResult},
+    rerank::{RerankRequest, RerankResponse, RerankWorkerResponse},
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
 use reqwest::multipart::{Form, Part};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tower::{Layer, Service};
 use tracing::{error, warn};
 
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    middleware::{scheduler::PreemptionGuard, TenantRequestMeta},
+    middleware::{
+        body_timeout::{
+            request_body_stalled_response, REQUEST_BODY_STALLED, REQUEST_BODY_TOO_LARGE,
+        },
+        scheduler::PreemptionGuard,
+        TenantRequestMeta,
+    },
     observability::{
         events::{self, Event},
-        metrics::{bool_to_static_str, metrics_labels, Metrics},
+        metrics::{bool_to_static_str, error_reason_from_status, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry},
+    rate_limit::RateLimitManager,
     routers::{
         common::{
             attach_sized_body,
+            attempt_ledger::{mark_upstream_answer, AttemptLedger},
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
                 REASON_MODEL_AMBIGUOUS, REASON_MODEL_SELECTION, REASON_NO_AVAILABLE_WORKER,
                 REASON_WORKER_MUTATES_BODY,
             },
+            decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
-            placement::{self, PlacementFailure, PlacementInputs},
+            placement::{self, CandidateFilter, PlacementFailure, PlacementInputs, RefusalSite},
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
-            retry::{is_retryable_response, is_retryable_status, RetryExecutor},
-            sse::SSE_CHANNEL_BUFFER,
+            retry::{
+                is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
+            },
+            sse_rechunk::{NoopObserver, RechunkPolicy, SseRechunker},
             worker_selection::{SelectWorkerRequest, WorkerSelector},
         },
         error::{self, extract_error_code_from_response},
         external::GatewayWorker,
         gateway::Gateway,
-        grpc::utils::{error_type_from_status, route_to_endpoint},
+        grpc::{
+            utils::{
+                error_reason_for_response, error_type_for_response, error_type_from_status,
+                route_to_endpoint,
+            },
+            wire::Wire,
+        },
         http::{
-            request_body::{serialize_request_body, RequestBodyError},
+            request_body::{
+                serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
+            },
             request_stream::{CappedBodyStream, StreamProgress},
+            stream_failure::{cause, head_success_recorded, RelaySource},
+            stream_relay::{relay_streaming_body, ChunkMode, Relay},
+            tenant_rate_limit::{self, TenantCharge, TenantReservation},
         },
         BodyPolicy, RouterTrait,
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        AttachedBody, ConnectionMode, RoutingPool, Worker, WorkerLoadGuard, WorkerRegistry,
-        WorkerType,
+        endpoint::Endpoint, ConnectionMode, GuardedStream, RoutingPool, RuntimeType, Worker,
+        WorkerLoadGuard, WorkerRegistry, WorkerType,
     },
 };
 
 /// Max body size for a WebRTC `/v1/realtime/calls` SDP offer (10 MiB).
 const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 
-/// Error codes for streamed-body aborts the client caused. They carry no
-/// worker verdict: recording a circuit-breaker sample for them would let slow
-/// or oversized uploaders open a healthy worker's breaker.
-const STREAMED_BODY_STALLED: &str = "request_body_stalled";
-const STREAMED_BODY_TOO_LARGE: &str = "request_body_too_large";
+/// Error code of a streamed body that broke off before it was forwarded.
+/// With the middleware's `REQUEST_BODY_STALLED` and `REQUEST_BODY_TOO_LARGE`
+/// it names an abort the client caused; the three carry no worker verdict:
+/// recording a circuit-breaker sample for one would let slow or oversized
+/// uploaders open a healthy worker's breaker.
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
+
+/// How a worker response body is relayed to the client. Re-chunking exists
+/// on this regular HTTP relay only; the PD and gRPC relays do not apply it.
+#[derive(Clone, Copy)]
+struct StreamRelayMode {
+    is_stream: bool,
+    /// The numbers the stream is re-sliced by, when its wire asks for it.
+    rechunk: Option<RechunkPolicy>,
+}
+
+/// One dispatch attempt of a typed request: the inputs every stage of
+/// `Router::route_typed_request_once` reads. The route builds it once and
+/// every retry attempt reads the same one; the lease, the ledger and the
+/// tried list are the state the attempts share.
+struct TypedAttempt<'a, T> {
+    headers: Option<&'a HeaderMap>,
+    /// The parsed request and its routing derivatives, held until the
+    /// lease's release point.
+    lease: &'a RequestLease<T>,
+    route: &'static str,
+    /// The canonical model id every registry, policy and metrics lookup is
+    /// keyed by.
+    model_id: &'a str,
+    /// The alias the client named, resolved, for the upstream body.
+    canonical_model: Option<&'a str>,
+    is_stream: bool,
+    /// The request's bookkeeping across attempts: breaker charges and the
+    /// workers whose answer was definitive.
+    ledger: &'a AttemptLedger,
+    /// The engines a failed attempt of this request dispatched to; a retry
+    /// re-selects away from them while another available worker is left.
+    tried: &'a parking_lot::Mutex<Vec<String>>,
+}
 
 /// Regular router that uses injected load balancing policies
 pub struct Router {
@@ -108,6 +172,10 @@ pub struct Router {
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
+    /// The tenant rate limiter, `None` when it is off. The typed routes that
+    /// take a tenant reservation reserve through it in
+    /// [`Router::route_typed_request`].
+    rate_limit_manager: Option<Arc<RateLimitManager>>,
 }
 
 trait RealtimeRestRequest: serde::Serialize + Clone {
@@ -175,6 +243,7 @@ impl Router {
             realtime_registry: ctx.realtime_registry.clone(),
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
+            rate_limit_manager: ctx.rate_limit_manager.clone(),
         })
     }
 
@@ -197,7 +266,11 @@ impl Router {
             Ok(worker) => {
                 let mut request_builder = worker
                     .http_client()
-                    .get(format!("{}/{endpoint}", worker.url()));
+                    .get(format!("{}/{endpoint}", worker.base_url()));
+                // A public route outside the auth middleware: the allow-listed
+                // caller headers go as they are and nothing is added (a
+                // configured worker key here would authenticate an anonymous
+                // caller as the worker).
                 for (name, value) in headers {
                     if header_utils::should_forward_request_header(&name) {
                         request_builder = request_builder.header(name, value);
@@ -206,8 +279,7 @@ impl Router {
 
                 match send_with_stale_conn_retry(request_builder).await {
                     Ok(res) => {
-                        let status = StatusCode::from_u16(res.status().as_u16())
-                            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                        let status = res.status();
 
                         // Preserve headers from backend
                         let response_headers =
@@ -220,13 +292,23 @@ impl Router {
                                 *response.headers_mut() = response_headers;
                                 response
                             }
-                            Err(e) => error::internal_error(
+                            // The worker's answer ended before it was whole:
+                            // the upstream's failure, under the code it had.
+                            Err(e) => error::bad_gateway(
                                 "read_response_failed",
-                                format!("Failed to read response: {e}"),
+                                format!("Failed to read response: {}", cause(&e)),
                             ),
                         }
                     }
-                    Err(e) => convert_reqwest_error(e),
+                    Err(e) => {
+                        error!(
+                            worker = Endpoint::redacted_str(worker.url()),
+                            endpoint,
+                            "Failed to proxy GET request: {}",
+                            cause(&e)
+                        );
+                        convert_reqwest_error(e)
+                    }
                 }
             }
             Err(e) => error::service_unavailable("no_workers", e),
@@ -235,7 +317,13 @@ impl Router {
 
     /// Select worker considering circuit breaker state.
     /// Filters to workers serving the specified model. When model is "unknown"
-    /// (generate endpoint without model), considers all HTTP workers.
+    /// (generate endpoint without model), considers all HTTP workers. `tried`
+    /// are the engines the request's failed attempts dispatched to (see
+    /// `PlacementInputs::tried`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "selection threads every routing input the policy consumes"
+    )]
     fn select_worker_for_model(
         &self,
         model_id: &str,
@@ -244,6 +332,8 @@ impl Router {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
         cache_namespace: Option<CacheNamespace>,
+        candidate_filter: Option<CandidateFilter<'_>>,
+        tried: &[String],
     ) -> Option<Arc<dyn Worker>> {
         // This router proxies plain HTTP to the worker's URL, so only HTTP
         // workers are candidates; nothing pins a wire on this path.
@@ -259,6 +349,9 @@ impl Router {
                 headers,
                 rid_key,
                 cache_namespace,
+                candidate_filter,
+                tried,
+                sequence: None,
             },
         )
     }
@@ -324,25 +417,145 @@ impl Router {
         }
     }
 
-    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize>(
+    /// The line and marker of a refusal this router answers on its own (a
+    /// `no_available_workers` 503, a `model_not_found` 404): one WARN per
+    /// refusal, rate-limited, with the regular pool's state, through
+    /// [`placement::report_refusal`]; the access log then keeps quiet about
+    /// it. Every other response passes through unchanged.
+    fn report_refusal(
         &self,
-        headers: Option<&HeaderMap>,
+        function: &'static str,
+        model_id: &str,
+        refusal: Response,
+    ) -> Response {
+        placement::report_refusal(
+            &self.worker_registry,
+            RefusalSite {
+                function,
+                mode: "Regular",
+                pools: &[("regular", RoutingPool::HttpRegular)],
+            },
+            // The line is written inside the request's span, which carries
+            // the id.
+            None,
+            model_id,
+            refusal,
+        )
+    }
+
+    /// Route a typed request to a worker serving `model_id`, retried as the
+    /// model's retry config allows. With `tenant_meta` (the routes that take a
+    /// tenant reservation) and the tenant rate limiter on, the request
+    /// reserves its estimate once, before any dispatch, and the one answer the
+    /// dispatch paths converge on resolves the reservation once
+    /// (`tenant_rate_limit::resolve`).
+    ///
+    /// A plain fn around an async block, not an async fn: everything the
+    /// route reads from the request by reference (whether it streams, its
+    /// routing derivatives, the tenant's estimate) is read here, before the
+    /// request moves into the lease, and the block uses the lease in place.
+    /// An async fn re-binds its by-value argument and keeps that local once
+    /// it has been borrowed, two copies of the request in the task beside
+    /// the lease's; the block holds the lease alone.
+    pub(crate) fn route_typed_request<'a, T>(
+        &'a self,
+        headers: Option<&'a HeaderMap>,
+        tenant_meta: Option<&'a TenantRequestMeta>,
         typed_req: T,
         route: &'static str,
-        model_id: &str,
-    ) -> Response {
+        model_id: &'a str,
+    ) -> impl Future<Output = Response> + Send + 'a
+    where
+        T: TenantCharge + serde::Serialize + Send + 'a,
+    {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
+        let routing = self.routing_derivatives(headers, &typed_req);
+        // Resolve once, here, so every registry, policy and metrics lookup
+        // below is keyed by the canonical model ID. Only `get_by_model`
+        // understands aliases; retry configs, hash rings and policies do not,
+        // and an alias would silently fall back to router defaults.
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let estimate = tenant_rate_limit::estimate(
+            self.rate_limit_manager.as_deref(),
+            tenant_meta,
+            &typed_req,
+            routing.text.as_deref(),
+        );
+        // Use per-model retry config if set by a worker, otherwise fall back to router default.
+        let per_model_retry_config = self
+            .worker_registry
+            .get_retry_config(canonical_model.as_deref().unwrap_or(model_id));
+        // The lease owns the parsed request and its routing derivatives for
+        // the dispatch phase; its release point encodes the retry policy.
+        let lease = RequestLease::new(
+            typed_req,
+            routing,
+            ReleasePoint::from_retry_config(
+                per_model_retry_config
+                    .as_ref()
+                    .unwrap_or(&self.retry_config),
+            ),
+        );
+        async move {
+            let model_id = canonical_model.as_deref().unwrap_or(model_id);
+            let retry_config = per_model_retry_config
+                .as_ref()
+                .unwrap_or(&self.retry_config);
+            let outcome = self.begin_route(route, model_id, is_stream);
+            let (reservation, denial) = tenant_rate_limit::reserve(estimate, model_id).await;
+            // The state the attempts share; `TypedAttempt` names each piece.
+            let tried = parking_lot::Mutex::new(Vec::new());
+            let ledger = AttemptLedger::default();
+            let attempt = TypedAttempt {
+                headers,
+                lease: &lease,
+                route,
+                model_id,
+                canonical_model: canonical_model.as_deref(),
+                is_stream,
+                ledger: &ledger,
+                tried: &tried,
+            };
+
+            let response = if let Some(denied) = denial {
+                denied
+            } else if lease.release_point() == ReleasePoint::AfterDispatch {
+                self.dispatch_once(&attempt, outcome.endpoint).await
+            } else {
+                self.dispatch_with_retries(&attempt, retry_config, outcome.endpoint)
+                    .await
+            };
+            let response = self
+                .resolve_tenant_reservation(reservation.as_ref(), route, is_stream, response)
+                .await;
+            outcome.answered_typed(&response, start);
+            response
+        }
+    }
+
+    /// The routing inputs of a request, derived once (for a typed request,
+    /// before the lease takes it): the token ids when the request or a valid
+    /// hint carries them
+    /// (the text rendering only when neither does), the request-id key and
+    /// the cache namespace.
+    fn routing_derivatives<T: GenerationRequest>(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+    ) -> RoutingDerivatives {
         // Pre-tokenized requests route on the token tree; the decimal-string
         // rendering is only materialized when there are no tokens. A valid
         // x-smg-routing-tokens hint wins over body-derived tokens/text.
-        let routing_tokens: Option<Vec<u32>> = header_utils::parse_routing_tokens_hint(headers)
-            .or_else(|| {
+        let tokens: Option<Vec<u32>> =
+            header_utils::parse_routing_tokens_hint(headers).or_else(|| {
                 typed_req
                     .routing_tokens()
+                    // the generate route's validator refuses a negative `input_ids`
+                    // entry before routing: the cast of a validated id cannot wrap
                     .map(|ids| ids.iter().map(|&id| id as u32).collect())
             });
-        let text = routing_tokens
+        let text = tokens
             .is_none()
             .then(|| typed_req.extract_text_for_routing());
         let rid_key = self
@@ -350,13 +563,25 @@ impl Router {
             .derive_rid_key(typed_req.rid())
             .map(str::to_string);
         let cache_namespace = CacheNamespace::derive(&typed_req.cache_partition());
-        // Resolve once, here, so every registry, policy and metrics lookup
-        // below is keyed by the canonical model ID. Only `get_by_model`
-        // understands aliases; retry configs, hash rings and policies do not,
-        // and an alias would silently fall back to router defaults.
-        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
-        let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        let model = model_id;
+        RoutingDerivatives {
+            tokens,
+            text,
+            rid_key,
+            cache_namespace,
+        }
+    }
+
+    /// The start of a route (the typed route and the multipart transcription
+    /// route): the request counted under the metric label of its canonical
+    /// model and the route's endpoint label, which the returned finalizers of
+    /// its router metrics carry to every exit.
+    fn begin_route<'a>(
+        &self,
+        route: &'static str,
+        model_id: &'a str,
+        is_stream: bool,
+    ) -> RouteOutcome<'a> {
+        let model_label = self.worker_registry.metric_model_label(model_id);
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -364,150 +589,190 @@ impl Router {
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_REGULAR,
             metrics_labels::CONNECTION_HTTP,
-            model,
+            model_label,
             endpoint,
             bool_to_static_str(is_stream),
         );
-
-        // Use per-model retry config if set by a worker, otherwise fall back to router default.
-        let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
-        let retry_config = per_model_retry_config
-            .as_ref()
-            .unwrap_or(&self.retry_config);
-
-        // The lease owns the parsed request and its routing derivatives for
-        // the dispatch phase; its release point encodes the retry policy.
-        let lease = RequestLease::new(
-            typed_req,
-            RoutingDerivatives {
-                tokens: routing_tokens,
-                text,
-                rid_key,
-                cache_namespace,
-            },
-            ReleasePoint::from_retry_config(retry_config),
-        );
-
-        let response = if lease.release_point() == ReleasePoint::AfterDispatch {
-            // Retries disabled: one dispatch; the lease frees the parsed
-            // request the moment the upstream bytes are serialized.
-            let res = self
-                .route_typed_request_once(
-                    headers,
-                    &lease,
-                    route,
-                    model_id,
-                    canonical_model.as_deref(),
-                    is_stream,
-                )
-                .await;
-            Metrics::record_router_upstream_response(
-                metrics_labels::ROUTER_HTTP,
-                res.status().as_u16(),
-                extract_error_code_from_response(&res),
-            );
-            // Mirror the retry executor's exhaustion accounting for a
-            // retryable response that gets no retry.
-            if is_retryable_response(&res) {
-                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
-            }
-            res
-        } else {
-            RetryExecutor::execute_response_with_retry(
-                retry_config,
-                // operation per attempt; the lease keeps the request alive
-                // for replay until the retry window closes (first
-                // non-retryable response).
-                |_: u32| async {
-                    let res = self
-                        .route_typed_request_once(
-                            headers,
-                            &lease,
-                            route,
-                            model_id,
-                            canonical_model.as_deref(),
-                            is_stream,
-                        )
-                        .await;
-
-                    // Need to be outside `route_typed_request_once` because that function has multiple return paths
-                    Metrics::record_router_upstream_response(
-                        metrics_labels::ROUTER_HTTP,
-                        res.status().as_u16(),
-                        extract_error_code_from_response(&res),
-                    );
-
-                    res
-                },
-                // should_retry predicate
-                |res, _attempt| is_retryable_response(res),
-                // on_backoff hook
-                |delay, attempt| {
-                    // Layer 3 worker metrics
-                    Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
-                    Metrics::record_worker_retry_backoff(attempt, delay);
-                },
-                // on_exhausted hook
-                || {
-                    Metrics::record_worker_retries_exhausted(
-                        metrics_labels::WORKER_REGULAR,
-                        endpoint,
-                    );
-                },
-            )
-            .await
-        };
-
-        if response.status().is_success() {
-            let duration = start.elapsed();
-            Metrics::record_router_duration(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_REGULAR,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint,
-                duration,
-            );
-        } else if !is_retryable_response(&response) {
-            Metrics::record_router_error(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_REGULAR,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint,
-                error_type_from_status(response.status()),
-            );
+        RouteOutcome {
+            model_label: Cow::Borrowed(model_label),
+            endpoint,
         }
-
-        response
     }
 
-    async fn route_typed_request_once<T: serde::Serialize>(
+    /// The one dispatch of a request with retries disabled: the lease frees
+    /// the parsed request the moment the upstream bytes are serialized, and a
+    /// retryable answer that gets no retry is counted as an exhaustion, as
+    /// the retry executor would count it.
+    async fn dispatch_once<T: GenerationRequest + serde::Serialize>(
         &self,
-        headers: Option<&HeaderMap>,
-        lease: &RequestLease<T>,
-        route: &'static str,
-        model_id: &str,
-        canonical_model: Option<&str>,
-        is_stream: bool,
+        attempt: &TypedAttempt<'_, T>,
+        endpoint: &'static str,
     ) -> Response {
-        let worker = match lease.with_view(|view| {
+        let res = self.route_typed_request_once(attempt).await;
+        Metrics::record_router_upstream_response(
+            metrics_labels::ROUTER_HTTP,
+            res.status().as_u16(),
+            extract_error_code_from_response(&res),
+        );
+        // Mirror the retry executor's exhaustion accounting for a
+        // retryable response that gets no retry.
+        if is_retryable_response(&res) {
+            Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+        }
+        res
+    }
+
+    /// The attempts of a request under the retry executor: the lease keeps
+    /// the request alive for replay until the retry window closes (the first
+    /// non-retryable answer); every attempt's upstream response, every
+    /// back-off and the exhaustion are counted.
+    async fn dispatch_with_retries<T: GenerationRequest + serde::Serialize>(
+        &self,
+        attempt: &TypedAttempt<'_, T>,
+        retry_config: &RetryConfig,
+        endpoint: &'static str,
+    ) -> Response {
+        RetryExecutor::execute_response_with_retry(
+            retry_config,
+            // operation per attempt; the lease keeps the request alive
+            // for replay until the retry window closes (first
+            // non-retryable response).
+            |_: u32| async {
+                let res = self.route_typed_request_once(attempt).await;
+
+                // Need to be outside `route_typed_request_once` because that function has multiple return paths
+                Metrics::record_router_upstream_response(
+                    metrics_labels::ROUTER_HTTP,
+                    res.status().as_u16(),
+                    extract_error_code_from_response(&res),
+                );
+
+                res
+            },
+            // should_retry predicate
+            |res, _attempt| is_retryable_response(res),
+            // on_backoff hook
+            |delay, attempt| {
+                // Layer 3 worker metrics
+                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                Metrics::record_worker_retry_backoff(attempt, delay);
+            },
+            // on_exhausted hook
+            || {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+            },
+        )
+        .await
+    }
+
+    /// Resolve the reservation, once, on the one answer both dispatch paths
+    /// converge on: settled, handed to the streamed body, or closed at the
+    /// estimate. An answer outside the limiter passes through.
+    async fn resolve_tenant_reservation(
+        &self,
+        reservation: Option<&TenantReservation>,
+        route: &'static str,
+        is_stream: bool,
+        response: Response,
+    ) -> Response {
+        tenant_rate_limit::resolve(
+            reservation,
+            route,
+            is_stream,
+            response,
+            self.max_payload_size,
+        )
+        .await
+    }
+
+    /// One attempt of a typed request as a sequence of named stages: the
+    /// worker, the dispatch-time overload re-check, the adapter, the
+    /// dispatch, the adapter's verdict, the accounting. Every stage reads the
+    /// same `TypedAttempt`; its lease, ledger and tried list carry what the
+    /// next attempt must know.
+    async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
+        &self,
+        attempt: &TypedAttempt<'_, T>,
+    ) -> Response {
+        let worker = match self.select_worker_for_attempt(attempt) {
+            Ok(worker) => worker,
+            Err(refusal) => return refusal,
+        };
+
+        // Dispatch-time re-check of the one chosen worker: O(1), and the only
+        // thing that closes the window between selection and dispatch in which
+        // a load report can flip the veto.
+        if let Some(shed) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            attempt.model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
+            return shed;
+        }
+
+        let mut decision_adapter =
+            match Self::decision_adapter_for_attempt(attempt, worker.as_ref()) {
+                Ok(adapter) => adapter,
+                Err(response) => return response,
+            };
+
+        let response = self
+            .dispatch_attempt(attempt, &worker, &mut decision_adapter)
+            .await;
+
+        // A streamed head's success was recorded before its relay task was
+        // spawned (see `forward_worker_response`); the adapter's verdict
+        // below may still turn the answer into a failure, which is recorded.
+        let head_success_recorded = head_success_recorded(&response);
+
+        // Judge the converted result so malformed successes become backend
+        // failures and follow the same outcome accounting and retry policy.
+        let response = if let Some(adapter) = decision_adapter {
+            adapter
+                .convert_response(response, self.max_payload_size)
+                .await
+        } else {
+            response
+        };
+
+        events::RequestReceivedEvent {}.emit();
+
+        self.account_attempt_outcome(attempt, &worker, response, head_success_recorded)
+    }
+
+    /// The worker of one attempt: selected away from the engines the request
+    /// already tried and from those whose answer was definitive, or the
+    /// refusal this router answers when the pool has none to give.
+    fn select_worker_for_attempt<T>(
+        &self,
+        attempt: &TypedAttempt<'_, T>,
+    ) -> Result<Arc<dyn Worker>, Response> {
+        let model_id = attempt.model_id;
+        let ledger = attempt.ledger;
+        // A retry never goes back to a worker whose answer was definitive.
+        let admits = |worker: &dyn Worker| ledger.admits(worker);
+        match attempt.lease.with_view(|view| {
+            // A retry re-selects away from the engines this request already
+            // tried, while another available worker is left to take it.
+            let tried = attempt.tried.lock();
             self.select_worker_for_model(
                 model_id,
                 view.text,
                 view.tokens,
-                headers,
+                attempt.headers,
                 view.rid_key,
                 view.cache_namespace,
+                Some(&admits),
+                &tried,
             )
         }) {
-            Some(w) => w,
+            Some(worker) => Ok(worker),
             None => {
                 // The verdict is judged from exactly the pool selection drew
                 // from, wildcard model included: that is what makes the shed
                 // fire for a model-less `/generate` and for a model that is
                 // also served over gRPC.
-                return match placement::single_failure(
+                let refusal = match placement::single_failure(
                     &self.worker_registry,
                     model_id,
                     RoutingPool::HttpRegular,
@@ -517,70 +782,204 @@ impl Router {
                     PlacementFailure::AllOverloaded(shed) => shed,
                     PlacementFailure::Unavailable
                     | PlacementFailure::PolicyDeclined(_)
-                    | PlacementFailure::NoCompatiblePair { .. } => error::service_unavailable(
-                        "no_available_workers",
+                    | PlacementFailure::NoCompatiblePair { .. }
+                    | PlacementFailure::PrefillAtCapacity => placement::no_available_workers(
                         "All workers are unavailable (circuit breaker open or unhealthy)",
                     ),
                 };
+                Err(self.report_refusal("Router::route_typed_request", model_id, refusal))
             }
+        }
+    }
+
+    /// The adapter of a `/v1/decisions` request bound for a worker that does
+    /// not speak the Decisions protocol itself; a worker that does keeps the
+    /// typed serialization path, extensions included.
+    fn decision_adapter_for_attempt<T: serde::Serialize>(
+        attempt: &TypedAttempt<'_, T>,
+        worker: &dyn Worker,
+    ) -> Result<Option<SglangDecisionAdapter>, Response> {
+        if attempt.route == "/v1/decisions"
+            && worker.metadata().spec.runtime_type == RuntimeType::Sglang
+        {
+            attempt.lease.with_view(|view| {
+                let request = serde_json::to_value(view.request)
+                    .and_then(serde_json::from_value::<DecisionsRequest>)
+                    .map_err(|error| {
+                        error::bad_request(
+                            "serialization_failed",
+                            format!("Failed to serialize Decisions request: {error}"),
+                        )
+                    })?;
+                SglangDecisionAdapter::new(&request)
+                    .map(Some)
+                    .map_err(|message| error::bad_request("unsupported_decisions_request", message))
+            })
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The attempt's dispatch: the worker's load guard, the request-sent
+    /// event, the trace headers, the relay mode, the serialized body and the
+    /// send through the relay. Once the bytes exist the lease frees the parsed
+    /// request when retries are disabled.
+    async fn dispatch_attempt<T: GenerationRequest + serde::Serialize>(
+        &self,
+        attempt: &TypedAttempt<'_, T>,
+        worker: &Arc<dyn Worker>,
+        decision_adapter: &mut Option<SglangDecisionAdapter>,
+    ) -> Response {
+        let headers = attempt.headers;
+        let lease = attempt.lease;
+        let route = attempt.route;
+        let upstream_route = if decision_adapter.is_some() {
+            UPSTREAM_ROUTE
+        } else {
+            route
         };
 
-        // Dispatch-time re-check of the one chosen worker: O(1), and the only
-        // thing that closes the window between selection and dispatch in which
-        // a load report can flip the veto.
-        if let Some(shed) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
-            return shed;
-        }
-
-        // Keyed-load accounting uses the same effective key as selection:
-        // rid-derived first, header fallback.
         let load_guard = lease.with_view(|view| {
             WorkerLoadGuard::with_key(
                 worker.clone(),
-                view.rid_key
-                    .or_else(|| self.policy_registry.sticky_header_key(headers)),
+                self.policy_registry.sticky_key(headers, view.rid_key),
             )
         });
 
         // Note: Using borrowed reference avoids heap allocation
-        events::RequestSentEvent { url: worker.url() }.emit();
+        events::RequestSentEvent {
+            url: worker.redacted_url(),
+        }
+        .emit();
         let raw_body_len = header_utils::content_length(headers);
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        let response = match lease.serialize_with(|view| {
-            serialize_request_body(view.request, canonical_model, worker.as_ref(), raw_body_len)
-        }) {
+        let mode = Self::relay_mode_for_attempt(attempt);
+        match Self::serialize_attempt_body(
+            attempt,
+            decision_adapter.as_ref(),
+            worker.as_ref(),
+            raw_body_len,
+        ) {
             Ok(body) => {
                 // Past this point dispatch needs only the serialized bytes;
                 // the lease frees the parsed request and its routing
                 // derivatives now when retries are disabled.
                 lease.release_dispatch();
+                if let Some(adapter) = decision_adapter.as_mut() {
+                    adapter.release_request();
+                }
                 self.send_serialized_request(
                     headers,
                     body,
-                    route,
-                    worker.as_ref(),
-                    is_stream,
+                    upstream_route,
+                    mode,
+                    RelaySource::new(attempt.model_id, route, Arc::clone(worker)),
                     load_guard,
                 )
                 .await
             }
-            Err(RequestBodyError::Serialize(e)) => error::bad_request(
-                "serialization_failed",
-                format!("Failed to serialize request body: {e}"),
-            ),
-            Err(RequestBodyError::Prepare(e)) => error::bad_request(
-                "request_preparation_failed",
-                format!("Failed to prepare request: {e}"),
-            ),
-        };
+            Err(response) => response,
+        }
+    }
 
-        events::RequestReceivedEvent {}.emit();
+    /// How the attempt's answer is relayed: streamed or buffered, and
+    /// re-chunked when the wire of the model the client asked for re-slices
+    /// its stream ([`Wire::rechunk_policy`]; the wire follows the requested
+    /// model, as request validation selects it, not the alias-resolved id).
+    fn relay_mode_for_attempt<T: GenerationRequest>(
+        attempt: &TypedAttempt<'_, T>,
+    ) -> StreamRelayMode {
+        let is_stream = attempt.is_stream;
+        let rechunk = (is_stream && attempt.route == "/v1/chat/completions")
+            .then(|| {
+                attempt.lease.with_view(|view| {
+                    view.request
+                        .get_model()
+                        .and_then(|model| Wire::for_model(model).rechunk_policy())
+                })
+            })
+            .flatten();
+        StreamRelayMode { is_stream, rechunk }
+    }
 
+    /// The upstream body of one attempt: the adapter's request when the
+    /// worker takes one, the typed request with its backend fields kept on the
+    /// routes whose extensions have no shared defaults, the typed request
+    /// otherwise; a serialization or preparation failure is the 400 it was.
+    fn serialize_attempt_body<T: serde::Serialize>(
+        attempt: &TypedAttempt<'_, T>,
+        decision_adapter: Option<&SglangDecisionAdapter>,
+        worker: &dyn Worker,
+        raw_body_len: Option<usize>,
+    ) -> Result<Bytes, Response> {
+        let route = attempt.route;
+        let canonical_model = attempt.canonical_model;
+        attempt
+            .lease
+            .serialize_with(|view| {
+                if let Some(adapter) = decision_adapter {
+                    serialize_request_body(adapter.request(), canonical_model, worker, raw_body_len)
+                } else if matches!(route, "/v1/decisions" | "/v1/systemone") {
+                    serialize_request_body_preserving_fields(
+                        view.request,
+                        canonical_model,
+                        worker,
+                        raw_body_len,
+                    )
+                } else {
+                    serialize_request_body(view.request, canonical_model, worker, raw_body_len)
+                }
+            })
+            .map_err(|failure| match failure {
+                RequestBodyError::Serialize(e) => error::bad_request(
+                    "serialization_failed",
+                    format!("Failed to serialize request body: {e}"),
+                ),
+                RequestBodyError::Prepare(e) => error::bad_request(
+                    "request_preparation_failed",
+                    format!("Failed to prepare request: {e}"),
+                ),
+            })
+    }
+
+    /// The attempt's answer on the request's ledger: the worker's breaker
+    /// outcome, unless a streamed head already recorded a success that the
+    /// verdict kept; the retry window settled on a definitive answer; the
+    /// engine on the tried list after a replayable failure; the worker error
+    /// metric on a server error.
+    fn account_attempt_outcome<T>(
+        &self,
+        attempt: &TypedAttempt<'_, T>,
+        worker: &Arc<dyn Worker>,
+        mut response: Response,
+        head_success_recorded: bool,
+    ) -> Response {
+        let model_id = attempt.model_id;
+        let ledger = attempt.ledger;
         let status = response.status();
-        worker.record_outcome(status.as_u16());
+        if !head_success_recorded || !status.is_success() {
+            ledger.record_outcome(worker.as_ref(), status.as_u16());
+        }
+        // A definitive answer closes the retry window on this worker: the next
+        // attempt goes to another available worker, or the answer stands.
+        ledger.settle(
+            &mut response,
+            [worker],
+            self.worker_registry
+                .get_routing_pool(model_id, RoutingPool::HttpRegular)
+                .iter(),
+        );
+        // A replayable failure: the retry re-selects away from this engine
+        // while another available worker is left to take the request.
+        if is_retryable_response(&response) {
+            let mut tried = attempt.tried.lock();
+            if !tried.iter().any(|engine| engine == worker.base_url()) {
+                tried.push(worker.base_url().to_string());
+            }
+        }
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
@@ -659,7 +1058,15 @@ impl Router {
 
                     send_with_stale_conn_retry(request_builder)
                         .await
-                        .map_err(convert_reqwest_error)
+                        .map_err(|e| {
+                            error!(
+                                worker = Endpoint::redacted_str(worker.url()),
+                                endpoint,
+                                "Failed to send request: {}",
+                                cause(&e)
+                            );
+                            convert_reqwest_error(e)
+                        })
                 }
             })
             .collect();
@@ -671,8 +1078,7 @@ impl Router {
         while let Some(result) = stream.next().await {
             match result {
                 Ok(res) => {
-                    let status = StatusCode::from_u16(res.status().as_u16())
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let status = res.status();
 
                     let response_headers = header_utils::preserve_response_headers(res.headers());
 
@@ -688,9 +1094,9 @@ impl Router {
                             last_response = Some(response);
                         }
                         Err(e) => {
-                            last_response = Some(error::internal_error(
+                            last_response = Some(error::bad_gateway(
                                 "read_response_failed",
-                                format!("Failed to read response: {e}"),
+                                format!("Failed to read response: {}", cause(&e)),
                             ));
                         }
                     }
@@ -716,8 +1122,13 @@ impl Router {
     }
 
     /// Forward an audio transcription request to an audio-capable worker as
-    /// `multipart/form-data`. Separate from `route_typed_request` because the
-    /// endpoint is not JSON-bodied.
+    /// `multipart/form-data`, as the sequence of its stages: the prologue it
+    /// shares with `route_typed_request` (the routing derivatives, the
+    /// canonical model, the request counted under its labels), the worker and
+    /// its dispatch-time overload re-check, the form's send and the relay of
+    /// the worker's answer. Separate from `route_typed_request` because the
+    /// endpoint is not JSON-bodied: the form is sent once (no retry could
+    /// replay it) and never passes through `prepare_request`.
     async fn route_multipart_transcription(
         &self,
         headers: Option<&HeaderMap>,
@@ -728,122 +1139,35 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let is_stream = body.is_stream();
-        // A valid x-smg-routing-tokens hint wins over body-derived text.
-        let hinted_tokens = header_utils::parse_routing_tokens_hint(headers);
-        let text = hinted_tokens
-            .is_none()
-            .then(|| body.extract_text_for_routing());
+        let routing = self.routing_derivatives(headers, body);
         // Resolve once, here, for the same reason as `route_typed_request`:
         // only `get_by_model` understands aliases, so the policy and hash ring
         // lookups below would silently fall back to router defaults on an
-        // alias. This path cannot reuse that resolution because multipart
-        // never goes through `route_typed_request`.
+        // alias.
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let model_id = canonical_model.as_deref().unwrap_or(model_id);
-        let endpoint = route_to_endpoint(route);
+        // The finalizers of the request's router metrics: one runs at every
+        // exit below.
+        let outcome = self.begin_route(route, model_id, is_stream);
 
-        Metrics::record_router_request(
-            metrics_labels::ROUTER_HTTP,
-            metrics_labels::BACKEND_REGULAR,
-            metrics_labels::CONNECTION_HTTP,
-            model_id,
-            endpoint,
-            bool_to_static_str(is_stream),
-        );
-
-        // Finalize router metrics for an early error that never reached an
-        // upstream worker (model_not_found, dp_aware_not_supported, no
-        // available workers, build failure). Without this, pre-send failures
-        // silently disappear from router_upstream_responses / router_error.
-        let record_pre_send_error = |response: &Response| {
-            let rstatus = response.status();
-            Metrics::record_router_upstream_response(
-                metrics_labels::ROUTER_HTTP,
-                rstatus.as_u16(),
-                extract_error_code_from_response(response),
-            );
-            // Response-aware: a terminal shed carries a retryable status but
-            // must still count as a router error.
-            if !is_retryable_response(response) {
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_HTTP,
-                    metrics_labels::BACKEND_REGULAR,
-                    metrics_labels::CONNECTION_HTTP,
-                    model_id,
-                    endpoint,
-                    error_type_from_status(rstatus),
-                );
+        let worker = match self.select_transcription_worker(headers, model_id, &routing) {
+            Ok(worker) => worker,
+            Err(refusal) => {
+                outcome.pre_send_error(&refusal);
+                return refusal;
             }
-        };
-
-        // Multipart transcription can't route through `worker.prepare_request`,
-        // which is the hook that injects `data_parallel_rank` for DP-aware
-        // workers. Pre-filter DP-aware workers out of the candidate pool so
-        // the policy can pick a non-DP worker when one exists; only fall back
-        // to model_not_found / 400 when every candidate is DP-aware.
-        let all_workers = self
-            .worker_registry
-            .get_routing_pool(model_id, RoutingPool::HttpRegular);
-        if all_workers.is_empty() {
-            let resp = error::model_not_found(model_id);
-            record_pre_send_error(&resp);
-            return resp;
-        }
-        let non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
-            .iter()
-            .filter(|w| !w.is_dp_aware())
-            .cloned()
-            .collect();
-        if non_dp_workers.is_empty() {
-            let resp = error::bad_request(
-                "dp_aware_not_supported",
-                "/v1/audio/transcriptions does not yet support DP-aware workers",
-            );
-            record_pre_send_error(&resp);
-            return resp;
-        }
-        let Some(worker) = placement::select_from(
-            &self.worker_registry,
-            &self.policy_registry,
-            model_id,
-            &non_dp_workers,
-            PlacementInputs {
-                text: text.as_deref(),
-                tokens: hinted_tokens.as_deref(),
-                headers,
-                rid_key: None,
-                cache_namespace: None,
-            },
-        ) else {
-            // Judged from the same candidates whether the pre-filter emptied
-            // or a self-filtering policy missed on an all-overloaded pool, so
-            // a shed keeps its Retry-After, retryability and metric.
-            let resp = match placement::failure_from(&non_dp_workers, model_id) {
-                PlacementFailure::AllOverloaded(shed) => shed,
-                PlacementFailure::NoCandidates
-                | PlacementFailure::Unavailable
-                | PlacementFailure::PolicyDeclined(_)
-                | PlacementFailure::NoCompatiblePair { .. } => {
-                    // The verdict cannot tell a policy miss from a drained
-                    // pool; the pool can.
-                    let message = if non_dp_workers.iter().any(|w| w.is_available()) {
-                        "Policy returned no eligible worker"
-                    } else {
-                        "All workers are unavailable (circuit breaker open or unhealthy)"
-                    };
-                    error::service_unavailable("no_available_workers", message)
-                }
-            };
-            record_pre_send_error(&resp);
-            return resp;
         };
 
         // Same dispatch-time re-check the regular path takes. A transcription
         // occupies its worker for far longer than a chat completion, so a
         // report landing in the selection→dispatch window is the one case where
         // dispatching anyway is measurably worse.
-        if let Some(resp) = overload::shed_if_worker_overloaded(worker.as_ref(), model_id) {
-            record_pre_send_error(&resp);
+        if let Some(resp) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
+            outcome.pre_send_error(&resp);
             return resp;
         }
 
@@ -853,18 +1177,161 @@ impl Router {
             self.policy_registry.sticky_header_key(headers),
         );
 
+        let res = match Self::send_transcription(
+            headers,
+            body,
+            audio,
+            worker.as_ref(),
+            route,
+            canonical_model.as_deref(),
+            &outcome,
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(response) => return response,
+        };
+
+        let status = res.status();
+
+        Metrics::record_router_upstream_response(metrics_labels::ROUTER_HTTP, status.as_u16(), "");
+
+        events::RequestReceivedEvent {}.emit();
+
+        if is_stream {
+            relay_transcription_stream(res, status, &worker, load_guard, outcome, start)
+        } else {
+            buffer_transcription_response(
+                res,
+                status,
+                worker.as_ref(),
+                self.max_payload_size,
+                &outcome,
+                start,
+            )
+            .await
+        }
+    }
+
+    /// The worker of a transcription, or the refusal this router answers.
+    /// Multipart transcription can't route through `worker.prepare_request`,
+    /// which is the hook that injects `data_parallel_rank` for DP-aware
+    /// workers: DP-aware workers are pre-filtered out of the candidate pool
+    /// so the policy can pick a non-DP worker when one exists, and the
+    /// request falls back to model_not_found / 400 only when the pool is
+    /// empty or every candidate is DP-aware. The verdict on a policy that
+    /// returns no worker is judged from the same pool.
+    fn select_transcription_worker(
+        &self,
+        headers: Option<&HeaderMap>,
+        model_id: &str,
+        routing: &RoutingDerivatives,
+    ) -> Result<Arc<dyn Worker>, Response> {
+        // The request's sequence before the pool read: see
+        // `PlacementInputs::sequence`.
+        let sequence = self
+            .policy_registry
+            .decider()
+            .map(|decider| decider.begin());
+        let all_workers = self
+            .worker_registry
+            .get_routing_pool(model_id, RoutingPool::HttpRegular);
+        if all_workers.is_empty() {
+            return Err(self.report_refusal(
+                "Router::route_multipart_transcription",
+                model_id,
+                error::model_not_found(model_id),
+            ));
+        }
+        let non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
+            .iter()
+            .filter(|w| !w.is_dp_aware())
+            .cloned()
+            .collect();
+        if non_dp_workers.is_empty() {
+            return Err(error::bad_request(
+                "dp_aware_not_supported",
+                "/v1/audio/transcriptions does not yet support DP-aware workers",
+            ));
+        }
+        let Some(worker) = placement::select_from(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            &non_dp_workers,
+            PlacementInputs {
+                text: routing.text.as_deref(),
+                tokens: routing.tokens.as_deref(),
+                headers,
+                rid_key: routing.rid_key.as_deref(),
+                cache_namespace: routing.cache_namespace,
+                candidate_filter: None,
+                tried: &[],
+                sequence,
+            },
+        ) else {
+            // Judged from the same candidates whether the pre-filter emptied
+            // or a self-filtering policy missed on an all-overloaded pool, so
+            // a shed keeps its Retry-After, retryability and metric.
+            let resp = match placement::failure_from(
+                &non_dp_workers,
+                model_id,
+                self.worker_registry.overload_shed_enabled(),
+            ) {
+                PlacementFailure::AllOverloaded(shed) => shed,
+                PlacementFailure::NoCandidates
+                | PlacementFailure::Unavailable
+                | PlacementFailure::PolicyDeclined(_)
+                | PlacementFailure::NoCompatiblePair { .. }
+                | PlacementFailure::PrefillAtCapacity => {
+                    // The verdict cannot tell a policy miss from a drained
+                    // pool; the pool can.
+                    let message = if non_dp_workers.iter().any(|w| w.is_available()) {
+                        "Policy returned no eligible worker"
+                    } else {
+                        "All workers are unavailable (circuit breaker open or unhealthy)"
+                    };
+                    placement::no_available_workers(message)
+                }
+            };
+            return Err(self.report_refusal(
+                "Router::route_multipart_transcription",
+                model_id,
+                resp,
+            ));
+        };
+        Ok(worker)
+    }
+
+    /// The send of a transcription to its worker: the trace headers, the
+    /// request-sent event, the multipart form, the forwarded headers and the
+    /// one send (the form's streamed body cannot be cloned, so the
+    /// stale-connection retry never fires). A form the request cannot
+    /// build or a send that fails is the finalized error answer.
+    async fn send_transcription(
+        headers: Option<&HeaderMap>,
+        body: &TranscriptionRequest,
+        audio: AudioFile,
+        worker: &dyn Worker,
+        route: &'static str,
+        canonical_model: Option<&str>,
+        outcome: &RouteOutcome<'_>,
+    ) -> Result<reqwest::Response, Response> {
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        events::RequestSentEvent { url: worker.url() }.emit();
+        events::RequestSentEvent {
+            url: worker.redacted_url(),
+        }
+        .emit();
 
-        let form = match build_transcription_form(body, audio, canonical_model.as_deref()) {
+        let form = match build_transcription_form(body, audio, canonical_model) {
             Ok(f) => f,
             Err(e) => {
                 let resp = error::bad_request("multipart_build_failed", e);
-                record_pre_send_error(&resp);
-                return resp;
+                outcome.pre_send_error(&resp);
+                return Err(resp);
             }
         };
 
@@ -879,244 +1346,48 @@ impl Router {
             worker.api_key(),
         );
 
-        let res = match send_with_stale_conn_retry(request_builder).await {
-            Ok(res) => res,
+        Metrics::record_worker_request(worker.url(), worker.model_id());
+        match send_with_stale_conn_retry(request_builder).await {
+            Ok(res) => Ok(res),
             Err(e) => {
                 error!(
                     "Failed to send multipart transcription request worker_url={} route={} error={}",
-                    worker.url(),
+                    Endpoint::redacted_str(worker.url()),
                     route,
-                    e
+                    cause(&e)
                 );
                 let err_resp = convert_reqwest_error(e);
-                let err_status = err_resp.status();
-                // Feed the synthetic status into the worker circuit breaker
-                // and worker-error metric; transport failures (timeouts,
-                // connect errors) must be visible to health tracking so the
-                // same bad worker isn't picked repeatedly.
-                worker.record_outcome(err_status.as_u16());
-                if err_status.is_server_error() {
-                    Metrics::record_worker_error(
-                        metrics_labels::WORKER_REGULAR,
-                        metrics_labels::CONNECTION_HTTP,
-                        error_type_from_status(err_status),
-                    );
-                }
-                Metrics::record_router_upstream_response(
-                    metrics_labels::ROUTER_HTTP,
-                    err_status.as_u16(),
-                    extract_error_code_from_response(&err_resp),
-                );
-                // Mirror route_typed_request: a send failure must still bump
-                // the terminal router_error counter, not just upstream_response.
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_HTTP,
-                    metrics_labels::BACKEND_REGULAR,
-                    metrics_labels::CONNECTION_HTTP,
-                    model_id,
-                    endpoint,
-                    error_type_from_status(err_status),
-                );
-                return err_resp;
-            }
-        };
-
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-        Metrics::record_router_upstream_response(metrics_labels::ROUTER_HTTP, status.as_u16(), "");
-
-        events::RequestReceivedEvent {}.emit();
-
-        let response = if is_stream {
-            // Preserve the upstream content-type verbatim. A `stream=true`
-            // hint from the client doesn't guarantee the worker actually
-            // streams — whisper backends may ignore it and return a normal
-            // JSON body (success or 4xx error). Don't relabel non-SSE
-            // responses as SSE; leave that judgment to whatever the worker
-            // set.
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
-            let stream = res.bytes_stream();
-            // Bounded channel applies backpressure: if the downstream client
-            // is slow, the upstream relay awaits on `send` rather than piling
-            // chunks in memory.
-            const STREAM_RELAY_BUFFER: usize = 32;
-            let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(STREAM_RELAY_BUFFER);
-            // Attribute worker-level and router-level outcomes to the actual
-            // stream completion from inside the relay task: a mid-stream error
-            // after a 2xx header, or a non-streaming 5xx header returned under
-            // `stream=true`, must be visible to circuit-breaker + worker-error
-            // + router-error metrics. Recording only at header time would mis-
-            // classify those.
-            let worker_for_stream = worker.clone();
-            let stream_header_status = status;
-            let stream_model_id = model_id.to_string();
-            let stream_endpoint = endpoint;
-            let stream_start = start;
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
-            )]
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let mut stream_failed = false;
-                let mut client_disconnected = false;
-                loop {
-                    tokio::select! {
-                        chunk = stream.next() => match chunk {
-                            // An upstream body can yield a zero-length chunk (the
-                            // chunked-encoding terminator surfaces as one). Forwarded,
-                            // hyper's h2 server sends it as an empty non-END_STREAM
-                            // DATA frame, and h2 >= 0.4.16 clients count those per
-                            // connection (never reset) and close the connection with
-                            // ENHANCE_YOUR_CALM after 100 — i.e. after ~100 streamed
-                            // responses on one client connection. Carry no bytes, send
-                            // no frame.
-                            Some(Ok(bytes)) if bytes.is_empty() => {}
-                            Some(Ok(bytes)) => {
-                                if tx.send(Ok(bytes)).await.is_err() {
-                                    client_disconnected = true;
-                                    break;
-                                }
-                            }
-                            Some(Err(e)) => {
-                                stream_failed = true;
-                                let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                                break;
-                            }
-                            None => break,
-                        },
-                        // Client gone with no chunk in flight (long prefill,
-                        // stalled upstream): break so the reqwest stream drops,
-                        // closing the upstream connection and letting the
-                        // engine abort generation.
-                        () = tx.closed() => {
-                            client_disconnected = true;
-                            break;
-                        }
-                    }
-                }
-                // Effective status = BAD_GATEWAY if the relay failed, else the
-                // worker's header status. Covers both "5xx header returned
-                // while stream=true" and "200 header then mid-stream break".
-                let effective_status = if stream_failed {
-                    StatusCode::BAD_GATEWAY
-                } else {
-                    stream_header_status
-                };
-                worker_for_stream.record_outcome(effective_status.as_u16());
-                if effective_status.is_server_error() {
-                    Metrics::record_worker_error(
-                        metrics_labels::WORKER_REGULAR,
-                        metrics_labels::CONNECTION_HTTP,
-                        error_type_from_status(effective_status),
-                    );
-                }
-                // A client disconnect gets no terminal router metric: it is
-                // neither a completed request (duration) nor a router or
-                // worker failure (error). Worker-level attribution above
-                // still applies — the header status is a worker fact.
-                if client_disconnected {
-                    return;
-                }
-                if effective_status.is_success() {
-                    Metrics::record_router_duration(
-                        metrics_labels::ROUTER_HTTP,
-                        metrics_labels::BACKEND_REGULAR,
-                        metrics_labels::CONNECTION_HTTP,
-                        &stream_model_id,
-                        stream_endpoint,
-                        stream_start.elapsed(),
-                    );
-                } else {
-                    Metrics::record_router_error(
-                        metrics_labels::ROUTER_HTTP,
-                        metrics_labels::BACKEND_REGULAR,
-                        metrics_labels::CONNECTION_HTTP,
-                        &stream_model_id,
-                        stream_endpoint,
-                        error_type_from_status(effective_status),
-                    );
-                }
-            });
-            let stream = ReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response = AttachedBody::wrap_response(response, load_guard);
-            response
-        } else {
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
-            match res.bytes().await {
-                Ok(body) => {
-                    let mut response = Response::new(Body::from(body));
-                    *response.status_mut() = status;
-                    *response.headers_mut() = response_headers;
-                    response
-                }
-                Err(e) => error::internal_error(
-                    "read_response_body_failed",
-                    format!("Failed to read response body: {e}"),
-                ),
-            }
-        };
-
-        // Non-streaming: classify metrics off the final response the client
-        // will actually see. A body-read failure can rewrite a 2xx upstream
-        // into a local 5xx, and we want the circuit breaker + metrics to see
-        // that. Streaming outcomes are owned by the relay task above.
-        if !is_stream {
-            let final_status = response.status();
-            worker.record_outcome(final_status.as_u16());
-            if final_status.is_server_error() {
-                Metrics::record_worker_error(
-                    metrics_labels::WORKER_REGULAR,
-                    metrics_labels::CONNECTION_HTTP,
-                    error_type_from_status(final_status),
-                );
-            }
-            if final_status.is_success() {
-                Metrics::record_router_duration(
-                    metrics_labels::ROUTER_HTTP,
-                    metrics_labels::BACKEND_REGULAR,
-                    metrics_labels::CONNECTION_HTTP,
-                    model_id,
-                    endpoint,
-                    start.elapsed(),
-                );
-            } else {
-                Metrics::record_router_error(
-                    metrics_labels::ROUTER_HTTP,
-                    metrics_labels::BACKEND_REGULAR,
-                    metrics_labels::CONNECTION_HTTP,
-                    model_id,
-                    endpoint,
-                    error_type_from_status(final_status),
-                );
+                outcome.send_failure(worker, &err_resp);
+                Err(err_resp)
             }
         }
-
-        response
     }
 
     /// Buffer a worker response body, capped at `limit` bytes; a larger body
-    /// is a misbehaving worker and yields a 502 before memory balloons.
-    async fn read_worker_body_capped<S, E>(mut stream: S, limit: usize) -> Result<Bytes, Response>
+    /// is a misbehaving worker and yields a 502 before memory balloons, and so
+    /// does a body the worker's connection cuts short (a close before the
+    /// announced length, a reset mid-body): the worker's transport failing
+    /// under the call, answered under its own code, never a fault of the
+    /// gateway's. The request's own timeout running out mid-body ends the
+    /// request as it does before the head (see [`convert_reqwest_error`]).
+    async fn read_worker_body_capped<S>(mut stream: S, limit: usize) -> Result<Bytes, Response>
     where
-        S: Stream<Item = Result<Bytes, E>> + Unpin,
-        E: std::fmt::Display,
+        S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
     {
         let mut body = BytesMut::new();
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
+                Err(e) if is_request_timeout(&e) => {
+                    return Err(request_timeout_response(format!(
+                        "Failed to get response body: {}",
+                        cause(&e)
+                    )));
+                }
                 Err(e) => {
-                    return Err(error::internal_error(
+                    return Err(error::bad_gateway(
                         "read_response_body_failed",
-                        format!("Failed to get response body: {e}"),
+                        format!("Failed to get response body: {}", cause(&e)),
                     ));
                 }
             };
@@ -1140,10 +1411,11 @@ impl Router {
         headers: Option<&HeaderMap>,
         body: Bytes,
         route: &'static str,
-        worker: &dyn Worker,
-        is_stream: bool,
+        mode: StreamRelayMode,
+        source: RelaySource,
         load_guard: WorkerLoadGuard,
     ) -> Response {
+        let worker = source.worker();
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
@@ -1161,94 +1433,82 @@ impl Router {
             api_key.as_ref(),
         );
 
+        Metrics::record_worker_request(worker.url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
                 error!(
                     "Failed to send typed request worker_url={} route={} error={}",
-                    worker.url(),
+                    Endpoint::redacted_str(worker.url()),
                     route,
-                    e
+                    cause(&e)
                 );
 
                 return convert_reqwest_error(e);
             }
         };
 
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard)
+        self.forward_worker_response(res, mode, source, load_guard)
             .await
     }
 
     /// Relay a worker response to the client. A streaming response flows
     /// through a bounded channel with the load guard attached to the body; a
-    /// buffered response is read capped at the ingress payload limit.
+    /// buffered response is read capped at the ingress payload limit. With
+    /// `rechunk`, SSE delta payloads are re-sliced to the bounds of the wire
+    /// of the model the client asked for ([`Wire::rechunk_policy`]). A streamed
+    /// body the worker ends with an error after a successful head is
+    /// accounted to `source` and, when it is SSE, ended with the typed error
+    /// event.
     async fn forward_worker_response(
         &self,
         res: reqwest::Response,
-        is_stream: bool,
-        worker_url: &str,
+        mode: StreamRelayMode,
+        source: RelaySource,
         load_guard: WorkerLoadGuard,
     ) -> Response {
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let StreamRelayMode { is_stream, rechunk } = mode;
+        let status = res.status();
 
         if is_stream {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, worker_url);
+            header_utils::insert_routed_worker_id(
+                &mut response_headers,
+                source.worker().redacted_url(),
+            );
             if status.is_success() && !response_headers.contains_key(CONTENT_TYPE) {
                 response_headers
                     .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             }
 
-            let stream = res.bytes_stream();
-            // Bounded channel applies backpressure: a slow client makes the
-            // relay await on `send` instead of buffering the whole response.
-            let (tx, rx) = mpsc::channel(SSE_CHANNEL_BUFFER);
-
-            // Spawn task to forward stream
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
-            )]
-            tokio::spawn(async move {
-                let mut stream = stream;
-                loop {
-                    tokio::select! {
-                        chunk = stream.next() => match chunk {
-                            // Same as the regular relay: an empty upstream chunk must
-                            // not become an empty h2 DATA frame toward the client.
-                            Some(Ok(bytes)) if bytes.is_empty() => {}
-                            Some(Ok(bytes)) => {
-                                if tx.send(Ok(bytes)).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Some(Err(e)) => {
-                                let _ = tx.send(Err(format!("Stream error: {e}"))).await;
-                                break;
-                            }
-                            None => break,
-                        },
-                        // Client gone with no chunk in flight (long prefill,
-                        // stalled upstream): break so the reqwest stream drops,
-                        // closing the upstream connection and letting the
-                        // engine abort generation.
-                        () = tx.closed() => break,
-                    }
-                }
-            });
-
-            let stream = ReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-
-            // Attach load guard to response body for proper RAII lifecycle
-            // Guard is dropped when response body is consumed or client disconnects
-            response = AttachedBody::wrap_response(response, load_guard);
+            // The same rule as the header synthesis above: a successful
+            // stream with no content-type is relayed as SSE.
+            let upstream_sse = match res
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+            {
+                Some(ct) => ct.starts_with("text/event-stream"),
+                None => status.is_success(),
+            };
+            let rechunker = rechunk
+                .filter(|_| upstream_sse)
+                .map(|policy| SseRechunker::with_observer(policy, NoopObserver));
+            let mut response = relay_streaming_body(
+                res.bytes_stream(),
+                Relay {
+                    status,
+                    upstream_sse,
+                    source,
+                    guard: load_guard,
+                    headers: response_headers,
+                    mode: rechunker.map_or(ChunkMode::Plain, |rechunker| {
+                        ChunkMode::Rechunk(Box::new(rechunker))
+                    }),
+                },
+            );
+            mark_upstream_answer(&mut response);
             response
         } else {
             // For non-streaming requests, preserve headers
@@ -1266,11 +1526,15 @@ impl Router {
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
+                    mark_upstream_answer(&mut response);
                     response
                 }
                 Err(error_response) => error_response,
             };
-            header_utils::insert_routed_worker_id(response.headers_mut(), worker_url);
+            header_utils::insert_routed_worker_id(
+                response.headers_mut(),
+                source.worker().redacted_url(),
+            );
 
             // load_guard dropped here automatically after response body is read
             response
@@ -1291,9 +1555,10 @@ impl Router {
         headers: &HeaderMap,
         body: Body,
         route: &'static str,
-        worker: &dyn Worker,
+        source: RelaySource,
         load_guard: WorkerLoadGuard,
     ) -> Response {
+        let worker = source.worker();
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
@@ -1315,6 +1580,7 @@ impl Router {
             api_key.as_ref(),
         );
 
+        Metrics::record_worker_request(worker.url(), worker.model_id());
         let send = send_with_stale_conn_retry(request_builder);
         tokio::pin!(send);
         let sent = tokio::select! {
@@ -1325,13 +1591,7 @@ impl Router {
                     timeout_secs,
                     "Streamed request body stalled waiting on the client; aborting dispatch"
                 );
-                return error::create_error(
-                    StatusCode::REQUEST_TIMEOUT,
-                    STREAMED_BODY_STALLED,
-                    format!(
-                        "No request body bytes arrived from the client for {timeout_secs} seconds"
-                    ),
-                );
+                return request_body_stalled_response(timeout_secs);
             }
         };
 
@@ -1344,7 +1604,7 @@ impl Router {
                 );
                 return error::create_error(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    STREAMED_BODY_TOO_LARGE,
+                    REQUEST_BODY_TOO_LARGE,
                     format!("Request body exceeded {} bytes", self.max_payload_size),
                 );
             }
@@ -1358,9 +1618,9 @@ impl Router {
             Err(e) => {
                 error!(
                     "Failed to send streamed request worker_url={} route={} error={}",
-                    worker.url(),
+                    Endpoint::redacted_str(worker.url()),
                     route,
-                    e
+                    cause(&e)
                 );
                 return convert_reqwest_error(e);
             }
@@ -1371,8 +1631,16 @@ impl Router {
             .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
             .is_some_and(|ct| ct.starts_with("text/event-stream"));
-        self.forward_worker_response(res, is_stream, worker.url(), load_guard)
-            .await
+        self.forward_worker_response(
+            res,
+            StreamRelayMode {
+                is_stream,
+                rechunk: None,
+            },
+            source,
+            load_guard,
+        )
+        .await
     }
 
     /// Build the public rerank response.
@@ -1382,6 +1650,14 @@ impl Router {
     /// has to be canonicalized here. `canonical_model` is set only when the
     /// client addressed the model by an alias; reporting the alias would make
     /// this route disagree with every other one about which model ran.
+    ///
+    /// The worker's body is read as a [`RerankWorkerResponse`]: the bare
+    /// result list or the Cohere-style `results` object, in either's spelling
+    /// of the score and the document, so a worker of any of the rerank
+    /// contracts answers in the gateway's one shape. The results keep the
+    /// worker's order (every contract sorts them, highest score first);
+    /// `top_k` and `return_documents` are applied here, whatever the worker
+    /// made of them.
     ///
     /// The worker body read is capped at `max_body_bytes`; a larger body is a
     /// misbehaving worker and yields a 502.
@@ -1415,8 +1691,8 @@ impl Router {
                 );
             }
         };
-        let rerank_results = match serde_json::from_slice::<Vec<RerankResult>>(&body_bytes) {
-            Ok(results) => results,
+        let rerank_results = match serde_json::from_slice::<RerankWorkerResponse>(&body_bytes) {
+            Ok(response) => response.into_results(),
             Err(e) => {
                 error!("Failed to build rerank response: {e}");
                 return error::internal_error(
@@ -1427,7 +1703,8 @@ impl Router {
         };
         let model = canonical_model.map_or(req.model, ToOwned::to_owned);
         let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid);
-        // Sorting is handled by Python worker (serving_rerank.py)
+        // The worker's order stands: every rerank contract answers sorted,
+        // highest score first.
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
         }
@@ -1514,6 +1791,308 @@ fn build_transcription_form(
     Ok(form)
 }
 
+/// The terminal accounting of one HTTP route: the labels its router
+/// metrics carry and the finalizers that write them, one per way the
+/// request ends. `Router::begin_route` builds it for the typed route,
+/// which ends through `answered_typed`, and for the multipart
+/// transcription route, which ends through `answered` and `answered_as`.
+struct RouteOutcome<'a> {
+    model_label: Cow<'a, str>,
+    endpoint: &'static str,
+}
+
+impl RouteOutcome<'_> {
+    /// Finalize router metrics for an early error that never reached an
+    /// upstream worker (model_not_found, dp_aware_not_supported, no
+    /// available workers, build failure). Without this, pre-send failures
+    /// silently disappear from router_upstream_responses / router_error.
+    fn pre_send_error(&self, response: &Response) {
+        let rstatus = response.status();
+        Metrics::record_router_upstream_response(
+            metrics_labels::ROUTER_HTTP,
+            rstatus.as_u16(),
+            extract_error_code_from_response(response),
+        );
+        // Response-aware: a terminal shed carries a retryable status but
+        // must still count as a router error.
+        if !is_retryable_response(response) {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                &self.model_label,
+                self.endpoint,
+                error_type_for_response(response),
+                error_reason_for_response(response),
+            );
+        }
+    }
+
+    /// A request the worker never answered. Its synthetic status feeds the
+    /// worker circuit breaker and worker-error metric (transport failures,
+    /// timeouts and connect errors must be visible to health tracking so the
+    /// same bad worker isn't picked repeatedly), then the upstream-response
+    /// counter and, as on `route_typed_request`, the terminal router_error
+    /// counter.
+    fn send_failure(&self, worker: &dyn Worker, err_resp: &Response) {
+        let err_status = err_resp.status();
+        worker_outcome(worker, err_status);
+        Metrics::record_router_upstream_response(
+            metrics_labels::ROUTER_HTTP,
+            err_status.as_u16(),
+            extract_error_code_from_response(err_resp),
+        );
+        Metrics::record_router_error(
+            metrics_labels::ROUTER_HTTP,
+            metrics_labels::BACKEND_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            &self.model_label,
+            self.endpoint,
+            error_type_from_status(err_status),
+            error_reason_for_response(err_resp),
+        );
+    }
+
+    /// The router's terminal metric of an answered request: its duration on
+    /// a success, else the error class of its status.
+    fn answered(&self, status: StatusCode, start: Instant) {
+        self.answered_as(status, error_reason_from_status(status), start);
+    }
+
+    /// [`Self::answered`] with the error counter's reason given: the
+    /// buffered transcription answer names the gateway's own read failure
+    /// by its code, not by the worker-style reason of its status.
+    fn answered_as(&self, status: StatusCode, reason: &'static str, start: Instant) {
+        if status.is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                &self.model_label,
+                self.endpoint,
+                start.elapsed(),
+            );
+        } else {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                &self.model_label,
+                self.endpoint,
+                error_type_from_status(status),
+                reason,
+            );
+        }
+    }
+
+    /// [`Self::answered`] for the typed route, whose answer may be replayed:
+    /// the duration on a success, else the response's own error class and
+    /// reason. The response is the request's answer whether it was
+    /// definitive at once or the last retryable one before the retries ran
+    /// out, so it counts once either way; the retry executor's exhaustion
+    /// counter records the spent retries beside it.
+    fn answered_typed(&self, response: &Response, start: Instant) {
+        if response.status().is_success() {
+            let duration = start.elapsed();
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                &self.model_label,
+                self.endpoint,
+                duration,
+            );
+        } else {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_HTTP,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_HTTP,
+                &self.model_label,
+                self.endpoint,
+                error_type_for_response(response),
+                error_reason_for_response(response),
+            );
+        }
+    }
+
+    /// The same labels, owned: what the stream relay's task carries.
+    fn into_owned(self) -> RouteOutcome<'static> {
+        RouteOutcome {
+            model_label: Cow::Owned(self.model_label.into_owned()),
+            endpoint: self.endpoint,
+        }
+    }
+}
+
+/// The worker's side of a request's outcome: the status feeds its circuit
+/// breaker, and a server error the worker-error metric.
+fn worker_outcome(worker: &dyn Worker, status: StatusCode) {
+    worker.record_outcome(status.as_u16());
+    if status.is_server_error() {
+        Metrics::record_worker_error(
+            metrics_labels::WORKER_REGULAR,
+            metrics_labels::CONNECTION_HTTP,
+            error_type_from_status(status),
+        );
+    }
+}
+
+/// Relays a streamed transcription body to the client; the worker's and the
+/// router's outcome is attributed when the stream ends, by the relay task.
+fn relay_transcription_stream(
+    res: reqwest::Response,
+    status: StatusCode,
+    worker: &Arc<dyn Worker>,
+    load_guard: WorkerLoadGuard,
+    outcome: RouteOutcome<'_>,
+    start: Instant,
+) -> Response {
+    // Preserve the upstream content-type verbatim. A `stream=true`
+    // hint from the client doesn't guarantee the worker actually
+    // streams — whisper backends may ignore it and return a normal
+    // JSON body (success or 4xx error). Don't relabel non-SSE
+    // responses as SSE; leave that judgment to whatever the worker
+    // set.
+    let mut response_headers = header_utils::preserve_response_headers(res.headers());
+    header_utils::insert_routed_worker_id(&mut response_headers, worker.redacted_url());
+    let stream = res.bytes_stream();
+    // Bounded channel applies backpressure: if the downstream client
+    // is slow, the upstream relay awaits on `send` rather than piling
+    // chunks in memory.
+    const STREAM_RELAY_BUFFER: usize = 32;
+    let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(STREAM_RELAY_BUFFER);
+    // Attribute worker-level and router-level outcomes to the actual
+    // stream completion from inside the relay task: a mid-stream error
+    // after a 2xx header, or a non-streaming 5xx header returned under
+    // `stream=true`, must be visible to circuit-breaker + worker-error
+    // + router-error metrics. Recording only at header time would mis-
+    // classify those.
+    let worker_for_stream = worker.clone();
+    let stream_header_status = status;
+    let outcome = outcome.into_owned();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "fire-and-forget stream relay; gateway shutdown need not wait for individual stream forwarding"
+    )]
+    tokio::spawn(async move {
+        let mut stream = stream;
+        let mut stream_failed = false;
+        let mut client_disconnected = false;
+        // One wait for the client's leaving, kept across the chunks (a
+        // `closed()` per `select!` round registers and drops a waiter on
+        // every chunk; kept, it registers once).
+        let client_gone = tx.closed();
+        tokio::pin!(client_gone);
+        loop {
+            tokio::select! {
+                chunk = stream.next() => match chunk {
+                    // An upstream body can yield a zero-length chunk (the
+                    // chunked-encoding terminator surfaces as one). Forwarded,
+                    // hyper's h2 server sends it as an empty non-END_STREAM
+                    // DATA frame, and h2 >= 0.4.16 clients count those per
+                    // connection (never reset) and close the connection with
+                    // ENHANCE_YOUR_CALM after 100 — i.e. after ~100 streamed
+                    // responses on one client connection. Carry no bytes, send
+                    // no frame.
+                    Some(Ok(bytes)) if bytes.is_empty() => {}
+                    Some(Ok(bytes)) => {
+                        if tx.send(Ok(bytes)).await.is_err() {
+                            client_disconnected = true;
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        stream_failed = true;
+                        let _ = tx.send(Err(format!("Stream error: {}", cause(&e)))).await;
+                        break;
+                    }
+                    None => break,
+                },
+                // Client gone with no chunk in flight (long prefill,
+                // stalled upstream): break so the reqwest stream drops,
+                // closing the upstream connection and letting the
+                // engine abort generation.
+                () = &mut client_gone => {
+                    client_disconnected = true;
+                    break;
+                }
+            }
+        }
+        // Effective status = BAD_GATEWAY if the relay failed, else the
+        // worker's header status. Covers both "5xx header returned
+        // while stream=true" and "200 header then mid-stream break".
+        let effective_status = if stream_failed {
+            StatusCode::BAD_GATEWAY
+        } else {
+            stream_header_status
+        };
+        worker_outcome(worker_for_stream.as_ref(), effective_status);
+        // A client disconnect gets no terminal router metric: it is
+        // neither a completed request (duration) nor a router or
+        // worker failure (error). Worker-level attribution above
+        // still applies — the header status is a worker fact.
+        if client_disconnected {
+            return;
+        }
+        outcome.answered(effective_status, start);
+    });
+    // The load guard rides in the body's own stream: released when
+    // the body is dropped, at its end or when the client leaves.
+    let body = Body::from_stream(GuardedStream::new(ReceiverStream::new(rx), load_guard));
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    *response.headers_mut() = response_headers;
+    response
+}
+
+/// Buffers a transcription body, read under the ingress payload cap; the
+/// worker's and the router's outcome is attributed from the response the
+/// client sees.
+async fn buffer_transcription_response(
+    res: reqwest::Response,
+    status: StatusCode,
+    worker: &dyn Worker,
+    max_payload_size: usize,
+    outcome: &RouteOutcome<'_>,
+    start: Instant,
+) -> Response {
+    let response_headers = header_utils::preserve_response_headers(res.headers());
+    // The same capped read as every typed route's buffered answer: a
+    // body above the ingress payload limit is a misbehaving worker
+    // and ends as a 502 before memory grows, and the request's own
+    // timeout ends the request as it does before the head.
+    let (mut response, reason) =
+        match Router::read_worker_body_capped(res.bytes_stream(), max_payload_size).await {
+            Ok(body) => {
+                let mut response = Response::new(Body::from(body));
+                *response.status_mut() = status;
+                *response.headers_mut() = response_headers;
+                // The worker's own answer: its status names the reason.
+                (response, error_reason_from_status(status))
+            }
+            // The gateway's own answer for a read that failed (a body cut
+            // short, one over the limit, the request's timeout): its code
+            // names the reason, not the worker-style reason of its status.
+            Err(error_response) => {
+                let reason = error_reason_for_response(&error_response);
+                (error_response, reason)
+            }
+        };
+    // The routed worker's id on the error answers too, as the typed
+    // routes' buffered arm sets it.
+    header_utils::insert_routed_worker_id(response.headers_mut(), worker.redacted_url());
+
+    // Non-streaming: classify metrics off the final response the client
+    // will actually see. A body-read failure can rewrite a 2xx upstream
+    // into a local 5xx, and we want the circuit breaker + metrics to see
+    // that. Streaming outcomes are owned by `relay_transcription_stream`.
+    let final_status = response.status();
+    worker_outcome(worker, final_status);
+    outcome.answered_as(final_status, reason, start);
+
+    response
+}
+
 /// True for transport failures surfaced without any response: no upstream
 /// status, not a timeout, and not a response-phase (body/decode) or local
 /// (builder/redirect) error. The dominant producer is a pooled connection
@@ -1528,17 +2107,33 @@ fn is_pre_response_transport_error(e: &reqwest::Error) -> bool {
         && !e.is_redirect()
 }
 
+/// Await `future` with no tracing dispatcher in scope.
+///
+/// hyper's client executor spawns every new pooled connection with
+/// `in_current_span()`. A connection created while a request span is current
+/// would enter that span on each of its polls, for every later request it
+/// serves, and keep the span alive for the connection's life. The upstream
+/// send is polled under the no-op dispatcher instead, so a connection it
+/// creates runs under no span.
+async fn untraced<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        tracing::dispatcher::with_default(&tracing::Dispatch::none(), || future.as_mut().poll(cx))
+    })
+    .await
+}
+
 /// Send with a single retry on pre-response transport failures. Requests
 /// whose body cannot be cloned (multipart streams) fail through unchanged.
 pub(crate) async fn send_with_stale_conn_retry(
     builder: reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let retry = builder.try_clone();
-    match builder.send().await {
+    match untraced(builder.send()).await {
         Err(e) if is_pre_response_transport_error(&e) => match retry {
             Some(retry) => {
                 Metrics::record_upstream_send_retry(metrics_labels::ROUTER_HTTP);
-                retry.send().await
+                untraced(retry.send()).await
             }
             None => Err(e),
         },
@@ -1547,25 +2142,53 @@ pub(crate) async fn send_with_stale_conn_retry(
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
-    let url = e
-        .url()
-        .map(|u| u.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let message = format!("{e}. URL: {url}");
+    // The error's words and its causes, without the URL reqwest puts in them:
+    // the worker's address is logged by the caller and is not the client's.
+    let message = cause(&e);
 
-    // TODO improve error status code
+    // The request's own timeout (the client's budget: `--request-timeout-secs`
+    // or the worker's `timeout_secs`), before the head or while the body is
+    // read, is the end of the request: the 504 goes to the client once, with
+    // no replay on another worker (see `retry::request_timeout_response`).
+    if is_request_timeout(&e) {
+        return request_timeout_response(message);
+    }
+
+    // reqwest files a request timeout under `Kind::Request` (with a `TimedOut`
+    // source), so `is_request()` is true for it as well: the timeout and
+    // connect arms have to be consulted before the generic request arm, or a
+    // timed-out upstream reads as a plain 500 and the 504 path is unreachable.
+    // The timeouts left here are not the request's own (the connect timeout,
+    // a timeout below the client): the worker's failure, answered as before
+    // and replayed.
+    // The worker's side failing under the call is the upstream's failure
+    // (502), as the disaggregated routers answer their start failures and
+    // the capped body read answers a body over its limit: the connect
+    // refused, the connection reset or closed before the head (the client
+    // files it as a request fault), the answer that did not decode or ended
+    // before it was whole (its decode fault; no route hands this conversion
+    // a body-read fault today, the relay's own reads answer those under
+    // their codes). The gateway's own side keeps the 500: a builder fault,
+    // a redirect it did not follow. A body the gateway forwards does not
+    // fail the send on its own: the one route that streams one answers its
+    // inbound fault and its cap (400, 413) before this conversion, and
+    // every other route sends a buffered body; were such a fault to arrive,
+    // the client files it as a request fault too (its body kind is the
+    // response body's read), not as the gateway's. Every code stays what
+    // it was, and the retry layer replays a 502 as it replayed the 500.
     let (status, code) = if let Some(upstream_status) = e.status() {
         (upstream_status, "call_upstream_status_error")
+    } else if e.is_timeout() {
+        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
+    } else if e.is_connect() {
+        (StatusCode::BAD_GATEWAY, "call_upstream_connection_failed")
     } else if e.is_builder() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             "call_upstream_builder_error",
         )
     } else if e.is_request() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_request_error",
-        )
+        (StatusCode::BAD_GATEWAY, "call_upstream_request_error")
     } else if e.is_redirect() {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1577,17 +2200,7 @@ fn convert_reqwest_error(e: reqwest::Error) -> Response {
             "call_upstream_body_error",
         )
     } else if e.is_decode() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_decode_error",
-        )
-    } else if e.is_timeout() {
-        (StatusCode::GATEWAY_TIMEOUT, "call_upstream_timeout")
-    } else if e.is_connect() {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "call_upstream_connection_failed",
-        )
+        (StatusCode::BAD_GATEWAY, "call_upstream_decode_error")
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1624,6 +2237,8 @@ impl Router {
                     .worker_registry
                     .any_model_retry_override_enables_retries(),
             max_buffered_request_bytes: self.max_buffered_request_bytes,
+            tenant_rate_limited: self.rate_limit_manager.is_some(),
+            message_thread: header_utils::anthropic_beta_named(headers, "message-threads"),
         })
     }
 
@@ -1659,6 +2274,8 @@ impl Router {
             Some(req.headers()),
             None,
             None,
+            None,
+            &[],
         ) else {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_NO_AVAILABLE_WORKER);
             return Err(req);
@@ -1692,7 +2309,10 @@ impl Router {
             worker.clone(),
             self.policy_registry.sticky_header_key(Some(req.headers())),
         );
-        events::RequestSentEvent { url: worker.url() }.emit();
+        events::RequestSentEvent {
+            url: worker.redacted_url(),
+        }
+        .emit();
 
         let (parts, body) = req.into_parts();
         let mut headers_with_trace = parts.headers;
@@ -1703,7 +2323,7 @@ impl Router {
                 &headers_with_trace,
                 body,
                 route,
-                worker.as_ref(),
+                RelaySource::new(model_id, route, Arc::clone(&worker)),
                 load_guard,
             )
             .await;
@@ -1711,11 +2331,21 @@ impl Router {
         events::RequestReceivedEvent {}.emit();
         let status = response.status();
         let error_code = extract_error_code_from_response(&response);
-        if error_code != STREAMED_BODY_STALLED
-            && error_code != STREAMED_BODY_TOO_LARGE
-            && error_code != STREAMED_BODY_ABORTED
-        {
-            worker.record_outcome(status.as_u16());
+        // The three streamed-body codes are the client's own faults (an
+        // upload that stalled, grew past the limit or broke off before it was
+        // forwarded): no worker answered, so they are neither the worker's
+        // outcome nor the router's error. The edge family counts them by
+        // status and code.
+        let client_body_fault = matches!(
+            error_code,
+            REQUEST_BODY_STALLED | REQUEST_BODY_TOO_LARGE | STREAMED_BODY_ABORTED
+        );
+        if !client_body_fault {
+            // A streamed head's success was recorded before its relay task
+            // was spawned (see `forward_worker_response`).
+            if !head_success_recorded(&response) {
+                worker.record_outcome(status.as_u16());
+            }
             if status.is_server_error() {
                 Metrics::record_worker_error(
                     metrics_labels::WORKER_REGULAR,
@@ -1729,6 +2359,10 @@ impl Router {
             status.as_u16(),
             error_code,
         );
+        // The duration on a success, else the error class and reason of the
+        // answer. This path sends once and never retries, so a worker's
+        // retryable status is the request's final answer too and counts like
+        // any other; the client's own body faults above do not.
         if status.is_success() {
             Metrics::record_router_duration(
                 metrics_labels::ROUTER_HTTP,
@@ -1738,7 +2372,7 @@ impl Router {
                 endpoint,
                 start.elapsed(),
             );
-        } else if !is_retryable_status(status) {
+        } else if !client_body_fault {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_HTTP,
                 metrics_labels::BACKEND_REGULAR,
@@ -1746,15 +2380,16 @@ impl Router {
                 model_id,
                 endpoint,
                 error_type_from_status(status),
+                error_reason_from_status(status),
             );
         }
         Ok(response)
     }
 }
 
-/// State for [`stream_eligible_request_bodies`]: the app-level router handle
-/// (the manager in production, a concrete router in tests) and the app
-/// context carrying the WASM manager.
+/// State of [`StreamBodyLayer`]: the app-level router handle (the manager in
+/// production, a concrete router in tests) and the app context carrying the
+/// WASM manager.
 #[derive(Clone)]
 pub struct StreamBodyState {
     router: Arc<dyn RouterTrait>,
@@ -1764,6 +2399,15 @@ pub struct StreamBodyState {
 impl StreamBodyState {
     pub fn new(router: Arc<dyn RouterTrait>, context: Arc<AppContext>) -> Self {
         Self { router, context }
+    }
+
+    /// The per-request buffer-vs-stream decision as a lean route layer: a
+    /// request on a route outside the typed set, or on a family that
+    /// buffers, is handed to the route as the route's own future; the route
+    /// service is cloned, the preemption token read and a future boxed only
+    /// for a request a forward-capable router may stream.
+    pub fn layer(self) -> StreamBodyLayer {
+        StreamBodyLayer { state: self }
     }
 
     /// WASM OnRequest hooks read (and may rewrite) the buffered body, so
@@ -1779,63 +2423,130 @@ impl StreamBodyState {
                     .map_or(true, |modules| !modules.is_empty())
             })
     }
+
+    /// The regular HTTP router a request may be streamed through, or the
+    /// reason it is buffered instead: the family's own [`BodyPolicy`], or a
+    /// registration race that turned dispatch model-addressed again (either
+    /// arm of the manager lookup).
+    fn forward_capable_router(&self) -> Result<Arc<dyn RouterTrait>, &'static str> {
+        if let BodyPolicy::MustBuffer(reason) = self.router.request_body_policy() {
+            return Err(reason);
+        }
+        let resolved = match self.router.as_any().downcast_ref::<Gateway>() {
+            Some(manager) => manager
+                .select_router_for_request(None)
+                .ok_or(REASON_MODEL_SELECTION)?,
+            None => Arc::clone(&self.router),
+        };
+        if resolved.as_any().downcast_ref::<Router>().is_none() {
+            return Err(REASON_MODEL_SELECTION);
+        }
+        Ok(resolved)
+    }
 }
 
-/// Route-layer middleware: every typed-JSON request on an eligible route is
-/// classified by the router family's [`BodyPolicy`]. A `MustBuffer` family
-/// is accounted and passed to the untouched handler; a `ForwardCapable`
-/// router then decides per request between the streamed pass-through and
-/// the handler's buffered `Json`/`ValidatedJson` path, always with the body
-/// unconsumed on decline. Sits inside the admission layer, so streamed
-/// requests hold an admission permit and race the preemption token.
-pub async fn stream_eligible_request_bodies(
-    State(state): State<StreamBodyState>,
-    cancel: PreemptionGuard,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    let route: &'static str = match req.uri().path() {
+/// The typed routes whose bodies may be streamed, by path; `None` for any
+/// other route.
+fn streamable_route(path: &str) -> Option<&'static str> {
+    Some(match path {
         "/generate" => "/generate",
         "/v1/chat/completions" => "/v1/chat/completions",
         "/v1/completions" => "/v1/completions",
         "/v1/messages" => "/v1/messages",
         "/v1/embeddings" => "/v1/embeddings",
         "/v1/classify" => "/v1/classify",
-        _ => return next.run(req).await,
-    };
-    if let BodyPolicy::MustBuffer(reason) = state.router.request_body_policy() {
-        Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
-        return next.run(req).await;
+        _ => return None,
+    })
+}
+
+/// [`StreamBodyState::layer`].
+#[derive(Clone)]
+pub struct StreamBodyLayer {
+    state: StreamBodyState,
+}
+
+impl<S> Layer<S> for StreamBodyLayer {
+    type Service = StreamBodyService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StreamBodyService {
+            inner,
+            state: self.state.clone(),
+        }
     }
-    // ForwardCapable: resolve the concrete regular router behind an optional
-    // manager. Either arm can only fail on a registration race that turned
-    // dispatch model-addressed again.
-    let resolved = match state.router.as_any().downcast_ref::<Gateway>() {
-        Some(manager) => match manager.select_router_for_request(None) {
-            Some(selected) => selected,
-            None => {
-                Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_MODEL_SELECTION);
-                return next.run(req).await;
+}
+
+/// The service [`StreamBodyLayer`] wraps a route in. Every typed-JSON
+/// request on an eligible route is classified by the router family's
+/// [`BodyPolicy`]. A `MustBuffer` family is accounted and passed to the
+/// untouched route; a `ForwardCapable` router then decides per request
+/// between the streamed pass-through and the route's buffered
+/// `Json`/`ValidatedJson` path, always with the body unconsumed on decline.
+/// Sits inside the admission layer, so streamed requests hold an admission
+/// permit and race the preemption token.
+#[derive(Clone)]
+pub struct StreamBodyService<S> {
+    inner: S,
+    state: StreamBodyState,
+}
+
+impl<S> Service<Request<Body>> for StreamBodyService<S>
+where
+    S: Service<Request<Body>, Response = Response, Error = Infallible> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Either<S::Future, BoxFuture<'static, Result<Response, Infallible>>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        let Some(route) = streamable_route(req.uri().path()) else {
+            return Either::Left(self.inner.call(req));
+        };
+        let resolved = match self.state.forward_capable_router() {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
+                return Either::Left(self.inner.call(req));
             }
-        },
-        None => Arc::clone(&state.router),
-    };
-    let Some(http) = resolved.as_any().downcast_ref::<Router>() else {
-        Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_MODEL_SELECTION);
-        return next.run(req).await;
-    };
-    let wasm_request_hooks = state.wasm_request_hooks();
-    cancel
-        .guard(async move {
-            match http
-                .route_streaming_request(req, route, wasm_request_hooks)
-                .await
-            {
-                Ok(response) => response,
-                Err(req) => next.run(req).await,
-            }
-        })
-        .await
+        };
+        let wasm_request_hooks = self.state.wasm_request_hooks();
+        let cancel = PreemptionGuard::from_extensions(req.extensions());
+        // The route service a declined request is handed to is the one that
+        // reported ready, as tower's contract has it; the clone stays here.
+        let clone = self.inner.clone();
+        let inner = std::mem::replace(&mut self.inner, clone);
+        Either::Right(Box::pin(async move {
+            let response = cancel
+                .guard(async move {
+                    let Some(http) = resolved.as_any().downcast_ref::<Router>() else {
+                        return route_request(inner, req).await;
+                    };
+                    match http
+                        .route_streaming_request(req, route, wasm_request_hooks)
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(req) => route_request(inner, req).await,
+                    }
+                })
+                .await;
+            Ok(response)
+        }))
+    }
+}
+
+/// The route's own answer to a request the layer does not stream.
+async fn route_request<S>(mut route: S, req: Request<Body>) -> Response
+where
+    S: Service<Request<Body>, Response = Response, Error = Infallible>,
+{
+    let Ok(response) = route.call(req).await;
+    response
 }
 
 #[async_trait]
@@ -1863,59 +2574,90 @@ impl RouterTrait for Router {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: GenerateRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/generate", model_id)
             .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
+        self.route_typed_request(
+            headers,
+            Some(tenant_meta),
+            super::chat_for_upstream(body),
+            "/v1/chat/completions",
+            model_id,
+        )
+        .await
     }
 
     async fn route_messages(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/messages", model_id)
+        if let Some(refused) = super::refuse_max_tokens_zero(body.max_tokens) {
+            return refused;
+        }
+        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/messages", model_id)
+            .await
+    }
+
+    async fn route_messages_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: CountMessageTokensRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_typed_request(headers, None, body, "/v1/messages/count_tokens", model_id)
             .await
     }
 
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
-            .await
+        self.route_typed_request(
+            headers,
+            Some(tenant_meta),
+            body,
+            "/v1/completions",
+            model_id,
+        )
+        .await
     }
 
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/responses", model_id)
             .await
     }
 
-    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn cancel_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        response_id: &str,
+    ) -> Response {
         let endpoint = format!("v1/responses/{response_id}/cancel");
         self.route_post_empty_request(headers, &endpoint).await
     }
@@ -1923,22 +2665,55 @@ impl RouterTrait for Router {
     async fn route_embeddings(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: EmbeddingRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/embeddings", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/embeddings", model_id)
             .await
     }
 
     async fn route_classify(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/classify", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/classify", model_id)
+            .await
+    }
+
+    async fn route_decisions(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: DecisionsRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_typed_request(headers, None, body, "/v1/decisions", model_id)
+            .await
+    }
+
+    async fn route_systemone(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: SystemOneRequest,
+        model_id: &str,
+    ) -> Response {
+        // Direct HTTP routers must enforce the same explicit-model contract
+        // as Gateway before shared routing can interpret its wildcard.
+        if model_id == crate::worker::UNKNOWN_MODEL_ID
+            || self
+                .worker_registry
+                .resolve_model_alias(model_id)
+                .as_deref()
+                == Some(crate::worker::UNKNOWN_MODEL_ID)
+        {
+            return error::model_not_found(model_id);
+        }
+        self.route_typed_request(headers, None, body, "/v1/systemone", model_id)
             .await
     }
 
@@ -1970,7 +2745,7 @@ impl RouterTrait for Router {
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let response_spec = RerankResponseSpec::from(&body);
         let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, None, body, "/v1/rerank", model_id)
             .await;
         if response.status().is_success() {
             Self::build_rerank_response(
@@ -2034,7 +2809,7 @@ impl RouterTrait for Router {
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_REGULAR,
             metrics_labels::CONNECTION_WEBSOCKET,
-            model,
+            self.worker_registry.metric_model_label(model),
             metrics_labels::ENDPOINT_REALTIME,
             "false",
         );
@@ -2079,7 +2854,7 @@ impl RouterTrait for Router {
             metrics_labels::ROUTER_HTTP,
             metrics_labels::BACKEND_REGULAR,
             metrics_labels::CONNECTION_WEBRTC,
-            &parsed.model,
+            self.worker_registry.metric_model_label(&parsed.model),
             metrics_labels::ENDPOINT_REALTIME,
             "false",
         );
@@ -2119,20 +2894,33 @@ mod tests {
     };
 
     use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
-    use openai_protocol::worker::HealthCheckConfig;
+    use openai_protocol::{profile::ProviderProfile, rerank::RerankResult};
+    use serde_json::{json, Value};
 
     use super::*;
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
-        policies::CacheAwarePolicy,
-        routers::common::{
-            body_policy::{
-                REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT, REASON_RETRYABLE,
-                REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE, REASON_WASM_REQUEST_HOOK,
+        middleware::ReportedRefusal,
+        observability::logging::test_support::{test_subscriber, RefusalLineCounter},
+        policies::as_cache_aware,
+        routers::{
+            common::{
+                body_policy::{
+                    REASON_MESSAGE_THREAD, REASON_NO_CONTENT_LENGTH, REASON_POLICY_NEEDS_TEXT,
+                    REASON_RETRYABLE, REASON_RETRY_FORFEITED, REASON_ROUTING_KEY_OVERRIDE,
+                    REASON_WASM_REQUEST_HOOK,
+                },
+                request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
+                test_support::fast_retry_config,
             },
-            request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
+            http::test_support,
         },
-        worker::BasicWorkerBuilder,
+        service_discovery::testing::create_test_app_context,
+        worker::{
+            circuit_breaker::CircuitState,
+            test_support::{no_health_check, RefusedAddress},
+            BasicWorkerBuilder,
+        },
     };
 
     /// Accepts `kill_first` connections and closes them before any response
@@ -2172,7 +2960,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_recovers_on_second_connection() {
         let (addr, accepted) = flaky_upstream(1).await;
-        let client = reqwest::Client::new();
+        let client = crate::server::http_client();
         let builder = client.post(format!("http://{addr}/generate")).body("{}");
 
         let res = send_with_stale_conn_retry(builder).await.unwrap();
@@ -2183,7 +2971,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_is_bounded_to_one() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
-        let client = reqwest::Client::new();
+        let client = crate::server::http_client();
         let builder = client.post(format!("http://{addr}/generate")).body("{}");
 
         let err = send_with_stale_conn_retry(builder).await.unwrap_err();
@@ -2194,7 +2982,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_skips_unclonable_bodies() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
-        let client = reqwest::Client::new();
+        let client = crate::server::http_client();
         let stream_body = reqwest::Body::wrap_stream(stream::once(async {
             Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
         }));
@@ -2204,13 +2992,6 @@ mod tests {
 
         send_with_stale_conn_retry(builder).await.unwrap_err();
         assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
-    }
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
     }
 
     fn create_test_regular_router() -> Router {
@@ -2240,6 +3021,7 @@ mod tests {
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            rate_limit_manager: None,
         }
     }
 
@@ -2248,6 +3030,219 @@ mod tests {
         let workers = router.worker_registry.get_all();
         workers[0].set_status(openai_protocol::worker::WorkerStatus::NotReady);
         router
+    }
+
+    /// The complete text of every event written on this thread's subscriber:
+    /// the message and the fields, as a reader of the log sees them.
+    #[derive(Clone, Default)]
+    struct EventTexts(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventTexts {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Text(String);
+            impl tracing::field::Visit for Text {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut text = Text(String::new());
+            event.record(&mut text);
+            self.0.lock().unwrap().push(text.0);
+        }
+    }
+
+    /// A failed call to a worker is logged log-safe as a whole: a worker
+    /// registered with userinfo at a port nobody listens on fails the proxied
+    /// GET, and the complete event (the message and every field) carries the
+    /// mask, never the user or the secret. The error's own text goes through
+    /// `cause`, so the line names no address of its own either, whatever the
+    /// HTTP client puts in its `Display`.
+    #[tokio::test]
+    async fn a_failed_call_to_a_worker_with_userinfo_is_logged_log_safe() {
+        let texts = EventTexts::default();
+        let _subscriber = test_subscriber(texts.clone());
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register_or_replace(Arc::new(
+            BasicWorkerBuilder::new(format!("http://alice:s3cret@127.0.0.1:{port}"))
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        ));
+        let router = Router {
+            worker_registry,
+            ..create_test_regular_router()
+        };
+
+        let response = router
+            .proxy_get_request(Request::new(Body::empty()), "health")
+            .await;
+
+        assert!(response.status().is_server_error(), "{}", response.status());
+        let texts = texts.0.lock().unwrap();
+        let line = texts
+            .iter()
+            .find(|text| text.contains("Failed to proxy GET request"))
+            .expect("the failure line");
+        assert!(
+            line.contains(&format!("http://***@127.0.0.1:{port}")),
+            "{line}"
+        );
+        assert!(!line.contains("s3cret"), "{line}");
+        assert!(!line.contains("alice"), "{line}");
+        assert!(
+            texts.iter().all(|text| !text.contains("s3cret")),
+            "{texts:?}"
+        );
+    }
+
+    /// One of the public GET pass-throughs, on a worker registered with a
+    /// trailing slash: the stub is asked for `/get_server_info`, not
+    /// `//get_server_info`.
+    #[tokio::test]
+    async fn a_get_pass_through_joins_to_a_slashed_registration_with_one_slash() {
+        use std::sync::Mutex;
+
+        use axum::http::Uri;
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(move |uri: Uri| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                recorder.lock().unwrap().push(uri.path().to_owned());
+                ([(CONTENT_TYPE, "application/json")], "{}").into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let slashed = BasicWorkerBuilder::new(format!("http://{addr}/"))
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build();
+        let router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, vec![slashed]);
+
+        let response = router
+            .proxy_get_request(
+                Request::builder().body(Body::empty()).unwrap(),
+                "get_server_info",
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["/get_server_info"]);
+    }
+
+    /// smg-lab #288: the `model` label of the request families is bounded by
+    /// the served models. A request for a model no worker serves is counted
+    /// under `other` (the value the bounded interner and the `path` label
+    /// already use), never under the client's string, so a client cannot
+    /// mint series; a served model keeps its own id.
+    #[test]
+    fn an_unserved_model_is_counted_under_other_and_a_served_one_under_its_id() {
+        use openai_protocol::validated::Normalizable;
+
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rendered = render_with_recorder(|| {
+            runtime.block_on(async {
+                let app = axum::Router::new().route(
+                    "/v1/chat/completions",
+                    axum::routing::post(|| async {
+                        ([(CONTENT_TYPE, "application/json")], "{}").into_response()
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test stub server lives for the duration of the test process"
+                )]
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let served = BasicWorkerBuilder::new(format!("http://{addr}"))
+                    .worker_type(WorkerType::Regular)
+                    .model(crate::worker::ModelCard::new("m1"))
+                    .health_config(no_health_check())
+                    .build();
+                let router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, vec![served]);
+                let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+                for model in ["ghost-1", "ghost-2", "m1"] {
+                    let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                        "model": model,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 4,
+                    }))
+                    .unwrap();
+                    request.normalize();
+                    let response = router.route_chat(None, &tenant, request, model).await;
+                    let expected = if model == "m1" {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    };
+                    assert_eq!(response.status(), expected, "{model}");
+                }
+            });
+        });
+        assert!(
+            !rendered.contains("ghost-"),
+            "a client-named model reached a label:\n{rendered}"
+        );
+        let requests: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_requests_total{"))
+            .collect();
+        assert!(
+            requests
+                .iter()
+                .any(|line| line.contains(r#"model="other""#) && line.ends_with(" 2")),
+            "{requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|line| line.contains(r#"model="m1""#) && line.ends_with(" 1")),
+            "{requests:?}"
+        );
+        let errors: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_request_errors_total{"))
+            .collect();
+        assert!(
+            errors.iter().any(|line| {
+                line.contains(r#"model="other""#)
+                    && line.contains(r#"error_type="no_workers""#)
+                    && line.ends_with(" 2")
+            }),
+            "{errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|line| line.contains(r#"model="m1""#)),
+            "{errors:?}"
+        );
     }
 
     #[test]
@@ -2324,6 +3319,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                &[],
             )
             .unwrap();
         assert!(selected.is_available());
@@ -2338,13 +3335,15 @@ mod tests {
                 None,
                 None,
                 None,
-                None
+                None,
+                None,
+                &[],
             )
             .is_none());
     }
 
     #[tokio::test]
-    async fn unavailable_workers_keep_generic_503_without_retry_after() {
+    async fn unavailable_workers_answer_503_with_retry_after() {
         let router = create_test_regular_router();
         for worker in router.worker_registry.get_all() {
             worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
@@ -2352,6 +3351,7 @@ mod tests {
 
         let response = router
             .route_typed_request(
+                None,
                 None,
                 DropProbeRequest {
                     text: "unavailable".to_string(),
@@ -2370,7 +3370,279 @@ mod tests {
                 .expect("gateway error code header"),
             "no_available_workers"
         );
-        assert!(response.headers().get(RETRY_AFTER).is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    /// Loopback POST /generate stub answering `status` with a JSON body on
+    /// every request, counting the requests it saw.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn fixed_status_upstream(status: StatusCode) -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, AtomicOrdering::SeqCst);
+                    (
+                        status,
+                        [(CONTENT_TYPE, "application/json")],
+                        r#"{"error":{"message":"upstream failed","type":"InternalServerError"}}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// A round-robin router over `worker_urls`, each worker's breaker opening
+    /// at `failure_threshold` failures.
+    fn breaker_router(worker_urls: &[&str], retry: RetryConfig, failure_threshold: u32) -> Router {
+        breaker_router_with_client(worker_urls, retry, failure_threshold, None)
+    }
+
+    /// [`breaker_router`] whose workers send through `client` when one is
+    /// given (one with a short total timeout, for the request-timeout cases).
+    fn breaker_router_with_client(
+        worker_urls: &[&str],
+        retry: RetryConfig,
+        failure_threshold: u32,
+        client: Option<Arc<reqwest::Client>>,
+    ) -> Router {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for url in worker_urls {
+            let mut builder = BasicWorkerBuilder::new(*url)
+                .worker_type(WorkerType::Regular)
+                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    failure_threshold,
+                    success_threshold: 1,
+                    timeout_duration: Duration::from_secs(60),
+                    window_duration: Duration::from_secs(60),
+                })
+                .health_config(no_health_check());
+            if let Some(client) = &client {
+                builder = builder.http_client(Arc::clone(client));
+            }
+            worker_registry.register_or_replace(Arc::new(builder.build()));
+        }
+        Router {
+            worker_registry,
+            policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            retry_config: retry,
+            max_payload_size: 536_870_912,
+            stream_stall_timeout: Some(Duration::from_secs(60)),
+            max_buffered_request_bytes: 0,
+            realtime_registry: Arc::new(RealtimeRegistry::new()),
+            webrtc_bind_addr: None,
+            webrtc_stun_server: None,
+            rate_limit_manager: None,
+        }
+    }
+
+    async fn generate(router: &Router, text: &str) -> Response {
+        router
+            .route_typed_request(
+                None,
+                None,
+                DropProbeRequest {
+                    text: text.to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await
+    }
+
+    /// Three attempts of one request on a worker that cannot serve it now are
+    /// one failure for its breaker: the threshold counts failed requests, not
+    /// attempts.
+    #[tokio::test]
+    async fn transient_upstream_failures_charge_the_breaker_once_per_request() {
+        let (url, hits) = fixed_status_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+        let router = breaker_router(&[&url], fast_retry_config(3), 2);
+        let worker = router.worker_registry.get_all().remove(0);
+
+        let response = generate(&router, "busy").await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            3,
+            "a 503 is replayed up to the retry limit"
+        );
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Closed,
+            "one failed request is one failure, under the threshold of two"
+        );
+
+        generate(&router, "busy again").await;
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Open,
+            "the second failed request reaches the threshold"
+        );
+    }
+
+    /// A 500 the worker itself answered is its verdict on the payload: it is
+    /// returned at once rather than replayed, and the worker is charged once.
+    #[tokio::test]
+    async fn a_workers_own_500_is_not_replayed_on_it() {
+        let (url, hits) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let router = breaker_router(&[&url], fast_retry_config(5), 2);
+        let worker = router.worker_registry.get_all().remove(0);
+
+        let response = generate(&router, "bad payload").await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            1,
+            "the worker's answer is definitive for this payload"
+        );
+        assert!(!is_retryable_response(&response));
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            body.windows(15).any(|w| w == b"upstream failed"),
+            "the client gets the worker's own body"
+        );
+    }
+
+    /// With two workers the request moves to the other one once; a second
+    /// definitive answer stands.
+    #[tokio::test]
+    async fn a_workers_own_500_moves_the_request_to_another_worker_once() {
+        let (url_a, hits_a) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (url_b, hits_b) = fixed_status_upstream(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let router = breaker_router(&[&url_a, &url_b], fast_retry_config(5), 5);
+
+        let response = generate(&router, "bad payload").await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(hits_a.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(hits_b.load(AtomicOrdering::SeqCst), 1);
+        for worker in router.worker_registry.get_all() {
+            assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        }
+    }
+
+    /// Once every breaker is open the verdict clears at the breaker timeout,
+    /// not inside a backoff: the 503 is terminal for the retry loop.
+    #[tokio::test]
+    async fn no_retry_runs_against_a_pool_of_open_breakers() {
+        let (url, hits) = fixed_status_upstream(StatusCode::OK).await;
+        let router = breaker_router(&[&url], fast_retry_config(5), 1);
+        let worker = router.worker_registry.get_all().remove(0);
+        worker.record_outcome(500);
+        assert!(!worker.is_available());
+
+        let response = generate(&router, "anything").await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        assert!(!is_retryable_response(&response));
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// A worker that answers `/generate` with a 200 after `delay`, counting
+    /// the requests it took (on arrival, before the delay).
+    async fn delayed_upstream(delay: Duration) -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, AtomicOrdering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    ([(CONTENT_TYPE, "application/json")], "{}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// The gateway's client for the request-timeout cases: `timeout` is its
+    /// budget for a call to a worker, what `--request-timeout-secs` sets.
+    fn client_with_timeout(timeout: Duration) -> Arc<reqwest::Client> {
+        Arc::new(
+            crate::server::http_client_builder()
+                .timeout(timeout)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// The request's timeout is its end: one attempt on one worker, the 504
+    /// `call_upstream_timeout` to the client after one timeout, no replay on
+    /// the other worker, and the worker that timed out charged once.
+    #[tokio::test]
+    async fn a_request_timeout_is_answered_once_and_not_replayed() {
+        let (slow_a, hits_a) = delayed_upstream(Duration::from_secs(10)).await;
+        let (slow_b, hits_b) = delayed_upstream(Duration::from_secs(10)).await;
+        let router = breaker_router_with_client(
+            &[&slow_a, &slow_b],
+            fast_retry_config(3),
+            1,
+            Some(client_with_timeout(Duration::from_secs(1))),
+        );
+
+        let started = Instant::now();
+        let response = generate(&router, "slow").await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "call_upstream_timeout"
+        );
+        assert!(!is_retryable_response(&response));
+        assert_eq!(
+            hits_a.load(AtomicOrdering::SeqCst) + hits_b.load(AtomicOrdering::SeqCst),
+            1,
+            "one attempt, on one worker"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1900),
+            "one timeout, not retries x timeout: {elapsed:?}"
+        );
+        let open = router
+            .worker_registry
+            .get_all()
+            .iter()
+            .filter(|worker| worker.circuit_breaker_state() == CircuitState::Open)
+            .count();
+        assert_eq!(open, 1, "the timeout is the one worker's failure sample");
     }
 
     fn rerank_request() -> RerankRequest {
@@ -2401,6 +3673,123 @@ mod tests {
             },
         ])
         .unwrap()
+    }
+
+    /// The gateway's response to a worker that answered `body`, with every
+    /// document asked for and no `top_k`.
+    async fn rerank_response_of(body: &str) -> RerankResponse {
+        let req = RerankRequest {
+            top_k: None,
+            return_documents: true,
+            ..rerank_request()
+        };
+        let upstream = Response::new(Body::from(body.to_string()));
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            upstream,
+            usize::MAX,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the body is read: {body}"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_results_object_with_relevance_scores_is_answered_in_the_gateway_shape() {
+        // The Cohere-style object: no document echoed, the object's own
+        // fields beside `results` unread.
+        let rerank = rerank_response_of(
+            r#"{"model": "test-model", "object": "list",
+                "usage": {"prompt_tokens": 12, "total_tokens": 12},
+                "results": [{"index": 1, "relevance_score": 0.93},
+                            {"index": 0, "relevance_score": 0.07}]}"#,
+        )
+        .await;
+        assert_eq!(rerank.model, "test-model");
+        let (first, second) = (&rerank.results[0], &rerank.results[1]);
+        assert_eq!((first.index, first.score), (1, 0.93));
+        assert_eq!((second.index, second.score), (0, 0.07));
+        assert_eq!(
+            first.document, None,
+            "a worker that echoes no document yields none"
+        );
+        assert!(rerank.usage.is_none(), "the worker's usage is not read");
+    }
+
+    #[tokio::test]
+    async fn a_document_object_and_the_text_spelling_read_as_the_document() {
+        let rerank = rerank_response_of(
+            r#"{"id": "r1", "model": "test-model", "usage": {"total_tokens": 9},
+                "results": [{"index": 0, "document": {"text": "d1"}, "relevance_score": 0.8}]}"#,
+        )
+        .await;
+        assert_eq!(rerank.results[0].document.as_deref(), Some("d1"));
+
+        let rerank = rerank_response_of(
+            r#"[{"index": 1, "score": 0.6, "text": "d2"}, {"index": 0, "score": 0.4}]"#,
+        )
+        .await;
+        assert_eq!(rerank.results[0].document.as_deref(), Some("d2"));
+        assert_eq!(rerank.results[1].document, None);
+        assert_eq!((rerank.results[1].index, rerank.results[1].score), (0, 0.4));
+    }
+
+    #[tokio::test]
+    async fn top_k_and_return_documents_apply_to_a_results_object_as_to_the_native_list() {
+        // `rerank_request` asks for one result and no documents.
+        let req = rerank_request();
+        let body = r#"{"results": [{"index": 0, "document": {"text": "d1"}, "relevance_score": 0.9},
+                                   {"index": 1, "document": {"text": "d2"}, "relevance_score": 0.5}]}"#;
+        let response = Router::build_rerank_response(
+            RerankResponseSpec::from(&req),
+            None,
+            Response::new(Body::from(body)),
+            usize::MAX,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rerank: RerankResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rerank.results.len(), 1, "top_k truncates the worker's list");
+        assert_eq!(
+            rerank.results[0].document, None,
+            "return_documents false drops the echoed document"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_in_no_rerank_shape_is_a_build_failure_not_a_pass_through() {
+        for body in [
+            r#"{"error": {"message": "no reranker loaded"}}"#,
+            r#"[{"index": 0}]"#,
+            "not json",
+        ] {
+            let req = rerank_request();
+            let response = Router::build_rerank_response(
+                RerankResponseSpec::from(&req),
+                None,
+                Response::new(Body::from(body)),
+                usize::MAX,
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{body}"
+            );
+            assert_eq!(
+                extract_error_code_from_response(&response),
+                "rerank_response_build_failed",
+                "{body}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2440,28 +3829,105 @@ mod tests {
         );
     }
 
-    fn body_chunks(chunks: &[&'static [u8]]) -> Vec<Result<Bytes, String>> {
-        chunks.iter().map(|c| Ok(Bytes::from_static(c))).collect()
+    /// The body of a worker's answer on `url`'s `/body`, as `client` reads it.
+    async fn worker_body(
+        client: &reqwest::Client,
+        url: &str,
+    ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin {
+        client
+            .post(format!("{url}/body"))
+            .send()
+            .await
+            .unwrap()
+            .bytes_stream()
+    }
+
+    /// The buffered transcription answer's outcome names the reason from
+    /// what the client sees: a body the gateway could not read whole (cut
+    /// under the read) is a bad gateway under the gateway's own code, counted
+    /// as the worker's connection failing (`transport_disconnect`), not as
+    /// the worker-style reason of a 502; a body that arrives whole is the
+    /// worker's answer, recorded by its status.
+    #[tokio::test]
+    async fn a_buffered_transcription_read_failure_names_the_gateways_reason() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let client = crate::server::http_client();
+        let worker = BasicWorkerBuilder::new("http://worker:8080").build();
+        let outcome = RouteOutcome {
+            model_label: Cow::Borrowed("m"),
+            endpoint: "transcriptions",
+        };
+
+        let cut = spawn_cut_stub("/body", "application/json", &["abc"], true).await;
+        let res = client.post(format!("{cut}/body")).send().await.unwrap();
+        let status = res.status();
+        let answer =
+            buffer_transcription_response(res, status, &worker, 1 << 20, &outcome, Instant::now())
+                .await;
+        assert_eq!(answer.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            extract_error_code_from_response(&answer),
+            "read_response_body_failed"
+        );
+        let rendered = handle.render();
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains("endpoint=\"transcriptions\"")
+                    && line.contains("reason=\"transport_disconnect\"")
+                    && line.ends_with(" 1")
+            }),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("reason=\"engine_internal\""),
+            "{rendered}"
+        );
+
+        let whole = spawn_cut_stub("/body", "application/json", &["abc"], false).await;
+        let res = client.post(format!("{whole}/body")).send().await.unwrap();
+        let status = res.status();
+        let answer =
+            buffer_transcription_response(res, status, &worker, 1 << 20, &outcome, Instant::now())
+                .await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        let rendered = handle.render();
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_request_duration_seconds_count{")
+                    && line.contains("endpoint=\"transcriptions\"")
+                    && line.ends_with(" 1")
+            }),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]
     async fn read_worker_body_capped_accepts_body_at_limit() {
-        let chunks = body_chunks(&[b"abc", b"def", b"gh"]);
+        let url = spawn_cut_stub("/body", "application/json", &["abc", "def", "gh"], false).await;
 
-        let body = Router::read_worker_body_capped(stream::iter(chunks), 8)
-            .await
-            .unwrap();
+        let body = Router::read_worker_body_capped(
+            worker_body(&crate::server::http_client(), &url).await,
+            8,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(body.as_ref(), b"abcdefgh");
     }
 
     #[tokio::test]
     async fn read_worker_body_capped_rejects_oversized_body_with_502() {
-        let chunks = body_chunks(&[b"abc", b"def", b"gh"]);
+        let url = spawn_cut_stub("/body", "application/json", &["abc", "def", "gh"], false).await;
 
-        let response = Router::read_worker_body_capped(stream::iter(chunks), 7)
-            .await
-            .unwrap_err();
+        let response = Router::read_worker_body_capped(
+            worker_body(&crate::server::http_client(), &url).await,
+            7,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -2470,47 +3936,135 @@ mod tests {
         );
     }
 
+    /// A body the engine's stream ends with an error is the worker's
+    /// transport failing under the call: a bad gateway under the read's code,
+    /// the class the over-limit body takes and the one the metrics file the
+    /// code under (`transport_disconnect`), never a 500 of the gateway's own.
     #[tokio::test]
-    async fn read_worker_body_capped_maps_read_failure_to_500() {
-        let chunks = vec![Ok(Bytes::from_static(b"abc")), Err("boom".to_string())];
+    async fn read_worker_body_capped_maps_a_read_failure_to_a_bad_gateway() {
+        let url = spawn_cut_stub("/body", "application/json", &["abc"], true).await;
 
-        let response = Router::read_worker_body_capped(stream::iter(chunks), 8)
-            .await
-            .unwrap_err();
+        let response = Router::read_worker_body_capped(
+            worker_body(&crate::server::http_client(), &url).await,
+            8,
+        )
+        .await
+        .unwrap_err();
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             extract_error_code_from_response(&response),
             "read_response_body_failed"
         );
     }
 
+    /// Loopback engine stub whose every answer is a 200 head announcing a
+    /// 1000-byte body, twelve bytes of it, and then the closed connection: an
+    /// engine that goes away mid-answer, as the client reads it ("end of file
+    /// before message length reached").
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only server task; lives no longer than the test"
+    )]
+    async fn spawn_close_after_headers_stub() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                          content-length: 1000\r\n\r\n{\"partial\":",
+                    )
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// An engine that closes the connection after its head and a few bytes
+    /// of the body it announced is answered the same way: a bad gateway
+    /// under the read's code, with the client's reason in the message.
+    #[tokio::test]
+    async fn a_worker_that_closes_mid_body_is_a_bad_gateway() {
+        let url = spawn_close_after_headers_stub().await;
+
+        let response = Router::read_worker_body_capped(
+            worker_body(&crate::server::http_client(), &url).await,
+            1 << 20,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "read_response_body_failed"
+        );
+    }
+
+    /// Loopback engine stub on `/body` whose head and first chunk leave at
+    /// once and whose body then never ends, as an engine that stalls
+    /// mid-answer does: the client's own timeout is what ends the read.
+    async fn spawn_stalled_body_stub() -> String {
+        let app = axum::Router::new().route(
+            "/body",
+            axum::routing::post(|| async {
+                let head = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                    b"{\"partial\":",
+                ))]);
+                (
+                    [(CONTENT_TYPE, "application/json")],
+                    Body::from_stream(head.chain(stream::pending())),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// The request's own timeout running out while the body is read is the
+    /// request's end: the same 504 as before the head, and as final.
+    #[tokio::test]
+    async fn read_worker_body_capped_ends_the_request_at_its_timeout() {
+        let url = spawn_stalled_body_stub().await;
+        let client = client_with_timeout(Duration::from_millis(200));
+
+        let response = Router::read_worker_body_capped(worker_body(&client, &url).await, 1 << 20)
+            .await
+            .unwrap_err();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "call_upstream_timeout"
+        );
+        assert!(!is_retryable_response(&response));
+    }
+
     fn least_load_policy() -> PolicyConfig {
         PolicyConfig::LeastLoad {
-            load_check_interval_secs: 10,
             kv_pressure_weight: 0.15,
             mean_prefill_tokens: 1024,
             default_throughput: 2000.0,
-            max_waiting_requests: 0,
         }
     }
 
     fn cache_aware_policy() -> PolicyConfig {
-        PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 0,
-            max_tree_size: 4096,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-        }
+        PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096)
     }
 
     fn streaming_router(
@@ -2564,6 +4118,7 @@ mod tests {
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            rate_limit_manager: None,
         }
     }
 
@@ -2625,6 +4180,28 @@ mod tests {
             headers.insert(CONTENT_LENGTH, len.parse().unwrap());
         }
         headers
+    }
+
+    /// A request that names the message-threads beta buffers: the thread
+    /// layer rebuilds the turn from its body before the route.
+    #[test]
+    fn a_message_thread_turn_decides_buffer() {
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker("http://worker1:8080")],
+        );
+        let mut headers = headers_with_content_length(Some("64"));
+        headers.insert(
+            "anthropic-beta",
+            "fine-grained-tool-streaming-2025-05-14, message-threads-2026-08-12"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Buffer(REASON_MESSAGE_THREAD)
+        );
     }
 
     #[test]
@@ -2758,6 +4335,43 @@ mod tests {
         );
     }
 
+    /// slime posts `/generate` without a `model`. The wildcard id must reach a
+    /// model-tagged worker, and the body forwarded upstream must not carry the
+    /// gateway's "unknown" placeholder: a model-aware upstream (a sidecar in
+    /// front of another gateway) would 404 on it, and SGLang ignores it only
+    /// by accident.
+    #[tokio::test]
+    async fn model_less_generate_forwards_without_the_placeholder_model() {
+        let (url, captured) = spawn_capture_stub("application/json", r#"{"text":"ok"}"#).await;
+        let worker = BasicWorkerBuilder::new(&url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .models(vec![crate::worker::ModelCard::new("model-a")])
+            .build();
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![worker]);
+        let req: GenerateRequest =
+            serde_json::from_value(serde_json::json!({ "text": "hello" })).unwrap();
+        assert_eq!(req.model, crate::worker::UNKNOWN_MODEL_ID);
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                req,
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (_headers, body) = captured.lock().await.take().unwrap();
+        let forwarded: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(forwarded["text"], "hello");
+        assert!(
+            forwarded.get("model").is_none(),
+            "the wildcard placeholder leaked upstream: {forwarded}"
+        );
+    }
+
     #[tokio::test]
     async fn streamed_request_forwards_chunked_and_relays_response() {
         let (url, captured) = spawn_capture_stub("application/json", r#"{"text":"ok"}"#).await;
@@ -2821,8 +4435,14 @@ mod tests {
         assert_eq!(body.as_ref(), b"data: hi\n\n");
     }
 
+    /// An oversized upload must map to the excluded 413 code. The size is the
+    /// client's own fault, so it is no router error either: only the
+    /// upstream-response family sees the 413.
     #[tokio::test]
     async fn oversized_streamed_body_yields_413() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (url, _captured) = spawn_capture_stub("application/json", "{}").await;
         let router = streaming_router(least_load_policy(), 8, vec![plain_worker(&url)]);
 
@@ -2836,13 +4456,31 @@ mod tests {
             extract_error_code_from_response(&response),
             "request_body_too_large"
         );
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_router_request_errors_total"),
+            "a client's oversized upload is not the router's error:\n{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_upstream_responses_total{")
+                    && line.contains("status_code=\"413\"")
+                    && line.contains("error_code=\"request_body_too_large\"")
+            }),
+            "{rendered}"
+        );
     }
 
     /// A stalled uploader must abort with 408 and leave the worker's circuit
     /// breaker untouched: 408 is a retryable status, so recording it as a
-    /// worker outcome would trip a threshold-1 breaker here.
+    /// worker outcome would trip a threshold-1 breaker here. The stall is the
+    /// client's own fault, so it is no router error either: only the
+    /// upstream-response family sees the 408.
     #[tokio::test(start_paused = true)]
     async fn stalled_streamed_body_yields_408_without_breaker_sample() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (url, _captured) = spawn_capture_stub("application/json", "{}").await;
         let worker = BasicWorkerBuilder::new(&url)
             .worker_type(WorkerType::Regular)
@@ -2881,12 +4519,29 @@ mod tests {
             worker.circuit_breaker_can_execute(),
             "a client-caused stall must not record a breaker failure"
         );
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_router_request_errors_total"),
+            "a client's stall is not the router's error:\n{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_upstream_responses_total{")
+                    && line.contains("status_code=\"408\"")
+                    && line.contains("error_code=\"request_body_stalled\"")
+            }),
+            "{rendered}"
+        );
     }
 
     /// A client abort mid-upload must map to the excluded 400 code and leave
-    /// the worker's threshold-1 circuit breaker untouched.
+    /// the worker's threshold-1 circuit breaker untouched. The abort is the
+    /// client's own fault, so it is no router error either.
     #[tokio::test]
     async fn aborted_streamed_body_yields_400_without_breaker_sample() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let (url, _captured) = spawn_capture_stub("application/json", "{}").await;
         let worker = BasicWorkerBuilder::new(&url)
             .worker_type(WorkerType::Regular)
@@ -2927,6 +4582,19 @@ mod tests {
         assert!(
             worker.circuit_breaker_can_execute(),
             "a client abort must not record a breaker failure"
+        );
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_router_request_errors_total"),
+            "a client's abort is not the router's error:\n{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_upstream_responses_total{")
+                    && line.contains("status_code=\"400\"")
+                    && line.contains("error_code=\"request_body_aborted\"")
+            }),
+            "{rendered}"
         );
     }
 
@@ -2974,6 +4642,29 @@ mod tests {
             .to_string()
     }
 
+    /// The routed-worker header names a worker registered with credentials
+    /// masked (the URL's userinfo whole), and the request-sent event line
+    /// the same; a worker registered without them keeps its header byte for
+    /// byte (the tests beside this one read it so).
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn the_routed_worker_header_and_the_event_mask_a_workers_credentials() {
+        let (url, _cap) = spawn_capture_stub("application/json", "{}").await;
+        let with_secret = url.replacen("http://", "http://user:secret@", 1);
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&with_secret)],
+        );
+
+        let header = routed_worker_id(&router, streamed_request(&[b"{\"text\":\"hello\"}"])).await;
+
+        assert_eq!(header, url.replacen("http://", "http://***@", 1));
+        assert!(!header.contains("secret"), "{header}");
+        assert!(!logs_contain("secret"));
+        assert!(logs_contain(&url.replacen("http://", "http://***@", 1)));
+    }
+
     #[tokio::test]
     async fn tokens_hint_streams_under_cache_aware_with_tree_affinity() {
         let (url_a, _cap_a) = spawn_capture_stub("application/json", "{}").await;
@@ -2984,11 +4675,7 @@ mod tests {
             vec![plain_worker(&url_a), plain_worker(&url_b)],
         );
         let workers = router.worker_registry.get_all();
-        router
-            .policy_registry
-            .get_default_policy()
-            .as_any()
-            .downcast_ref::<CacheAwarePolicy>()
+        as_cache_aware(router.policy_registry.get_default_policy().as_ref())
             .unwrap()
             .init_workers(&workers);
 
@@ -3091,7 +4778,13 @@ mod tests {
             _probe: Arc::clone(&probe),
         };
         let response = router
-            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .route_typed_request(
+                None,
+                None,
+                req,
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -3099,6 +4792,223 @@ mod tests {
             released.load(AtomicOrdering::SeqCst),
             "the parsed request must be freed before the upstream answers"
         );
+    }
+
+    /// `/v1/messages/count_tokens` goes through worker selection to the
+    /// worker's own endpoint, carrying the Anthropic protocol headers.
+    #[tokio::test]
+    async fn messages_count_tokens_forwards_to_the_selected_worker() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<(HeaderMap, Value)>();
+        let app = axum::Router::new().route(
+            "/v1/messages/count_tokens",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let tx = tx.clone();
+                async move {
+                    let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let _ = tx.send((headers, body));
+                    (
+                        [(CONTENT_TYPE, "application/json")],
+                        r#"{"input_tokens":42}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&format!("http://{addr}"))],
+        );
+        let body: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "system": "be brief",
+            "messages": [{"role": "user", "content": "hello"}],
+            "context_management": {"edits": []},
+            "mcp_servers": [{"type": "url", "name": "tools", "url": "https://example.com"}],
+        }))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("token-counting-2024-11-01"),
+        );
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(
+                Some(&headers),
+                &tenant,
+                body,
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], br#"{"input_tokens":42}"#);
+        let (seen_headers, seen_body) = rx.recv().await.unwrap();
+        assert_eq!(seen_headers["anthropic-version"], "2023-06-01");
+        assert_eq!(seen_headers["anthropic-beta"], "token-counting-2024-11-01");
+        assert_eq!(seen_body["system"], "be brief");
+        assert_eq!(seen_body["context_management"], json!({"edits": []}));
+        assert_eq!(
+            seen_body["mcp_servers"],
+            json!([
+                {"type": "url", "name": "tools", "url": "https://example.com"}
+            ])
+        );
+        assert!(seen_body.get("max_tokens").is_none());
+    }
+
+    /// Of the engine's `x-override-*` headers only the priority reaches the
+    /// worker, on the typed and on the streamed path.
+    #[tokio::test]
+    async fn override_priority_header_reaches_the_worker_alone() {
+        let (url, captured) = spawn_capture_stub("application/json", "{}").await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Override-Priority", HeaderValue::from_static("7"));
+        headers.insert("x-override-rid", HeaderValue::from_static("client-rid"));
+        headers.insert(
+            "x-override-bootstrap-host",
+            HeaderValue::from_static("evil.invalid"),
+        );
+
+        let typed = router
+            .route_typed_request(
+                Some(&headers),
+                None,
+                DropProbeRequest {
+                    text: "hello".to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(typed.status(), StatusCode::OK);
+        let (seen, _) = captured.lock().await.take().unwrap();
+        assert_eq!(seen["x-override-priority"], "7");
+        assert!(seen.get("x-override-rid").is_none());
+        assert!(seen.get("x-override-bootstrap-host").is_none());
+
+        let mut request = streamed_request(&[b"{\"text\":\"hello\"}"]);
+        request.headers_mut().extend(headers);
+        let streamed = router
+            .route_streaming_request(request, "/generate", false)
+            .await
+            .unwrap();
+        assert_eq!(streamed.status(), StatusCode::OK);
+        let (seen, _) = captured.lock().await.take().unwrap();
+        assert_eq!(seen["x-override-priority"], "7");
+        assert!(seen.get("x-override-rid").is_none());
+        assert!(seen.get("x-override-bootstrap-host").is_none());
+    }
+
+    #[tokio::test]
+    async fn messages_count_tokens_without_workers_is_not_forwarded() {
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
+        let body: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .unwrap();
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant, body, "m")
+            .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The relay renders no prompt, so it cannot give `max_tokens: 0` the
+    /// public API's empty message; it refuses the shape with a 400 naming the
+    /// field, unary and streamed, and the worker never sees the request. A
+    /// positive `max_tokens` is forwarded as before.
+    #[tokio::test]
+    async fn max_tokens_zero_is_refused_by_the_relay_and_not_forwarded() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+        let app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |body: Bytes| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(serde_json::from_slice(&body).unwrap_or(Value::Null));
+                    (
+                        [(CONTENT_TYPE, "application/json")],
+                        r#"{"type":"message"}"#,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&format!("http://{addr}"))],
+        );
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        let request = |max_tokens: u32, stream: bool| -> CreateMessageRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": max_tokens,
+                "stream": stream,
+                "messages": [{"role": "user", "content": "hello"}],
+            }))
+            .unwrap()
+        };
+
+        for stream in [false, true] {
+            let response = router
+                .route_messages(
+                    None,
+                    &tenant,
+                    request(0, stream),
+                    crate::worker::UNKNOWN_MODEL_ID,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                extract_error_code_from_response(&response),
+                "max_tokens_zero_not_relayed"
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused request reached the worker"
+        );
+
+        let response = router
+            .route_messages(
+                None,
+                &tenant,
+                request(16, false),
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let forwarded = rx.recv().await.unwrap();
+        assert_eq!(forwarded["max_tokens"], 16);
     }
 
     /// With retries enabled the request must survive for replay: a 503 on the
@@ -3153,13 +5063,255 @@ mod tests {
             _probe: Arc::new(()),
         };
         let response = router
-            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .route_typed_request(
+                None,
+                None,
+                req,
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let bodies = bodies.lock().await;
         assert_eq!(bodies.len(), 2, "503 then 200 must mean two attempts");
         assert_eq!(bodies[0], bodies[1], "the retry must replay the same body");
+    }
+
+    /// The relayed chat body carries the client's sampling fields as the
+    /// client wrote them, on the streamed and the unary path alike. The
+    /// request goes through `normalize` as the extractor runs it: that is
+    /// where `max_tokens` used to be rewritten into `max_completion_tokens`,
+    /// a name an upstream reading only `max_tokens` ignores, answering with
+    /// its default length instead of the requested one.
+    #[tokio::test]
+    async fn relayed_chat_body_keeps_the_clients_sampling_fields() {
+        use openai_protocol::validated::Normalizable;
+        use tokio::sync::Mutex;
+
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&bodies);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let stream = body["stream"].as_bool().unwrap_or(false);
+                    sink.lock().await.push(body);
+                    if stream {
+                        ([(CONTENT_TYPE, "text/event-stream")], "data: [DONE]\n\n").into_response()
+                    } else {
+                        ([(CONTENT_TYPE, "application/json")], "{}").into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&format!("http://{addr}"))],
+        );
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for stream in [true, false] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 4096,
+                "min_tokens": 16,
+                "ignore_eos": true,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "seed": 7,
+                "stream": stream,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 2, "one streamed and one unary dispatch");
+        for (body, stream) in bodies.iter().zip([true, false]) {
+            assert_eq!(body["stream"], json!(stream));
+            assert_eq!(
+                body["max_tokens"],
+                json!(4096),
+                "the cap reaches the upstream under the name the client wrote"
+            );
+            assert!(
+                body.get("max_completion_tokens").is_none(),
+                "no field the client did not send"
+            );
+            assert_eq!(body["min_tokens"], json!(16));
+            assert_eq!(body["ignore_eos"], json!(true));
+            assert_eq!(body["temperature"], json!(0.7));
+            assert_eq!(body["top_p"], json!(0.9));
+            assert_eq!(body["seed"], json!(7));
+        }
+    }
+
+    /// The relay forwards the request as its provider profile normalized it:
+    /// a MiniMax stream sent without `stream_options` reaches the upstream
+    /// asking for the usage chunk the vendor's API always ends a stream with;
+    /// a plain served model's stream carries no field the client did not send.
+    #[tokio::test]
+    async fn the_relay_forwards_the_minimax_stream_usage_default() {
+        use openai_protocol::validated::Normalizable;
+        use tokio::sync::Mutex;
+
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&bodies);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock()
+                        .await
+                        .push(serde_json::from_slice(&body).unwrap());
+                    ([(CONTENT_TYPE, "text/event-stream")], "data: [DONE]\n\n").into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&format!("http://{addr}"))],
+        );
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for model in ["MiniMax-M3", "self-hosted-model"] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+        }
+
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 2, "one dispatch per model");
+        assert_eq!(
+            bodies[0]["stream_options"]["include_usage"],
+            json!(true),
+            "the MiniMax stream asks the upstream for the usage chunk"
+        );
+        assert!(
+            bodies[1].get("stream_options").is_none(),
+            "a plain served model's stream carries no stream_options the client did not send: {}",
+            bodies[1]
+        );
+    }
+
+    /// A request pinned by a routing key whose worker answers a transient
+    /// 503 is retried on another worker, not replayed on the one that just
+    /// failed: one attempt there, the second on the other worker, 200.
+    #[tokio::test]
+    async fn a_keyed_retry_moves_to_another_worker_after_a_transient_failure() {
+        async fn stub(status: StatusCode, body: &'static str) -> (String, Arc<AtomicUsize>) {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&hits);
+            let app = axum::Router::new().route(
+                "/generate",
+                axum::routing::post(move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        counter.fetch_add(1, AtomicOrdering::SeqCst);
+                        (status, body).into_response()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "test stub server lives for the duration of the test process"
+            )]
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            (format!("http://{addr}"), hits)
+        }
+        let (refusing, refused) = stub(StatusCode::SERVICE_UNAVAILABLE, "busy").await;
+        let (serving, served) = stub(StatusCode::OK, "{}").await;
+
+        let mut router = streaming_router(
+            PolicyConfig::ConsistentHashing,
+            1024 * 1024,
+            vec![plain_worker(&refusing), plain_worker(&serving)],
+        );
+        router.retry_config = RetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            ..Default::default()
+        };
+
+        // Keys hash to either worker; the first one owned by the refusing
+        // worker is the case under test (the others succeed in one attempt).
+        for key in (0..64).map(|i| format!("session-{i}")) {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-routing-key", key.parse().unwrap());
+            let refused_before = refused.load(AtomicOrdering::SeqCst);
+            let served_before = served.load(AtomicOrdering::SeqCst);
+            let response = router
+                .route_typed_request(
+                    Some(&headers),
+                    None,
+                    DropProbeRequest {
+                        text: "pinned".to_string(),
+                        _probe: Arc::new(()),
+                    },
+                    "/generate",
+                    crate::worker::UNKNOWN_MODEL_ID,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "key {key}");
+            let refused_now = refused.load(AtomicOrdering::SeqCst) - refused_before;
+            let served_now = served.load(AtomicOrdering::SeqCst) - served_before;
+            if refused_now == 0 {
+                assert_eq!(
+                    served_now, 1,
+                    "a key owned by the serving worker: one attempt"
+                );
+                continue;
+            }
+            assert_eq!(
+                refused_now, 1,
+                "the refusing worker sees the request once, not once per retry"
+            );
+            assert_eq!(served_now, 1, "the retry landed on the other worker");
+            return;
+        }
+        panic!("no key hashed to the refusing worker");
     }
 
     #[tokio::test]
@@ -3177,5 +5329,1720 @@ mod tests {
     async fn missing_worker_falls_back_to_buffered() {
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
         assert_falls_back_with_body_intact(&router).await;
+    }
+
+    /// reqwest reports a request timeout as `Kind::Request` with a `TimedOut`
+    /// source, so `is_request()` is true for it too; the converter has to
+    /// consult the timeout arm first or a timed-out upstream is a 500.
+    #[tokio::test]
+    async fn upstream_timeout_is_a_gateway_timeout() {
+        // Never accepted: the connect completes into the backlog and the
+        // request then waits for an answer that never comes, so the client
+        // timeout fires.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = crate::server::http_client_builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let err = client
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap_err();
+        drop(listener);
+        assert!(err.is_timeout());
+        assert!(err.is_request(), "the kind reqwest gives a timeout");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_timeout"
+        );
+        assert!(
+            !is_retryable_response(&response),
+            "the request's own timeout is its end, not a worker fault to route around"
+        );
+    }
+
+    /// A timeout below the client is not the request's own: an `io` timeout
+    /// in the error's chain (the OS gave up on a peer that stopped
+    /// answering; here the request body's stream reports one) keeps today's
+    /// 504 and stays replayable, as a connection that failed under the
+    /// request is.
+    #[tokio::test]
+    async fn a_timeout_below_the_client_is_not_the_requests_own() {
+        // A stub that reads the whole request body, so the body's error
+        // reaches the client as the send's failure.
+        let app = axum::Router::new().route(
+            "/generate",
+            axum::routing::post(|_body: Bytes| async { "{}" }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let body = stream::iter([
+            Ok(Bytes::from_static(b"{\"text\":")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the peer stopped answering",
+            )),
+        ]);
+        let err = crate::server::http_client()
+            .post(format!("http://{addr}/generate"))
+            .body(reqwest::Body::wrap_stream(body))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            err.is_timeout(),
+            "reqwest reads the io timeout as one: {err:?}"
+        );
+        assert!(!is_request_timeout(&err));
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_timeout"
+        );
+        assert!(is_retryable_response(&response));
+    }
+
+    /// The answer to a call that never reached its worker tells the client
+    /// the reason and not the worker's address: reqwest puts the URL in the
+    /// outer error, and the converter leaves it out.
+    #[tokio::test]
+    async fn an_upstream_failures_answer_names_the_reason_and_not_the_worker() {
+        let refused = RefusedAddress::reserve();
+        let addr = refused.addr();
+        let err = crate::server::http_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.url().is_some(), "reqwest attaches the URL to the error");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_connection_failed"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("error sending request: "), "{message}");
+        assert!(!message.contains(&addr.to_string()), "{message}");
+        assert!(!message.contains("URL"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn upstream_connection_failure_keeps_its_own_code() {
+        // A reserved port nobody listens at: the connect is refused.
+        let refused = RefusedAddress::reserve();
+        let addr = refused.addr();
+        let err = crate::server::http_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_connect());
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_connection_failed"
+        );
+        assert!(
+            is_retryable_response(&response),
+            "a connect failure before any byte is replayed, as before"
+        );
+    }
+
+    /// A worker that closes the connection before any response byte: the
+    /// client files it as a request fault; the answer is the upstream's
+    /// failure, replayed on another worker as before.
+    #[tokio::test]
+    async fn a_connection_closed_before_the_head_is_an_upstream_failure() {
+        let (addr, _accepted) = flaky_upstream(usize::MAX).await;
+        let err = crate::server::http_client()
+            .post(format!("http://{addr}/generate"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_request(), "{err:?}");
+        assert!(!err.is_connect() && !err.is_timeout(), "{err:?}");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_request_error"
+        );
+        assert!(is_retryable_response(&response));
+    }
+
+    /// A worker whose body ends before the length its head announced: the
+    /// client files the read as a decode fault, and the conversion answers
+    /// it as the upstream's failure. No route hands the conversion a
+    /// body-read fault today (the relay's own reads answer under their codes;
+    /// see `a_proxied_get_whose_body_is_cut_short_is_an_upstream_failure`):
+    /// the case pins the arm for a caller that will.
+    #[tokio::test]
+    async fn a_body_cut_short_is_an_upstream_failure() {
+        let addr = spawn_short_body_stub().await;
+        let response = crate::server::http_client()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap();
+        let err = response.bytes().await.unwrap_err();
+        assert!(err.is_decode(), "{err:?}");
+        assert!(!err.is_body(), "{err:?}");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_decode_error"
+        );
+    }
+
+    /// The relay's own read of the body of a proxied GET, cut short by the
+    /// worker: the upstream's failure under the code it had.
+    #[tokio::test]
+    async fn a_proxied_get_whose_body_is_cut_short_is_an_upstream_failure() {
+        let addr = spawn_short_body_stub().await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register_or_replace(Arc::new(
+            BasicWorkerBuilder::new(format!("http://{addr}"))
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        ));
+        let router = Router {
+            worker_registry,
+            ..create_test_regular_router()
+        };
+
+        let response = router
+            .proxy_get_request(Request::new(Body::empty()), "health")
+            .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "read_response_failed"
+        );
+    }
+
+    /// A worker's 200 that is not the JSON the route asked for, handed to
+    /// the conversion: the upstream's failure, as an answer over the payload
+    /// limit is. As above, no route reaches this arm today.
+    #[tokio::test]
+    async fn an_answer_that_does_not_decode_is_an_upstream_failure() {
+        let (addr, _accepted) = flaky_upstream(0).await;
+        let response = crate::server::http_client()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap();
+        let err = response.json::<Value>().await.unwrap_err();
+        assert!(err.is_decode(), "{err:?}");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_decode_error"
+        );
+    }
+
+    /// Accepts one connection, answers a head that announces more body than
+    /// it writes, and closes.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only server task; lives no longer than the test"
+    )]
+    async fn spawn_short_body_stub() -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 64\r\n\r\n{\"text\":")
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        addr
+    }
+
+    /// Loopback engine stub on `path`: answers `content_type` with `chunks`,
+    /// one write each, and with `cut` ends the body with an error, so the
+    /// server closes the connection before the transfer's end, as an engine's
+    /// own server that dies mid-stream does.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_cut_stub(
+        path: &'static str,
+        content_type: &'static str,
+        chunks: &'static [&'static str],
+        cut: bool,
+    ) -> String {
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::post(move || async move {
+                let items: Vec<Result<Bytes, std::io::Error>> = chunks
+                    .iter()
+                    .map(|chunk| Ok(Bytes::from_static(chunk.as_bytes())))
+                    .chain(cut.then(|| Err(std::io::Error::other("the engine went away"))))
+                    .collect();
+                let body = stream::iter(items).then(|item| async move {
+                    // One write per chunk: the client reads them before the cut.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    item
+                });
+                ([(CONTENT_TYPE, content_type)], Body::from_stream(body))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// [`spawn_cut_stub`] without the pauses: the head and one chunk leave
+    /// the engine's server, and the cut follows as soon as the server has
+    /// flushed them (one yield of its task), so the body's error is right
+    /// behind the head when the relay starts.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_abrupt_cut_stub(path: &'static str, chunk: &'static str) -> String {
+        let app = axum::Router::new().route(
+            path,
+            axum::routing::post(move || async move {
+                let head = stream::iter(vec![Ok(Bytes::from_static(chunk.as_bytes()))]);
+                let cut = stream::once(async {
+                    tokio::task::yield_now().await;
+                    Err::<Bytes, std::io::Error>(std::io::Error::other("the engine went away"))
+                });
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(head.chain(cut)),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// A regular worker at `url` whose breaker is half-open: it opened on two
+    /// failures, its timeout is over, and one success closes it. The order of
+    /// a head's success and a cut's failure is then readable from its state:
+    /// the success first closes it and the cut leaves it closed (one failure
+    /// under the threshold of two); the cut first opens it again.
+    fn half_open_worker(url: &str) -> crate::worker::BasicWorker {
+        half_open_worker_closing_after(url, 1)
+    }
+
+    /// A half-open worker at `url` whose breaker closes only after `successes`
+    /// successes: one recorded head leaves it half-open, a second closes it.
+    fn half_open_worker_closing_after(url: &str, successes: u32) -> crate::worker::BasicWorker {
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                failure_threshold: 2,
+                success_threshold: successes,
+                timeout_duration: Duration::ZERO,
+                ..Default::default()
+            })
+            .build();
+        worker.record_circuit_breaker_outcome(false);
+        worker.record_circuit_breaker_outcome(false);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+        worker
+    }
+
+    /// A regular worker at `url` whose circuit breaker opens on the first failure.
+    fn fragile_worker(url: &str) -> crate::worker::BasicWorker {
+        BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..Default::default()
+            })
+            .build()
+    }
+
+    fn streaming_chat_request() -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap()
+    }
+
+    /// The events of an SSE body, blank-line separated.
+    fn sse_events(body: &str) -> Vec<&str> {
+        body.split("\n\n")
+            .filter(|event| !event.is_empty())
+            .collect()
+    }
+
+    const CHAT_SSE_CHUNKS: &[&str] = &[
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+    ];
+
+    const MESSAGES_SSE_CHUNKS: &[&str] = &[
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\
+         \"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\
+         \"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\
+         \"output_tokens\":0}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\
+         \"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    ];
+
+    /// An engine's server that closes the connection mid-stream used to leave
+    /// the client a transfer that ended in an error: no event said why, and
+    /// nothing counted the worker's failure. The relay ends the SSE response
+    /// the way the gRPC path does, with a `stream_error` event and `[DONE]`,
+    /// and the worker is charged.
+    #[tokio::test]
+    async fn an_upstream_cut_mid_stream_ends_the_sse_response_with_a_typed_error_event_and_done() {
+        let url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            true,
+        )
+        .await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![fragile_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 4, "{body}");
+        assert_eq!(events[0], CHAT_SSE_CHUNKS[0].trim_end());
+        assert_eq!(events[1], CHAT_SSE_CHUNKS[1].trim_end());
+        let error: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Stream error: "),
+            "{body}"
+        );
+        assert_eq!(events[3], "data: [DONE]");
+        let worker = &router.worker_registry.get_all()[0];
+        assert!(
+            !worker.circuit_breaker_can_execute(),
+            "the cut is the worker's failure: its threshold-1 breaker opens"
+        );
+    }
+
+    /// The successful head of a streamed response is recorded on the worker's
+    /// breaker before the relay task is spawned, so a body the worker cuts
+    /// right behind the head is sampled after the head's success and stands,
+    /// instead of being erased by a success recorded after it. Read on a
+    /// current-thread runtime, where the relay cannot run before the body is
+    /// polled: the half-open breaker is closed by the head's success as soon
+    /// as the head is relayed, the response is marked so its caller does not
+    /// record it again, and the cut read afterwards is the one failure on the
+    /// closed breaker.
+    #[tokio::test]
+    async fn a_streamed_heads_success_is_recorded_before_the_relay_can_sample_a_cut() {
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![half_open_worker("http://127.0.0.1:9")],
+        );
+        let worker = Arc::clone(&router.worker_registry.get_all()[0]);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let sample = |family: &str| {
+            handle
+                .render()
+                .lines()
+                .find(|line| {
+                    line.starts_with(family) && line.contains(r#"worker="http://127.0.0.1:9""#)
+                })
+                .map(str::to_string)
+        };
+        let items: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(CHAT_SSE_CHUNKS[0].as_bytes())),
+            Err(std::io::Error::other("the engine went away")),
+        ];
+        let upstream = http::Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(reqwest::Body::wrap_stream(stream::iter(items)))
+            .unwrap();
+
+        let response = router
+            .forward_worker_response(
+                reqwest::Response::from(upstream),
+                StreamRelayMode {
+                    is_stream: true,
+                    rechunk: None,
+                },
+                RelaySource::new("m", "/v1/chat/completions", Arc::clone(&worker)),
+                WorkerLoadGuard::with_key(Arc::clone(&worker), None),
+            )
+            .await;
+
+        // The head is out and the relay has not run: the success is recorded.
+        assert!(head_success_recorded(&response));
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        assert!(
+            sample("smg_worker_cb_outcomes_total{")
+                .is_some_and(|line| line.contains(r#"outcome="success""#) && line.ends_with(" 1")),
+            "{}",
+            handle.render()
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert_eq!(sse_events(body).len(), 3, "{body}");
+        // The cut is the one failure after the success: sampled and standing.
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        assert_eq!(
+            sample("smg_worker_cb_consecutive_failures{").as_deref(),
+            Some(r#"smg_worker_cb_consecutive_failures{worker="http://127.0.0.1:9"} 1"#),
+            "{}",
+            handle.render()
+        );
+    }
+
+    /// Through the typed route on a multi-threaded runtime, against an
+    /// engine's server that writes the head and dies at once (the body's
+    /// error waits behind the head): the relay task could sample the cut
+    /// before the caller recorded the head, and the head's success then
+    /// erased the sample. With the head recorded before the relay is spawned,
+    /// the half-open breaker is closed by the head and left closed by the
+    /// cut, every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cut_right_behind_the_head_is_sampled_after_the_heads_success_on_the_typed_route() {
+        const ROUNDS: usize = 40;
+        let url = spawn_abrupt_cut_stub("/v1/chat/completions", CHAT_SSE_CHUNKS[0]).await;
+        let mut reopened = Vec::new();
+        for round in 0..ROUNDS {
+            let router = streaming_router(
+                least_load_policy(),
+                1024 * 1024,
+                vec![half_open_worker(&url)],
+            );
+            let response = router
+                .route_typed_request(
+                    None,
+                    None,
+                    streaming_chat_request(),
+                    "/v1/chat/completions",
+                    crate::worker::UNKNOWN_MODEL_ID,
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let state = router.worker_registry.get_all()[0].circuit_breaker_state();
+            if state != CircuitState::Closed {
+                reopened.push((round, state));
+            }
+        }
+        assert!(
+            reopened.is_empty(),
+            "the cut was sampled before the head's success in {} of {ROUNDS} rounds: {reopened:?}",
+            reopened.len()
+        );
+    }
+
+    /// The same, through the streamed route (the raw request body relayed as
+    /// it arrives), whose caller records the head itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cut_right_behind_the_head_is_sampled_after_the_heads_success_on_the_streamed_route()
+    {
+        const ROUNDS: usize = 40;
+        let url = spawn_abrupt_cut_stub("/generate", CHAT_SSE_CHUNKS[0]).await;
+        let mut reopened = Vec::new();
+        for round in 0..ROUNDS {
+            let router = streaming_router(
+                least_load_policy(),
+                1024 * 1024,
+                vec![half_open_worker(&url)],
+            );
+            let response = router
+                .route_streaming_request(
+                    streamed_request(&[b"{\"text\":\"hi\"}"]),
+                    "/generate",
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let state = router.worker_registry.get_all()[0].circuit_breaker_state();
+            if state != CircuitState::Closed {
+                reopened.push((round, state));
+            }
+        }
+        assert!(
+            reopened.is_empty(),
+            "the cut was sampled before the head's success in {} of {ROUNDS} rounds: {reopened:?}",
+            reopened.len()
+        );
+    }
+
+    /// The head's success is recorded once per request: with a breaker that
+    /// closes after two successes, one clean streamed request leaves it
+    /// half-open on both routes. A caller recording the head again behind
+    /// `forward_worker_response` would close it (and the guards at the two
+    /// callers could be removed unnoticed).
+    #[tokio::test]
+    async fn a_streamed_heads_success_is_recorded_once_on_both_routes() {
+        let url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![half_open_worker_closing_after(&url, 2)],
+        );
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            router.worker_registry.get_all()[0].circuit_breaker_state(),
+            CircuitState::HalfOpen,
+            "the typed route recorded the head's success once"
+        );
+
+        let url = spawn_cut_stub("/generate", "text/event-stream", CHAT_SSE_CHUNKS, false).await;
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![half_open_worker_closing_after(&url, 2)],
+        );
+        let response = router
+            .route_streaming_request(
+                streamed_request(&[b"{\"text\":\"hi\"}"]),
+                "/generate",
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            router.worker_registry.get_all()[0].circuit_breaker_state(),
+            CircuitState::HalfOpen,
+            "the streamed route recorded the head's success once"
+        );
+    }
+
+    /// A cut that lands inside a frame (the worker died mid-write) leaves the
+    /// partial line as it is and writes the error event on its own frame, so
+    /// a client that parses frame by frame still reads the typed error.
+    #[tokio::test]
+    async fn an_upstream_cut_inside_a_frame_writes_the_error_event_on_its_own_frame() {
+        const CHUNKS: &[&str] = &[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"con",
+        ];
+        let url = spawn_cut_stub("/v1/chat/completions", "text/event-stream", CHUNKS, true).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![fragile_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 4, "{body}");
+        assert_eq!(events[0], CHUNKS[0].trim_end());
+        assert_eq!(events[1], CHUNKS[1], "the partial frame stands alone");
+        let error: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(events[3], "data: [DONE]");
+    }
+
+    /// On the Messages API the same cut ends the stream with the API's own
+    /// error event, typed `api_error` as the gRPC path types a worker's
+    /// failure there; the protocol has no `[DONE]`.
+    #[tokio::test]
+    async fn an_upstream_cut_on_a_messages_stream_ends_it_with_the_api_s_error_event() {
+        let url = spawn_cut_stub(
+            "/v1/messages",
+            "text/event-stream",
+            MESSAGES_SSE_CHUNKS,
+            true,
+        )
+        .await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![fragile_worker(&url)]);
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                request,
+                "/v1/messages",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body ends cleanly after the error event");
+        let body = std::str::from_utf8(&body).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 3, "{body}");
+        let (name, data) = events[2].split_once("\ndata: ").unwrap();
+        assert_eq!(name, "event: error", "{body}");
+        let error: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], "api_error");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Stream error: "),
+            "{body}"
+        );
+        assert!(!body.contains("[DONE]"), "{body}");
+        let worker = &router.worker_registry.get_all()[0];
+        assert!(!worker.circuit_breaker_can_execute());
+    }
+
+    /// A body the worker streams under any other content type is cut as
+    /// before, so a partial document is not taken for a complete one, and the
+    /// worker is charged the same.
+    #[tokio::test]
+    async fn an_upstream_cut_on_a_non_sse_body_still_ends_the_transfer_in_error_and_is_counted() {
+        let url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "application/json",
+            &["{\"choices\":[{\"message\":{\"content\":\"par"],
+            true,
+        )
+        .await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![fragile_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            to_bytes(response.into_body(), usize::MAX).await.is_err(),
+            "a cut JSON body is not made to look complete"
+        );
+        let worker = &router.worker_registry.get_all()[0];
+        assert!(
+            !worker.circuit_breaker_can_execute(),
+            "the cut is the worker's failure: its threshold-1 breaker opens"
+        );
+    }
+
+    /// A stream the worker completes is relayed as it was: nothing is added
+    /// and the worker is not charged.
+    #[tokio::test]
+    async fn a_stream_the_upstream_completes_is_relayed_unchanged() {
+        let url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![fragile_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            CHAT_SSE_CHUNKS.concat()
+        );
+        let worker = &router.worker_registry.get_all()[0];
+        assert!(worker.circuit_breaker_can_execute());
+    }
+
+    /// A refusal this router answers on its own is marked as reported for
+    /// the access log and written at WARN within the per-second allowance,
+    /// never at ERROR: the `no_available_workers` 503 of a drained pool and
+    /// the `model_not_found` 404 of a model nobody serves, each under a
+    /// client retrying at once.
+    #[tokio::test]
+    async fn a_refusal_is_marked_and_written_at_warn_within_the_allowance() {
+        let errors = Arc::new(AtomicUsize::new(0));
+        let refusal_lines = Arc::new(AtomicUsize::new(0));
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
+        let router = create_test_regular_router();
+        for worker in router.worker_registry.get_all() {
+            worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        }
+        let allowance = usize::try_from(placement::REFUSAL_LINES_PER_SECOND).unwrap();
+        let refusals = 5 * allowance;
+
+        for (model, status, code) in [
+            (
+                crate::worker::UNKNOWN_MODEL_ID,
+                StatusCode::SERVICE_UNAVAILABLE,
+                placement::NO_AVAILABLE_WORKERS_CODE,
+            ),
+            (
+                "nobody-serves-this",
+                StatusCode::NOT_FOUND,
+                placement::MODEL_NOT_FOUND_CODE,
+            ),
+        ] {
+            for _ in 0..refusals {
+                let response = router
+                    .route_typed_request(
+                        None,
+                        None,
+                        DropProbeRequest {
+                            text: "refused".to_string(),
+                            _probe: Arc::new(()),
+                        },
+                        "/generate",
+                        model,
+                    )
+                    .await;
+                assert_eq!(response.status(), status, "{code}");
+                assert_eq!(extract_error_code_from_response(&response), code);
+                assert!(
+                    response.extensions().get::<ReportedRefusal>().is_some(),
+                    "the {code} refusal is marked as reported, so the access log keeps quiet"
+                );
+            }
+        }
+        assert_eq!(
+            errors.load(AtomicOrdering::Relaxed),
+            0,
+            "a refusal is not an error of the gateway"
+        );
+        assert!(
+            refusal_lines.load(AtomicOrdering::Relaxed) <= 2 * allowance,
+            "{refusals} refusals of each kind inside one second write at most {allowance} lines each"
+        );
+    }
+
+    /// A refusal this router answers on its own (its pool drained) is counted
+    /// as `unavailable`, not as a backend's error: no worker was contacted.
+    #[test]
+    fn a_refusal_this_router_answers_is_counted_as_unavailable() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let router = create_test_regular_router();
+        for worker in router.worker_registry.get_all() {
+            worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let response = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(router.route_typed_request(
+                None,
+                None,
+                DropProbeRequest {
+                    text: "refused".to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            ))
+        });
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            placement::NO_AVAILABLE_WORKERS_CODE
+        );
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains("router_type=\"http\"")
+                    && line.contains("backend_type=\"regular\"")
+            })
+            .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"unavailable\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// A request whose every attempt came back retryable (two workers, each
+    /// answering 503) is answered with the last attempt's status once its
+    /// retries are spent. That answer is the request's failure: counted once
+    /// in the router error family under the status's class and reason,
+    /// beside the exhaustion counter, as the gRPC pipeline counts the same
+    /// outcome. The duration family stays empty: nothing succeeded.
+    #[test]
+    fn an_exhausted_requests_last_retryable_answer_counts_as_its_error() {
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let rendered = render_with_recorder(|| {
+            runtime.block_on(async {
+                let mut workers = Vec::new();
+                for _ in 0..2 {
+                    let hits = Arc::clone(&hits);
+                    let app = axum::Router::new().route(
+                        "/generate",
+                        axum::routing::post(move || {
+                            let hits = Arc::clone(&hits);
+                            async move {
+                                hits.fetch_add(1, AtomicOrdering::SeqCst);
+                                (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    [(CONTENT_TYPE, "application/json")],
+                                    r#"{"error":"busy"}"#,
+                                )
+                                    .into_response()
+                            }
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "test stub server lives for the duration of the test process"
+                    )]
+                    tokio::spawn(async move {
+                        axum::serve(listener, app).await.unwrap();
+                    });
+                    workers.push(plain_worker(&format!("http://{addr}")));
+                }
+                let mut router = streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, workers);
+                router.retry_config = fast_retry_config(2);
+                let request: GenerateRequest =
+                    serde_json::from_value(json!({ "text": "hello" })).unwrap();
+                let response = router
+                    .route_typed_request(
+                        None,
+                        None,
+                        request,
+                        "/generate",
+                        crate::worker::UNKNOWN_MODEL_ID,
+                    )
+                    .await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            });
+        });
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            2,
+            "one attempt per worker"
+        );
+        let errors: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_request_errors_total{"))
+            .collect();
+        assert!(
+            errors.iter().any(|line| {
+                line.contains("router_type=\"http\"")
+                    && line.contains("backend_type=\"regular\"")
+                    && line.contains("endpoint=\"generate\"")
+                    && line.contains("error_type=\"backend_error\"")
+                    && line.contains("reason=\"engine_unavailable\"")
+                    && line.ends_with(" 1")
+            }),
+            "the exhausted request's last answer counts once as its error:\n{rendered}"
+        );
+        assert_eq!(errors.len(), 1, "one sample, one label set:\n{rendered}");
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_worker_retries_exhausted_total{")
+                    && line.contains("endpoint=\"generate\"")
+                    && line.ends_with(" 1")
+            }),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_router_request_duration_seconds"),
+            "nothing succeeded, so no duration:\n{rendered}"
+        );
+    }
+
+    /// The streamed-body route sends once and never retries, so a worker's
+    /// retryable status is the request's final answer too: counted once in
+    /// the router error family under the status's class and reason, with no
+    /// exhaustion recorded (there was no retry budget to spend).
+    #[test]
+    fn a_streamed_requests_retryable_answer_counts_as_its_error() {
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let rendered = render_with_recorder(|| {
+            runtime.block_on(async {
+                let app = axum::Router::new().route(
+                    "/generate",
+                    axum::routing::post(|| async {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [(CONTENT_TYPE, "application/json")],
+                            r#"{"error":"busy"}"#,
+                        )
+                            .into_response()
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test stub server lives for the duration of the test process"
+                )]
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let router = streaming_router(
+                    least_load_policy(),
+                    1024 * 1024,
+                    vec![plain_worker(&format!("http://{addr}"))],
+                );
+                let response = router
+                    .route_streaming_request(
+                        streamed_request(&[b"{\"text\":\"hello\"}"]),
+                        "/generate",
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            });
+        });
+        let errors: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_request_errors_total{"))
+            .collect();
+        assert_eq!(errors.len(), 1, "one sample, one label set:\n{rendered}");
+        assert!(
+            errors[0].contains("router_type=\"http\"")
+                && errors[0].contains("backend_type=\"regular\"")
+                && errors[0].contains("endpoint=\"generate\"")
+                && errors[0].contains("error_type=\"backend_error\"")
+                && errors[0].contains("reason=\"engine_unavailable\"")
+                && errors[0].ends_with(" 1"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_worker_retries_exhausted_total"),
+            "no retry budget was spent:\n{rendered}"
+        );
+    }
+
+    // --- Streamed deltas per provider profile ---------------------------------
+    //
+    // The delta re-slicing of `routers::common::sse_rechunk` is MiniMax's
+    // stream contract and applies to MiniMax models only: under every other
+    // model id, and under a served model aliased under another vendor's name,
+    // the relay forwards every upstream SSE event before the next one exists.
+    // A guard: these tests pass on the code they were written against.
+
+    /// Deltas per stream: two characters each, so a re-slicer holds all of
+    /// them (their total stays under its slice threshold) until an idle flush
+    /// or the end of the stream.
+    const RELAY_DELTAS: usize = 12;
+    /// The upstream parks after this many deltas until the client has read
+    /// their text: whatever the client reads meanwhile left before the next
+    /// delta existed, with no clock in the assertion.
+    const RELAY_PARK_AFTER: usize = RELAY_DELTAS / 2;
+    /// The client's patience per half; a path that held the deltas back
+    /// fails here instead of hanging the suite.
+    const RELAY_PATIENCE: Duration = Duration::from_secs(10);
+
+    /// The text of upstream delta `i`.
+    fn relay_text(i: usize) -> String {
+        format!("{i:02}")
+    }
+
+    /// A worker whose chat completion streams `RELAY_DELTAS` short deltas and
+    /// `[DONE]`, parked after `RELAY_PARK_AFTER` of them until `resume` fires.
+    async fn spawn_parked_sse_worker(resume: Arc<tokio::sync::Notify>) -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |_body: Bytes| {
+                let resume = resume.clone();
+                async move {
+                    let frames = stream::unfold((0usize, resume), |(i, resume)| async move {
+                        if i > RELAY_DELTAS {
+                            return None;
+                        }
+                        if i == RELAY_PARK_AFTER {
+                            resume.notified().await;
+                        }
+                        let frame = if i < RELAY_DELTAS {
+                            format!(
+                                "data: {{\"id\":\"chatcmpl-parked\",\"object\":\"chat.completion.chunk\",\
+                                 \"created\":1700000000,\"model\":\"m\",\"choices\":[{{\"index\":0,\
+                                 \"delta\":{{\"content\":\"{}\"}},\"finish_reason\":null}}]}}\n\n",
+                                relay_text(i)
+                            )
+                        } else {
+                            "data: [DONE]\n\n".to_string()
+                        };
+                        Some((Ok::<_, std::io::Error>(Bytes::from(frame)), (i + 1, resume)))
+                    });
+                    (
+                        [(CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(frames),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// The next non-empty content delta of the SSE body, `None` at its end.
+    async fn next_relayed_content_delta(body: &mut Body, pending: &mut Vec<u8>) -> Option<String> {
+        loop {
+            while let Some(end) = pending.windows(2).position(|w| w == b"\n\n") {
+                let event: Vec<u8> = pending.drain(..end + 2).collect();
+                let event = String::from_utf8_lossy(&event);
+                let Some(payload) = event.strip_prefix("data: ") else {
+                    continue;
+                };
+                let Ok(json) = serde_json::from_str::<Value>(payload.trim()) else {
+                    continue;
+                };
+                if let Some(content) = json["choices"][0]["delta"]["content"].as_str() {
+                    if !content.is_empty() {
+                        return Some(content.to_string());
+                    }
+                }
+            }
+            let frame = http_body_util::BodyExt::frame(body)
+                .await?
+                .expect("an SSE frame");
+            if let Some(data) = frame.data_ref() {
+                pending.extend_from_slice(data);
+            }
+        }
+    }
+
+    /// The content deltas of one streamed chat completion for `model` through
+    /// the relay, in two halves: those read while the upstream was parked
+    /// after its `RELAY_PARK_AFTER`th delta, and those read after it resumed.
+    async fn relayed_content_deltas_around_the_park(model: &str) -> (Vec<String>, Vec<String>) {
+        use openai_protocol::validated::Normalizable;
+
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let url = spawn_parked_sse_worker(resume.clone()).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16,
+            "stream": true,
+        }))
+        .unwrap();
+        request.normalize();
+        let response = router
+            .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "{model}");
+        let mut body = response.into_body();
+        let mut pending = Vec::new();
+
+        let parked_text: String = (0..RELAY_PARK_AFTER).map(relay_text).collect();
+        let mut parked = Vec::new();
+        let read = tokio::time::timeout(RELAY_PATIENCE, async {
+            while parked.concat() != parked_text {
+                assert!(
+                    parked_text.starts_with(&parked.concat()),
+                    "{model}: the parked half read as {parked:?}"
+                );
+                let delta = next_relayed_content_delta(&mut body, &mut pending)
+                    .await
+                    .unwrap_or_else(|| panic!("{model}: the stream ended at {parked:?}"));
+                parked.push(delta);
+            }
+        })
+        .await;
+        assert!(
+            read.is_ok(),
+            "{model}: the parked half did not reach the client within {RELAY_PATIENCE:?}: {parked:?}"
+        );
+
+        resume.notify_one();
+        let mut resumed = Vec::new();
+        let read = tokio::time::timeout(RELAY_PATIENCE, async {
+            while let Some(delta) = next_relayed_content_delta(&mut body, &mut pending).await {
+                resumed.push(delta);
+            }
+        })
+        .await;
+        assert!(
+            read.is_ok(),
+            "{model}: the stream did not end within {RELAY_PATIENCE:?} of the upstream resuming: {resumed:?}"
+        );
+        (parked, resumed)
+    }
+
+    /// Every upstream delta left the relay as its own event before the next
+    /// delta existed, on both sides of the park.
+    async fn assert_relay_keeps_one_delta_per_event(model: &str) {
+        let (parked, resumed) = relayed_content_deltas_around_the_park(model).await;
+        let expected = |deltas: std::ops::Range<usize>| deltas.map(relay_text).collect::<Vec<_>>();
+        assert_eq!(
+            parked,
+            expected(0..RELAY_PARK_AFTER),
+            "{model}: one event per upstream delta while the upstream was parked"
+        );
+        assert_eq!(
+            resumed,
+            expected(RELAY_PARK_AFTER..RELAY_DELTAS),
+            "{model}: one event per upstream delta after the upstream resumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_relay_keeps_one_delta_per_event_for_deepseek() {
+        assert_relay_keeps_one_delta_per_event("deepseek-v4.1").await;
+    }
+
+    #[tokio::test]
+    async fn the_relay_keeps_one_delta_per_event_for_kimi() {
+        assert_relay_keeps_one_delta_per_event("kimi-k3").await;
+    }
+
+    #[tokio::test]
+    async fn the_relay_keeps_one_delta_per_event_for_glm() {
+        assert_relay_keeps_one_delta_per_event("glm-5").await;
+    }
+
+    #[tokio::test]
+    async fn the_relay_keeps_one_delta_per_event_for_a_plain_served_model() {
+        assert_relay_keeps_one_delta_per_event("served-plain-relay-model").await;
+    }
+
+    /// A served model aliased under a Kimi name takes Kimi's profile for
+    /// either name (alias names unique to this test: the table is
+    /// process-wide), and Kimi's profile re-slices nothing.
+    #[tokio::test]
+    async fn the_relay_keeps_one_delta_per_event_for_a_served_model_aliased_under_a_kimi_name() {
+        ProviderProfile::register_model_aliases([("kimi-k3-relay-guard", "served-relay-guard")]);
+        assert_eq!(
+            ProviderProfile::for_model("served-relay-guard"),
+            ProviderProfile::Kimi
+        );
+        assert_relay_keeps_one_delta_per_event("served-relay-guard").await;
+        assert_relay_keeps_one_delta_per_event("kimi-k3-relay-guard").await;
+    }
+
+    /// MiniMax's stream contract: the relay holds the short deltas and
+    /// re-slices them into fewer, larger events (the parked half leaves on
+    /// the idle flush), the text unchanged.
+    #[tokio::test]
+    async fn the_relay_re_slices_a_minimax_stream_as_the_contract_asks() {
+        let (parked, resumed) = relayed_content_deltas_around_the_park("MiniMax-M3").await;
+        assert!(
+            parked.len() < RELAY_PARK_AFTER,
+            "re-sliced into fewer events than upstream deltas, got {parked:?}"
+        );
+        let all: String = parked.iter().chain(&resumed).map(String::as_str).collect();
+        let expected: String = (0..RELAY_DELTAS).map(relay_text).collect();
+        assert_eq!(
+            all, expected,
+            "the re-slicing changes the cuts, not the text"
+        );
+    }
+
+    /// A family that buffers every body (the trait's default policy).
+    #[derive(Debug)]
+    struct BufferingStub;
+
+    #[async_trait]
+    impl RouterTrait for BufferingStub {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn router_type(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    /// Routes behind the stream-body layer that answer with the body they
+    /// were handed.
+    fn echo_app(state: StreamBodyState) -> axum::Router {
+        let echo = || axum::routing::post(|body: Bytes| async move { body });
+        axum::Router::new()
+            .route("/v1/chat/completions", echo())
+            .route("/generate", echo())
+            .route("/other", echo())
+            .route_layer(state.layer())
+    }
+
+    async fn posted(app: axum::Router, request: Request<Body>) -> (StatusCode, Bytes) {
+        use tower::ServiceExt;
+
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        (
+            status,
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+    }
+
+    fn sized_post(path: &str, body: &'static str) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .header(CONTENT_LENGTH, body.len())
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// The lean layer does what the `from_fn` form did on the paths that do
+    /// not stream: a family that buffers, and a route outside the typed set,
+    /// hand the request to the route with its body intact.
+    #[tokio::test]
+    async fn the_stream_body_layer_passes_a_buffering_family_and_other_routes_through() {
+        let context = create_test_app_context();
+        let app = echo_app(StreamBodyState::new(Arc::new(BufferingStub), context));
+
+        assert_eq!(
+            posted(
+                app.clone(),
+                sized_post("/v1/chat/completions", r#"{"a":1}"#)
+            )
+            .await,
+            (StatusCode::OK, Bytes::from_static(br#"{"a":1}"#))
+        );
+        assert_eq!(
+            posted(app, sized_post("/other", "plain")).await,
+            (StatusCode::OK, Bytes::from_static(b"plain"))
+        );
+    }
+
+    /// On a forward-capable router the path filter decides first: a sized
+    /// request to a route outside the typed set is the route's own answer
+    /// and never reaches the upstream. Then the decision itself: a router
+    /// that declines (no content length, so no streamed forward) hands the
+    /// route the body unconsumed; one that streams relays the upstream's
+    /// answer and the route never runs.
+    #[tokio::test]
+    async fn the_stream_body_layer_declines_to_the_route_and_streams_past_it() {
+        let (url, captured) = spawn_capture_stub("application/json", r#"{"text":"ok"}"#).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let context = create_test_app_context();
+        let app = echo_app(StreamBodyState::new(Arc::new(router), context));
+
+        assert_eq!(
+            posted(app.clone(), sized_post("/other", "plain")).await,
+            (StatusCode::OK, Bytes::from_static(b"plain"))
+        );
+        assert!(
+            captured.lock().await.is_none(),
+            "a request outside the typed set reached the upstream"
+        );
+
+        let declined = Request::builder()
+            .method(Method::POST)
+            .uri("/generate")
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(Body::from(r#"{"text":"hello"}"#))
+            .unwrap();
+        assert_eq!(
+            posted(app.clone(), declined).await,
+            (StatusCode::OK, Bytes::from_static(br#"{"text":"hello"}"#))
+        );
+        assert!(
+            captured.lock().await.is_none(),
+            "a declined request reached the upstream"
+        );
+
+        let (status, body) = posted(app, streamed_request(&[b"{\"text\":\"", b"hello\"}"])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), br#"{"text":"ok"}"#);
+        let (_headers, forwarded) = captured.lock().await.take().unwrap();
+        assert_eq!(forwarded.as_ref(), b"{\"text\":\"hello\"}");
+    }
+
+    /// A request preempted while its streamed forward is in flight gets the
+    /// preemption answer through the layer, as it did through the extractor.
+    #[tokio::test]
+    async fn the_stream_body_layer_answers_a_preempted_streamed_request() {
+        use tokio_util::sync::CancellationToken;
+
+        // An upstream that accepts connections and never answers: only the
+        // token can end the request.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let context = create_test_app_context();
+        let app = echo_app(StreamBodyState::new(Arc::new(router), context));
+
+        let token = CancellationToken::new();
+        let mut request = streamed_request(&[b"{\"text\":\"hello\"}"]);
+        request.extensions_mut().insert(token.clone());
+        token.cancel();
+        let (status, _) = posted(app, request).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        drop(listener);
+    }
+
+    /// A worker that answers the chat route with `body` as one sized answer
+    /// under `content_type`: hyper writes the `Content-Length` an upstream
+    /// that knows its length would.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_sized_worker(body: &'static str, content_type: &'static str) -> String {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || async move { ([(CONTENT_TYPE, content_type)], body) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// A sized answer of two short deltas and `[DONE]`: the re-slicing
+    /// policy holds deltas this short and merges them, so a rechunker that
+    /// ran on the body shows in the relayed bytes.
+    const SIZED_DELTA_BODY: &str = "data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"},\
+                            \"finish_reason\":null}]}\n\n\
+                            data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
+                            \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\
+                            \"finish_reason\":null}]}\n\n\
+                            data: [DONE]\n\n";
+
+    /// A streamed SSE relay may change the body's length, by re-slicing it
+    /// or by ending a cut stream with its error event, so a sized upstream
+    /// answer reaches the client without the upstream's `Content-Length` on
+    /// the re-sliced path and on the plain path alike, its text whole.
+    #[tokio::test]
+    async fn a_streamed_sse_relay_drops_the_upstreams_content_length() {
+        use openai_protocol::validated::Normalizable;
+
+        let url = spawn_sized_worker(SIZED_DELTA_BODY, "text/event-stream").await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for model in ["MiniMax-M3", "served-plain-relay-model"] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+            assert!(
+                !response.headers().contains_key(CONTENT_LENGTH),
+                "{model}: the Content-Length of a sized upstream answer"
+            );
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let text: String = sse_events(std::str::from_utf8(&bytes).unwrap())
+                .iter()
+                .filter_map(|event| event.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .filter_map(|json| {
+                    json["choices"][0]["delta"]["content"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .collect();
+            assert_eq!(text, "Hello", "{model}: the text is whole");
+        }
+    }
+
+    /// A streamed answer that is not SSE is relayed byte for byte, on the
+    /// re-chunking model and the plain one alike, so a sized upstream answer
+    /// keeps the upstream's `Content-Length` and reaches the client whole.
+    /// The body carries deltas the re-slicing policy would hold and merge,
+    /// so a rechunker that ran under the wrong content type shows in the
+    /// bytes.
+    #[tokio::test]
+    async fn a_streamed_relay_keeps_the_content_length_of_a_sized_non_sse_answer() {
+        use openai_protocol::validated::Normalizable;
+
+        let url = spawn_sized_worker(SIZED_DELTA_BODY, "application/json").await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for model in ["MiniMax-M3", "served-plain-relay-model"] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(CONTENT_LENGTH)
+                    .and_then(|length| length.to_str().ok()),
+                Some(SIZED_DELTA_BODY.len().to_string().as_str()),
+                "{model}: the upstream's Content-Length of a sized non-SSE answer"
+            );
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            assert_eq!(
+                bytes.as_ref(),
+                SIZED_DELTA_BODY.as_bytes(),
+                "{model}: the bytes are whole"
+            );
+        }
+    }
+
+    /// The plain path ends a cut stream with its error event too, so a sized
+    /// upstream answer that is cut reaches the client without the upstream's
+    /// `Content-Length`: the frames that arrived, the typed error event and
+    /// `[DONE]` under no declared length the event would overrun.
+    #[tokio::test]
+    async fn a_cut_sized_stream_on_the_plain_path_ends_with_its_error_event_and_no_length() {
+        const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+                            data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        let first = BODY.find("\n\n").unwrap() + 2;
+        let url = test_support::spawn_sized_sse_worker_cut_after(BODY, first).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(CONTENT_LENGTH),
+            "a cut stream's length is not the upstream's"
+        );
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("the body ends cleanly after the error event")
+            .to_bytes();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 3, "{body}");
+        assert_eq!(events[0], BODY[..first].trim_end());
+        let error: Value = serde_json::from_str(events[1].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(events[2], "data: [DONE]");
+    }
+}
+
+#[cfg(test)]
+mod upstream_span_tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    use tracing::Instrument;
+    use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
+
+    use super::send_with_stale_conn_retry;
+
+    /// Counts how often any span is entered on this thread's subscriber.
+    struct EnterCounter(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> Layer<S> for EnterCounter {
+        fn on_enter(
+            &self,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A pooled connection created while a request span is current must not
+    /// run under that span: hyper's executor spawns the connection task with
+    /// the span current at creation, and the task would then enter it on
+    /// every poll while the body streams, and for every later request the
+    /// connection serves.
+    #[tokio::test]
+    async fn a_connection_created_under_a_request_span_does_not_enter_it_per_chunk() {
+        let enters = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            Registry::default().with(EnterCounter(enters.clone())),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let chunks = 64usize;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test server task; it ends with the connection"
+        )]
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .expect("response head");
+            for _ in 0..chunks {
+                socket
+                    .write_all(b"9\r\ndata: x\n\n\r\n")
+                    .await
+                    .expect("chunk");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            socket.write_all(b"0\r\n\r\n").await.expect("last chunk");
+        });
+        let client = crate::server::http_client();
+        let response =
+            send_with_stale_conn_retry(client.get(format!("http://{addr}/v1/chat/completions")))
+                .instrument(tracing::info_span!("http_request"))
+                .await
+                .expect("response");
+        let before_body = enters.load(Ordering::Relaxed);
+        let body = response.bytes().await.expect("body");
+        assert_eq!(body.len(), chunks * b"data: x\n\n".len());
+        let during_body = enters.load(Ordering::Relaxed) - before_body;
+        assert_eq!(
+            during_body, 0,
+            "the connection task entered the request span {during_body} times while the body streamed"
+        );
     }
 }

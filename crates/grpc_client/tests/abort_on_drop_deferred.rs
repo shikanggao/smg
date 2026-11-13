@@ -3,171 +3,23 @@
 //!
 //! The deferral contract: with `defer_abort_until_first_item`, dropping the
 //! stream before the backend produced any response holds the abort until the
-//! first response arrives (the disaggregated decode leg uses this so a client
+//! first response arrives (the disaggregated decode side uses this so a client
 //! disconnect can never tear down a request mid-KV-handoff); dropping after
 //! the first response — or without the deferral — aborts promptly, and
-//! `mark_completed` suppresses the abort entirely.
+//! `mark_completed` suppresses the abort entirely. The dropped stream itself
+//! is released by the backend's own end of it after the abort, within a
+//! bound, not by an immediate reset.
 
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::time::Duration;
 
 use futures::StreamExt;
 use smg_grpc_client::{vllm_proto as proto, VllmEngineClient};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
-use tonic::{transport::Server, Request, Response, Status};
 
-type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
-
-#[derive(Default)]
-struct MockState {
-    /// Sender feeding the currently open generate stream.
-    generate_tx: Mutex<Option<GenerateTx>>,
-    /// Request ids passed to Abort.
-    aborted: Mutex<Vec<String>>,
-}
-
-impl MockState {
-    fn lock_tx(&self) -> std::sync::MutexGuard<'_, Option<GenerateTx>> {
-        self.generate_tx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn aborted_ids(&self) -> Vec<String> {
-        self.aborted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-}
-
-#[derive(Clone, Default)]
-struct MockEngine {
-    state: Arc<MockState>,
-}
-
-#[tonic::async_trait]
-impl proto::vllm_engine_server::VllmEngine for MockEngine {
-    type GenerateStream = ReceiverStream<Result<proto::GenerateResponse, Status>>;
-
-    async fn generate(
-        &self,
-        _request: Request<proto::GenerateRequest>,
-    ) -> Result<Response<Self::GenerateStream>, Status> {
-        let (tx, rx) = mpsc::channel(4);
-        *self.state.lock_tx() = Some(tx);
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn abort(
-        &self,
-        request: Request<proto::AbortRequest>,
-    ) -> Result<Response<proto::AbortResponse>, Status> {
-        self.state
-            .aborted
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(request.into_inner().request_ids);
-        Ok(Response::new(proto::AbortResponse::default()))
-    }
-
-    async fn embed(
-        &self,
-        _request: Request<proto::EmbedRequest>,
-    ) -> Result<Response<proto::EmbedResponse>, Status> {
-        Err(Status::unimplemented("unused in tests"))
-    }
-
-    async fn health_check(
-        &self,
-        _request: Request<proto::HealthCheckRequest>,
-    ) -> Result<Response<proto::HealthCheckResponse>, Status> {
-        Err(Status::unimplemented("unused in tests"))
-    }
-
-    async fn get_model_info(
-        &self,
-        _request: Request<proto::GetModelInfoRequest>,
-    ) -> Result<Response<proto::GetModelInfoResponse>, Status> {
-        Err(Status::unimplemented("unused in tests"))
-    }
-
-    async fn get_server_info(
-        &self,
-        _request: Request<proto::GetServerInfoRequest>,
-    ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
-        Err(Status::unimplemented("unused in tests"))
-    }
-
-    async fn get_loads(
-        &self,
-        _request: Request<proto::GetLoadsRequest>,
-    ) -> Result<Response<proto::GetLoadsResponse>, Status> {
-        Err(Status::unimplemented("unused in tests"))
-    }
-
-    type GetTokenizerStream =
-        ReceiverStream<Result<smg_grpc_client::common_proto::GetTokenizerChunk, Status>>;
-
-    async fn get_tokenizer(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::GetTokenizerRequest>,
-    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        Err(Status::unimplemented("unused in tests"))
-    }
-
-    type SubscribeKvEventsStream =
-        ReceiverStream<Result<smg_grpc_client::common_proto::KvEventBatch, Status>>;
-
-    async fn subscribe_kv_events(
-        &self,
-        _request: Request<smg_grpc_client::common_proto::SubscribeKvEventsRequest>,
-    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        Err(Status::unimplemented("unused in tests"))
-    }
-}
-
-async fn spawn_mock() -> Result<(String, Arc<MockState>), Box<dyn std::error::Error>> {
-    let mock = MockEngine::default();
-    let state = Arc::clone(&mock.state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "mock server for one test; lives until the test process exits"
-    )]
-    tokio::spawn(
-        Server::builder()
-            .add_service(proto::vllm_engine_server::VllmEngineServer::new(mock))
-            .serve_with_incoming(TcpListenerStream::new(listener)),
-    );
-    Ok((format!("http://{addr}"), state))
-}
+mod common;
+use common::{generate_request, spawn_mock, wait_for_abort};
 
 fn chunk() -> proto::GenerateResponse {
     proto::GenerateResponse::default()
-}
-
-/// Wait (bounded) until the mock has recorded at least one abort.
-async fn wait_for_abort(state: &MockState) -> Vec<String> {
-    for _ in 0..100 {
-        let ids = state.aborted_ids();
-        if !ids.is_empty() {
-            return ids;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    state.aborted_ids()
-}
-
-fn generate_request(id: &str) -> proto::GenerateRequest {
-    proto::GenerateRequest {
-        request_id: id.to_string(),
-        ..Default::default()
-    }
 }
 
 #[tokio::test]
@@ -243,4 +95,65 @@ async fn mark_completed_suppresses_abort_in_deferred_mode() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(state.aborted_ids().is_empty());
+}
+
+#[tokio::test]
+async fn flush_cache_forwards_timeout_and_result() {
+    let (endpoint, _) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+    let result = client.flush_cache(1.5).await.unwrap();
+    assert!(result.success);
+    assert_eq!(result.message, "reset result");
+    assert!(!client.flush_cache(0.0).await.unwrap().success);
+}
+
+/// A dropped stream is released by the backend's own end of it, not by a
+/// reset: after the abort it stays open on the wire until the backend ends
+/// it (a chunk the backend sends meanwhile still goes through; a reset would
+/// have closed the response body's channel on the backend's side).
+#[tokio::test]
+async fn a_dropped_stream_is_released_by_the_backends_own_end_not_a_reset() {
+    let (endpoint, state) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+
+    let stream = client.generate(generate_request("rel-1")).await.unwrap();
+    drop(stream);
+    assert_eq!(wait_for_abort(&state).await, ["rel-1"]);
+
+    // Time for a reset, had one been sent, to reach the backend and close
+    // its response body's channel.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let tx = state.lock_tx().clone().unwrap();
+    tx.send(Ok(chunk()))
+        .await
+        .expect("the stream stays open until the backend ends it");
+    // The backend's end of the stream.
+    drop(tx);
+}
+
+/// A backend that never ends a dropped stream holds it only for the release
+/// bound; past it the stream is released with a reset after all.
+#[tokio::test]
+async fn a_backend_that_never_ends_a_dropped_stream_is_reset_after_the_bound() {
+    let (endpoint, state) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+
+    let stream = client
+        .generate(generate_request("rel-2"))
+        .await
+        .unwrap()
+        .with_release_drain_bound(Duration::from_millis(300));
+    drop(stream);
+    assert_eq!(wait_for_abort(&state).await, ["rel-2"]);
+
+    let tx = state.lock_tx().clone().unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tx.send(Ok(chunk()))
+        .await
+        .expect("still open inside the bound");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(
+        tx.send(Ok(chunk())).await.is_err(),
+        "past the bound the stream is released with a reset"
+    );
 }

@@ -72,7 +72,8 @@ impl PipelineStage for TranscriptionPreparationStage {
         // expansion + tokenize + stop decoder), then store the transcription
         // variant carrying the synthesized request and response contract.
         let (token_ids, processed_messages, _tool_constraints) =
-            prepare_chat_like(ctx, &chat_request).await?;
+            // A transcription carries no images: no pool to resolve a wire dtype over.
+            prepare_chat_like(ctx, &chat_request, &[]).await?;
 
         ctx.state.preparation = Some(PreparationOutput::Transcription {
             token_ids,
@@ -127,6 +128,7 @@ fn build_chat_request(
             },
         }]),
         name: None,
+        ext: Default::default(),
     });
 
     let prefill = family
@@ -143,8 +145,12 @@ fn build_chat_request(
         messages.push(ChatMessage::Assistant {
             content: Some(MessageContent::Text(prefill)),
             name: None,
+            refusal: None,
+            audio: None,
+            function_call: None,
             tool_calls: None,
-            reasoning_content: None,
+            reasoning: Default::default(),
+            ext: Default::default(),
         });
     }
 

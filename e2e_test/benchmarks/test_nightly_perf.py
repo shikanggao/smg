@@ -1,7 +1,7 @@
 """Nightly comprehensive benchmark tests.
 
-Runs models on k8s H100 or H200 runners using genai-bench default scenarios
-and concurrency levels. No performance thresholds — results are uploaded
+Runs models using genai-bench default scenarios and concurrency levels
+(nightly-benchmark-amd.yml). No performance thresholds — results are uploaded
 as artifacts for tracking over time.
 
 Each model has Single (1 worker) and Multi (N workers) classes, both
@@ -101,31 +101,9 @@ _NIGHTLY_MODELS: list[tuple[str, str, int, list[str], dict]] = [
     ("Qwen/Qwen2.5-7B-Instruct", "Qwen7b", 4, ["http", "grpc"], {}),
     ("Qwen/Qwen3-30B-A3B", "Qwen30b", 4, ["http", "grpc"], {}),
     ("openai/gpt-oss-20b", "GptOss20b", 1, ["http", "grpc"], {}),
-    ("minimaxai/minimax-m2", "MinimaxM2", 1, ["http", "grpc"], {}),
-    (
-        "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
-        "Llama4Maverick",
-        1,
-        ["http", "grpc"],
-        {},
-    ),
     (
         "meta-llama/Llama-4-Scout-17B-16E-Instruct",
         "Llama4Scout",
-        1,
-        ["http", "grpc"],
-        {},
-    ),
-    (
-        "meta-llama/Llama-3.3-70B-Instruct",
-        "Llama70b",
-        1,
-        ["http", "grpc"],
-        {},
-    ),
-    (
-        "RedHatAI/Llama-3.3-70B-Instruct-FP8-dynamic",
-        "Llama70bFp8",
         1,
         ["http", "grpc"],
         {},

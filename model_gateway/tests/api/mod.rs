@@ -2,7 +2,11 @@
 
 mod api_endpoints_test;
 mod messages_api_test;
+mod messages_streaming_test;
+mod messages_test;
+mod messages_threads_test;
 mod parser_endpoints_test;
+mod query_path_refusals_test;
 mod request_formats_test;
 #[cfg(feature = "provider-openai")]
 mod responses_api_test;

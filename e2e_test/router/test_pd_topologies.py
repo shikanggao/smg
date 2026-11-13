@@ -2,7 +2,7 @@
 
 One class sweeps the topologies 1p1d, 1p2d, 2p1d, 1p3d, 3p1d and 2p2d, two
 asymmetric-tp pairs (1p2d-ptp2-dtp1, 2p1d-ptp1-dtp2) and the HTTP PD router's
-1p1d and 2p2d. The counts, and the per-leg tp when the legs differ, ride in
+1p1d and 2p2d. The counts, and the per-pool tp when the pools differ, ride in
 the ``setup_backend`` param because the fixture is class-scoped, and every
 test runs once per topology. The gateway logs each
 selected pair at debug level, so requests are attributed to workers from the
@@ -10,23 +10,38 @@ router log instead of guessed.
 
 What a user of PD mode hits, in the order they hit it:
 
-- registration: ``/workers`` lists every leg with its role, all healthy
+- registration: ``/workers`` lists every worker with its role, all healthy
 - placement: every prefill and every decode worker takes traffic
 - transfer: a long prompt's context reaches decode; concurrent requests do
   not see each other's KV; a second turn still sees the first
 - streaming: a stream completes with usage; an abandoned stream frees the
-  engine slots on both legs instead of generating to its limit
-- failure: a leg loses one worker and traffic keeps flowing; a leg loses its
+  engine slots on both pools instead of generating to its limit
+- failure: a pool loses one worker and traffic keeps flowing; a pool loses its
   only worker and the client gets a prompt error instead of a hang; the
-  worker comes back and rejoins rotation
+  worker comes back and rejoins rotation; a decode engine dies under live
+  streams and each stream ends with an error frame, never silently, while
+  its peers keep serving and its restart on the same GPU rejoins
 - operations: a PD fleet assembled at runtime through the worker API in IGW
   mode routes through prefill and decode
 
 TokenSpeed runs Qwen3.5-9B, the model its disaggregation path is proven on;
 SGLang and vLLM run Llama-3.1-8B.
 
+On the mock engine (``E2E_RUNTIME=mock``) the gRPC and HTTP topologies run on
+scripted mock workers in the prefill and decode roles: the gateway's pairing,
+dual dispatch, placement, streaming and failure handling with no KV moving
+(the decode side has the prompt). A test that reads the answer states it with
+the prompt it is for (``mock_answers``, filed on every decode worker); the
+asymmetric-tp pairs and the engine-death case stay on the engines.
+
+A MoRI-IO lane (``E2E_VLLM_KV_BACKEND=moriio``, ``E2E_VLLM_MORIIO_MODE`` read
+or write) runs every topology on SMG's HTTP PD router, the one that speaks the
+MoRI-IO handoff, so every row moves real KV. It reads idleness from the
+engines' own metrics (HTTP workers send no load reports), checks that decode
+computed none of a long prompt, and expects SMG to refuse ``n>1``.
+
 Usage:
-    E2E_RUNTIME=tokenspeed pytest e2e_test/router/test_pd_topologies.py -v -k 2p2d
+    E2E_RUNTIME=tokenspeed E2E_ENGINE=tokenspeed pytest e2e_test/router/test_pd_topologies.py -v -k 2p2d
 """
 
 from __future__ import annotations
@@ -40,6 +55,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from urllib.parse import urlparse
@@ -47,7 +63,14 @@ from urllib.parse import urlparse
 import httpx
 import pytest
 from infra import ConnectionMode, Gateway, WorkerType, cleanup_pool, start_workers, stop_workers
-from infra.constants import DEFAULT_STARTUP_TIMEOUT, get_runtime, is_sglang
+from infra.constants import (
+    DEFAULT_STARTUP_TIMEOUT,
+    get_gpu_vendor,
+    get_runtime,
+    is_sglang,
+    vllm_kv_backend,
+    vllm_moriio_mode,
+)
 from infra.model_specs import get_model_spec
 from infra.pd_logs import (
     LOG_FLUSH_TIMEOUT_S,
@@ -55,6 +78,7 @@ from infra.pd_logs import (
     read_logs,
     worker_log_dir,
 )
+from infra.streams import SseChatEnd, read_sse_chat
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +89,11 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _PAIR_RE = re.compile(r"prefill=(\S+)\s+decode=(\S+)")
 
 _MODEL = "meta-llama/Llama-3.1-8B-Instruct"
-_MODEL_BY_ENGINE = {"tokenspeed": "Qwen/Qwen3.5-9B"}
+# The mock engine reads the model's tokenizer and template from an ungated twin.
+_MODEL_BY_ENGINE = {
+    "tokenspeed": "Qwen/Qwen3.5-9B",
+    "mock": "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8",
+}
 # A restart reloads the model on the same GPUs: give it the budget the model
 # declares for its first load, not Worker.start()'s default.
 _RESTART_TIMEOUT = get_model_spec(_MODEL_BY_ENGINE.get(get_runtime(), _MODEL)).get(
@@ -81,13 +109,74 @@ _HEALTH_ARGS = [
     "--health-success-threshold",
     "1",
 ]
+
+
+def _moriio_lane() -> bool:
+    """vLLM PD with KV over MoRI-IO, which setup_backend runs on the HTTP PD router."""
+    return get_runtime() == "vllm" and vllm_kv_backend() == "moriio"
+
+
+def _moriio_holds_memory_of(role: str) -> bool:
+    """Whether the other role keeps a stopped ``role`` worker's GPU memory in use.
+
+    On one node the role that moves the KV (decode in READ, prefill in WRITE)
+    keeps the memory of each worker it moved KV with until it exits itself,
+    over RDMA as over XGMI, so a worker restarted on that GPU fails vLLM's
+    startup memory check.
+    """
+    if not _moriio_lane():
+        return False
+    return role == ("prefill" if vllm_moriio_mode() == "read" else "decode")
+
+
+_MORIIO_HELD_MEMORY = (
+    "the other MoRI-IO role keeps this worker's KV cache until it exits, "
+    "so a restart on the same GPU runs out of memory (vllm-project/vllm#60425)"
+)
+
+
+def _nixl_decodes_keep_a_dead_prefills_memory(role: str) -> bool:
+    """Whether the decodes keep a stopped sole ``role`` worker's KV region until they serve again.
+
+    A vLLM decode over NIXL maps the prefill's KV region it pulls from and
+    forgets an idle prefill (``engine_ttl``) only while it handles a request
+    (0.31.0; 0.27.1 freed it when the prefill exited). A pool of two keeps
+    serving through its survivor, so that restart passes; the sole prefill's
+    decodes idle behind the router's 503, nothing makes them forget it, and
+    its restart on the same GPU fails vLLM's startup memory check. Seen on
+    CUDA only: the ROCm lane's decodes release the region when the prefill
+    exits and its restart passes, so that lane keeps the case. Lift the skip
+    when a release frees a dead peer's region without traffic (re-check it
+    at every engine pin move).
+    """
+    return (
+        role == "prefill"
+        and get_runtime() == "vllm"
+        and vllm_kv_backend() == "nixl"
+        and get_gpu_vendor() == "nvidia"
+    )
+
+
+_NIXL_HELD_MEMORY = (
+    "a vLLM decode over NIXL forgets a dead prefill only while it serves a request, and none "
+    "reaches it while the prefill pool is empty, so the sole prefill restarted on the same GPU "
+    "fails the engine's startup memory check (vLLM 0.31.0 on CUDA; the ROCm lane releases the "
+    "region and keeps this case; lift the skip when a release frees a dead peer's region "
+    "without traffic)"
+)
+
+
+# The gateway refreshes the load reports it serves on /loads once per
+# load-monitor interval; the idle checks below wait for a report taken after
+# the clients left before they judge, so the sweep pins the interval it reads.
+_LOAD_MONITOR_INTERVAL_S = 2
 _GATEWAY_ARGS = [
     "--prefill-policy",
     "round_robin",
     "--decode-policy",
     "round_robin",
     "--load-monitor-interval",
-    "2",
+    str(_LOAD_MONITOR_INTERVAL_S),
     *_HEALTH_ARGS,
 ]
 _TOPOLOGIES = (
@@ -98,17 +187,29 @@ _TOPOLOGIES = (
     + [
         # Asymmetric tensor parallelism: the KV layout changes across the
         # handoff. A prefill wider than its decodes and the reverse both fit
-        # four GPUs.
-        pytest.param(("pd_grpc", (p, d, ptp, dtp)), id=f"{p}p{d}d-ptp{ptp}-dtp{dtp}")
-        for p, d, ptp, dtp in [(1, 2, 2, 1), (2, 1, 1, 2)]
+        # four GPUs. The mock engine has no tensor parallelism, so there
+        # these pairs would be the symmetric ones again.
+        pytest.param(
+            ("pd_grpc", (p, d, ptp, dtp)),
+            id=f"{p}p{d}d-ptp{ptp}-dtp{dtp}",
+            marks=pytest.mark.skipif(
+                _moriio_lane(),
+                reason="vLLM's MoRI-IO connector pairs unequal TP sizes only when every "
+                "rank holds all KV heads (vllm-project/vllm#46332); the model's 8 are split",
+            ),
+        )
+        for p, d, ptp, dtp in ([(1, 2, 2, 1), (2, 1, 1, 2)] if get_runtime() != "mock" else [])
     ]
     + [
         # The HTTP PD router is its own code path: pairing and error answers
-        # on both engines, the KV handoff on SGLang. A vLLM leg registered by
+        # on both engines, the KV handoff on SGLang. A vLLM worker registered by
         # URL carries no kv_connector, so the router passes the request
         # through and decode recomputes the prompt; vLLM's handoff is covered
         # by the gRPC rows, where the worker reports its connector. The
-        # TokenSpeed e2e worker has no HTTP frontend.
+        # TokenSpeed e2e worker has no HTTP frontend. On the mock engine the
+        # HTTP workers take the roles: the router's injected bootstrap
+        # fields, its bootstrap probe and its server-info read are answered,
+        # and no KV moves.
         pytest.param(
             ("pd_http", (p, d)),
             id=f"{p}p{d}d-http",
@@ -180,6 +281,43 @@ def _wait_for_pairs(minimum: int, timeout: float = LOG_FLUSH_TIMEOUT_S) -> list[
     return pairs
 
 
+FANOUT_MARKER = "PD fan-out: one single-sample pair per sample"
+_UUID = r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}"
+
+
+def _fanout_logged(parent: str) -> tuple[bool, set[int]]:
+    """Whether the gateway logged the fan-out of ``parent`` and the choice
+    indices of the single-sample children it dispatched under it
+    (``<parent>-<uuid>-<index>``)."""
+    # The response's id may already carry the dispatch uuid the children
+    # extend; the fan-out line names the request by its bare id.
+    bare = re.sub("-" + _UUID + "$", "", parent)
+    child_re = re.compile(re.escape(bare) + "-" + _UUID + r"-(\d+)\b")
+    taken = False
+    children: set[int] = set()
+    for raw in read_logs(_LOG_DIR, "smg*").splitlines():
+        line = _ANSI.sub("", raw)
+        if FANOUT_MARKER in line and bare in line:
+            taken = True
+        children.update(int(m.group(1)) for m in child_re.finditer(line))
+    return taken, children
+
+
+def _wait_for_fanout(parent: str, count: int, timeout: float = LOG_FLUSH_TIMEOUT_S) -> None:
+    deadline = time.monotonic() + timeout
+    taken, children = _fanout_logged(parent)
+    while not (taken and len(children) >= count) and time.monotonic() < deadline:
+        time.sleep(0.5)
+        taken, children = _fanout_logged(parent)
+    assert taken, (
+        f"router logged no PD fan-out for {parent}; is --log-level debug reaching {_LOG_DIR}/smg*?"
+    )
+    assert children == set(range(count)), (
+        f"router dispatched the choices of {parent} as children {sorted(children)}, "
+        f"expected one single-sample child per choice, 0..{count - 1}"
+    )
+
+
 def _log_sizes(log_dir: Path) -> dict[Path, int]:
     """Byte size of every worker log now, to read only what is appended later."""
     return {p: p.stat().st_size for p in log_dir.glob("worker-*.log") if p.is_file()}
@@ -192,8 +330,9 @@ def _logs_since(log_dir: Path, sizes: dict[Path, int]) -> str:
         if not path.is_file():
             continue
         with path.open("rb") as fh:
-            # A restart truncates the log (mode "w"): a stale offset past EOF
-            # would silently read nothing, so fall back to the whole file.
+            # A restart moves the previous log aside and reopens the path at
+            # 0 bytes: a stale offset past EOF would silently read nothing, so
+            # fall back to the whole file.
             start = sizes.get(path, 0)
             fh.seek(start if start <= path.stat().st_size else 0)
             parts.append(fh.read().decode("utf-8", errors="replace"))
@@ -201,15 +340,19 @@ def _logs_since(log_dir: Path, sizes: dict[Path, int]) -> str:
 
 
 def _fleet_logs(sizes: dict[Path, int], gateway: Gateway) -> str:
-    """The captured log files of this gateway's own legs, named by port."""
-    legs = gateway.prefill_workers + gateway.decode_workers
-    ports = {str(urlparse(w.base_url).port) for w in legs}
+    """The captured log files of this gateway's own workers, named by port."""
+    workers = gateway.prefill_workers + gateway.decode_workers
+    ports = {str(urlparse(w.base_url).port) for w in workers}
     return "\n".join(str(p) for p in sorted(sizes) if p.stem.rsplit("_", 1)[-1] in ports)
 
 
 def _vllm_transport_installed(*packages: str) -> bool:
-    """Whether every KV transport package is importable from this interpreter."""
-    return all(importlib.util.find_spec(package) is not None for package in packages)
+    """Whether every transport is discoverable, including ROCm's NIXL module name."""
+    return all(
+        importlib.util.find_spec(package) is not None
+        or (package == "nixl" and importlib.util.find_spec("nixl_rocm") is not None)
+        for package in packages
+    )
 
 
 def _vllm_transports_requested() -> set[str]:
@@ -339,11 +482,57 @@ def _wait_until_served(gateway: Gateway, model: str, timeout: float) -> None:
     pytest.fail(f"gateway did not serve within {timeout:.0f}s; last: {last}")
 
 
+def _launched_transport(worker) -> str:
+    """A worker's KV transport as the gateway names it in its pairing key."""
+    backend = worker.effective_kv_backend()
+    return f"moriio-{vllm_moriio_mode()}" if backend == "moriio" else backend
+
+
+def _metric_samples(text: str, name: str, **labels: str) -> list[float]:
+    """Values of a Prometheus metric's samples that carry ``labels``."""
+    samples = []
+    for line in text.splitlines():
+        rest = line[len(name) :] if line.startswith(name) else None
+        if rest is None or (rest and rest[0] not in " {"):
+            continue  # another metric, or a longer name with this prefix
+        if all(f'{k}="{v}"' in rest for k, v in labels.items()):
+            samples.append(float(line.rsplit(" ", 1)[1]))
+    return samples
+
+
+def _worker_metric(worker, name: str, **labels: str) -> float:
+    """Sum of one vLLM worker's samples of a metric that carry ``labels``, from
+    its /metrics. vLLM exports the series this file reads from start-up, so a
+    worker without one fails the test instead of reading as zero."""
+    response = httpx.get(f"{worker.http_url}/metrics", timeout=5.0)
+    response.raise_for_status()
+    samples = _metric_samples(response.text, name, **labels)
+    where = f" with {labels}" if labels else ""
+    assert samples, f"{worker.base_url} exports no {name} sample{where}"
+    return sum(samples)
+
+
+def _engines_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
+    """The idle check from each vLLM worker's own /metrics, for workers without load reports."""
+    states = [
+        {
+            "worker": w.base_url,
+            "num_running_reqs": _worker_metric(w, "vllm:num_requests_running"),
+            "num_waiting_reqs": _worker_metric(w, "vllm:num_requests_waiting"),
+        }
+        for w in gateway.prefill_workers + gateway.decode_workers
+    ]
+    busy = [s for s in states if s["num_running_reqs"] + s["num_waiting_reqs"] > 0]
+    return (not busy, states)
+
+
 def _fleet_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
+    if _moriio_lane():
+        return _engines_idle(gateway)
     resp = httpx.get(f"{gateway.base_url}/loads", timeout=5.0)
     assert resp.status_code == 200, resp.text
     loads = resp.json().get("loads", [])
-    # /loads omits workers the monitor has no report for; an unreported leg
+    # /loads omits workers the monitor has no report for; an unreported worker
     # is not evidence of idleness.
     reported = {e.get("worker") for e in loads}
     expected = {w.base_url for w in gateway.prefill_workers + gateway.decode_workers}
@@ -354,21 +543,55 @@ def _fleet_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
 
 
 def _require_load_reports(backend: str) -> None:
-    """The idle check reads /loads; HTTP SGLang workers report none without metrics."""
-    if backend == "pd_http":
+    """The idle check reads /loads; HTTP SGLang workers report none without metrics.
+
+    A MoRI-IO lane reads its engines' own metrics instead (see ``_fleet_idle``);
+    the mock's HTTP workers report their loads as its gRPC workers do.
+    """
+    if backend == "pd_http" and not _moriio_lane() and get_runtime() != "mock":
         pytest.skip("load reports need gRPC workers")
 
 
+# How long a tick's report can take to reach /loads: the gateway gives a
+# group's poll LOAD_POLL_DEADLINE (worker/monitor.rs, 3 s) before it publishes
+# the tick, and an engine that answers between scheduler steps can use it. A
+# poll that misses the deadline is not published late: the tick prunes the
+# worker from /loads, which the check reads as not idle.
+_LOAD_POLL_DEADLINE_S = 3.0
+
+# How long after the clients left the first report taken after they left can
+# take to reach /loads. The poll under way at that moment may run to its
+# deadline and publish samples that predate their requests; the next tick
+# starts no later than one interval after that poll ends (the loop's timer
+# fires a missed tick at once, which is sooner); and its own poll may run to
+# the deadline again. /loads carries no sample time, so the check waits this
+# long instead of asking a report when it was taken.
+_FRESH_LOAD_REPORT_S = _LOAD_MONITOR_INTERVAL_S + 2 * _LOAD_POLL_DEADLINE_S
+
+
 def _assert_fleet_idle_within(gateway: Gateway, timeout: float) -> None:
+    """Every worker reads idle on a load report taken after the clients left, within ``timeout``.
+
+    ``/loads`` serves the gateway's latest load report and says nothing about
+    when it was taken: read the moment the clients left, it can be the report
+    taken before their requests arrived, and say idle about engines that still
+    hold the abandoned work. The first read therefore waits until the first
+    report taken after the clients left has reached ``/loads`` at the latest
+    (``_FRESH_LOAD_REPORT_S``); the deadline still counts from the moment they
+    left. The MoRI-IO lane reads the engines' own metrics, which are live, so
+    it does not wait.
+    """
     started = time.monotonic()
     deadline = started + timeout
+    if not _moriio_lane():
+        time.sleep(_FRESH_LOAD_REPORT_S)
     idle, loads = _fleet_idle(gateway)
     while not idle and time.monotonic() < deadline:
         time.sleep(1.0)
         idle, loads = _fleet_idle(gateway)
     # A floor on how long the engines kept working after the clients left:
-    # the clock starts once the callers joined their threads, and /loads is
-    # a 2 s-interval report, so only differences well above that mean much.
+    # the clock starts once the callers joined their threads and the first
+    # read waits for a fresh report, so only differences well above that mean much.
     if idle:
         logger.info("fleet idle within %.1fs of the clients leaving", time.monotonic() - started)
     assert idle, f"engines still hold work after {timeout:.0f}s: {loads}"
@@ -394,6 +617,45 @@ def _run_all(fns: list[Callable[[], None]], timeout: float) -> list[BaseExceptio
     return errors
 
 
+@dataclass
+class _StreamOutcome:
+    """How one streamed chat completion ended: the response status, the SSE
+    stream's end (see :class:`SseChatEnd`), or the exception that cut it."""
+
+    status: int | None = None
+    end: SseChatEnd = field(default_factory=SseChatEnd)
+    exception: str | None = None
+
+
+def _stream_chat(
+    gateway: Gateway, model: str, *, max_tokens: int, first_token: threading.Event
+) -> _StreamOutcome:
+    """Stream one chat completion to its end, ``first_token`` set at its first
+    chunk. A response that is not a stream (a status other than 200) is kept
+    as an error with its body."""
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Write a very long story about the sea."}],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": True,
+        "ignore_eos": True,
+    }
+    outcome = _StreamOutcome()
+    try:
+        with httpx.stream(
+            "POST", f"{gateway.base_url}/v1/chat/completions", json=body, timeout=120.0
+        ) as resp:
+            outcome.status = resp.status_code
+            if resp.status_code != 200:
+                outcome.end.error = {"http_status": resp.status_code, "body": resp.read()[:300]}
+                return outcome
+            outcome.end = read_sse_chat(resp.iter_lines(), on_first_chunk=first_token.set)
+    except Exception as exc:  # reported in the outcome, judged by the test
+        outcome.exception = repr(exc)
+    return outcome
+
+
 def _long_prompt(secret: str) -> str:
     filler = (
         "The harbor office logs every vessel by name, tonnage and berth, and the "
@@ -412,10 +674,10 @@ def _long_prompt(secret: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(4)
 @pytest.mark.e2e
-@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"])
+@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"], mock=_MODEL_BY_ENGINE["mock"])
 @pytest.mark.workers(parallel_start=True)
 @pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
 @pytest.mark.parametrize("setup_backend", _TOPOLOGIES, indirect=True)
@@ -436,10 +698,10 @@ class TestPDTopology:
 
         assert listed == expected, f"/workers roles {listed} != launched {expected}"
         unhealthy = [w.url for ws in by_role.values() for w in ws if w.status != "healthy"]
-        assert not unhealthy, f"unhealthy legs after startup: {unhealthy}"
+        assert not unhealthy, f"unhealthy workers after startup: {unhealthy}"
         assert any(m.get("id") for m in gateway.list_models()), "no model listed"
 
-        # Every leg reports the KV transport the lane launched it with: a row
+        # Every worker reports the KV transport the lane launched it with: a row
         # that names a transport its workers never took sweeps the wrong thing
         # (#2498). gRPC discovery reads the engine's own server args, so the
         # transport is known there; HTTP discovery's curated server_info does
@@ -447,22 +709,22 @@ class TestPDTopology:
         # only moves KV over Mooncake, so both sides are that constant.
         keys = _pairing_keys(gateway)
         logger.info("pairing keys: %s", keys)
-        legs = gateway.prefill_workers + gateway.decode_workers
-        reported = {w.base_url: keys.get(w.base_url, "?/?").split("/")[1] for w in legs}
-        launched = {w.base_url: w.effective_kv_backend() for w in legs}
+        workers = gateway.prefill_workers + gateway.decode_workers
+        reported = {w.base_url: keys.get(w.base_url, "?/?").split("/")[1] for w in workers}
+        launched = {w.base_url: _launched_transport(w) for w in workers}
         wrong = {
             u: (reported[u], launched[u]) for u in launched if reported[u] not in ("?", launched[u])
         }
         assert not wrong, (
-            f"legs report a different KV transport than they were launched with: {wrong}"
+            f"workers report a different KV transport than they were launched with: {wrong}"
         )
         if mode == "pd_grpc":
             unknown = [u for u, t in reported.items() if t == "?"]
-            assert not unknown, f"gRPC legs without a known KV transport on /workers: {unknown}"
+            assert not unknown, f"gRPC workers without a known KV transport on /workers: {unknown}"
 
     # -- placement ---------------------------------------------------------
 
-    def test_every_leg_takes_traffic(self, setup_backend):
+    def test_every_worker_takes_traffic(self, setup_backend):
         _, model, client, gateway = setup_backend
         prefills = {w.base_url for w in gateway.prefill_workers}
         decodes = {w.base_url for w in gateway.decode_workers}
@@ -481,9 +743,15 @@ class TestPDTopology:
 
     # -- transfer ----------------------------------------------------------
 
-    def test_concurrent_requests_do_not_alias(self, setup_backend):
+    def test_concurrent_requests_do_not_alias(self, setup_backend, mock_answers):
         _, model, client, gateway = setup_backend
         answers: dict[str, str] = {}
+        # On the mock: each word's answer, filed for the prompt that names it
+        # (the phrase, not the bare word: the rendered prompt holds the
+        # template's own text too), whichever decode worker and order the
+        # requests land in.
+        for word in _WORDS:
+            mock_answers.enqueue(word, prompt_contains=f"nothing else: {word}")
 
         def _echo(word: str) -> Callable[[], None]:
             def _run() -> None:
@@ -504,23 +772,60 @@ class TestPDTopology:
             foreign = [w for w in _WORDS if w != word and w in content]
             assert not foreign, f"answer for {word!r} carried {foreign}: {content[:120]!r}"
 
-    def test_long_prompt_context_reaches_decode(self, setup_backend):
+    def test_long_prompt_context_reaches_decode(self, setup_backend, mock_answers):
         _, model, client, gateway = setup_backend
         secret = "48213"
+        computed_before = self._decode_computed(gateway) if _moriio_lane() else 0.0
+        # On the mock: the decode side reads the whole prompt (it is sent it),
+        # and answers the code it holds.
+        mock_answers.enqueue(secret, prompt_contains=f"the access code is {secret}")
 
-        message = _ask(client, model, _long_prompt(secret), max_tokens=128)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": _long_prompt(secret)}],
+            temperature=0,
+            max_tokens=128,
+            timeout=120.0,
+        )
 
-        text = _answer_text(message)
+        text = _answer_text(response.choices[0].message.model_dump())
         assert secret in text, f"decode did not see the prefilled context: {text[:200]!r}"
+        if _moriio_lane():
+            # Decode took the prompt's KV over MoRI-IO (or, on a rerun, from its
+            # own prefix cache) instead of computing it: READ leaves it the last
+            # token, WRITE none. The counters can lag the response by a moment.
+            allowed = 1 if vllm_moriio_mode() == "read" else 0
+            deadline = time.monotonic() + 5.0
+            computed = self._decode_computed(gateway) - computed_before
+            while computed > allowed and time.monotonic() < deadline:
+                time.sleep(0.5)
+                computed = self._decode_computed(gateway) - computed_before
+            assert computed <= allowed, (
+                f"decode computed {computed:.0f} of the prompt's "
+                f"{response.usage.prompt_tokens} tokens instead of receiving their KV"
+            )
 
-    def test_second_turn_sees_the_first(self, setup_backend):
+    @staticmethod
+    def _decode_computed(gateway: Gateway) -> float:
+        """Prompt tokens the decode workers computed themselves."""
+        return sum(
+            _worker_metric(w, "vllm:prompt_tokens_by_source_total", source="local_compute")
+            for w in gateway.decode_workers
+        )
+
+    def test_second_turn_sees_the_first(self, setup_backend, mock_answers):
         _, model, client, gateway = setup_backend
         first = {"role": "user", "content": "Remember this: the password is marigold. Reply OK."}
+        # On the mock: the first turn's answer, then the second's, each filed
+        # for the prompt that ends with its question (the second prompt holds
+        # the first turn too).
+        mock_answers.enqueue("OK", prompt_contains="Reply OK.")
         reply = client.chat.completions.create(
             model=model, messages=[first], temperature=0, max_tokens=64, timeout=120.0
         )
         assistant = reply.choices[0].message
 
+        mock_answers.enqueue("marigold", prompt_contains="What is the password?")
         follow_up = client.chat.completions.create(
             model=model,
             messages=[
@@ -538,8 +843,12 @@ class TestPDTopology:
 
     # -- streaming ---------------------------------------------------------
 
-    def test_stream_completes_with_usage(self, setup_backend):
+    def test_stream_completes_with_usage(self, setup_backend, mock_answers):
         _, model, client, gateway = setup_backend
+        mock_answers.enqueue(
+            "one two three four five six seven eight nine ten",
+            prompt_contains="Count from one to ten",
+        )
 
         stream = client.chat.completions.create(
             model=model,
@@ -556,7 +865,7 @@ class TestPDTopology:
                 usage = chunk.usage
             for choice in chunk.choices:
                 # Thinking models may spend the whole budget in the reasoning
-                # channel; either channel proves the decode leg streamed.
+                # channel; either channel proves the decode side streamed.
                 delta = choice.delta
                 text += delta.content or ""
                 text += (
@@ -570,7 +879,7 @@ class TestPDTopology:
         assert finish in ("stop", "length"), f"stream ended without a finish reason: {finish}"
         assert usage is not None and usage.completion_tokens > 0, f"no usage on the stream: {usage}"
 
-    def test_abandoned_streams_free_both_legs(self, setup_backend):
+    def test_abandoned_streams_free_both_sides(self, setup_backend):
         backend, model, client, gateway = setup_backend
         _require_load_reports(backend)
         body = {
@@ -597,7 +906,7 @@ class TestPDTopology:
         _assert_fleet_idle_within(gateway, 30.0)
         _wait_until_served(gateway, model, timeout=60.0)
 
-    def test_aborts_during_prefill_free_both_legs(self, setup_backend):
+    def test_aborts_during_prefill_free_both_sides(self, setup_backend):
         """Clients that give up before the first token leave no room behind."""
         backend, model, _, gateway = setup_backend
         _require_load_reports(backend)
@@ -625,7 +934,7 @@ class TestPDTopology:
         _assert_fleet_idle_within(gateway, 30.0)
         _wait_until_served(gateway, model, timeout=60.0)
 
-    def test_batched_completion_serves_every_choice(self, setup_backend, request):
+    def test_batched_completion_serves_every_choice(self, setup_backend, request, mock_answers):
         """Every choice of an ``n>1`` request must come back through the PD pair.
 
         On the room-based engines (SGLang, TokenSpeed) the gRPC router fans
@@ -634,6 +943,24 @@ class TestPDTopology:
         handoff for ``n>1``, leaving decode to recompute the prompt.
         """
         mode, model, _, gateway = setup_backend
+        # On the mock: one stated answer per single-sample child of the
+        # fan-out, each filed under the prompt, taken on whichever decode
+        # worker its child lands. The hits count one per choice, so the
+        # answers alone cannot tell four children from one n=4 dispatch:
+        # the gateway's dispatch log is read below.
+        for _ in range(4):
+            mock_answers.enqueue("red, yellow and blue.", prompt_contains="primary colors")
+        if _moriio_lane():
+            # One MoRI-IO handoff moves one request's KV, so SMG refuses n>1
+            # rather than letting the samples share a prefill.
+            resp = httpx.post(
+                f"{gateway.base_url}/v1/completions",
+                json={"model": model, "prompt": "The three primary colors are", "n": 4},
+                timeout=60.0,
+            )
+            assert resp.status_code == 400, f"{resp.status_code} {resp.text[:300]}"
+            assert _error_code(resp) == "moriio_fanout_unsupported", resp.text[:300]
+            return
         if mode == "pd_http" and is_sglang():
             # The shape the gRPC fan-out fixed: the HTTP PD router mints one
             # room for a single-prompt request whatever ``n`` is, the engine
@@ -663,14 +990,23 @@ class TestPDTopology:
         choices = resp.json().get("choices", [])
         assert len(choices) == 4, f"expected 4 choices, got {len(choices)}"
         assert all(c.get("text", "").strip() for c in choices), f"empty choice in {choices}"
+        if get_runtime() == "mock" and mode != "pd_http":
+            # The fan-out itself: one single-sample child per choice under
+            # the one selected pair, each with its own room. The HTTP PD
+            # router dispatches the request once instead (one room for every
+            # sample, the shape above); the mock's decode side has the
+            # prompt and serves the four choices itself.
+            _wait_for_fanout(resp.json()["id"], 4)
 
     # -- failure -----------------------------------------------------------
 
-    def _leg_survives_losing_one(self, setup_backend, role: str) -> None:
+    def _pool_survives_losing_one(self, setup_backend, role: str) -> None:
         _, model, client, gateway = setup_backend
         workers = gateway.prefill_workers if role == "prefill" else gateway.decode_workers
         if len(workers) < 2:
             pytest.skip(f"topology has a single {role} worker")
+        if _moriio_holds_memory_of(role):
+            pytest.skip(_MORIIO_HELD_MEMORY)
         victim = workers[-1]
         peers = {w.base_url for w in workers[:-1]}
 
@@ -697,13 +1033,132 @@ class TestPDTopology:
         assert victim.base_url in used, f"restarted {role} worker never rejoined rotation"
 
     @pytest.mark.flaky(reruns=0)  # a restart per attempt; a real failure must surface once
-    def test_decode_leg_survives_losing_one_worker(self, setup_backend):
-        self._leg_survives_losing_one(setup_backend, "decode")
+    def test_decode_pool_survives_losing_one_worker(self, setup_backend):
+        self._pool_survives_losing_one(setup_backend, "decode")
 
     @pytest.mark.flaky(reruns=0)  # a restart per attempt; a real failure must surface once
-    def test_prefill_leg_survives_losing_one_worker(self, setup_backend):
-        self._leg_survives_losing_one(setup_backend, "prefill")
+    def test_prefill_pool_survives_losing_one_worker(self, setup_backend):
+        self._pool_survives_losing_one(setup_backend, "prefill")
 
+    @pytest.mark.flaky(reruns=0)  # a restart per attempt; a real failure must surface once
+    @pytest.mark.skip_for_runtime(
+        "mock", reason="the engine runs inside the mock worker: nothing dies under it"
+    )
+    def test_decode_engine_death_under_streaming_traffic(self, setup_backend):
+        """A decode engine dies under live streams.
+
+        Each stream ends complete or with the gateway's error frame and
+        ``[DONE]``, never silently and never as a completion the engine
+        aborted; the gateway stops routing to the worker and its peers answer
+        new requests; the worker's restart on the same GPU rejoins rotation.
+
+        The fault is the engine's own processes dying under their launcher,
+        what a device fault or the kernel's out-of-memory killer does, not an
+        orderly stop: the launcher reports the death and exits, and the
+        harness restarts the worker once its ranks have released the device
+        memory. Over a KV transport whose peers keep a dead engine's memory
+        mapped, the restart fails its startup memory check here: that is
+        this row's finding about the transport, not a reason to skip.
+        """
+        mode, model, client, gateway = setup_backend
+        if mode != "pd_grpc":
+            # The MoRI-IO lanes run on the HTTP PD router and skip here too.
+            pytest.skip(
+                "the stream-failure contract asserted here is the gRPC pipeline's; "
+                "the HTTP PD router relays the engine's own frames"
+            )
+        decodes = gateway.decode_workers
+        if len(decodes) < 2:
+            pytest.skip("topology has a single decode worker")
+        victim = decodes[-1]
+        if is_sglang() and victim.effective_kv_backend() == "nixl":
+            # The nightly SGLang-over-NIXL row keeps the other peer restarts
+            # out by name for the same reason.
+            pytest.skip(
+                "the SGLang prefill segfaults when its decode comes back on the same "
+                "address (#2503), and this row restarts the decode on its old port"
+            )
+        peers = {w.base_url for w in decodes[:-1]}
+
+        streams = 4 * len(decodes)
+        before = len(_pairs_logged())
+        outcomes: list[_StreamOutcome] = []
+        first_tokens = [threading.Event() for _ in range(streams)]
+
+        def _run(event: threading.Event) -> None:
+            outcomes.append(_stream_chat(gateway, model, max_tokens=600, first_token=event))
+
+        threads = [threading.Thread(target=_run, args=(e,), daemon=True) for e in first_tokens]
+        for t in threads:
+            t.start()
+        # Every stream is past its first token before the kill, so the engine
+        # dies under live decode, on the victim and on its peers alike.
+        deadline = time.monotonic() + 60.0
+        for event in first_tokens:
+            assert event.wait(max(0.0, deadline - time.monotonic())), (
+                "a stream had no first token within 60s"
+            )
+        pairs = _wait_for_pairs(before + streams)[before:]
+        decodes_used = {d for _, d in pairs}
+        assert victim.base_url in decodes_used, f"no stream landed on {victim.base_url}: {pairs}"
+
+        killed = victim.kill_engine()
+        assert killed, f"{victim.base_url}: the launcher had no engine process to kill"
+        logger.info(
+            "%s: engine processes %s killed under %d streams", victim.base_url, killed, streams
+        )
+
+        for t in threads:
+            t.join(timeout=120.0)
+        try:
+            assert len(outcomes) == streams, (
+                f"{streams - len(outcomes)} streams still running 120s after the kill"
+            )
+            logger.info("stream outcomes after the kill: %s", outcomes)
+            exceptions = [o for o in outcomes if o.exception is not None]
+            assert not exceptions, f"streams failed below the SSE layer: {exceptions}"
+            ends = [o.end for o in outcomes]
+            aborted = [e for e in ends if e.finish_reason == "abort"]
+            assert not aborted, f"streams ended as completions the engine aborted: {aborted}"
+            silent = [
+                e for e in ends if e.error is None and e.finish_reason not in ("stop", "length")
+            ]
+            assert not silent, (
+                f"streams ended with neither a completion nor an error frame: {silent}"
+            )
+            failed = [e for e in ends if e.error is not None]
+            assert failed, "no stream reported the engine's death"
+            undone = [e for e in failed if not e.done]
+            assert not undone, f"failed streams not closed with [DONE]: {undone}"
+
+            # The gateway takes the worker out of rotation on its own and the
+            # peers answer: no client reads an error for a worker that is gone.
+            _wait_for_status(gateway, victim.base_url, "unhealthy", timeout=30.0)
+            before = len(_pairs_logged())
+            for i in range(6):
+                _ask(client, model, f"Reply with the number {i}.", max_tokens=8)
+            pairs = _wait_for_pairs(before + 6)[before:]
+            used = {d for _, d in pairs}
+            assert victim.base_url not in used, "gateway kept routing to the dead decode worker"
+            assert used <= peers, f"unknown decode workers in placement: {used - peers}"
+        finally:
+            # Whatever the verdict, the class's later tests need the pool back.
+            # stop() reaps the engine's processes and waits for the device
+            # memory before the same GPU is loaded again.
+            victim.stop()
+            victim.start(timeout=_RESTART_TIMEOUT)
+            _wait_for_status(gateway, victim.base_url, "healthy", timeout=60.0)
+        before = len(_pairs_logged())
+        count = 4 * len(decodes)
+        for i in range(count):
+            _ask(client, model, f"Reply with the number {i}.", max_tokens=8)
+        pairs = _wait_for_pairs(before + count)[before:]
+        assert victim.base_url in {d for _, d in pairs}, (
+            "restarted decode worker never rejoined rotation"
+        )
+
+    # The name keeps "leg": two workflows select this test by `not sole_leg_outage`
+    # (the nightly PD sweep and the PR e2e matrix); a rename moves those filters with it.
     @pytest.mark.flaky(reruns=0)  # a restart per attempt; a real failure must surface once
     def test_sole_leg_outage_is_reported_promptly(self, setup_backend):
         _, model, client, gateway = setup_backend
@@ -712,7 +1167,11 @@ class TestPDTopology:
         elif len(gateway.prefill_workers) == 1:
             role, victim = "prefill", gateway.prefill_workers[0]
         else:
-            pytest.skip("both legs have more than one worker")
+            pytest.skip("both pools have more than one worker")
+        if _moriio_holds_memory_of(role):
+            pytest.skip(_MORIIO_HELD_MEMORY)
+        if _nixl_decodes_keep_a_dead_prefills_memory(role):
+            pytest.skip(_NIXL_HELD_MEMORY)
 
         victim.stop()
         try:
@@ -725,10 +1184,10 @@ class TestPDTopology:
                 "sole %s down: status=%s code=%s after %.1fs", role, resp.status_code, code, elapsed
             )
             assert elapsed < 20.0, f"request hung for {elapsed:.1f}s while the only {role} was down"
-            # The model exists and its leg is merely down: a 503 the client can
+            # The model exists and its pool is merely down: a 503 the client can
             # retry, never a 404 that says the model is gone (#2465). Every
             # router answers no_available_workers (#2479); the HTTP PD router
-            # may name the leg instead.
+            # may name the role instead.
             assert resp.status_code == 503, (
                 f"unexpected outage answer: {resp.status_code} {resp.text[:200]}"
             )
@@ -738,7 +1197,7 @@ class TestPDTopology:
                 f"{role}_unavailable",
             ), f"outage answer carried an unexpected code: {code!r} {resp.text[:200]}"
         finally:
-            # Whatever the verdict, the class's later tests need the leg back.
+            # Whatever the verdict, the class's later tests need the pool back.
             victim.start(timeout=_RESTART_TIMEOUT)
             _wait_for_status(gateway, victim.base_url, "healthy", timeout=60.0)
         _wait_until_served(gateway, model, timeout=120.0)
@@ -774,7 +1233,7 @@ class TestPDMixedTransport:
 
     Placement pairs a prefill with a decode on their KV transfer protocol
     (#2483): a NIXL prefill's handoff never lands on a Mooncake decode, and
-    the gateway reports which protocol each leg speaks.
+    the gateway reports which protocol each worker speaks.
     """
 
     def test_every_request_lands_on_a_matching_pair(self, setup_backend):
@@ -844,10 +1303,10 @@ class TestPDMismatchedTransport:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(4)
 @pytest.mark.e2e
-@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"])
+@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"], mock=_MODEL_BY_ENGINE["mock"])
 @pytest.mark.workers(parallel_start=True)
 @pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
 @pytest.mark.parametrize(
@@ -870,16 +1329,20 @@ class TestPDMismatchedTransport:
     ],
     indirect=True,
 )
+@pytest.mark.skipif(
+    _moriio_lane(),
+    reason="the gRPC servicer reports SMG_PAIRING_PROTOCOL; a MoRI-IO lane's workers are HTTP",
+)
 class TestPDMismatchedProtocol:
     """A pairing protocol set in the engine's environment reaches placement.
 
     A deployment injects ``SMG_PAIRING_PROTOCOL`` into the engine container;
     the servicer reports it in server info and the gateway pairs on it alone.
-    Two legs with different values are refused with `no_compatible_pd_pair`,
+    Two workers with different values are refused with `no_compatible_pd_pair`,
     whatever their transport and layout say.
     """
 
-    def test_legs_with_different_protocols_are_refused(self, setup_backend):
+    def test_workers_with_different_protocols_are_refused(self, setup_backend):
         _, model, _, gateway = setup_backend
         _wait_for_healthy_workers(gateway, 2, timeout=120.0)
         keys = _pairing_keys(gateway)
@@ -928,14 +1391,14 @@ class TestPDSmallWindow:
         _wait_until_served(gateway, model, timeout=60.0)
         # The window must have reached the engine, or the burst fits and the
         # gate is never crossed. Engines that report their window on /loads
-        # (SGLang, TokenSpeed) are checked; vLLM reports none. Every leg has
+        # (SGLang, TokenSpeed) are checked; vLLM reports none. Every worker has
         # to appear in /loads first, which takes the monitor an interval.
         deadline = time.monotonic() + 30.0
         reported, loads = _fleet_idle(gateway)
         while not reported and time.monotonic() < deadline:
             time.sleep(1.0)
             reported, loads = _fleet_idle(gateway)
-        assert reported, f"a leg never reported a load: {loads}"
+        assert reported, f"a worker never reported a load: {loads}"
         decode_urls = {w.base_url for w in gateway.decode_workers}
         windows = {
             e["worker"]: e["max_running_requests"]
@@ -990,11 +1453,11 @@ class TestPDSmallWindow:
 
         # Only what this burst appended, per file: earlier classes kill workers
         # out from under their peers. The capture guard checks this fleet's own
-        # files exist, so an uncaptured leg cannot pass as a quiet one.
+        # files exist, so an uncaptured worker cannot pass as a quiet one.
         assert_worker_logs_captured(_fleet_logs(before, gateway), "bootstrap timeouts")
         new_lines = _logs_since(worker_dir, before)
         for marker in _BOOTSTRAP_TIMEOUT_MARKERS:
-            assert marker not in new_lines, f"an engine leg timed out a bootstrap: {marker!r}"
+            assert marker not in new_lines, f"an engine worker timed out a bootstrap: {marker!r}"
         _wait_until_served(gateway, model, timeout=60.0)
 
 
@@ -1003,20 +1466,23 @@ class TestPDSmallWindow:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(4)
 @pytest.mark.e2e
-@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"])
+@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"], mock=_MODEL_BY_ENGINE["mock"])
 class TestPDAssembledAtRuntime:
     """IGW gateway with no workers; prefill and decode arrive through the API."""
 
     @pytest.mark.flaky(reruns=0)  # a restart per attempt; a real failure must surface once
-    def test_legs_added_through_the_api_route_as_pd(self):
+    def test_workers_added_through_the_api_route_as_pd(self):
         engine = get_runtime()
         model_id = _MODEL_BY_ENGINE.get(engine, _MODEL)
         model_path = get_model_spec(model_id)["model"]
         cleanup_pool()  # the sweep above owns no cached workers, but be explicit about the GPUs
         log_dir = os.environ.get("E2E_LOG_DIR")
+        moriio = _moriio_lane()
+        # MoRI-IO workers are HTTP workers registered with their handoff fields.
+        mode = ConnectionMode.HTTP if moriio else ConnectionMode.GRPC
         prefill: list = []
         decode: list = []
         gateway = Gateway()
@@ -1024,7 +1490,7 @@ class TestPDAssembledAtRuntime:
             prefill = start_workers(
                 model_id,
                 engine,
-                mode=ConnectionMode.GRPC,
+                mode=mode,
                 count=1,
                 worker_type=WorkerType.PREFILL,
                 log_dir=log_dir,
@@ -1032,7 +1498,7 @@ class TestPDAssembledAtRuntime:
             decode = start_workers(
                 model_id,
                 engine,
-                mode=ConnectionMode.GRPC,
+                mode=mode,
                 count=1,
                 worker_type=WorkerType.DECODE,
                 log_dir=log_dir,
@@ -1043,11 +1509,17 @@ class TestPDAssembledAtRuntime:
             )
             before = len(_pairs_logged())
 
-            ok, detail = gateway.add_worker(
-                prefill[0].base_url, worker_type="prefill", bootstrap_port=prefill[0].bootstrap_port
-            )
+            def _register(worker, worker_type: str) -> tuple[bool, str | None]:
+                if moriio:
+                    spec = worker.moriio_registration()
+                    return gateway.add_worker(worker.base_url, worker_type=worker_type, spec=spec)
+                return gateway.add_worker(
+                    worker.base_url, worker_type=worker_type, bootstrap_port=worker.bootstrap_port
+                )
+
+            ok, detail = _register(prefill[0], "prefill")
             assert ok, f"registering the prefill worker failed: {detail}"
-            ok, detail = gateway.add_worker(decode[0].base_url, worker_type="decode")
+            ok, detail = _register(decode[0], "decode")
             assert ok, f"registering the decode worker failed: {detail}"
             roles = {r: len(ws) for r, ws in _workers_by_role(gateway).items()}
             logger.info("roles after registration: %s", roles)
@@ -1077,7 +1549,7 @@ class TestPDAssembledAtRuntime:
                 f"with no decode worker the gateway answered {resp.status_code} after {elapsed:.1f}s"
             )
 
-            ok, detail = gateway.add_worker(decode[0].base_url, worker_type="decode")
+            ok, detail = _register(decode[0], "decode")
             assert ok, f"re-registering the decode worker failed: {detail}"
             _wait_until_served(gateway, model_path, timeout=120.0)
         finally:

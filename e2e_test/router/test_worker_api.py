@@ -20,17 +20,38 @@ import time
 
 import httpx
 import pytest
-from infra import ConnectionMode, Gateway, start_workers, stop_workers
+from infra import (
+    ConnectionMode,
+    Gateway,
+    get_runtime,
+    start_workers,
+    stop_workers,
+    worker_startup_timeout,
+)
 
 logger = logging.getLogger(__name__)
 
 # Skip all tests in this module for vLLM (HTTP mode not supported)
 pytestmark = pytest.mark.skip_for_runtime("vllm", reason="vLLM does not support HTTP mode")
 
+_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+# Nothing here reads what an engine produces: the assertions are the
+# gateway's own (the registry on /workers, the ids on /v1/models, the status
+# codes), so every class but the mixed local-and-external one (it needs
+# external provider keys) also runs on the scripted mock worker, on the CPU
+# row, under the same checkpoint's tokenizer from an ungated repository.
+_MODEL_BY_ENGINE = {"mock": "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"}
 
-@pytest.mark.engine("sglang")
+
+def _worker_model() -> str:
+    """The model the lane's engine serves the workers these classes start."""
+    return _MODEL_BY_ENGINE.get(get_runtime(), _MODEL)
+
+
+@pytest.mark.engine("sglang", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
+@pytest.mark.model(_MODEL, mock=_MODEL_BY_ENGINE["mock"])
 @pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
 class TestWorkerAPI:
     """Tests for worker management APIs using setup_backend fixture."""
@@ -76,7 +97,7 @@ class TestWorkerAPI:
         logger.info("Gateway health check passed")
 
 
-@pytest.mark.engine("sglang")
+@pytest.mark.engine("sglang", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
 class TestIGWMode:
@@ -102,9 +123,7 @@ class TestIGWMode:
     def test_igw_add_worker(self):
         """Test adding a worker to IGW gateway."""
         engine = os.environ.get("E2E_ENGINE", "sglang")
-        http_workers = start_workers(
-            "meta-llama/Llama-3.1-8B-Instruct", engine, mode=ConnectionMode.HTTP, count=1
-        )
+        http_workers = start_workers(_worker_model(), engine, mode=ConnectionMode.HTTP, count=1)
 
         try:
             http_worker = http_workers[0]
@@ -134,9 +153,7 @@ class TestIGWMode:
     def test_igw_add_and_remove_worker(self):
         """Test adding and removing workers dynamically."""
         engine = os.environ.get("E2E_ENGINE", "sglang")
-        http_workers = start_workers(
-            "meta-llama/Llama-3.1-8B-Instruct", engine, mode=ConnectionMode.HTTP, count=1
-        )
+        http_workers = start_workers(_worker_model(), engine, mode=ConnectionMode.HTTP, count=1)
 
         try:
             http_worker = http_workers[0]
@@ -190,7 +207,7 @@ class TestIGWMode:
             stop_workers(http_workers)
 
 
-@pytest.mark.engine("sglang")
+@pytest.mark.engine("sglang", "mock")
 @pytest.mark.gpu(2)
 @pytest.mark.e2e
 class TestIGWMultiWorker:
@@ -199,12 +216,10 @@ class TestIGWMultiWorker:
     def test_igw_multiple_workers(self):
         """Test adding multiple workers (HTTP + gRPC) to IGW gateway."""
         engine = os.environ.get("E2E_ENGINE", "sglang")
-        http_workers = start_workers(
-            "meta-llama/Llama-3.1-8B-Instruct", engine, mode=ConnectionMode.HTTP, count=1
-        )
+        http_workers = start_workers(_worker_model(), engine, mode=ConnectionMode.HTTP, count=1)
         try:
             grpc_workers = start_workers(
-                "meta-llama/Llama-3.1-8B-Instruct",
+                _worker_model(),
                 engine,
                 mode=ConnectionMode.GRPC,
                 count=1,
@@ -248,7 +263,7 @@ class TestIGWMultiWorker:
 # rejects HTTP mode — TokenSpeed has no HTTP frontend in this repo.
 # Including ``tokenspeed`` here would fail deterministically on every
 # run rather than validate health-check behaviour.
-@pytest.mark.engine("sglang", "vllm")
+@pytest.mark.engine("sglang", "vllm", "mock")
 @pytest.mark.gpu(1)
 class TestDisableHealthCheck:
     """Tests for --disable-health-check CLI option."""
@@ -256,9 +271,7 @@ class TestDisableHealthCheck:
     def test_disable_health_check_workers_immediately_healthy(self):
         """Test that workers are immediately healthy when health checks are disabled."""
         engine = os.environ.get("E2E_ENGINE", "sglang")
-        http_workers = start_workers(
-            "meta-llama/Llama-3.1-8B-Instruct", engine, mode=ConnectionMode.HTTP, count=1
-        )
+        http_workers = start_workers(_worker_model(), engine, mode=ConnectionMode.HTTP, count=1)
 
         try:
             http_worker = http_workers[0]
@@ -368,6 +381,15 @@ class TestIGWMixedWorkerClassification:
             stop_workers(http_workers)
             raise
         all_local_workers = http_workers + grpc_workers
+        # A worker added while it still loads is registered once its health
+        # answers, which a gRPC servicer does only after its planned warm-up,
+        # after the engine's start; the gateway polls it for
+        # --worker-startup-timeout-secs after the add. That bound, and the
+        # test's own wait for the registrations below, is the one the harness
+        # gives these workers to start: worker_startup_timeout, the bound
+        # start_workers itself waits (the model's startup_timeout or the
+        # default, floored by E2E_STARTUP_TIMEOUT).
+        startup_wait = max(worker_startup_timeout(w.model_id) for w in all_local_workers)
 
         try:
             # Start gateway in IGW mode FIRST with extended startup timeout
@@ -375,7 +397,7 @@ class TestIGWMixedWorkerClassification:
             gateway = Gateway()
             gateway.start(
                 igw_mode=True,
-                extra_args=["--worker-startup-timeout-secs", "300"],
+                extra_args=["--worker-startup-timeout-secs", str(startup_wait)],
             )
 
             try:
@@ -424,7 +446,7 @@ class TestIGWMixedWorkerClassification:
                 # Local backends need time to load models (especially gRPC/DeepSeek).
                 # External workers are instant with disable_health_check.
                 expected_workers = 6  # 2 HTTP + 2 gRPC + OpenAI + xAI
-                deadline = time.perf_counter() + 300
+                deadline = time.perf_counter() + startup_wait
                 while time.perf_counter() < deadline:
                     workers = gateway.list_workers()
                     healthy = sum(1 for w in workers if w.status == "healthy")
@@ -497,7 +519,7 @@ class TestIGWMixedWorkerClassification:
             stop_workers(all_local_workers)
 
 
-@pytest.mark.engine("sglang")
+@pytest.mark.engine("sglang", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
 class TestWorkerAPIRestSemantics:
@@ -512,9 +534,7 @@ class TestWorkerAPIRestSemantics:
     def test_post_duplicate_url_returns_409(self):
         """POST /workers with the same URL twice should return 409 Conflict."""
         engine = os.environ.get("E2E_ENGINE", "sglang")
-        http_workers = start_workers(
-            "meta-llama/Llama-3.1-8B-Instruct", engine, mode=ConnectionMode.HTTP, count=1
-        )
+        http_workers = start_workers(_worker_model(), engine, mode=ConnectionMode.HTTP, count=1)
 
         try:
             http_worker = http_workers[0]
@@ -550,9 +570,7 @@ class TestWorkerAPIRestSemantics:
     def test_patch_partial_update(self):
         """PATCH /workers/{id} should do partial update and persist changes."""
         engine = os.environ.get("E2E_ENGINE", "sglang")
-        http_workers = start_workers(
-            "meta-llama/Llama-3.1-8B-Instruct", engine, mode=ConnectionMode.HTTP, count=1
-        )
+        http_workers = start_workers(_worker_model(), engine, mode=ConnectionMode.HTTP, count=1)
 
         try:
             http_worker = http_workers[0]
@@ -609,9 +627,7 @@ class TestWorkerAPIRestSemantics:
     def test_put_full_replace(self):
         """PUT /workers/{id} should do full replace with model re-discovery."""
         engine = os.environ.get("E2E_ENGINE", "sglang")
-        http_workers = start_workers(
-            "meta-llama/Llama-3.1-8B-Instruct", engine, mode=ConnectionMode.HTTP, count=1
-        )
+        http_workers = start_workers(_worker_model(), engine, mode=ConnectionMode.HTTP, count=1)
 
         try:
             http_worker = http_workers[0]
@@ -649,9 +665,7 @@ class TestWorkerAPIRestSemantics:
     def test_put_url_mismatch_returns_400(self):
         """PUT /workers/{id} with a different URL should return 400."""
         engine = os.environ.get("E2E_ENGINE", "sglang")
-        http_workers = start_workers(
-            "meta-llama/Llama-3.1-8B-Instruct", engine, mode=ConnectionMode.HTTP, count=1
-        )
+        http_workers = start_workers(_worker_model(), engine, mode=ConnectionMode.HTTP, count=1)
 
         try:
             http_worker = http_workers[0]

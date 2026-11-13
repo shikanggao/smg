@@ -88,7 +88,9 @@ pub async fn run_fanout(
             }
             Err(e) => {
                 let connection_mode = match &e {
-                    RlError::UnsupportedConnectionMode { mode, .. } => Some(mode.clone()),
+                    RlError::NoControlEndpoint {
+                        connection_mode, ..
+                    } => Some(connection_mode.clone()),
                     _ => None,
                 };
                 report.failed.push(RlFailedCall {
@@ -225,6 +227,7 @@ mod tests {
         let bad = FakeEngine::start(StatusCode::INTERNAL_SERVER_ERROR, json!({"e": 1}), 0).await;
         let mut grpc = worker("g1", &format!("{}/grpc", good.url), RuntimeType::Sglang);
         grpc.connection_mode = ConnectionMode::Grpc;
+        grpc.control_url = None;
         let app = crate::router::<()>(state(
             vec![
                 worker("w1", &good.url, RuntimeType::Sglang),
@@ -261,7 +264,8 @@ mod tests {
         assert_eq!(by_id("w2")["error"], "upstream_error");
         assert_eq!(by_id("w2")["status"], 500);
         assert_eq!(by_id("w3")["error"], "upstream_unreachable");
-        assert_eq!(by_id("g1")["error"], "unsupported_connection_mode");
+        assert_eq!(by_id("g1")["error"], "no_control_endpoint");
+        assert_eq!(by_id("g1")["connection_mode"], "grpc");
         assert_eq!(
             body["results"]["w2"]["status"], 500,
             "failed also in results"
@@ -383,5 +387,32 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A fan-out reaches the workers driven over their engine connection
+    /// like any other, each once, with the same body.
+    #[tokio::test]
+    async fn a_fanout_reaches_workers_over_their_engine_connection() {
+        use crate::testing::{zmq_worker, FakeCalls};
+
+        let (a, b) = (FakeCalls::succeeding(2), FakeCalls::succeeding(1));
+        let app = crate::router::<()>(state(
+            vec![zmq_worker("z1", a.clone()), zmq_worker("z2", b.clone())],
+            8,
+        ));
+        let req = Request::post("/engine/release_memory_occupation?selector=engine%3Dtokenspeed")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"tags":["kv_cache"]}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["succeeded"], 2);
+        for calls in [a, b] {
+            let seen = calls.seen();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].0, "release_memory_occupation");
+            assert_eq!(seen[0].1, Some(json!({"tags": ["kv_cache"]})));
+        }
     }
 }

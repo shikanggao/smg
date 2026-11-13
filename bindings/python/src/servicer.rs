@@ -1,0 +1,1968 @@
+//! Python lifecycle bindings for the Rust engine servicers.
+//!
+//! One binding per engine servicer, each over that engine's same-host ZMQ
+//! wire; `VllmGrpcServer` is the first, and the servicers for the other ZMQ
+//! engines bind the same way as their protocols land. Rust owns the
+//! listener, the engine link, and the request path; Python launches the
+//! headless engine, starts and stops the server, and announces draining. The
+//! one request-time crossing is worker-side media processing, when the
+//! Python processor is chosen: a request's `media_refs` go to a Python object
+//! that runs the engine's own processors (the Python servicer's, with vLLM's
+//! input processor behind them), and what it produces comes back as bytes
+//! the engine reads directly. The other choice, smg's own pipeline
+//! ([`SmgMediaProcessor`]), never crosses: it is the Router's media pipeline
+//! run in this process.
+
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use bytes::Bytes;
+use engine_servicer::{
+    BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
+    EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq, MediaError,
+    MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia, ServicerConfig, ServicerError,
+    SglangEncodeDispatcher, SglangMediaProcessor, SglangModelInfo, SglangServicerConfig,
+    SglangServicerServer, TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer,
+    TrtllmModelInfo, TrtllmServicerConfig, TrtllmServicerServer, VllmModelInfo, VllmServicerConfig,
+    VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
+    DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
+    PIXEL_MODALITIES,
+};
+use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
+use prost::Message;
+use pyo3::{
+    exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
+    prelude::*,
+    types::{PyBytes, PyDict},
+};
+use smg::routers::grpc::worker_media::{
+    PixelFormat, WorkerMediaError, WorkerMediaItem, WorkerMediaPipeline, WorkerMediaSettings,
+    SCHEMES,
+};
+use smg_grpc_client::vllm_proto as vllm;
+use tokio::sync::oneshot;
+
+fn to_py_err(error: ServicerError) -> PyErr {
+    match error {
+        ServicerError::InvalidConfig(_) => PyValueError::new_err(error.to_string()),
+        ServicerError::StopTimeout => PyTimeoutError::new_err(error.to_string()),
+        ServicerError::Startup(_) | ServicerError::Poisoned | ServicerError::ThreadPanicked => {
+            PyRuntimeError::new_err(error.to_string())
+        }
+    }
+}
+
+/// The engine startup bound from the launcher's seconds; `None` is the crate
+/// default.
+fn startup_timeout(secs: Option<f64>) -> PyResult<Duration> {
+    match secs {
+        None => Ok(DEFAULT_ENGINE_STARTUP_TIMEOUT),
+        Some(secs) if secs > 0.0 => Duration::try_from_secs_f64(secs).map_err(|error| {
+            PyValueError::new_err(format!("engine_startup_timeout_secs {secs}: {error}"))
+        }),
+        Some(secs) => Err(PyValueError::new_err(format!(
+            "engine_startup_timeout_secs must be positive, got {secs}"
+        ))),
+    }
+}
+
+/// The bound on the whole engine start from the launcher's seconds: `None`
+/// is the crate default, `0` is no ceiling.
+fn startup_ceiling(secs: Option<f64>) -> PyResult<Option<Duration>> {
+    let Some(secs) = secs else {
+        return Ok(Some(DEFAULT_ENGINE_STARTUP_CEILING));
+    };
+    if secs == 0.0 {
+        return Ok(None);
+    }
+    if secs < 0.0 || secs.is_nan() {
+        return Err(PyValueError::new_err(format!(
+            "engine_startup_ceiling_secs must be positive, or 0 for no ceiling, got {secs}"
+        )));
+    }
+    Duration::try_from_secs_f64(secs)
+        .map(Some)
+        .map_err(|error| {
+            PyValueError::new_err(format!("engine_startup_ceiling_secs {secs}: {error}"))
+        })
+}
+
+/// The engine-silence bound from the launcher's seconds; `None` is the crate
+/// default.
+fn silence_timeout(secs: Option<f64>) -> PyResult<Duration> {
+    match secs {
+        None => Ok(DEFAULT_ENGINE_SILENCE_TIMEOUT),
+        Some(secs) if secs > 0.0 => Duration::try_from_secs_f64(secs).map_err(|error| {
+            PyValueError::new_err(format!("engine_silence_timeout_secs {secs}: {error}"))
+        }),
+        Some(secs) => Err(PyValueError::new_err(format!(
+            "engine_silence_timeout_secs must be positive, got {secs}"
+        ))),
+    }
+}
+
+/// The prefill rate the engine-silence bound allows, in tokens per second;
+/// `None` is the crate default, `0` allows nothing.
+fn prefill_tokens_per_sec(rate: Option<i64>) -> PyResult<u64> {
+    match rate {
+        None => Ok(DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC),
+        Some(rate) => u64::try_from(rate).map_err(|_| {
+            PyValueError::new_err(format!(
+                "engine_prefill_tokens_per_sec must be 0 or more, got {rate}"
+            ))
+        }),
+    }
+}
+
+/// Install the Rust tracing subscriber for a process that only hosts a
+/// servicer. `level` overrides `RUST_LOG`.
+#[pyfunction]
+#[pyo3(signature = (level = None))]
+pub fn init_servicer_tracing(level: Option<&str>) -> PyResult<()> {
+    engine_servicer::init_tracing(level).map_err(to_py_err)
+}
+
+/// The worker-side media processor behind a Python object (see
+/// `smg_grpc_servicer.vllm.rust_media.RustMediaBridge`): `name`, `schemes`,
+/// `source` and `max_inflight` attributes, and `probe(done)` /
+/// `submit(request_id, prompt_token_ids, prompt_text, items, arrival_time,
+/// want_identity, done)` methods that schedule the work on Python's loop
+/// and call `done` from whichever thread finishes it. Calls into Python
+/// only to hand work over, from a blocking thread: taking the GIL can wait
+/// behind the processor's own Python threads, and that wait must not hold
+/// one of the servicer's few runtime workers. The wait for the result is a
+/// Rust channel.
+struct PythonMediaProcessor {
+    bridge: Arc<Py<PyAny>>,
+    name: String,
+    /// The schemes the backend accepts, as of its last probe (a sidecar
+    /// announces its own set when it answers).
+    schemes: Arc<Mutex<String>>,
+    source: String,
+    max_inflight: usize,
+}
+
+impl PythonMediaProcessor {
+    fn new(bridge: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            name: bridge.getattr("name")?.extract()?,
+            schemes: Arc::new(Mutex::new(bridge.getattr("schemes")?.extract()?)),
+            source: bridge.getattr("source")?.extract()?,
+            max_inflight: bridge.getattr("max_inflight")?.extract()?,
+            bridge: Arc::new(bridge.clone().unbind()),
+        })
+    }
+
+    /// Run `call` against the bridge on a blocking thread, with the GIL.
+    async fn call_bridge(
+        bridge: Arc<Py<PyAny>>,
+        call: impl FnOnce(Python<'_>, &Py<PyAny>) -> PyResult<()> + Send + 'static,
+    ) -> Result<(), String> {
+        match tokio::task::spawn_blocking(move || Python::attach(|py| call(py, &bridge))).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(join) => Err(format!("media bridge call did not run: {join}")),
+        }
+    }
+}
+
+impl MediaProcessor for PythonMediaProcessor {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn schemes(&self) -> String {
+        self.schemes
+            .lock()
+            .map(|schemes| schemes.clone())
+            .unwrap_or_default()
+    }
+
+    fn source(&self) -> &str {
+        &self.source
+    }
+
+    fn max_inflight(&self) -> usize {
+        self.max_inflight
+    }
+
+    /// The engine's own processors take what the model takes, audio
+    /// included, as they do on the Python servicer; the bridge hands the
+    /// item over under the same modality name.
+    fn modalities(&self) -> &'static [&'static str] {
+        ALL_MODALITIES
+    }
+
+    fn probe(&self) -> BoxFuture<bool> {
+        let bridge = Arc::clone(&self.bridge);
+        let schemes = Arc::clone(&self.schemes);
+        Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            let scheduled = Self::call_bridge(bridge, move |py, bridge| {
+                let done = Py::new(
+                    py,
+                    ProbeDone {
+                        tx: Mutex::new(Some(tx)),
+                    },
+                )?;
+                bridge.call_method1(py, "probe", (done,))?;
+                Ok(())
+            })
+            .await;
+            match scheduled {
+                Ok(()) => match rx.await {
+                    Ok((serving, announced)) => {
+                        if let (Some(announced), Ok(mut schemes)) = (announced, schemes.lock()) {
+                            *schemes = announced;
+                        }
+                        serving
+                    }
+                    Err(_) => false,
+                },
+                Err(error) => {
+                    tracing::warn!(error, "media processor probe could not be scheduled");
+                    false
+                }
+            }
+        })
+    }
+
+    fn process(&self, request: MediaRequest) -> BoxFuture<Result<ProcessedMedia, MediaError>> {
+        let bridge = Arc::clone(&self.bridge);
+        Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            let scheduled = Self::call_bridge(bridge, move |py, bridge| {
+                let done = Py::new(
+                    py,
+                    MediaDone {
+                        tx: Mutex::new(Some(tx)),
+                    },
+                )?;
+                let items: Vec<(String, String)> = request
+                    .items
+                    .into_iter()
+                    .map(|item| (item.modality, item.url))
+                    .collect();
+                bridge.call_method1(
+                    py,
+                    "submit",
+                    (
+                        request.request_id,
+                        request.prompt_token_ids,
+                        request.prompt_text,
+                        items,
+                        request.arrival_time,
+                        request.want_identity,
+                        done,
+                    ),
+                )?;
+                Ok(())
+            })
+            .await;
+            if let Err(error) = scheduled {
+                return Err(MediaError::Internal(format!(
+                    "media processor could not take the request: {error}"
+                )));
+            }
+            rx.await.unwrap_or_else(|_| {
+                Err(MediaError::Unavailable(
+                    "media processor dropped the request".to_string(),
+                ))
+            })
+        })
+    }
+}
+
+/// Python's `bytes` copied into Rust-owned bytes; for the small buffers.
+fn bytes_of(value: &Bound<'_, PyBytes>) -> Bytes {
+    Bytes::copy_from_slice(value.as_bytes())
+}
+
+/// Memory lent by Python without a copy: `_owner` (a read-only numpy view
+/// over the request's own tensor storage) keeps it alive for as long as these
+/// bytes exist, and nothing writes to it in the meantime. The buffer protocol
+/// is not part of the limited API this extension builds against, so the
+/// range is read off the view itself. Dropped off a Python thread, the
+/// owner's reference is released on the next GIL acquisition.
+struct PyBacked {
+    _owner: Py<PyAny>,
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: the memory is only read, and the Python object that owns it is
+// held for the lifetime of this value; `Py<PyAny>` is itself Send + Sync.
+#[expect(
+    unsafe_code,
+    reason = "a raw pointer into Python-owned memory the owner keeps alive"
+)]
+unsafe impl Send for PyBacked {}
+#[expect(
+    unsafe_code,
+    reason = "a raw pointer into Python-owned memory the owner keeps alive"
+)]
+unsafe impl Sync for PyBacked {}
+
+impl AsRef<[u8]> for PyBacked {
+    #[expect(
+        unsafe_code,
+        reason = "the limited API has no buffer protocol; the owner guarantees the range"
+    )]
+    fn as_ref(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        // SAFETY: `ptr`/`len` describe the owner's contiguous storage, which
+        // outlives this value (see the struct doc).
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// The `ok` payload: prompt ids, the encoded features, the lent frames (one
+/// numpy view each), the cache salt, the serialized identity.
+type OkPayload<'py> = (
+    Vec<u32>,
+    Option<Bound<'py, PyBytes>>,
+    Vec<Bound<'py, PyAny>>,
+    Option<String>,
+    Option<Bound<'py, PyBytes>>,
+);
+
+/// A lent frame as zero-copy bytes. The range is read off the view itself,
+/// never taken from the caller: an address that did not belong to `owner`
+/// would be read out of bounds on a runtime thread. The view must be
+/// C-contiguous and read-only (the latter is the owner's promise that no
+/// Python write races the send).
+fn lent_bytes(owner: Bound<'_, PyAny>) -> PyResult<Bytes> {
+    let flags = owner.getattr("flags")?;
+    if !flags.getattr("c_contiguous")?.extract::<bool>()? {
+        return Err(PyValueError::new_err("a lent buffer must be C-contiguous"));
+    }
+    if flags.getattr("writeable")?.extract::<bool>()? {
+        return Err(PyValueError::new_err("a lent buffer must be read-only"));
+    }
+    let address: usize = owner.getattr("ctypes")?.getattr("data")?.extract()?;
+    let len: usize = owner.getattr("nbytes")?.extract()?;
+    if address == 0 && len > 0 {
+        return Err(PyValueError::new_err("a lent buffer has no address"));
+    }
+    Ok(Bytes::from_owner(PyBacked {
+        _owner: owner.unbind(),
+        ptr: address as *const u8,
+        len,
+    }))
+}
+
+/// Python's answer to one media request, called once: `("ok",
+/// (prompt_token_ids, mm_features | None, aux_frames, cache_salt | None,
+/// media_identity | None))` where each aux frame is a read-only numpy view
+/// lent without a copy, or `(kind, message)` with `kind` one of `invalid`,
+/// `unavailable`, `internal`.
+#[pyclass(name = "_MediaDone")]
+struct MediaDone {
+    tx: Mutex<Option<oneshot::Sender<Result<ProcessedMedia, MediaError>>>>,
+}
+
+#[pymethods]
+impl MediaDone {
+    fn __call__(&self, kind: &str, payload: &Bound<'_, PyAny>) -> PyResult<()> {
+        let outcome = match kind {
+            "ok" => {
+                let (prompt_token_ids, mm_features, aux_frames, cache_salt, media_identity): OkPayload<'_> =
+                    payload.extract()?;
+                let media_identity = media_identity
+                    .map(|bytes| vllm::MediaIdentity::decode(bytes.as_bytes()))
+                    .transpose()
+                    .map_err(|error| {
+                        PyValueError::new_err(format!(
+                            "media identity could not be decoded: {error}"
+                        ))
+                    })?;
+                Ok(ProcessedMedia {
+                    prompt_token_ids,
+                    features: MediaFeatures::Encoded {
+                        mm_features: mm_features.as_ref().map(bytes_of),
+                        aux_frames: aux_frames
+                            .into_iter()
+                            .map(lent_bytes)
+                            .collect::<PyResult<_>>()?,
+                        cache_salt,
+                    },
+                    media_identity,
+                })
+            }
+            "invalid" => Err(MediaError::Invalid(payload.extract()?)),
+            "unavailable" => Err(MediaError::Unavailable(payload.extract()?)),
+            _ => Err(MediaError::Internal(payload.extract()?)),
+        };
+        let sender = self
+            .tx
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("media completion poisoned"))?
+            .take();
+        // A request whose caller gave up has no receiver; nothing to report.
+        if let Some(sender) = sender {
+            let _ = sender.send(outcome);
+        }
+        Ok(())
+    }
+}
+
+/// What a probe answers: whether the processor serves and, when it knows
+/// them, the schemes it accepts now.
+type ProbeAnswer = (bool, Option<String>);
+
+/// Python's answer to a probe, called once.
+#[pyclass(name = "_ProbeDone")]
+struct ProbeDone {
+    tx: Mutex<Option<oneshot::Sender<ProbeAnswer>>>,
+}
+
+#[pymethods]
+impl ProbeDone {
+    #[pyo3(signature = (serving, schemes = None))]
+    fn __call__(&self, serving: bool, schemes: Option<String>) -> PyResult<()> {
+        let sender = self
+            .tx
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("probe completion poisoned"))?
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send((serving, schemes));
+        }
+        Ok(())
+    }
+}
+
+/// smg's own media pipeline as the worker-side processor (`--mm-processor
+/// smg`): the Router's fetch, decode, preprocess and placeholder expansion,
+/// run in this process, answering in the Router's batch shape. No Python on
+/// the request path.
+struct SmgMediaProcessor {
+    pipeline: Arc<WorkerMediaPipeline>,
+    source: String,
+    max_inflight: usize,
+}
+
+impl MediaProcessor for SmgMediaProcessor {
+    fn name(&self) -> &str {
+        "smg"
+    }
+
+    fn schemes(&self) -> String {
+        SCHEMES.to_string()
+    }
+
+    fn source(&self) -> &str {
+        &self.source
+    }
+
+    fn max_inflight(&self) -> usize {
+        self.max_inflight
+    }
+
+    /// The set `process` maps below: image and video, no audio (the
+    /// pipeline preprocesses no audio for this engine).
+    fn modalities(&self) -> &'static [&'static str] {
+        PIXEL_MODALITIES
+    }
+
+    fn probe(&self) -> BoxFuture<bool> {
+        // In-process and stateless between requests: serving whenever up.
+        Box::pin(async { true })
+    }
+
+    fn process(&self, request: MediaRequest) -> BoxFuture<Result<ProcessedMedia, MediaError>> {
+        let pipeline = Arc::clone(&self.pipeline);
+        Box::pin(async move {
+            let items = request
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let modality = match item.modality.as_str() {
+                        "image" => Modality::Image,
+                        "video" => Modality::Video,
+                        other => {
+                            return Err(MediaError::Invalid(format!(
+                                "media_refs[{index}]: unsupported modality {other}"
+                            )))
+                        }
+                    };
+                    Ok(WorkerMediaItem {
+                        modality,
+                        url: item.url.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let output = pipeline
+                .process(request.prompt_token_ids, &items, request.want_identity)
+                .await
+                .map_err(|error| match error {
+                    WorkerMediaError::Invalid(message) => MediaError::Invalid(message),
+                    WorkerMediaError::Media {
+                        fault,
+                        code,
+                        message,
+                    } => MediaError::Media {
+                        fault,
+                        code: code.as_str(),
+                        message,
+                    },
+                    WorkerMediaError::Internal(message) => MediaError::Internal(message),
+                })?;
+            Ok(ProcessedMedia {
+                prompt_token_ids: output.prompt_token_ids,
+                features: MediaFeatures::Batches(output.batches),
+                media_identity: output.identity,
+            })
+        })
+    }
+}
+
+struct SmgSglangMediaProcessor {
+    pipeline: Arc<WorkerMediaPipeline>,
+    admission: Arc<tokio::sync::Semaphore>,
+}
+
+impl SglangMediaProcessor for SmgSglangMediaProcessor {
+    fn identity_key(&self) -> Option<&str> {
+        self.pipeline.sglang_identity_key()
+    }
+
+    /// Bound preprocessing concurrency through cancellation and preserve typed media errors.
+    fn process(
+        &self,
+        mut request: smg_grpc_client::sglang_proto::GenerateRequest,
+    ) -> BoxFuture<Result<smg_grpc_client::sglang_proto::GenerateRequest, tonic::Status>> {
+        let pipeline = Arc::clone(&self.pipeline);
+        let admission = Arc::clone(&self.admission);
+        Box::pin(async move {
+            let permit = admission
+                .acquire_owned()
+                .await
+                .map_err(|_| tonic::Status::unavailable("media processor is closing"))?;
+            // Keep admission until preprocessing actually finishes, including
+            // when the caller aborts while a blocking decoder is running.
+            let span = tracing::debug_span!(target: "smg_request_timing",
+                "sglang_media", request_id = %request.request_id);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "keep the processing slot until a cancelled caller's decoder actually finishes"
+            )]
+            tokio::spawn(tracing::Instrument::instrument(async move {
+                let _permit = permit;
+
+                let mm = request.mm_inputs.take()
+                    .ok_or_else(|| tonic::Status::invalid_argument("missing media references"))?;
+                if mm.pixel_values.is_some() || !mm.model_specific_tensors.is_empty()
+                    || !mm.image_data.is_empty() || !mm.video_data.is_empty()
+                    || !mm.audio_urls.is_empty() || !mm.audio_data.is_empty()
+                    || !request.extra_mm_inputs.is_empty() {
+                    return Err(tonic::Status::invalid_argument("SGLang references require images or videos without tensors or raw media"));
+                }
+                // The shared pipeline matches anchors per modality, preserving URL order.
+                let items = mm.image_urls.into_iter().map(|url| (Modality::Image, url))
+                    .chain(mm.video_urls.into_iter().map(|url| (Modality::Video, url)))
+                    .map(|(modality, url)| WorkerMediaItem { modality, url })
+                    .collect::<Vec<_>>();
+                let tokenized = request.tokenized.as_mut()
+                    .ok_or_else(|| tonic::Status::invalid_argument("media references require tokenized input"))?;
+                let (tokens, inputs, extras) = pipeline.process_sglang(
+                    std::mem::take(&mut tokenized.input_ids), &items,
+                ).await.map_err(|error| match error {
+                    WorkerMediaError::Invalid(message) => tonic::Status::invalid_argument(message),
+                    WorkerMediaError::Internal(message) => tonic::Status::internal(message),
+                    WorkerMediaError::Media { fault, code, message } => {
+                        smg_grpc_client::stamp_media_code(
+                            fault.stamp(match fault {
+                                smg_grpc_client::WorkerMediaFault::Client => tonic::Status::invalid_argument(message),
+                                smg_grpc_client::WorkerMediaFault::Transient => tonic::Status::unavailable(message),
+                            }), code.as_str(),
+                        )
+                    }
+                })?;
+                tokenized.input_ids = tokens;
+                request.mm_inputs = Some(Box::new(inputs));
+                request.extra_mm_inputs = extras;
+                Ok(request)
+            }, span)).await.map_err(|error| tonic::Status::internal(format!("media task: {error}")))?
+        })
+    }
+}
+
+/// The settings the launcher passes as `smg_media_processor`, by key; the
+/// pipeline itself is built off the GIL once the tokenizer is loaded.
+struct NativeMediaOptions {
+    settings: WorkerMediaSettings,
+    source: String,
+    max_inflight: usize,
+}
+
+fn native_media_options(
+    options: &Bound<'_, PyDict>,
+    served_model_name: &str,
+) -> PyResult<NativeMediaOptions> {
+    let item = |key: &str| -> PyResult<Option<Bound<'_, PyAny>>> {
+        Ok(options.get_item(key)?.filter(|value| !value.is_none()))
+    };
+    let string =
+        |key: &str| -> PyResult<Option<String>> { item(key)?.map(|v| v.extract()).transpose() };
+    let count =
+        |key: &str| -> PyResult<Option<usize>> { item(key)?.map(|v| v.extract()).transpose() };
+    let required = |key: &str| -> PyResult<String> {
+        string(key)?
+            .ok_or_else(|| PyValueError::new_err(format!("smg_media_processor needs {key:?}")))
+    };
+    let raw_pixels = item("raw_pixels")?
+        .map(|v| v.extract::<bool>())
+        .transpose()?
+        .unwrap_or(false);
+    let allowed_domains: Option<Vec<String>> =
+        item("allowed_domains")?.map(|v| v.extract()).transpose()?;
+    let processor_kwargs = match string("processor_kwargs_json")? {
+        Some(json) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
+            .map_err(|error| {
+                PyValueError::new_err(format!(
+                    "smg_media_processor processor_kwargs_json is not a JSON object: {error}"
+                ))
+            })?,
+        None => serde_json::Map::new(),
+    };
+    // The engine's own video frame budget (`0`: every frame); absent when
+    // the launcher could not tell, which leaves each spec to its constant.
+    // `video_loader_rule` carries the engine's loader rules as the launcher
+    // reported them; the pipeline refuses the entries that reach the family
+    // (every rule the default loader reads for a family on that loader, the
+    // flag rules for a family whose loader the engine registers for its
+    // processor class, none for a sampler that never followed a loader).
+    let video_frame_budget = count("video_frame_budget")?;
+    // The engine's encoder budget, the most feature tokens one item may
+    // carry; absent when the launcher could not tell, which leaves an item's
+    // size to the engine, as before.
+    let encoder_budget = count("engine_encoder_budget")?.filter(|&budget| budget > 0);
+    let fetch_timeout_ms: u64 = item("fetch_timeout_ms")?
+        .map(|v| v.extract())
+        .transpose()?
+        .unwrap_or(10_000);
+    // A video gets the budget the engine's own loader gives one (30 s, against
+    // 5 s for an image): a clip is many times an image's size.
+    let video_fetch_timeout_ms: u64 = item("video_fetch_timeout_ms")?
+        .map(|v| v.extract())
+        .transpose()?
+        .unwrap_or(30_000);
+    // The engine's per-prompt limits by modality name; one the pipeline does
+    // not fetch is of no consequence here.
+    let engine_item_limits = item("engine_item_limits")?
+        .map(|v| v.extract::<HashMap<String, usize>>())
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(modality, limit)| {
+            let modality = match modality.as_str() {
+                "image" => Modality::Image,
+                "video" => Modality::Video,
+                "audio" => Modality::Audio,
+                _ => return None,
+            };
+            Some((modality, limit))
+        })
+        .collect();
+    // The TurboJPEG policy as the launcher resolved it (flag > env >
+    // `prefer`); a launcher without the setting leaves it to the pipeline's
+    // own fallback (`SMG_MM_TURBOJPEG`).
+    let turbojpeg = string("turbojpeg")?
+        .map(|raw| {
+            raw.parse::<TurboJpegPolicy>()
+                .map_err(PyValueError::new_err)
+        })
+        .transpose()?;
+    Ok(NativeMediaOptions {
+        settings: WorkerMediaSettings {
+            model_dir: required("model_dir")?,
+            tokenizer_dir: None,
+            model_id: required("model_id")?,
+            served_model_name: Some(served_model_name.to_string()),
+            pixel_format: if raw_pixels {
+                PixelFormat::RawU8
+            } else {
+                PixelFormat::Normalized
+            },
+            encoder_dtype: string("encoder_dtype")?.unwrap_or_else(|| "float32".to_string()),
+            processor_kwargs,
+            max_items: count("max_items")?,
+            engine_item_limits,
+            max_item_bytes: count("max_item_bytes")?,
+            allowed_domains,
+            fetch_timeout: Duration::from_millis(fetch_timeout_ms),
+            video_fetch_timeout: Duration::from_millis(video_fetch_timeout_ms),
+            video_frame_budget,
+            video_loader_rule: string("video_loader_rule")?,
+            encoder_budget,
+            turbojpeg,
+        },
+        source: string("source")?.unwrap_or_else(|| "default".to_string()),
+        max_inflight: count("max_inflight")?.unwrap_or(4).max(1),
+    })
+}
+
+/// Rust-owned `vllm.grpc.engine.VllmEngine` server over a same-host vLLM
+/// EngineCore, with lifecycle driven from Python.
+#[pyclass(name = "VllmGrpcServer")]
+pub struct PyVllmGrpcServer {
+    inner: VllmServicerServer,
+}
+
+#[pymethods]
+impl PyVllmGrpcServer {
+    #[new]
+    #[pyo3(signature = (
+        bind_address,
+        ipc_base_url,
+        handshake_address,
+        model_path,
+        *,
+        engine_count = 1,
+        tokenizer_dir = None,
+        served_model_name = None,
+        tokenizer_path = None,
+        is_generation = true,
+        max_context_length = 0,
+        vocab_size = 0,
+        supports_vision = false,
+        model_type = String::new(),
+        architectures = None,
+        eos_token_ids = None,
+        pad_token_id = 0,
+        bos_token_id = 0,
+        default_sampling_params_json = String::new(),
+        data_parallel_size = 1,
+        pairing_protocol = String::new(),
+        kv_connector = String::new(),
+        kv_role = String::new(),
+        kv_engine_id = String::new(),
+        runs_mooncake = false,
+        supports_ec_transfer = false,
+        ec_connector = String::new(),
+        ec_role = String::new(),
+        ec_zmq_addrs = None,
+        kv_cache_dtype = String::new(),
+        attention_backend = String::new(),
+        model_dtype = String::new(),
+        block_size = 0,
+        structured_outputs_backend = String::new(),
+        kv_events_endpoint = String::new(),
+        kv_events_replay_endpoint = String::new(),
+        kv_events_topic = String::new(),
+        shm_namespace_id = String::new(),
+        pooler_use_activation = None,
+        pooler_dimensions = None,
+        mm_device_do_normalize = false,
+        mm_item_limits = String::new(),
+        mm_encoder_budget = 0,
+        max_num_seqs = 0,
+        engine_reasoning_parser = String::new(),
+        constrained_decoding_start = String::new(),
+        structural_tag_vocabulary = String::new(),
+        log_stats = None,
+        media_processor = None,
+        smg_media_processor = None,
+        engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
+        engine_silence_timeout_secs = None,
+        engine_prefill_tokens_per_sec = None,
+        metrics_bind_address = None,
+        warmup_nonce = None,
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        bind_address: String,
+        ipc_base_url: String,
+        handshake_address: String,
+        model_path: String,
+        engine_count: usize,
+        tokenizer_dir: Option<String>,
+        served_model_name: Option<String>,
+        tokenizer_path: Option<String>,
+        is_generation: bool,
+        max_context_length: u32,
+        vocab_size: u32,
+        supports_vision: bool,
+        model_type: String,
+        architectures: Option<Vec<String>>,
+        eos_token_ids: Option<Vec<u32>>,
+        pad_token_id: i32,
+        bos_token_id: i32,
+        default_sampling_params_json: String,
+        data_parallel_size: i32,
+        pairing_protocol: String,
+        kv_connector: String,
+        kv_role: String,
+        kv_engine_id: String,
+        runs_mooncake: bool,
+        supports_ec_transfer: bool,
+        ec_connector: String,
+        ec_role: String,
+        ec_zmq_addrs: Option<Vec<String>>,
+        kv_cache_dtype: String,
+        attention_backend: String,
+        model_dtype: String,
+        block_size: i32,
+        structured_outputs_backend: String,
+        kv_events_endpoint: String,
+        kv_events_replay_endpoint: String,
+        kv_events_topic: String,
+        shm_namespace_id: String,
+        pooler_use_activation: Option<bool>,
+        pooler_dimensions: Option<u32>,
+        mm_device_do_normalize: bool,
+        mm_item_limits: String,
+        mm_encoder_budget: i32,
+        max_num_seqs: i32,
+        engine_reasoning_parser: String,
+        constrained_decoding_start: String,
+        structural_tag_vocabulary: String,
+        log_stats: Option<bool>,
+        media_processor: Option<Bound<'_, PyAny>>,
+        smg_media_processor: Option<Bound<'_, PyDict>>,
+        engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
+        engine_silence_timeout_secs: Option<f64>,
+        engine_prefill_tokens_per_sec: Option<i64>,
+        metrics_bind_address: Option<String>,
+        warmup_nonce: Option<String>,
+    ) -> PyResult<Self> {
+        if media_processor.is_some() && smg_media_processor.is_some() {
+            return Err(PyValueError::new_err(
+                "media_processor (the Python processors) and smg_media_processor (smg's \
+                 pipeline) are two choices for one slot; pass one",
+            ));
+        }
+        let media_processor = media_processor
+            .map(|bridge| PythonMediaProcessor::new(&bridge))
+            .transpose()?
+            .map(|processor| Arc::new(processor) as Arc<dyn MediaProcessor>);
+        let served_model_name = served_model_name.unwrap_or_else(|| model_path.clone());
+        let native = smg_media_processor
+            .map(|options| native_media_options(&options, &served_model_name))
+            .transpose()?;
+        let model = VllmModelInfo {
+            served_model_name,
+            tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
+            model_path,
+            is_generation,
+            max_context_length,
+            vocab_size,
+            supports_vision,
+            model_type,
+            architectures: architectures.unwrap_or_default(),
+            eos_token_ids: eos_token_ids.unwrap_or_default(),
+            pad_token_id,
+            bos_token_id,
+            default_sampling_params_json,
+            data_parallel_size,
+            pairing_protocol,
+            kv_connector,
+            kv_role,
+            kv_engine_id,
+            runs_mooncake,
+            supports_ec_transfer,
+            ec_connector,
+            ec_role,
+            ec_zmq_addrs: ec_zmq_addrs.unwrap_or_default(),
+            kv_cache_dtype,
+            attention_backend,
+            model_dtype,
+            block_size,
+            structured_outputs_backend,
+            kv_events_endpoint,
+            kv_events_replay_endpoint,
+            kv_events_topic,
+            shm_namespace_id,
+            pooler_use_activation,
+            pooler_dimensions,
+            mm_device_do_normalize,
+            mm_item_limits,
+            mm_encoder_budget,
+            max_num_seqs,
+            engine_reasoning_parser,
+            constrained_decoding_start,
+            structural_tag_vocabulary,
+            log_stats,
+        };
+        let servicer = ServicerConfig {
+            bind_address,
+            ipc_base_url,
+            handshake_address,
+            engine_count,
+            tokenizer_dir,
+            engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
+            engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
+            engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
+            metrics_bind_address,
+            warmup_nonce,
+        };
+        let mut config = VllmServicerConfig {
+            servicer,
+            model,
+            media_processor,
+        };
+        let inner = py.detach(|| -> PyResult<VllmServicerServer> {
+            let Some(native) = native else {
+                return VllmServicerServer::start(config).map_err(to_py_err);
+            };
+            // The pipeline needs the tokenizer the servicer would load after
+            // the engine connects; load it here and hand the same one over.
+            let dir = config.servicer.tokenizer_dir.clone().ok_or_else(|| {
+                PyValueError::new_err("the smg media processor needs tokenizer_dir")
+            })?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    PyRuntimeError::new_err(format!("media pipeline setup runtime: {error}"))
+                })?;
+            let (tokenizer, pipeline) = runtime.block_on(async {
+                let tokenizer = llm_tokenizer::factory::create_tokenizer_async(&dir)
+                    .await
+                    .map_err(|error| {
+                        PyRuntimeError::new_err(format!(
+                            "loading the tokenizer from {dir} for the smg media processor: {error:#}"
+                        ))
+                    })?;
+                let pipeline = WorkerMediaPipeline::new(native.settings, Arc::clone(&tokenizer))
+                    .await
+                    .map_err(|error| {
+                        PyValueError::new_err(format!("smg media processor: {error:#}"))
+                    })?;
+                Ok::<_, PyErr>((tokenizer, pipeline))
+            })?;
+            tracing::info!(
+                spec = pipeline.spec_name(),
+                pixel_format = ?pipeline.pixel_format(),
+                max_inflight = native.max_inflight,
+                item_limits = %pipeline.item_limits_summary(),
+                video_frame_budget = ?pipeline.video_frame_budget(),
+                encoder_budget = ?pipeline.encoder_budget(),
+                "smg media processor ready"
+            );
+            config.media_processor = Some(Arc::new(SmgMediaProcessor {
+                pipeline: Arc::new(pipeline),
+                source: native.source,
+                max_inflight: native.max_inflight,
+            }));
+            VllmServicerServer::start_with_tokenizer(config, tokenizer).map_err(to_py_err)
+        })?;
+        Ok(Self { inner })
+    }
+
+    /// The bound `ip:port`.
+    #[getter]
+    fn address(&self) -> String {
+        self.inner.address()
+    }
+
+    /// The metrics listener's bound `ip:port`; `None` when the server was
+    /// built without `metrics_bind_address`.
+    #[getter]
+    fn metrics_address(&self) -> Option<String> {
+        self.inner.metrics_address()
+    }
+
+    #[getter]
+    fn running(&self) -> bool {
+        self.inner.running()
+    }
+
+    /// Whether the engine handshake completed; health is NOT_SERVING until it has.
+    #[getter]
+    fn engine_ready(&self) -> bool {
+        self.inner.engine_ready()
+    }
+
+    /// Report that the engine process is alive while the handshake runs: the
+    /// launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the engine
+    /// is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
+    }
+
+    /// The last fatal error (engine connect or server exit), if any.
+    #[getter]
+    fn last_error(&self) -> PyResult<Option<String>> {
+        self.inner.last_error().map_err(to_py_err)
+    }
+
+    /// Admitted requests whose processing or response stream has not ended.
+    #[getter]
+    fn active_requests(&self) -> usize {
+        self.inner.active_requests()
+    }
+
+    /// Announce SERVING (`True`) or drain (`False`); health flips at once and
+    /// admission closes with the drain.
+    fn set_serving(&self, serving: bool) {
+        self.inner.set_serving(serving);
+    }
+
+    /// Hold (`False`) or release (`True`) readiness alone: health flips,
+    /// admission stays open for the launcher's own requests before SERVING
+    /// (its planned warm-up's, `smg-warmup-<nonce>-<n>` under the constructor's
+    /// `warmup_nonce`, else `smg-warmup-<n>`) and closes to every other;
+    /// `set_serving(False)` is the drain switch.
+    fn set_ready(&self, ready: bool) {
+        self.inner.set_ready(ready);
+    }
+
+    /// Whether the KV-event relay's subscriptions have reached the engine's
+    /// publishers (`True` as well when there is none to wait for: events
+    /// off, a lazy relay start, a relay that gave up). The launcher holds
+    /// its planned warm-up until then, so the warm-up's batches are the
+    /// first the relay's history records.
+    #[getter]
+    fn kv_relay_subscribed(&self) -> bool {
+        self.inner.kv_relay_subscribed()
+    }
+
+    /// Stop the server: open streams are cancelled, connections get most of
+    /// `timeout_secs` to close, then the listener thread is joined.
+    #[pyo3(signature = (timeout_secs = 5.0))]
+    fn stop(&self, py: Python<'_>, timeout_secs: f64) -> PyResult<()> {
+        if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
+            return Err(PyValueError::new_err(
+                "timeout_secs must be finite and positive",
+            ));
+        }
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+    }
+}
+
+/// Rust-owned `tokenspeed.grpc.scheduler.TokenSpeedScheduler` server over
+/// same-host headless TokenSpeed scheduler(s) on the msgpack ZMQ wire. The
+/// Python launcher keeps the lifecycle: it starts the scheduler(s) dialing
+/// `handshake_address`, polls this object, and stops it.
+#[pyclass(name = "TokenSpeedGrpcServer")]
+pub struct PyTokenSpeedGrpcServer {
+    inner: TokenSpeedServicerServer,
+}
+
+#[pymethods]
+impl PyTokenSpeedGrpcServer {
+    #[new]
+    #[pyo3(signature = (
+        bind_address,
+        ipc_base_url,
+        handshake_address,
+        model_path,
+        *,
+        engine_count = 1,
+        tokenizer_dir = None,
+        served_model_name = None,
+        tokenizer_path = None,
+        model_type = String::new(),
+        architectures = None,
+        max_context_length = 0,
+        max_req_input_len = 0,
+        vocab_size = 0,
+        eos_token_ids = None,
+        pad_token_id = 0,
+        bos_token_id = 0,
+        weight_version = String::new(),
+        default_sampling_params_json = String::new(),
+        supports_vision = false,
+        supports_multimodal = false,
+        supported_modalities = None,
+        mrope_positions = None,
+        spatial_merge_size = None,
+        image_token_id = None,
+        video_token_id = None,
+        position_id_per_seconds = None,
+        seconds_per_chunk = None,
+        model_dtype = String::new(),
+        multimodal_encoder_dtype = String::new(),
+        server_args_json = String::new(),
+        scheduler_info_json = String::new(),
+        tokenspeed_version = String::new(),
+        constrained_decoding = String::new(),
+        max_running_requests = 0,
+        data_parallel_size = 1,
+        kv_events_endpoint = String::new(),
+        kv_events_replay_endpoint = String::new(),
+        kv_events_topic = String::new(),
+        engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
+        engine_silence_timeout_secs = None,
+        engine_prefill_tokens_per_sec = None,
+        metrics_bind_address = None,
+        warmup_nonce = None,
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        bind_address: String,
+        ipc_base_url: String,
+        handshake_address: String,
+        model_path: String,
+        engine_count: usize,
+        tokenizer_dir: Option<String>,
+        served_model_name: Option<String>,
+        tokenizer_path: Option<String>,
+        model_type: String,
+        architectures: Option<Vec<String>>,
+        max_context_length: i32,
+        max_req_input_len: i32,
+        vocab_size: i32,
+        eos_token_ids: Option<Vec<u32>>,
+        pad_token_id: i32,
+        bos_token_id: i32,
+        weight_version: String,
+        default_sampling_params_json: String,
+        supports_vision: bool,
+        supports_multimodal: bool,
+        supported_modalities: Option<Vec<i32>>,
+        mrope_positions: Option<bool>,
+        spatial_merge_size: Option<u32>,
+        image_token_id: Option<u32>,
+        video_token_id: Option<u32>,
+        position_id_per_seconds: Option<f64>,
+        seconds_per_chunk: Option<f64>,
+        model_dtype: String,
+        multimodal_encoder_dtype: String,
+        server_args_json: String,
+        scheduler_info_json: String,
+        tokenspeed_version: String,
+        constrained_decoding: String,
+        max_running_requests: i32,
+        data_parallel_size: i32,
+        kv_events_endpoint: String,
+        kv_events_replay_endpoint: String,
+        kv_events_topic: String,
+        engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
+        engine_silence_timeout_secs: Option<f64>,
+        engine_prefill_tokens_per_sec: Option<i64>,
+        metrics_bind_address: Option<String>,
+        warmup_nonce: Option<String>,
+    ) -> PyResult<Self> {
+        let model = TokenSpeedModelInfo {
+            served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
+            tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
+            model_path,
+            model_type,
+            architectures: architectures.unwrap_or_default(),
+            max_context_length,
+            max_req_input_len,
+            vocab_size,
+            eos_token_ids: eos_token_ids.unwrap_or_default(),
+            pad_token_id,
+            bos_token_id,
+            weight_version,
+            default_sampling_params_json,
+            supports_vision,
+            supports_multimodal,
+            supported_modalities: supported_modalities.unwrap_or_default(),
+            mrope_positions,
+            spatial_merge_size,
+            image_token_id,
+            video_token_id,
+            position_id_per_seconds,
+            seconds_per_chunk,
+            model_dtype,
+            multimodal_encoder_dtype,
+            server_args_json,
+            scheduler_info_json,
+            tokenspeed_version,
+            constrained_decoding,
+            max_running_requests,
+            data_parallel_size,
+            kv_events_endpoint,
+            kv_events_replay_endpoint,
+            kv_events_topic,
+        };
+        let servicer = ServicerConfig {
+            bind_address,
+            ipc_base_url,
+            handshake_address,
+            engine_count,
+            tokenizer_dir,
+            engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
+            engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
+            engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
+            metrics_bind_address,
+            warmup_nonce,
+        };
+        let config = TokenSpeedServicerConfig { servicer, model };
+        let inner = py
+            .detach(|| TokenSpeedServicerServer::start(config))
+            .map_err(to_py_err)?;
+        Ok(Self { inner })
+    }
+
+    /// The bound `ip:port`.
+    #[getter]
+    fn address(&self) -> String {
+        self.inner.address()
+    }
+
+    /// The metrics listener's bound `ip:port`; `None` when the server was
+    /// built without `metrics_bind_address`.
+    #[getter]
+    fn metrics_address(&self) -> Option<String> {
+        self.inner.metrics_address()
+    }
+
+    #[getter]
+    fn running(&self) -> bool {
+        self.inner.running()
+    }
+
+    /// Whether the scheduler handshake completed; health is NOT_SERVING
+    /// until it has.
+    #[getter]
+    fn engine_ready(&self) -> bool {
+        self.inner.engine_ready()
+    }
+
+    /// Report that the scheduler process is alive while the handshake runs:
+    /// the launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the
+    /// scheduler is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
+    }
+
+    /// The last fatal error (scheduler connect or server exit), if any.
+    #[getter]
+    fn last_error(&self) -> PyResult<Option<String>> {
+        self.inner.last_error().map_err(to_py_err)
+    }
+
+    /// Admitted requests whose processing or response stream has not ended.
+    #[getter]
+    fn active_requests(&self) -> usize {
+        self.inner.active_requests()
+    }
+
+    /// Announce SERVING (`True`) or drain (`False`); health flips at once and
+    /// admission closes with the drain.
+    fn set_serving(&self, serving: bool) {
+        self.inner.set_serving(serving);
+    }
+
+    /// Hold (`False`) or release (`True`) readiness alone: health flips,
+    /// admission stays open for the launcher's own requests before SERVING
+    /// (its planned warm-up's, `smg-warmup-<nonce>-<n>` under the constructor's
+    /// `warmup_nonce`, else `smg-warmup-<n>`) and closes to every other;
+    /// `set_serving(False)` is the drain switch.
+    fn set_ready(&self, ready: bool) {
+        self.inner.set_ready(ready);
+    }
+
+    /// Whether the KV-event relay's subscriptions have reached the engine's
+    /// publishers (`True` as well when there is none to wait for: events
+    /// off, a lazy relay start, a relay that gave up). The launcher holds
+    /// its planned warm-up until then, so the warm-up's batches are the
+    /// first the relay's history records.
+    #[getter]
+    fn kv_relay_subscribed(&self) -> bool {
+        self.inner.kv_relay_subscribed()
+    }
+
+    /// Stop the server: open streams are cancelled, connections get most of
+    /// `timeout_secs` to close, then the listener thread is joined.
+    #[pyo3(signature = (timeout_secs = 5.0))]
+    fn stop(&self, py: Python<'_>, timeout_secs: f64) -> PyResult<()> {
+        if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
+            return Err(PyValueError::new_err(
+                "timeout_secs must be finite and positive",
+            ));
+        }
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+    }
+}
+
+/// What the encode bridge answers one dispatch with: whether the scheduler is
+/// to wait for embeddings, the per-encoder assignment by the modality's enum
+/// value, the encoder list it indexes, and the callable that releases the
+/// receiver's dispatch thread once the request is on the wire.
+type DispatchAnswer = (
+    bool,
+    Option<BTreeMap<u32, Vec<u32>>>,
+    Option<Vec<String>>,
+    Option<Py<PyAny>>,
+);
+
+/// The bridge's answer converted with its release slot taken out first: the
+/// receiver's thread is parked on that release from the moment the bridge
+/// returns, so an answer that does not convert runs it here before the error
+/// is reported, never dropping it unrun.
+fn dispatch_answer(py: Python<'_>, answer: &Bound<'_, PyAny>) -> PyResult<DispatchAnswer> {
+    let release = answer
+        .get_item(3)
+        .ok()
+        .and_then(|slot| slot.extract::<Option<Py<PyAny>>>().ok())
+        .flatten();
+    answer.extract::<DispatchAnswer>().inspect_err(|_| {
+        if let Some(release) = release {
+            if let Err(release_error) = release.call0(py) {
+                tracing::warn!(%release_error, "encode dispatch release failed after a malformed answer");
+            }
+        }
+    })
+}
+
+/// The encode dispatch of an SGLang language-side worker behind a Python
+/// object (see `smg_grpc_servicer.sglang.rust_encode.EncodeDispatchBridge`):
+/// `dispatch(rid, image_urls, video_urls, audio_urls, on_error)` runs
+/// SGLang's own receiver for the request (the assignment across the encoders,
+/// the encode requests to them on the receiver's thread) and returns a
+/// [`DispatchAnswer`]; `on_error` is this side's [`DispatchError`], which the
+/// bridge calls with the receiver's failure once the release ran, so the
+/// notice reaches the scheduler rank holding the request. The bridge's
+/// `transport_mode` (the engine's receiver mode, `http` or `grpc`) is read
+/// once, when the server is built: it decides what the dispatch is asked for
+/// (the gRPC encoder service takes images only). Calls into Python only from
+/// a blocking thread, as the media bridge does.
+struct PythonEncodeDispatcher {
+    bridge: Arc<Py<PyAny>>,
+    transport: EncodeTransport,
+}
+
+/// The transport the bridge's receiver runs: its `transport_mode`, the
+/// engine's receiver mode; another value refuses the server by name.
+fn encode_transport(bridge: &Bound<'_, PyAny>) -> PyResult<EncodeTransport> {
+    let mode: String = bridge.getattr("transport_mode")?.extract()?;
+    match mode.as_str() {
+        "http" => Ok(EncodeTransport::Http),
+        "grpc" => Ok(EncodeTransport::Grpc),
+        other => Err(PyValueError::new_err(format!(
+            "the encode dispatcher's transport_mode is {other:?}; the engine's receiver modes \
+             are \"http\" and \"grpc\""
+        ))),
+    }
+}
+
+impl SglangEncodeDispatcher for PythonEncodeDispatcher {
+    fn transport(&self) -> EncodeTransport {
+        self.transport
+    }
+
+    fn dispatch(
+        &self,
+        request: EncodeDispatchRequest,
+    ) -> EncodeFuture<Result<EncodeDispatchOutcome, String>> {
+        let bridge = Arc::clone(&self.bridge);
+        Box::pin(async move {
+            let EncodeDispatchRequest {
+                rid,
+                media:
+                    EncodeMediaRefs {
+                        image_urls,
+                        video_urls,
+                        audio_urls,
+                    },
+                on_error,
+            } = request;
+            // The release becomes its guard inside the blocking task: a
+            // handler gone before this task ends drops the task's output
+            // with it, and the guard still releases the receiver's thread.
+            let runtime = tokio::runtime::Handle::current();
+            let answer = tokio::task::spawn_blocking(move || {
+                let (need_wait_for_mm_inputs, num_items_assigned, encoder_urls, release) =
+                    Python::attach(|py| -> PyResult<DispatchAnswer> {
+                        let on_error = Py::new(
+                            py,
+                            DispatchError {
+                                rid: rid.clone(),
+                                sink: on_error,
+                            },
+                        )?;
+                        let answer = bridge.call_method1(
+                            py,
+                            "dispatch",
+                            (rid, image_urls, video_urls, audio_urls, on_error),
+                        )?;
+                        dispatch_answer(py, answer.bind(py))
+                    })?;
+                let sent = release.map(|release| {
+                    EncodeRelease::new(
+                        Box::new(move || {
+                            Box::pin(async move {
+                                let released = tokio::task::spawn_blocking(move || {
+                                    Python::attach(|py| release.call0(py).map(|_| ()))
+                                })
+                                .await;
+                                match released {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => {
+                                        tracing::warn!(%error, "encode dispatch release failed");
+                                    }
+                                    Err(join) => {
+                                        tracing::warn!(%join, "encode dispatch release did not run");
+                                    }
+                                }
+                            })
+                        }),
+                        runtime,
+                    )
+                });
+                Ok::<_, PyErr>(EncodeDispatchOutcome {
+                    need_wait_for_mm_inputs,
+                    num_items_assigned,
+                    encoder_urls,
+                    sent,
+                })
+            })
+            .await;
+            match answer {
+                Ok(Ok(outcome)) => Ok(outcome),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(join) => Err(format!("encode dispatch did not run: {join}")),
+            }
+        })
+    }
+}
+
+/// Where the encode bridge reports a dispatch failure, called once from the
+/// receiver's thread after the release: `(error_msg, error_code)`, the
+/// receiver's own `EncoderDispatchErrorReq` fields. A code outside the HTTP
+/// range is reported as 500.
+#[pyclass(name = "_DispatchError")]
+struct DispatchError {
+    rid: String,
+    sink: EncodeDispatchErrorSink,
+}
+
+#[pymethods]
+impl DispatchError {
+    fn __call__(&self, error_msg: String, error_code: i64) {
+        (self.sink)(EncoderDispatchErrorReq {
+            rid: self.rid.clone(),
+            error_msg,
+            error_code: u16::try_from(error_code).unwrap_or(500),
+        });
+    }
+}
+
+/// Rust-owned `trtllm.TrtllmService` server over a same-host TensorRT-LLM
+/// engine on the msgpack ZMQ wire (the shim beside the engine's LLM API dials
+/// in). The Python launcher keeps the lifecycle: it starts the shim against
+/// the handshake address, polls `engine_ready`/`last_error`, drains and
+/// stops. The facts come from the engine's arguments, which the launcher
+/// reads before the engine starts; the handshake fills what it left at 0.
+#[pyclass(name = "TrtllmGrpcServer")]
+pub struct PyTrtllmGrpcServer {
+    inner: TrtllmServicerServer,
+}
+
+#[pymethods]
+impl PyTrtllmGrpcServer {
+    #[new]
+    #[pyo3(signature = (
+        bind_address,
+        ipc_base_url,
+        handshake_address,
+        model_path,
+        *,
+        engine_count = 1,
+        tokenizer_dir = None,
+        served_model_name = None,
+        max_input_len = 0,
+        max_seq_len = 0,
+        max_batch_size = 0,
+        vocab_size = 0,
+        hidden_size = 0,
+        num_layers = 0,
+        num_heads = 0,
+        supported_features = None,
+        eos_token_ids = None,
+        backend = String::new(),
+        trtllm_version = String::new(),
+        tensor_parallel_size = 0,
+        pipeline_parallel_size = 0,
+        context_parallel_size = 0,
+        data_parallel_size = 1,
+        guided_decoding_backend = String::new(),
+        structural_tag_vocabulary = String::new(),
+        max_running_requests = 0,
+        kv_events_endpoint = String::new(),
+        kv_events_replay_endpoint = String::new(),
+        kv_events_topic = String::new(),
+        engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
+        engine_silence_timeout_secs = None,
+        engine_prefill_tokens_per_sec = None,
+        metrics_bind_address = None,
+        warmup_nonce = None,
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        bind_address: String,
+        ipc_base_url: String,
+        handshake_address: String,
+        model_path: String,
+        engine_count: usize,
+        tokenizer_dir: Option<String>,
+        served_model_name: Option<String>,
+        max_input_len: i32,
+        max_seq_len: i32,
+        max_batch_size: i32,
+        vocab_size: i32,
+        hidden_size: i32,
+        num_layers: i32,
+        num_heads: i32,
+        supported_features: Option<Vec<String>>,
+        eos_token_ids: Option<Vec<u32>>,
+        backend: String,
+        trtllm_version: String,
+        tensor_parallel_size: i32,
+        pipeline_parallel_size: i32,
+        context_parallel_size: i32,
+        data_parallel_size: i32,
+        guided_decoding_backend: String,
+        structural_tag_vocabulary: String,
+        max_running_requests: i32,
+        kv_events_endpoint: String,
+        kv_events_replay_endpoint: String,
+        kv_events_topic: String,
+        engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
+        engine_silence_timeout_secs: Option<f64>,
+        engine_prefill_tokens_per_sec: Option<i64>,
+        metrics_bind_address: Option<String>,
+        warmup_nonce: Option<String>,
+    ) -> PyResult<Self> {
+        let model = TrtllmModelInfo {
+            served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
+            model_path,
+            max_input_len,
+            max_seq_len,
+            max_batch_size,
+            vocab_size,
+            hidden_size,
+            num_layers,
+            num_heads,
+            supported_features: supported_features.unwrap_or_default(),
+            eos_token_ids: eos_token_ids.unwrap_or_default(),
+            backend,
+            trtllm_version,
+            tensor_parallel_size,
+            pipeline_parallel_size,
+            context_parallel_size,
+            data_parallel_size,
+            guided_decoding_backend,
+            structural_tag_vocabulary,
+            max_running_requests,
+            kv_events_endpoint,
+            kv_events_replay_endpoint,
+            kv_events_topic,
+        };
+        let servicer = ServicerConfig {
+            bind_address,
+            ipc_base_url,
+            handshake_address,
+            engine_count,
+            tokenizer_dir,
+            engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
+            engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
+            engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
+            metrics_bind_address,
+            warmup_nonce,
+        };
+        let config = TrtllmServicerConfig { servicer, model };
+        let inner = py
+            .detach(|| TrtllmServicerServer::start(config))
+            .map_err(to_py_err)?;
+        Ok(Self { inner })
+    }
+
+    /// The bound `ip:port`.
+    #[getter]
+    fn address(&self) -> String {
+        self.inner.address()
+    }
+
+    /// The metrics listener's bound `ip:port`; `None` when the server was
+    /// built without `metrics_bind_address`.
+    #[getter]
+    fn metrics_address(&self) -> Option<String> {
+        self.inner.metrics_address()
+    }
+
+    #[getter]
+    fn running(&self) -> bool {
+        self.inner.running()
+    }
+
+    /// Whether the engine handshake completed; health is NOT_SERVING until
+    /// it has.
+    #[getter]
+    fn engine_ready(&self) -> bool {
+        self.inner.engine_ready()
+    }
+
+    /// Report that the engine process is alive while the handshake runs: the
+    /// launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the engine
+    /// is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
+    }
+
+    /// The last fatal error (engine connect or server exit), if any.
+    #[getter]
+    fn last_error(&self) -> PyResult<Option<String>> {
+        self.inner.last_error().map_err(to_py_err)
+    }
+
+    /// Admitted requests whose processing or response stream has not ended.
+    #[getter]
+    fn active_requests(&self) -> usize {
+        self.inner.active_requests()
+    }
+
+    /// Announce SERVING (`True`) or drain (`False`); health flips at once and
+    /// admission closes with the drain.
+    fn set_serving(&self, serving: bool) {
+        self.inner.set_serving(serving);
+    }
+
+    /// Hold (`False`) or release (`True`) readiness alone: health flips,
+    /// admission stays open for the launcher's own requests before SERVING
+    /// and closes to every other; `set_serving(False)` is the drain switch.
+    fn set_ready(&self, ready: bool) {
+        self.inner.set_ready(ready);
+    }
+
+    /// Whether the KV-event relay's subscriptions have reached the engine's
+    /// publishers (`True` as well when there is none to wait for).
+    #[getter]
+    fn kv_relay_subscribed(&self) -> bool {
+        self.inner.kv_relay_subscribed()
+    }
+
+    /// Stop the server: open streams are cancelled, connections get most of
+    /// `timeout_secs` to close, then the listener thread is joined.
+    #[pyo3(signature = (timeout_secs = 5.0))]
+    fn stop(&self, py: Python<'_>, timeout_secs: f64) -> PyResult<()> {
+        if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
+            return Err(PyValueError::new_err(
+                "timeout_secs must be finite and positive",
+            ));
+        }
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+    }
+}
+
+/// Rust-owned `sglang.grpc.scheduler.SglangScheduler` server over a same-host
+/// headless SGLang scheduler on the msgpack ZMQ wire (the SMG plugin inside
+/// the scheduler dials in). The Python launcher keeps the lifecycle: it starts
+/// the scheduler dialing `handshake_address`, polls this object, and stops it.
+#[pyclass(name = "SglangGrpcServer")]
+pub struct PySglangGrpcServer {
+    inner: SglangServicerServer,
+}
+
+#[pymethods]
+impl PySglangGrpcServer {
+    #[new]
+    #[pyo3(signature = (
+        bind_address,
+        ipc_base_url,
+        handshake_address,
+        model_path,
+        *,
+        engine_count = 1,
+        tokenizer_dir = None,
+        served_model_name = None,
+        tokenizer_path = None,
+        is_generation = true,
+        model_type = String::new(),
+        architectures = None,
+        max_context_length = 0,
+        max_req_input_len = 0,
+        vocab_size = 0,
+        eos_token_ids = None,
+        pad_token_id = 0,
+        bos_token_id = 0,
+        weight_version = String::new(),
+        preferred_sampling_params = String::new(),
+        default_sampling_params_json = String::new(),
+        supports_vision = false,
+        id2label_json = String::new(),
+        num_labels = 0,
+        server_args_json = String::new(),
+        scheduler_info_json = String::new(),
+        sglang_version = String::new(),
+        max_running_requests = 0,
+        data_parallel_size = 1,
+        kv_events_endpoint = String::new(),
+        kv_events_replay_endpoint = String::new(),
+        kv_events_topic = String::new(),
+        encode_dispatcher = None,
+        smg_media_processor = None,
+        engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
+        engine_silence_timeout_secs = None,
+        engine_prefill_tokens_per_sec = None,
+        metrics_bind_address = None,
+        warmup_nonce = None,
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        bind_address: String,
+        ipc_base_url: String,
+        handshake_address: String,
+        model_path: String,
+        engine_count: usize,
+        tokenizer_dir: Option<String>,
+        served_model_name: Option<String>,
+        tokenizer_path: Option<String>,
+        is_generation: bool,
+        model_type: String,
+        architectures: Option<Vec<String>>,
+        max_context_length: i32,
+        max_req_input_len: i32,
+        vocab_size: i32,
+        eos_token_ids: Option<Vec<u32>>,
+        pad_token_id: i32,
+        bos_token_id: i32,
+        weight_version: String,
+        preferred_sampling_params: String,
+        default_sampling_params_json: String,
+        supports_vision: bool,
+        id2label_json: String,
+        num_labels: i32,
+        server_args_json: String,
+        scheduler_info_json: String,
+        sglang_version: String,
+        max_running_requests: i32,
+        data_parallel_size: i32,
+        kv_events_endpoint: String,
+        kv_events_replay_endpoint: String,
+        kv_events_topic: String,
+        encode_dispatcher: Option<Bound<'_, PyAny>>,
+        smg_media_processor: Option<Bound<'_, PyDict>>,
+        engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
+        engine_silence_timeout_secs: Option<f64>,
+        engine_prefill_tokens_per_sec: Option<i64>,
+        metrics_bind_address: Option<String>,
+        warmup_nonce: Option<String>,
+    ) -> PyResult<Self> {
+        // The language side's encode dispatch, behind the launcher's bridge
+        // object; absent on every other worker.
+        let encode_dispatcher = encode_dispatcher
+            .map(|bridge| -> PyResult<Arc<dyn SglangEncodeDispatcher>> {
+                let transport = encode_transport(&bridge)?;
+                Ok(Arc::new(PythonEncodeDispatcher {
+                    bridge: Arc::new(bridge.unbind()),
+                    transport,
+                }))
+            })
+            .transpose()?;
+        let native = smg_media_processor
+            .map(|options| {
+                native_media_options(
+                    &options,
+                    served_model_name.as_deref().unwrap_or(&model_path),
+                )
+            })
+            .transpose()?;
+        let model = SglangModelInfo {
+            served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
+            tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
+            model_path,
+            is_generation,
+            model_type,
+            architectures: architectures.unwrap_or_default(),
+            max_context_length,
+            max_req_input_len,
+            vocab_size,
+            eos_token_ids: eos_token_ids.unwrap_or_default(),
+            pad_token_id,
+            bos_token_id,
+            weight_version,
+            preferred_sampling_params,
+            default_sampling_params_json,
+            supports_vision,
+            id2label_json,
+            num_labels,
+            server_args_json,
+            scheduler_info_json,
+            sglang_version,
+            max_running_requests,
+            data_parallel_size,
+            kv_events_endpoint,
+            kv_events_replay_endpoint,
+            kv_events_topic,
+        };
+        let servicer = ServicerConfig {
+            bind_address,
+            ipc_base_url,
+            handshake_address,
+            engine_count,
+            tokenizer_dir,
+            engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
+            engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
+            engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
+            metrics_bind_address,
+            warmup_nonce,
+        };
+        let mut config = SglangServicerConfig {
+            servicer,
+            model,
+            encode_dispatcher,
+            media_processor: None,
+        };
+        let inner = py.detach(|| -> PyResult<SglangServicerServer> {
+            if let Some(native) = native {
+                if !matches!(
+                    native.settings.encoder_dtype.as_str(),
+                    "float32" | "bfloat16" | "float16"
+                ) {
+                    return Err(PyValueError::new_err(
+                        "SGLang media dtype must be float32, bfloat16 or float16",
+                    ));
+                }
+                if native.max_inflight > tokio::sync::Semaphore::MAX_PERMITS {
+                    return Err(PyValueError::new_err(
+                        "media max_inflight exceeds the semaphore limit",
+                    ));
+                }
+                let dir = config.servicer.tokenizer_dir.as_ref().ok_or_else(|| {
+                    PyValueError::new_err("smg media processing requires tokenizer_dir")
+                })?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+                let pipeline = runtime
+                    .block_on(async {
+                        let tokenizer = llm_tokenizer::factory::create_tokenizer_async(dir).await?;
+                        let mut settings = native.settings;
+                        settings.tokenizer_dir = Some(dir.clone());
+                        WorkerMediaPipeline::new_sglang(settings, tokenizer).await
+                    })
+                    .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
+                if !matches!(pipeline.spec_name(), "glm53_flash" | "minimax_m3") {
+                    return Err(PyValueError::new_err(format!(
+                        "SGLang smg media processing currently supports GLM-5.3-Flash and MiniMax-M3; got {}",
+                        pipeline.spec_name()
+                    )));
+                }
+                config.media_processor = Some(Arc::new(SmgSglangMediaProcessor {
+                    pipeline: Arc::new(pipeline),
+                    admission: Arc::new(tokio::sync::Semaphore::new(native.max_inflight)),
+                }));
+            }
+            SglangServicerServer::start(config).map_err(to_py_err)
+        })?;
+        Ok(Self { inner })
+    }
+
+    /// The bound `ip:port`.
+    #[getter]
+    fn address(&self) -> String {
+        self.inner.address()
+    }
+
+    /// The metrics listener's bound `ip:port`; `None` when the server was
+    /// built without `metrics_bind_address`.
+    #[getter]
+    fn metrics_address(&self) -> Option<String> {
+        self.inner.metrics_address()
+    }
+
+    #[getter]
+    fn running(&self) -> bool {
+        self.inner.running()
+    }
+
+    /// Whether the scheduler handshake completed; health is NOT_SERVING
+    /// until it has.
+    #[getter]
+    fn engine_ready(&self) -> bool {
+        self.inner.engine_ready()
+    }
+
+    /// Report that the scheduler process is alive while the handshake runs:
+    /// the launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the
+    /// scheduler is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
+    }
+
+    /// The last fatal error (scheduler connect or server exit), if any.
+    #[getter]
+    fn last_error(&self) -> PyResult<Option<String>> {
+        self.inner.last_error().map_err(to_py_err)
+    }
+
+    /// Admitted requests whose processing or response stream has not ended.
+    #[getter]
+    fn active_requests(&self) -> usize {
+        self.inner.active_requests()
+    }
+
+    /// Announce SERVING (`True`) or drain (`False`); health flips at once and
+    /// admission closes with the drain.
+    fn set_serving(&self, serving: bool) {
+        self.inner.set_serving(serving);
+    }
+
+    /// Hold (`False`) or release (`True`) readiness alone: health flips,
+    /// admission stays open for the launcher's own requests before SERVING
+    /// (its planned warm-up's, `smg-warmup-<nonce>-<n>` under the constructor's
+    /// `warmup_nonce`, else `smg-warmup-<n>`) and closes to every other;
+    /// `set_serving(False)` is the drain switch.
+    fn set_ready(&self, ready: bool) {
+        self.inner.set_ready(ready);
+    }
+
+    /// Whether the KV-event relay's subscriptions have reached the engine's
+    /// publishers (`True` as well when there is none to wait for: events
+    /// off, a lazy relay start, a relay that gave up). The launcher holds
+    /// its planned warm-up until then, so the warm-up's batches are the
+    /// first the relay's history records.
+    #[getter]
+    fn kv_relay_subscribed(&self) -> bool {
+        self.inner.kv_relay_subscribed()
+    }
+
+    /// Stop the server: open streams are cancelled, connections get most of
+    /// `timeout_secs` to close, then the listener thread is joined.
+    #[pyo3(signature = (timeout_secs = 5.0))]
+    fn stop(&self, py: Python<'_>, timeout_secs: f64) -> PyResult<()> {
+        if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
+            return Err(PyValueError::new_err(
+                "timeout_secs must be finite and positive",
+            ));
+        }
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+    }
+}

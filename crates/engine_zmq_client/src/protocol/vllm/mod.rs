@@ -5,14 +5,15 @@
 //! shapes, field order, and `array_like` positional-tuple encoding are the wire
 //! contract with Python `EngineCoreProc` — do not reorder fields.
 //!
-//! Text generation, structured outputs (guided decoding), and multimodal
-//! features are typed fully. Pooling params and prompt embeds are carried as
-//! [`crate::codec::OpaqueValue`] — they serialize as `nil` on supported paths.
+//! Text generation, structured outputs (guided decoding), multimodal features
+//! and pooling (embedding) requests are typed fully. Prompt embeds are carried
+//! as [`crate::codec::OpaqueValue`] — they serialize as `nil` on supported paths.
 
 pub mod logprobs;
 pub mod lora;
 pub mod multimodal;
 pub mod output;
+pub mod pooling;
 pub mod request;
 pub mod sampling;
 pub mod stats;
@@ -21,26 +22,31 @@ pub mod structured_outputs;
 use bytes::Bytes;
 
 use crate::{
-    codec::encode_msgpack,
+    codec::{
+        add_request_capacity, encode_msgpack, tensor::encode_with_aux_frames, FrameStr, OpaqueValue,
+    },
     error::Result,
     protocol::{
         vllm::{
             output::{
                 decode_engine_core_outputs, DpControlMessage, EngineCoreOutput, EngineCoreOutputs,
             },
-            request::{EngineCoreRequest, EngineCoreRequestType},
+            request::{EngineCoreRequest, EngineCoreRequestType, UtilityCall},
             stats::SchedulerStats,
         },
-        EngineBatch, EngineLoad, EngineOutput, EngineProtocol, WaveEvent,
+        EngineBatch, EngineLoad, EngineOutput, EngineProtocol, UtilityReply, WaveEvent,
     },
 };
 
 /// Map vLLM's piggybacked scheduler stats onto the engine-neutral load signal.
 impl From<SchedulerStats> for EngineLoad {
+    /// Count both runnable and deferred queues, saturating the waiting total.
     fn from(stats: SchedulerStats) -> Self {
         Self {
             num_running: stats.num_running_reqs,
-            num_waiting: stats.num_waiting_reqs,
+            num_waiting: stats
+                .num_waiting_reqs
+                .saturating_add(stats.num_skipped_waiting_reqs),
             kv_cache_usage: stats.kv_cache_usage,
         }
     }
@@ -48,7 +54,15 @@ impl From<SchedulerStats> for EngineLoad {
 
 impl EngineOutput for EngineCoreOutput {
     fn request_id(&self) -> &str {
-        &self.request_id
+        self.request_id.as_str()
+    }
+
+    fn own_request_id(&mut self, id: FrameStr) {
+        self.request_id = id;
+    }
+
+    fn request_id_shared(&self) -> FrameStr {
+        self.request_id.clone()
     }
 
     fn finished(&self) -> bool {
@@ -63,6 +77,7 @@ pub struct VllmProtocol;
 impl EngineProtocol for VllmProtocol {
     type Request = EngineCoreRequest;
     type Output = EngineCoreOutput;
+    type Layout = ();
 
     fn add_frame() -> Bytes {
         EngineCoreRequestType::Add.to_frame()
@@ -70,6 +85,19 @@ impl EngineProtocol for VllmProtocol {
 
     fn abort_frame() -> Bytes {
         EngineCoreRequestType::Abort.to_frame()
+    }
+
+    fn prompt_tokens(request: &Self::Request) -> u64 {
+        request
+            .prompt_token_ids
+            .as_ref()
+            .map_or(0, |ids| ids.len() as u64)
+    }
+
+    fn reported_every_step(_request: &Self::Request) -> bool {
+        // The engine core reports every request it stepped on every step;
+        // streaming is the frontend's affair and not on the request.
+        true
     }
 
     fn request_id(request: &Self::Request) -> &str {
@@ -84,9 +112,13 @@ impl EngineProtocol for VllmProtocol {
         request.validate()
     }
 
-    fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        // Text path carries no aux tensor frames.
-        Ok((encode_msgpack(request)?, Vec::new()))
+    /// Encode the request with its large typed tensors as auxiliary frames
+    /// ([`encode_with_aux_frames`]); raw features keep the encoding their
+    /// producer gave them, and the text path its one allocation: the payload's
+    /// buffer is sized from the prompt before the write.
+    fn encode_add(request: &Self::Request, _layout: &()) -> Result<(Vec<u8>, Vec<Bytes>)> {
+        let prompt_tokens = request.prompt_token_ids.as_ref().map_or(0, Vec::len);
+        encode_with_aux_frames(request, add_request_capacity(prompt_tokens))
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
@@ -105,20 +137,48 @@ impl EngineProtocol for VllmProtocol {
         )))
     }
 
-    fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>> {
-        // vLLM multiplexes request batches, utility RPCs, and DP control on one
-        // wire struct; only request batches carry per-request outputs (utility
-        // results surface as an empty batch the dispatcher ignores).
+    fn encode_utility(
+        call_id: i64,
+        method: &str,
+        args: &[OpaqueValue],
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        // Framed `[engine, UTILITY, (client_index, call_id, method, args)]`,
+        // as vLLM's `AsyncMPClient._call_utility_async` sends it; this client
+        // has one output socket, so `client_index` is 0.
+        Ok(Some((
+            EngineCoreRequestType::Utility.to_frame(),
+            encode_msgpack(&UtilityCall {
+                client_index: 0,
+                call_id,
+                method: method.to_string(),
+                args: args.to_vec(),
+            })?,
+        )))
+    }
+
+    /// Decode the batch and retain its engine timestamp on each local output.
+    fn decode_batch(frames: &[Bytes], _layout: &()) -> Result<EngineBatch<Self::Output>> {
+        // vLLM multiplexes request batches, utility replies, and DP control on
+        // one wire struct; each lands in its own slot of the batch.
         match decode_engine_core_outputs(frames)? {
             EngineCoreOutputs::RequestBatch(batch) => Ok(EngineBatch {
                 engine_index: batch.engine_index,
-                outputs: batch.outputs,
+                outputs: batch
+                    .outputs
+                    .into_iter()
+                    .map(|mut output| {
+                        output.batch_timestamp = Some(batch.timestamp);
+                        output
+                    })
+                    .collect(),
                 finished_request_ids: batch
                     .finished_requests
-                    .map(|ids| ids.into_iter().collect())
+                    .map(|ids| ids.into_iter().map(FrameStr::from).collect())
                     .unwrap_or_default(),
-                load: batch.scheduler_stats.map(|stats| EngineLoad::from(*stats)),
+                load: batch.scheduler_stats.map(EngineLoad::from),
+                kv_transfer: batch.kv_transfer,
                 wave: None,
+                utility: None,
             }),
             EngineCoreOutputs::DpControl(control) => Ok(EngineBatch {
                 engine_index: control.engine_index,
@@ -128,7 +188,14 @@ impl EngineProtocol for VllmProtocol {
                 }),
                 ..EngineBatch::default()
             }),
-            EngineCoreOutputs::Utility(_) => Ok(EngineBatch::default()),
+            EngineCoreOutputs::Utility(reply) => Ok(EngineBatch {
+                engine_index: reply.engine_index,
+                utility: Some(UtilityReply {
+                    call_id: reply.output.call_id,
+                    outcome: reply.output.into_outcome(),
+                }),
+                ..EngineBatch::default()
+            }),
         }
     }
 }
@@ -138,7 +205,185 @@ mod tests {
     use rmpv::Value;
 
     use super::*;
-    use crate::codec::decode_value;
+    use crate::{
+        codec::{
+            decode_value,
+            tensor::{TensorFields, WireArrayData, TENSOR_AUX_MIN_BYTES},
+        },
+        protocol::vllm::request::MmFeaturesPayload,
+    };
+
+    /// Build nested large and small tensors plus an embedding mask.
+    fn media_request() -> EngineCoreRequest {
+        use std::collections::BTreeMap;
+
+        use multimodal::{
+            MmBatchedField, MmFeatureSpec, MmField, MmFieldElem, MmKwargValue, PlaceholderRange,
+        };
+
+        use crate::codec::tensor::WireTensor;
+
+        let tensor = |n| WireTensor::from_raw("uint8", vec![n], vec![42; n]);
+        EngineCoreRequest {
+            request_id: "media".into(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            mm_features: Some(
+                vec![MmFeatureSpec {
+                    data: Some(BTreeMap::from([(
+                        "pixels".into(),
+                        MmFieldElem {
+                            data: Some(MmKwargValue::List(vec![
+                                MmKwargValue::Tensor(tensor(4 * TENSOR_AUX_MIN_BYTES)),
+                                MmKwargValue::List(vec![
+                                    MmKwargValue::Tensor(tensor(255)),
+                                    MmKwargValue::Int(3),
+                                ]),
+                            ])),
+                            field: MmField::Batched(MmBatchedField { keep_on_cpu: false }),
+                        },
+                    )])),
+                    modality: "image".into(),
+                    identifier: "image-1".into(),
+                    mm_position: PlaceholderRange {
+                        offset: 0,
+                        length: TENSOR_AUX_MIN_BYTES,
+                        is_embed: Some(WireTensor::from_raw(
+                            "bool",
+                            vec![TENSOR_AUX_MIN_BYTES],
+                            vec![1; TENSOR_AUX_MIN_BYTES],
+                        )),
+                    },
+                    mm_hash: None,
+                }]
+                .into(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// Preserve values and share large tensor allocations across encoded frames.
+    #[test]
+    fn typed_media_aux_frames_preserve_nested_tensors_and_masks_without_copying() {
+        use crate::codec::{decode_msgpack, tensor::resolve_array_bytes};
+
+        let request = media_request();
+        let before = encode_msgpack(&request).unwrap();
+        let (payload, aux) = VllmProtocol::encode_add(&request, &()).unwrap();
+        assert_eq!(
+            aux.iter().map(Bytes::len).collect::<Vec<_>>(),
+            vec![4 * TENSOR_AUX_MIN_BYTES, TENSOR_AUX_MIN_BYTES]
+        );
+        assert!(payload.len() < 1024);
+        assert_eq!(before, encode_msgpack(&request).unwrap());
+        let mut pointers = Vec::new();
+        request.for_each_tensor(&mut |data| {
+            if let WireArrayData::RawView(bytes) = data {
+                if bytes.len() >= TENSOR_AUX_MIN_BYTES {
+                    pointers.push(bytes.as_ptr());
+                }
+            }
+        });
+        assert_eq!(
+            pointers,
+            aux.iter().map(|bytes| bytes.as_ptr()).collect::<Vec<_>>()
+        );
+        let mut decoded: EngineCoreRequest = decode_msgpack(&payload).unwrap();
+        let mut frames = vec![Bytes::from(payload)];
+        frames.extend(aux);
+        decoded.for_each_tensor_mut(&mut |data| {
+            *data =
+                WireArrayData::RawView(resolve_array_bytes(data.clone(), "test", &frames).unwrap());
+        });
+        assert_eq!(decoded, request);
+    }
+
+    /// Requests containing only small tensors stay byte-identical and inline.
+    #[test]
+    fn small_tensors_stay_inline() {
+        use crate::codec::tensor::WireTensor;
+
+        for size in [0, 255, 256, 4096, TENSOR_AUX_MIN_BYTES - 1] {
+            let mut request = media_request();
+            let Some(MmFeaturesPayload::Typed(features)) = &mut request.mm_features else {
+                panic!()
+            };
+            let tensor = || WireTensor::from_raw("uint8", vec![size], vec![42; size]);
+            features[0].mm_position.is_embed =
+                Some(WireTensor::from_raw("bool", vec![size], vec![1; size]));
+            features[0].mm_position.length = size;
+            for field in features[0].data.as_mut().unwrap().values_mut() {
+                field.data = Some(multimodal::MmKwargValue::List(vec![
+                    multimodal::MmKwargValue::Tensor(tensor()),
+                ]));
+            }
+            let (payload, aux) = VllmProtocol::encode_add(&request, &()).unwrap();
+            assert!(aux.is_empty(), "size={size}");
+            assert_eq!(payload, encode_msgpack(&request).unwrap());
+        }
+    }
+
+    /// Keep externally supplied auxiliary frame addressing unchanged.
+    #[test]
+    fn existing_aux_indices_and_raw_features_are_not_rebased() {
+        let mut request = media_request();
+        let Some(MmFeaturesPayload::Typed(features)) = &mut request.mm_features else {
+            panic!()
+        };
+        features[0].mm_position.is_embed.as_mut().unwrap().data = WireArrayData::AuxIndex(1);
+        let (payload, frames) = VllmProtocol::encode_add(&request, &()).unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(payload, encode_msgpack(&request).unwrap());
+        let raw = decode_value(&encode_msgpack(&request.mm_features).unwrap()).unwrap();
+        request.mm_features = Some(MmFeaturesPayload::Raw(raw));
+        let (payload, frames) = VllmProtocol::encode_add(&request, &()).unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(payload, encode_msgpack(&request).unwrap());
+    }
+
+    /// Keep text-only requests byte-for-byte identical.
+    #[test]
+    fn text_request_wire_is_unchanged() {
+        let request = EngineCoreRequest::default();
+        let (payload, frames) = VllmProtocol::encode_add(&request, &()).unwrap();
+        assert_eq!(payload, encode_msgpack(&request).unwrap());
+        assert!(frames.is_empty());
+    }
+
+    /// Waiting load includes deferred work and saturates instead of wrapping.
+    #[test]
+    fn scheduler_load_includes_deferred_waiting() {
+        for (runnable, deferred, total) in [
+            (0, 4, 4),
+            (3, 4, 7),
+            (3, 0, 3),
+            (0, 0, 0),
+            (u64::MAX, 1, u64::MAX),
+        ] {
+            let load = EngineLoad::from(SchedulerStats {
+                num_running_reqs: 2,
+                num_waiting_reqs: runnable,
+                num_skipped_waiting_reqs: deferred,
+                kv_cache_usage: 0.5,
+            });
+            assert_eq!(load.num_waiting, total);
+            assert_eq!(load.num_running, 2);
+            assert_eq!(load.kv_cache_usage, 0.5);
+        }
+    }
+
+    /// The engine core reports every request it stepped on every step
+    /// (streaming is the frontend's affair and not on the request), so every
+    /// request counts toward the silence, and its prompt as pending prefill.
+    #[test]
+    fn every_request_is_reported_every_step() {
+        let request = EngineCoreRequest {
+            request_id: "r".to_string(),
+            prompt_token_ids: Some(vec![1, 2, 3]),
+            ..Default::default()
+        };
+        assert!(VllmProtocol::reported_every_step(&request));
+        assert_eq!(VllmProtocol::prompt_tokens(&request), 3);
+    }
 
     #[test]
     fn start_wave_encodes_a_nil_excluded_rank() {

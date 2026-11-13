@@ -1,5 +1,12 @@
 target-version = "py312"
 line-length = 100
+# The vendored DeepSeek-V4.1 reference encoder (fixture oracle) stays byte-identical to
+# upstream for diffing; force-exclude keeps it excluded when pre-commit passes paths
+# explicitly.
+# The vLLM gRPC launcher fixtures (grpc_servicer/tests/launchers) are byte-identical
+# upstream files too, executed by the launcher-switch smoke.
+extend-exclude = ["crates/tokenizer/scripts/oracle", "grpc_servicer/tests/launchers"]
+force-exclude = true
 
 [lint]
 select = ["E", "F", "I", "W", "UP"]

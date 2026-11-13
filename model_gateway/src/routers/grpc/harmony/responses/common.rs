@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 
-use axum::response::Response;
 use openai_protocol::{
     common::ToolCall,
     responses::{
@@ -11,17 +10,17 @@ use openai_protocol::{
         ResponsesToolChoice, StringOrContentParts, ToolChoiceOptions,
     },
 };
-use serde_json::{from_value, to_string, Value};
-use smg_data_connector::{ResponseId, ResponseStorageError};
-use smg_mcp::McpToolSession;
-use tracing::{debug, error, warn};
+use serde_json::to_string;
+use smg_mcp::{McpServerBinding, McpToolSession};
+use tracing::debug;
 use uuid::Uuid;
 
-use super::execution::ToolResult;
+use super::execution::{convert_mcp_tools_to_response_tools, ToolResult};
 use crate::routers::{
     common::openai_bridge::{self, FormatRegistry, ResponseFormat},
-    error,
-    grpc::common::responses::{utils::resolve_function_identity, ResponsesContext},
+    grpc::common::responses::{
+        streaming::OutputItemKind, utils::resolve_function_identity, ResponsesContext,
+    },
 };
 
 /// Record of a single MCP tool call execution
@@ -60,6 +59,31 @@ impl McpCallTracking {
     }
 }
 
+/// The request's MCP session, opened once for the loop; the session's MCP
+/// tools join the request's tool list, so the model sees them beside the
+/// user's own.
+pub(super) fn open_mcp_session<'a>(
+    ctx: &'a ResponsesContext,
+    mcp_servers: Vec<McpServerBinding>,
+    request: &mut ResponsesRequest,
+) -> McpToolSession<'a> {
+    let session_request_id = format!("resp_{}", Uuid::now_v7());
+    let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &session_request_id);
+    let mcp_tools = session.mcp_tools();
+    if !mcp_tools.is_empty() {
+        let mcp_response_tools = convert_mcp_tools_to_response_tools(&session);
+        let mut all_tools = request.tools.take().unwrap_or_default();
+        all_tools.extend(mcp_response_tools);
+        request.tools = Some(all_tools);
+        debug!(
+            mcp_tool_count = mcp_tools.len(),
+            total_tool_count = request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            "MCP client available - added static MCP tools to Harmony Responses request"
+        );
+    }
+    session
+}
+
 /// Build next request with tool results appended to history
 ///
 /// Constructs a new ResponsesRequest with:
@@ -94,7 +118,7 @@ pub(super) fn build_next_request_with_tools(
     // Add reasoning if present (from analysis channel)
     if let Some(analysis_text) = analysis {
         items.push(ResponseInputOutputItem::new_reasoning(
-            format!("reasoning_{assistant_id}"),
+            OutputItemKind::Reasoning.new_id(),
             vec![],
             vec![ResponseReasoningContent::ReasoningText {
                 text: analysis_text,
@@ -192,123 +216,6 @@ pub(super) fn inject_mcp_metadata(
     );
 }
 
-/// Load previous conversation messages from storage
-///
-/// If the request has `previous_response_id`, loads the response chain from storage
-/// and prepends the conversation history to the request input items.
-pub(super) async fn load_previous_messages(
-    ctx: &ResponsesContext,
-    request: ResponsesRequest,
-) -> Result<ResponsesRequest, Response> {
-    let Some(ref prev_id_str) = request.previous_response_id else {
-        // No previous_response_id, return request as-is
-        return Ok(request);
-    };
-
-    let prev_id = ResponseId::from(prev_id_str.as_str());
-
-    // Load response chain from storage
-    let chain = match ctx
-        .response_storage
-        .get_response_chain(&prev_id, None)
-        .await
-    {
-        Ok(chain) => chain,
-        Err(ResponseStorageError::ResponseNotFound(_)) => {
-            return Err(error::bad_request(
-                "previous_response_not_found",
-                format!("Previous response with id '{prev_id_str}' not found."),
-            ));
-        }
-        Err(e) => {
-            error!(
-                function = "load_previous_messages",
-                prev_id = %prev_id_str,
-                error = %e,
-                "Failed to load previous response chain from storage"
-            );
-            return Err(error::internal_error(
-                "load_previous_response_chain_failed",
-                format!("Failed to load previous response chain for {prev_id_str}: {e}"),
-            ));
-        }
-    };
-
-    if chain.responses.is_empty() {
-        return Err(error::bad_request(
-            "previous_response_not_found",
-            format!("Previous response with id '{prev_id_str}' not found."),
-        ));
-    }
-
-    // Build conversation history from stored responses
-    let mut history_items = Vec::new();
-
-    // Helper to deserialize and collect items from a JSON array
-    let deserialize_items = |arr: &Value, item_type: &str| -> Vec<ResponseInputOutputItem> {
-        arr.as_array()
-            .into_iter()
-            .flat_map(|items| items.iter())
-            .filter_map(|item| {
-                from_value::<ResponseInputOutputItem>(item.clone())
-                    .map_err(|e| {
-                        warn!(
-                            "Failed to deserialize stored {} item: {}. Item: {}",
-                            item_type, e, item
-                        );
-                    })
-                    .ok()
-            })
-            .collect()
-    };
-
-    for stored in &chain.responses {
-        history_items.extend(deserialize_items(&stored.input, "input"));
-        history_items.extend(deserialize_items(
-            stored
-                .raw_response
-                .get("output")
-                .unwrap_or(&Value::Array(vec![])),
-            "output",
-        ));
-    }
-
-    debug!(
-        previous_response_id = %prev_id_str,
-        history_items_count = history_items.len(),
-        "Loaded conversation history from previous response"
-    );
-
-    // Build modified request with history prepended
-    let mut modified_request = request;
-
-    // Convert current input to items format
-    let all_items = match modified_request.input {
-        ResponseInput::Items(items) => {
-            // Prepend history to existing items
-            let mut combined = history_items;
-            combined.extend(items);
-            combined
-        }
-        ResponseInput::Text(text) => {
-            // Convert text to item and prepend history
-            history_items.push(ResponseInputOutputItem::SimpleInputMessage {
-                content: StringOrContentParts::String(text),
-                role: "user".to_string(),
-                r#type: None,
-                phase: None,
-            });
-            history_items
-        }
-    };
-
-    // Update request with combined items and clear previous_response_id
-    modified_request.input = ResponseInput::Items(all_items);
-    modified_request.previous_response_id = None;
-
-    Ok(modified_request)
-}
-
 /// Strip `ResponseTool::ImageGeneration` from a request's tools list once
 /// the MCP session has exposed an MCP-routed replacement.
 ///
@@ -370,6 +277,8 @@ pub(super) fn strip_image_generation_from_request_tools(
 
 #[cfg(test)]
 mod namespace_tests {
+    use serde_json::from_value;
+
     use super::*;
     use crate::routers::grpc::common::responses::utils::namespace_test_request;
     #[test]

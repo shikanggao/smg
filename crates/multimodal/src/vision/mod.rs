@@ -9,7 +9,7 @@
 //!
 //! - `transforms`: Core image transformations (resize, normalize, crop, etc.)
 //! - `preprocessor_config`: HuggingFace config parsing
-//! - `processor`: Vision processor trait and registry
+//! - `processor`: Vision processor trait
 //! - `processors`: Model-specific implementations (LLaVA, Qwen-VL, etc.)
 //!
 //! Modality-neutral encoder outputs live in [`crate::encoder_inputs`], while
@@ -27,27 +27,37 @@
 //! // Load config from HuggingFace
 //! let config = PreProcessorConfig::from_json(config_json)?;
 //!
-//! // Create processor and preprocess images
-//! let processor = LlavaProcessor::new();
-//! let result = processor.preprocess(&images, &config)?;
+//! // Create a processor that resolves the config once, then preprocess the
+//! // batch's images, borrowed one by one.
+//! let processor = LlavaProcessor::from_configs(&model_config, &config);
+//! let result = processor.preprocess(&images.iter().collect::<Vec<_>>())?;
 //! ```
 
-pub(crate) mod execution;
+pub mod execution;
+pub(crate) mod orientation;
 pub mod preprocessor_config;
 pub mod processor;
 pub mod processors;
+pub(crate) mod rgb_runs;
 pub(crate) mod scratch;
+/// The torch `uint8` resample's own rows (NEON, or the plain loops) for the
+/// targets without the Pillow-exact vector passes; x86-64 routes the torch
+/// taps through those passes in `transforms`.
+#[cfg(not(target_arch = "x86_64"))]
+mod torch_resample;
 pub mod transforms;
 
 // Re-export commonly used types, including compatibility paths for shared
 // preprocessing outputs.
 pub use preprocessor_config::PreProcessorConfig;
 pub use processor::{
-    ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor, VisionProcessorRegistry,
+    ModelSpecificValue, PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor,
+    VisionPreprocessingContext,
 };
 pub use processors::{
-    Glm53FlashProcessor, Llama4VisionProcessor, LlavaNextProcessor, LlavaProcessor,
-    MiniMaxM3VisionProcessor, Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor,
-    Qwen2VLProcessor, Qwen3OmniVisionProcessor, Qwen3VLProcessor,
+    DeepseekV41Processor, Gemma4Processor, Glm53FlashProcessor, Llama4VisionProcessor,
+    LlavaNextProcessor, LlavaProcessor, MiniMaxM3VisionProcessor, NemotronOmniProcessor,
+    Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor,
+    Qwen3OmniVisionProcessor, Qwen3VLProcessor, Step3VLProcessor,
 };
 pub use transforms::TransformError;

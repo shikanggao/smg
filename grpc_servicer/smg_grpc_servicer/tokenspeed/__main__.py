@@ -4,24 +4,67 @@ Usage::
 
     python -m smg_grpc_servicer.tokenspeed --model <model> --host 127.0.0.1 --port 50051
 
-All :class:`ServerArgs` flags are accepted — argv is parsed by
-``prepare_server_args`` so there is no flag drift vs the HTTP frontend.
+``--servicer-impl {python,rust}``, ``--servicer-metrics-port`` and ``--servicer-metrics-host``
+are this package's flags; every other flag is TokenSpeed's
+:class:`ServerArgs`, parsed by ``prepare_server_args`` so there is no flag
+drift vs the HTTP frontend. The contract is served from Rust by default
+(see :mod:`smg_grpc_servicer.tokenspeed.rust`); ``--servicer-impl python`` (or
+``SMG_TOKENSPEED_SERVICER_IMPL=python``, the fallback the flag overrides)
+selects the deprecated Python servicer, and the launcher logs the deprecation.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import sys
 
 from tokenspeed.runtime.utils.server_args import prepare_server_args
 
+from smg_grpc_servicer.rust_lifecycle import (
+    ServicerConfigError,
+    announce_servicer_impl,
+    check_metrics_port_needs_rust,
+    configuration_exit,
+)
+from smg_grpc_servicer.tokenspeed.rust import (
+    METRICS_PORT_ENV,
+    METRICS_PORT_FLAG,
+    SERVICER_IMPL_ENV,
+    add_metrics_arguments,
+    add_servicer_impl_argument,
+    serve_rust,
+    servicer_impl_source,
+)
 from smg_grpc_servicer.tokenspeed.server import serve_grpc
 
 try:
     import uvloop
 except ImportError:  # uvloop is optional — fall back to the default loop.
     uvloop = None
+
+logger = logging.getLogger("smg_grpc_servicer.tokenspeed")
+
+
+def split_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    """Our flags first; everything else is TokenSpeed's ``ServerArgs``.
+
+    A ``--help`` goes on to TokenSpeed's parser, which prints its own help
+    and exits; this package's flags are printed ahead of it."""
+    parser = argparse.ArgumentParser(
+        prog="python -m smg_grpc_servicer.tokenspeed",
+        description="smg's own flags; every other flag is TokenSpeed's ServerArgs, listed below.",
+        add_help=False,
+        allow_abbrev=False,
+    )
+    add_servicer_impl_argument(parser)
+    add_metrics_arguments(parser)
+    ours, rest = parser.parse_known_args(argv)
+    if any(arg in ("-h", "--help") for arg in rest):
+        parser.print_help()
+        print()
+    return ours, rest
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -33,9 +76,24 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     )
 
-    server_args = prepare_server_args(argv)
+    ours, rest = split_args(argv)
+    server_args = prepare_server_args(rest)
     if uvloop is not None:
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    # The switch picks the request path (--servicer-impl, else the environment,
+    # else the default: the Rust servicer); the entrypoint and every ServerArgs
+    # flag stay the same, and the Router cannot tell them apart.
+    try:
+        impl, origin = servicer_impl_source(ours)
+        announce_servicer_impl(impl, origin, SERVICER_IMPL_ENV, logger)
+        if impl == "rust":
+            raise SystemExit(asyncio.run(serve_rust(server_args)))
+        # A metrics port under the Python servicer is a port nobody serves.
+        check_metrics_port_needs_rust(impl, ours, METRICS_PORT_ENV, flag=METRICS_PORT_FLAG)
+    except ServicerConfigError as error:
+        # A knob the servicer cannot use: one named ERROR line and exit code
+        # 2, before any engine work, not a traceback.
+        raise configuration_exit(error, logger) from None
     asyncio.run(serve_grpc(server_args))
 
 

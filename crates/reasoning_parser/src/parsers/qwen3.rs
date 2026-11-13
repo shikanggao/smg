@@ -9,7 +9,7 @@ use crate::{
 
 /// Qwen3 reasoning parser.
 ///
-/// This parser requires explicit <think> tokens to enter reasoning mode
+/// This parser requires explicit `<think>` tokens to enter reasoning mode
 /// (in_reasoning=false initially).
 pub struct Qwen3Parser {
     base: BaseReasoningParser,
@@ -48,6 +48,10 @@ impl ReasoningParser for Qwen3Parser {
         text: &str,
     ) -> Result<ParserResult, ParseError> {
         self.base.parse_reasoning_streaming_incremental(text)
+    }
+
+    fn flush(&mut self) -> Result<ParserResult, ParseError> {
+        self.base.flush()
     }
 
     fn reset(&mut self) {
@@ -111,6 +115,10 @@ impl ReasoningParser for QwenThinkingParser {
         text: &str,
     ) -> Result<ParserResult, ParseError> {
         self.base.parse_reasoning_streaming_incremental(text)
+    }
+
+    fn flush(&mut self) -> Result<ParserResult, ParseError> {
+        self.base.flush()
     }
 
     fn reset(&mut self) {

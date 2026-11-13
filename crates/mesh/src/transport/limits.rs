@@ -19,7 +19,7 @@ pub const STREAM_CHUNK_OVERHEAD_MARGIN: usize = 64 * 1024;
 
 /// Maximum payload bytes per stream chunk after reserving envelope
 /// headroom. Senders MUST split values larger than this into multiple
-/// chunks via [`crate::chunking::chunk_value`].
+/// chunks via `chunk_value` in the transport's chunking module.
 pub const MAX_STREAM_CHUNK_BYTES: usize = MAX_MESSAGE_SIZE - STREAM_CHUNK_OVERHEAD_MARGIN;
 
 /// Default cap on how many chunk entries a single `StreamBatch`
@@ -32,3 +32,8 @@ pub const DEFAULT_MAX_CHUNKS_PER_BATCH: usize = 5;
 /// receive loops. If no frame arrives within this window the loop
 /// closes, freeing the mpsc channel and per-stream task.
 pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the dialing end of a `sync_stream` sends a heartbeat, which the
+/// accepting end answers: a frame each way well inside
+/// [`STREAM_IDLE_TIMEOUT`], so a stream with nothing to sync stays open.
+pub const STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);

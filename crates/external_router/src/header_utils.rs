@@ -64,6 +64,33 @@ pub fn extract_routing_key_hint(headers: Option<&HeaderMap>) -> Option<&str> {
     extract_routing_key_hint_named(headers, &HEADER_ROUTING_KEY)
 }
 
+/// Whether the request's `anthropic-beta` header names the beta `name` in
+/// its dated form, `name-YYYY-MM-DD`: the header may repeat, and each value
+/// may list several betas, comma separated. A longer beta name that begins
+/// with `name` is another beta, not this one.
+pub fn anthropic_beta_named(headers: &HeaderMap, name: &str) -> bool {
+    headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|beta| beta.trim().strip_prefix(name).is_some_and(is_dated_suffix))
+}
+
+/// `-YYYY-MM-DD`, the date a public beta's name ends with: the shape alone,
+/// not the calendar.
+fn is_dated_suffix(rest: &str) -> bool {
+    let bytes = rest.as_bytes();
+    bytes.len() == 11
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if i == 0 || i == 5 || i == 8 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+}
+
 /// Declared size of the incoming raw body; pre-sizes reserialization buffers.
 pub fn content_length(headers: Option<&HeaderMap>) -> Option<usize> {
     headers?
@@ -129,9 +156,10 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     headers
 }
 
-/// Stamp the response with the id of the worker that served the request — the
-/// worker URL as the gateway knows it, including the `@<rank>` suffix for
-/// dp-aware workers.
+/// Stamp the response with the id of the worker that served the request: the
+/// rendering of its URL that the caller passes. Callers must pass it with any
+/// userinfo masked (keeping a dp-aware worker's `@<rank>` suffix), since the
+/// value reaches every client and the access log.
 ///
 /// Lets a client see which replica answered: which pod to pull logs from, and
 /// whether retries landed somewhere new. Call after
@@ -395,11 +423,19 @@ pub fn should_forward_request_header(name: &str) -> bool {
     const REQUEST_ID_PREFIX: &str = "x-request-id-";
 
     name.eq_ignore_ascii_case("authorization")
+        // Anthropic Messages protocol headers: engines serving /v1/messages
+        // select API version and beta behavior from them.
+        || name.eq_ignore_ascii_case("anthropic-version")
+        || name.eq_ignore_ascii_case("anthropic-beta")
         || name.eq_ignore_ascii_case("x-request-id")
         || name.eq_ignore_ascii_case("x-correlation-id")
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
         || name.eq_ignore_ascii_case("x-smg-routing-key")
+        // SGLang's scheduling priority, read by an engine started with
+        // SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES. The other x-override-* headers stay
+        // blocked: the engine would apply them over the PD, DP-rank and rid fields.
+        || name.eq_ignore_ascii_case("x-override-priority")
         || name
             .get(..REQUEST_ID_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
@@ -407,7 +443,60 @@ pub fn should_forward_request_header(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use rustls::crypto::ring;
+
     use super::*;
+
+    /// The beta is found in a repeated header and in a comma-separated list,
+    /// by its undated name; another beta or no header is not it.
+    #[test]
+    fn anthropic_beta_named_reads_repeated_and_listed_values() {
+        let mut headers = HeaderMap::new();
+        assert!(!anthropic_beta_named(&headers, "message-threads"));
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+        );
+        assert!(!anthropic_beta_named(&headers, "message-threads"));
+        assert!(anthropic_beta_named(&headers, "interleaved-thinking"));
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static(
+                "fine-grained-tool-streaming-2025-05-14, message-threads-2026-08-12",
+            ),
+        );
+        assert!(anthropic_beta_named(&headers, "message-threads"));
+        assert!(anthropic_beta_named(
+            &headers,
+            "fine-grained-tool-streaming"
+        ));
+        assert!(!anthropic_beta_named(&headers, "threads"));
+    }
+
+    /// The dated form alone is the beta: a longer beta name sharing the
+    /// prefix, the undated name, a malformed date and a date of the right
+    /// shape but the wrong length are not it.
+    #[test]
+    fn anthropic_beta_named_requires_the_dated_suffix() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("token-counting-2024-11-01, token-efficient-tools-2025-02-19"),
+        );
+        assert!(anthropic_beta_named(&headers, "token-counting"));
+        assert!(anthropic_beta_named(&headers, "token-efficient-tools"));
+        assert!(!anthropic_beta_named(&headers, "token"));
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("message-threads, message-threads-2026-8-12"),
+        );
+        assert!(!anthropic_beta_named(&headers, "message-threads"));
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("message-threads-2026-08-1, message-threads-2026-08-123"),
+        );
+        assert!(!anthropic_beta_named(&headers, "message-threads"));
+    }
 
     #[test]
     fn preserve_response_headers_drops_smg_owned_error_code() {
@@ -422,9 +511,20 @@ mod tests {
         assert!(is_smg_owned_error_code_header("X-SMG-Error-Code"));
     }
 
+    /// The tests' HTTP client, the process-level TLS crypto provider
+    /// installed first; the request builders under test come from it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+    )]
+    fn client() -> reqwest::Client {
+        let _ = ring::default_provider().install_default();
+        reqwest::Client::new()
+    }
+
     #[test]
     fn apply_forwarded_request_headers_user_auth_wins_without_duplicate() {
-        let client = reqwest::Client::new();
+        let client = client();
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::AUTHORIZATION,
@@ -458,7 +558,7 @@ mod tests {
 
     #[test]
     fn apply_forwarded_request_headers_falls_back_to_worker_key() {
-        let client = reqwest::Client::new();
+        let client = client();
         let headers = HeaderMap::new(); // caller sent no Authorization
         let worker_key = "worker-key".to_string();
 
@@ -535,6 +635,10 @@ mod tests {
         assert!(should_forward_request_header("x-request-id-123"));
         assert!(should_forward_request_header("x-smg-routing-key"));
         assert!(should_forward_request_header("X-SMG-Routing-Key"));
+        assert!(should_forward_request_header("anthropic-version"));
+        assert!(should_forward_request_header("Anthropic-Beta"));
+        assert!(should_forward_request_header("x-override-priority"));
+        assert!(should_forward_request_header("X-Override-Priority"));
     }
 
     #[test]
@@ -552,6 +656,16 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
+        // Of the engine's x-override-* headers only the priority is forwarded.
+        assert!(!should_forward_request_header("x-override-rid"));
+        assert!(!should_forward_request_header("x-override-bootstrap-host"));
+        assert!(!should_forward_request_header("x-override-bootstrap-port"));
+        assert!(!should_forward_request_header("x-override-bootstrap-room"));
+        assert!(!should_forward_request_header("x-override-routed-dp-rank"));
+        assert!(!should_forward_request_header(
+            "x-override-disagg-prefill-dp-rank"
+        ));
+        assert!(!should_forward_request_header("x-override-conversation-id"));
     }
 
     #[test]

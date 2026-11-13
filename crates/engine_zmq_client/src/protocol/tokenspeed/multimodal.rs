@@ -1,0 +1,387 @@
+//! TokenSpeed multimodal wire structs — the native `MultimodalInputs` /
+//! `MultimodalDataItem` from `runtime/multimodal/inputs.py`. Unlike the
+//! request/output messages these are UNtagged `msgspec.Struct(array_like=True)`
+//! positional arrays. **Field order is the wire contract** — append only,
+//! never reorder.
+//!
+//! The msgpack transport bypasses the engine's `InputProcessor`, so everything
+//! it would derive must arrive precomputed: `pad_value` (via [`mm_pad_value`]),
+//! pad-substituted `input_ids` (the placeholder ranges overwritten with the pad
+//! value), the original ids in `input_ids_unpadded`, and the MRoPE position
+//! table of the families whose rule the translate computes (slots 3-5 of
+//! [`TokenSpeedWireMmInputs`]); an item of an MRoPE family the translate has no
+//! rule for is refused rather than let it silently degrade to 1-D positions.
+
+use std::collections::BTreeMap;
+
+use serde::{ser::SerializeTuple, Deserialize, Serialize, Serializer};
+
+use crate::codec::tensor::{TensorFields, WireArrayData, WireTensor};
+
+/// Engine-side modality discriminants (`inputs.py::Modality`).
+///
+/// NOTE: these differ from `smg.grpc.common.Modality`, which has AUDIO=2 and
+/// VIDEO=3 — translate explicitly, never pass the proto int through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TokenSpeedWireModality {
+    Image = 1,
+    Video = 2,
+    Audio = 3,
+}
+
+impl TokenSpeedWireModality {
+    /// Pad-substitute modality tag (`inputs.py::_modality_pad_tag`):
+    /// IMAGE=0, VIDEO=1, AUDIO=2 — offset from the enum discriminants.
+    fn pad_tag(self) -> u64 {
+        match self {
+            Self::Image => 0,
+            Self::Video => 1,
+            Self::Audio => 2,
+        }
+    }
+}
+
+impl Serialize for TokenSpeedWireModality {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(*self as u8)
+    }
+}
+
+/// First multimodal pad-substitute token id (`inputs.py::_MM_PAD_BASE`).
+const MM_PAD_BASE: u64 = 1_000_000;
+
+/// Per-modality pad-substitute hash slots (`inputs.py::_MM_PAD_HASH_SLOTS`,
+/// `((2^31 - 1) - 1_000_000 + 1) / 3`).
+const MM_PAD_HASH_SLOTS: u64 = 715_494_549;
+
+/// The engine's `MultimodalDataItem.set_pad_value()` formula.
+///
+/// Prefix-cache content identity and speculative-decode pad substitution both
+/// key off this exact value, and nothing computes it on the msgpack path, so
+/// senders must reproduce it bit-for-bit. The result is always within
+/// `[1_000_000, 2^31)`.
+pub fn mm_pad_value(modality: TokenSpeedWireModality, hash: u64) -> u32 {
+    let value = MM_PAD_BASE + modality.pad_tag() * MM_PAD_HASH_SLOTS + hash % MM_PAD_HASH_SLOTS;
+    // Bounded by 1_000_000 + 2*715_494_549 + 715_494_548 = 2^31 - 3, so the
+    // fallback is unreachable by construction.
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+/// An item's encode-to-prefill rendezvous under EPD disaggregation: the
+/// encode worker that ships this item's embedding hosts the bootstrap server
+/// at `bootstrap_host:bootstrap_port`, and the prefill receives the embedding
+/// on `bootstrap_room`. Rides as the engine's `encode_handshake` dict (a
+/// msgpack map under these three keys), one per item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncodeHandshake {
+    pub bootstrap_host: String,
+    pub bootstrap_port: i32,
+    pub bootstrap_room: i64,
+}
+
+/// One multimodal item — `MultimodalDataItem`, a 10-slot positional array:
+/// `[modality, hash, pad_value, offsets, feature, feature_shm,
+/// model_specific_data, encoded, encoded_deepstack, encode_handshake]`.
+///
+/// `encoded`/`encoded_deepstack` are scheduler-local ("always None on the
+/// wire") and `feature_shm` is a same-host optimization — this sender emits
+/// inline `feature` tensors and nil for those three. `feature` itself is nil
+/// for an item whose embedding does not come from this worker's tower: an
+/// EPD prefill's item, which receives it from the encode worker named by
+/// `encode_handshake`, or a prefill/decode side's item, whose KV arrives from
+/// the prefill (the item keeps its metadata so the prompt pads and positions
+/// come out the same on both sides).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenSpeedWireMmItem {
+    pub modality: TokenSpeedWireModality,
+    /// Content hash: u64 little-endian fold of the gateway content hash. The
+    /// engine uses it for within-batch dedup and as the pad-value seed.
+    pub hash: u64,
+    /// Precomputed [`mm_pad_value`]`(modality, hash)`.
+    pub pad_value: u32,
+    /// Inclusive `[start, end]` token ranges in the pad-substituted
+    /// `input_ids`, one per placeholder span.
+    pub offsets: Vec<(u64, u64)>,
+    /// Primary encoder tensor. Kwarg naming (`pixel_values` vs `patches`) is
+    /// the engine model integration's concern; the slot is anonymous. `None`
+    /// when the embedding arrives out of band (see the struct doc).
+    pub feature: Option<WireTensor>,
+    /// Side tensors (grids, types, per-item sizes) with wire dtype preserved.
+    pub model_specific_data: BTreeMap<String, WireTensor>,
+    /// The EPD encode-to-prefill rendezvous of this item; `None` outside EPD.
+    pub encode_handshake: Option<EncodeHandshake>,
+}
+
+impl Serialize for TokenSpeedWireMmItem {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        const NIL: Option<()> = None;
+        let mut tuple = serializer.serialize_tuple(10)?;
+        tuple.serialize_element(&self.modality)?;
+        tuple.serialize_element(&self.hash)?;
+        tuple.serialize_element(&self.pad_value)?;
+        tuple.serialize_element(&self.offsets)?;
+        tuple.serialize_element(&self.feature)?;
+        tuple.serialize_element(&NIL)?; // feature_shm
+        tuple.serialize_element(&self.model_specific_data)?;
+        tuple.serialize_element(&NIL)?; // encoded (scheduler-local)
+        tuple.serialize_element(&NIL)?; // encoded_deepstack (scheduler-local)
+        tuple.serialize_element(&self.encode_handshake)?;
+        tuple.end()
+    }
+}
+
+impl TensorFields for TokenSpeedWireMmItem {
+    /// The feature, then the side tensors in key order: the slot order.
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.feature.for_each_tensor(visit);
+        self.model_specific_data.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.feature.for_each_tensor_mut(visit);
+        self.model_specific_data.for_each_tensor_mut(visit);
+    }
+}
+
+/// Request-level multimodal payload — `MultimodalInputs`, a 7-slot positional
+/// array: `[mm_items, im_token_id, video_token_id, mrope_positions,
+/// mrope_position_delta, mrope_position_delta_scalar, <reserved>]`.
+///
+/// The three MRoPE slots are what the engine's own input processor writes on
+/// the path this wire bypasses: the position table `(3, L)` int64 over the
+/// whole prompt (the executor slices it per prefill chunk), the position
+/// delta `(1, 1)` int64 the decode steps continue from, and that delta as a
+/// plain integer. All nil for a model whose positions are one-dimensional:
+/// the executor then keeps its linear positions.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TokenSpeedWireMmInputs {
+    pub mm_items: Vec<TokenSpeedWireMmItem>,
+    pub im_token_id: Option<u32>,
+    pub video_token_id: Option<u32>,
+    pub mrope_positions: Option<WireTensor>,
+    pub mrope_position_delta: Option<WireTensor>,
+    pub mrope_position_delta_scalar: Option<i64>,
+}
+
+impl Serialize for TokenSpeedWireMmInputs {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        const NIL: Option<()> = None;
+        let mut tuple = serializer.serialize_tuple(7)?;
+        tuple.serialize_element(&self.mm_items)?;
+        tuple.serialize_element(&self.im_token_id)?;
+        tuple.serialize_element(&self.video_token_id)?;
+        tuple.serialize_element(&self.mrope_positions)?;
+        tuple.serialize_element(&self.mrope_position_delta)?;
+        tuple.serialize_element(&self.mrope_position_delta_scalar)?;
+        tuple.serialize_element(&NIL)?; // reserved trailing slot (never read in-process)
+        tuple.end()
+    }
+}
+
+impl TensorFields for TokenSpeedWireMmInputs {
+    /// The items' tensors, then the position table and the delta: the slot
+    /// order, so a table past the auxiliary-frame bar rides as a frame.
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.mm_items.for_each_tensor(visit);
+        self.mrope_positions.for_each_tensor(visit);
+        self.mrope_position_delta.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.mm_items.for_each_tensor_mut(visit);
+        self.mrope_positions.for_each_tensor_mut(visit);
+        self.mrope_position_delta.for_each_tensor_mut(visit);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rmpv::Value;
+
+    use super::*;
+    use crate::codec::{decode_value, encode_msgpack};
+
+    fn image_item() -> TokenSpeedWireMmItem {
+        let mut model_specific_data = BTreeMap::new();
+        model_specific_data.insert(
+            "vit_grid".to_string(),
+            WireTensor::from_raw(
+                "uint32",
+                vec![1, 3],
+                vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+            ),
+        );
+        TokenSpeedWireMmItem {
+            modality: TokenSpeedWireModality::Image,
+            hash: 0xDEAD_BEEF,
+            pad_value: mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF),
+            offsets: vec![(2, 4)],
+            feature: Some(WireTensor::from_raw("bfloat16", vec![3, 2], vec![0u8; 12])),
+            model_specific_data,
+            encode_handshake: None,
+        }
+    }
+
+    /// Pinned against `inputs.py::set_pad_value`: `1_000_000 +
+    /// tag * 715_494_549 + hash % 715_494_549`.
+    #[test]
+    fn pad_value_matches_engine_formula() {
+        assert_eq!(
+            mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF),
+            1_000_000 + (0xDEAD_BEEFu64 % 715_494_549) as u32
+        );
+        assert_eq!(mm_pad_value(TokenSpeedWireModality::Image, 0), 1_000_000);
+        assert_eq!(
+            mm_pad_value(TokenSpeedWireModality::Video, 0),
+            1_000_000 + 715_494_549
+        );
+        assert_eq!(
+            mm_pad_value(TokenSpeedWireModality::Audio, 0),
+            1_000_000 + 2 * 715_494_549
+        );
+        // Maximum stays within int32, mirroring the engine's guarantee.
+        assert!(u64::from(mm_pad_value(TokenSpeedWireModality::Audio, 715_494_548)) < (1u64 << 31));
+    }
+
+    /// The item is an untagged 10-slot array with nils in the scheduler-local
+    /// slots and the modality as the engine's enum int (IMAGE=1).
+    #[test]
+    fn item_encodes_as_untagged_ten_slot_array() {
+        let encoded = encode_msgpack(&image_item()).unwrap();
+        let Value::Array(slots) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(slots.len(), 10);
+        assert_eq!(slots[0], Value::from(1u8)); // Modality.IMAGE
+        assert_eq!(slots[1], Value::from(0xDEAD_BEEFu64));
+        assert_eq!(
+            slots[3],
+            Value::Array(vec![Value::Array(vec![
+                Value::from(2u64),
+                Value::from(4u64),
+            ])])
+        );
+        // feature rides as the (dtype, shape, ext-3) tensor tuple.
+        let Value::Array(tensor) = &slots[4] else {
+            panic!("expected tensor tuple, got {:?}", slots[4]);
+        };
+        assert_eq!(tensor[0].as_str(), Some("bfloat16"));
+        assert!(matches!(&tensor[2], Value::Ext(3, _)));
+        assert_eq!(slots[5], Value::Nil); // feature_shm
+        let Value::Map(msd) = &slots[6] else {
+            panic!("expected model_specific_data map");
+        };
+        assert_eq!(msd[0].0.as_str(), Some("vit_grid"));
+        assert_eq!(slots[7], Value::Nil);
+        assert_eq!(slots[8], Value::Nil);
+        assert_eq!(slots[9], Value::Nil);
+    }
+
+    /// An EPD prefill's item carries no feature (the embedding comes from the
+    /// encode worker) and its rendezvous in slot 9 as the engine's dict: a
+    /// map under the three keys, the metadata slots as on any item.
+    #[test]
+    fn an_epd_item_rides_its_handshake_map_and_no_feature() {
+        let mut item = image_item();
+        item.feature = None;
+        item.encode_handshake = Some(EncodeHandshake {
+            bootstrap_host: "10.0.0.9".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: 41,
+        });
+        let encoded = encode_msgpack(&item).unwrap();
+        let Value::Array(slots) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(slots.len(), 10);
+        assert_eq!(slots[4], Value::Nil); // feature
+        assert_eq!(slots[5], Value::Nil); // feature_shm
+        assert!(matches!(&slots[6], Value::Map(side) if side.len() == 1));
+        let Value::Map(handshake) = &slots[9] else {
+            panic!("expected the handshake map, got {:?}", slots[9]);
+        };
+        let mut entries: Vec<(String, Value)> = handshake
+            .iter()
+            .map(|(key, value)| (key.as_str().unwrap().to_string(), value.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            entries,
+            vec![
+                ("bootstrap_host".to_string(), Value::from("10.0.0.9")),
+                ("bootstrap_port".to_string(), Value::from(8998)),
+                ("bootstrap_room".to_string(), Value::from(41i64)),
+            ]
+        );
+        // A feature-less item has no tensor to lift into an auxiliary frame.
+        let mut visited = 0;
+        item.for_each_tensor(&mut |_| visited += 1);
+        assert_eq!(visited, 1, "the one side tensor");
+    }
+
+    /// The request-level payload is an untagged 7-slot array; without a
+    /// position table the three MRoPE slots and the reserved trailing slot
+    /// are nil.
+    #[test]
+    fn inputs_encode_as_untagged_seven_slot_array() {
+        let inputs = TokenSpeedWireMmInputs {
+            mm_items: vec![image_item()],
+            im_token_id: Some(9),
+            ..Default::default()
+        };
+        let encoded = encode_msgpack(&inputs).unwrap();
+        let Value::Array(slots) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(slots.len(), 7);
+        assert!(matches!(&slots[0], Value::Array(items) if items.len() == 1));
+        assert_eq!(slots[1], Value::from(9u32));
+        for slot in &slots[2..7] {
+            assert_eq!(*slot, Value::Nil);
+        }
+    }
+
+    /// The position table rides in slot 3 as a `(3, L)` int64 tensor tuple,
+    /// the delta in slot 4 as `(1, 1)` int64, the scalar in slot 5; the
+    /// table and the delta are visited after the items' tensors, so a table
+    /// past the auxiliary-frame bar is lifted into a frame.
+    #[test]
+    fn the_position_table_rides_in_slots_three_to_five() {
+        let inputs = TokenSpeedWireMmInputs {
+            mm_items: vec![image_item()],
+            im_token_id: Some(9),
+            video_token_id: None,
+            mrope_positions: Some(
+                WireTensor::from_i64(vec![3, 2], vec![0, 1, 0, 1, 0, 1]).unwrap(),
+            ),
+            mrope_position_delta: Some(WireTensor::from_i64(vec![1, 1], vec![-3]).unwrap()),
+            mrope_position_delta_scalar: Some(-3),
+        };
+        let encoded = encode_msgpack(&inputs).unwrap();
+        let Value::Array(slots) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(slots.len(), 7);
+        let Value::Array(table) = &slots[3] else {
+            panic!("expected the table tuple, got {:?}", slots[3]);
+        };
+        assert_eq!(table[0], Value::from("int64"));
+        assert_eq!(
+            table[1],
+            Value::Array(vec![Value::from(3u32), Value::from(2u32)])
+        );
+        let Value::Array(delta) = &slots[4] else {
+            panic!("expected the delta tuple, got {:?}", slots[4]);
+        };
+        assert_eq!(
+            delta[1],
+            Value::Array(vec![Value::from(1u32), Value::from(1u32)])
+        );
+        assert_eq!(slots[5], Value::from(-3i64));
+        assert_eq!(slots[6], Value::Nil);
+        let mut visited = 0;
+        inputs.for_each_tensor(&mut |_| visited += 1);
+        assert_eq!(visited, 4, "feature, side tensor, table, delta");
+    }
+}

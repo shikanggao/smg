@@ -15,7 +15,7 @@ use crate::{
 /// Handles the Mistral-specific format:
 /// `[TOOL_CALLS] [{"name": "func", "arguments": {...}}, ...]`
 ///
-/// Reference: https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3?chat_template=default
+/// Reference: <https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3?chat_template=default>
 pub struct MistralParser {
     /// Parser for handling incomplete JSON during streaming
     partial_json: PartialJson,
@@ -59,7 +59,7 @@ impl MistralParser {
             if name.is_empty() {
                 continue;
             }
-            let schema = &tool.function.parameters;
+            let schema = tool.function.parameters_schema();
             let name_json = serde_json::to_string(name).unwrap_or_default();
             tags.push(serde_json::json!({
                 "begin": format!("{{\"name\": {name_json}, \"arguments\": "),
@@ -80,6 +80,7 @@ impl MistralParser {
                         "type": "tags_with_separator",
                         "tags": tags,
                         "separator": ", ",
+                        "at_least_one": at_least_one,
                     },
                     "end": "]",
                 }],

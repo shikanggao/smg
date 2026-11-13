@@ -6,11 +6,13 @@ name: Nightly PD Topologies
 
 on:
   schedule:
-    - cron: "45 9 * * *" # 09:45 UTC daily, after the nightly benchmarks release the GPU pool
+    - cron: "45 9 * * 1-6" # 09:45 UTC Monday-Saturday, all enabled engines
+    - cron: "45 9 * * 0" # Sunday 09:45 UTC, non-AMD engines only
+    - cron: "35 22 * * 0" # Sunday 22:35 UTC, AMD engines only
   workflow_dispatch:
     inputs:
       engines:
-        description: "Space-separated engines to run (sglang vllm tokenspeed); empty = all"
+        description: "Space-separated engines to run (sglang vllm tokenspeed vllm-amd); empty = all"
         required: false
         default: ""
       filter:
@@ -22,7 +24,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: nightly-pd
+  # Keep the deferred AMD run independent of the normal/non-AMD queue.
+  group: ${{ github.event_name == 'schedule' && github.event.schedule == '35 22 * * 0' && 'nightly-pd-amd-sunday' || 'nightly-pd' }}
   cancel-in-progress: false
 
 jobs:
@@ -34,20 +37,45 @@ jobs:
       - id: plan
         env:
           ENGINES: ${{ inputs.engines }}
+          AMD_ENABLED: ${{ vars.SMG_RUN_AMD_LEGS }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
         run: |
           wanted="${ENGINES:-sglang vllm tokenspeed}"
+          # vllm-amd needs AMD's self-hosted runner; until it is online
+          # (SMG_RUN_AMD_LEGS=true) only a dispatch that names it runs it.
+          if [ -z "$ENGINES" ] && [ "$AMD_ENABLED" = true ]; then
+            wanted="$wanted vllm-amd"
+          fi
+          # Match the triggering cron, even if a queued run starts another day.
+          # Explicit workflow_dispatch engine selection keeps its original behavior.
+          if [ "$EVENT_NAME" = schedule ]; then
+            case "$SCHEDULE" in
+              "45 9 * * 0") wanted="sglang vllm tokenspeed" ;;
+              "35 22 * * 0")
+                wanted=""
+                if [ "$AMD_ENABLED" = true ]; then wanted="vllm-amd"; fi
+                ;;
+            esac
+          fi
           # One row per engine, plus each engine's other KV transport: vLLM over
           # Mooncake next to its NIXL default, SGLang over NIXL next to its
           # Mooncake default (TokenSpeed only has Mooncake). The NIXL row skips
           # the peer-restart tests: the SGLang prefill segfaults when its decode
-          # comes back on the same address (#2503).
+          # comes back on the same address (#2503). vllm-amd is vLLM over NIXL
+          # and over MoRI-IO in WRITE mode; MoRI-IO's READ mode is left out
+          # while its decode faults on its first transfer over XGMI on AMD's
+          # MI300X runners (vllm-project/vllm#61144).
           matrix=$(printf '%s\n' $wanted | jq -Rsc '
             split("\n") | map(select(length > 0)) |
             map(if . == "vllm" then [{engine: "vllm"}, {engine: "vllm", kv_backend: "mooncake"}]
                 elif . == "sglang" then [{engine: "sglang"},
                   {engine: "sglang", kv_backend: "nixl",
                    filter: "not sole_leg_outage and not survives_losing"}]
-                else [{engine: .}] end) | add')
+                elif . == "vllm-amd" then [
+                  {engine: "vllm", kv_backend: "nixl", vendor: "amd"},
+                  {engine: "vllm", kv_backend: "moriio", moriio_mode: "write", vendor: "amd"}]
+                else [{engine: .}] end) | add // []')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "matrix: $matrix"
 
@@ -136,16 +164,21 @@ jobs:
           if [ -n "$tag" ]; then
             candidate="ghcr.io/${REPO_OWNER}/smg:${tag}"
             if docker login ghcr.io -u "$GH_ACTOR" --password-stdin <<< "$GH_TOKEN" > /dev/null 2>&1 \
-               && docker manifest inspect "$candidate" > /dev/null 2>&1; then
-              image="$candidate"
+               && manifest="$(docker manifest inspect --verbose "$candidate" 2>/dev/null)"; then
+              digest="$(jq -r 'if type == "array" then .[] | select(.Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "amd64") | .Descriptor.digest else .Descriptor.digest // empty end' <<< "$manifest")"
+              if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                image="${candidate}@${digest}"
+              fi
             fi
           fi
           echo "image=${image}" >> "$GITHUB_OUTPUT"
-          echo "TokenSpeed image: ${image:-none (source build)}"
+          echo "TokenSpeed image: ${image:-none (nightly wheel install)}"
 
   pd-topologies:
-    name: pd-topologies (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
+    name: pd-topologies (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }}${{ matrix.moriio_mode && format('-{0}', matrix.moriio_mode) || '' }}${{ matrix.vendor && format('-{0}', matrix.vendor) || '' }})
     needs: [plan, build-wheel, tokenspeed-image]
+    # A disabled Sunday AMD run has no rows; job-if is evaluated before matrix.
+    if: ${{ needs.plan.outputs.matrix != '[]' }}
     strategy:
       fail-fast: false
       matrix:
@@ -153,8 +186,22 @@ jobs:
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
+      # The pinned TokenSpeed engine runs on its Rust control plane and
+      # carries no in-process Python frontend, so its workers run the Rust
+      # servicer, as on the pull-request lanes; the other engines keep their
+      # servicer package's default.
+      servicer_impl: ${{ matrix.engine == 'tokenspeed' && 'rust' || '' }}
       gpu_tier: "4"
-      runner: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
+      runner: ${{ matrix.vendor == 'amd' && (vars.SMG_RUNNER_AMD_GPU_8 || '8-gpu-mi300x') || (vars.SMG_RUNNER_GPU_4 || '4-gpu-h100') }}
+      # The AMD rows run in vLLM's ROCm image of the CI's vLLM pin
+      # (scripts/ci_install_vllm.sh), which ships NIXL, UCX and MoRI. The
+      # container gets the GPUs, the runner's model cache and its HF_TOKEN, but
+      # no RDMA devices, so MoRI-IO moves KV over XGMI.
+      gpu_vendor: ${{ matrix.vendor || 'nvidia' }}
+      container_image: ${{ matrix.vendor == 'amd' && 'vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f' || '' }}
+      container_options: ${{ matrix.vendor == 'amd' && (vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') || '' }}
+      vllm_moriio_mode: ${{ matrix.moriio_mode || '' }}
+      vllm_moriio_backend: ${{ matrix.kv_backend == 'moriio' && 'xgmi' || '' }}
       # The whole sweep: ten topologies (eight gRPC, two HTTP), eight on
       # TokenSpeed (no HTTP frontend), each with worker restarts; TokenSpeed
       # also extracts its engine image and loads a slower model. Run
@@ -165,8 +212,9 @@ jobs:
       test_dirs: e2e_test/router/test_pd_topologies.py
       kv_backend: ${{ matrix.kv_backend || '' }}
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
-      # The mixed-transport fleet needs both vLLM backends installed whatever the row's own
-      vllm_extra_kv_backends: ${{ matrix.engine == 'vllm' && 'mooncake' || '' }}
+      # The mixed-transport fleet needs both vLLM backends installed whatever the
+      # row's own; the AMD image has no Mooncake, so those rows skip that fleet.
+      vllm_extra_kv_backends: ${{ matrix.engine == 'vllm' && matrix.vendor != 'amd' && 'mooncake' || '' }}
       # A row's own filter always applies; a dispatch filter narrows within it.
       test_filter: >-
         ${{ (inputs.filter != '' && matrix.filter != '')

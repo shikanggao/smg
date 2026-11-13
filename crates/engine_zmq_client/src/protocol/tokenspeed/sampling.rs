@@ -1,7 +1,7 @@
-// TokenSpeed `SamplingParams` — a Python `msgspec.Struct(kw_only=True,
-// array_like=True)` (runtime/sampling/sampling_params.py), so it rides the
-// wire as an untagged positional msgpack array nested inside the tokenized
-// request. **Field order is the wire contract** — append only, never reorder.
+//! TokenSpeed `SamplingParams` — a Python `msgspec.Struct(kw_only=True,
+//! array_like=True)` (runtime/sampling/sampling_params.py), so it rides the
+//! wire as an untagged positional msgpack array nested inside the tokenized
+//! request. **Field order is the wire contract** — append only, never reorder.
 
 use std::collections::HashMap;
 
@@ -14,8 +14,10 @@ use crate::codec::OpaqueValue;
 /// downstream kernels always see a positive cutoff.
 pub const TOP_K_DISABLED: i32 = 1 << 30;
 
-/// TokenSpeed's greedy-sampling threshold: a temperature below this collapses
-/// to greedy (`temperature = 1.0`, `top_k = 1`) during normalization.
+/// TokenSpeed's greedy-sampling threshold: a non-negative temperature below
+/// this collapses to greedy (`temperature = 1.0`, `top_k = 1`) during
+/// normalization. A negative one is not greedy: the engine's range check
+/// refuses it.
 const SAMPLING_EPS: f64 = 1e-6;
 
 /// Engine-facing sampling parameters for TokenSpeed text generation.
@@ -35,7 +37,8 @@ pub struct SamplingParams {
     /// Token IDs that stop generation (a Python set; encoded as an array).
     /// The normalized form uses `None` rather than an empty collection.
     pub stop_token_ids: Option<Vec<u32>>,
-    /// Controls randomness. Below [`SAMPLING_EPS`] normalizes to greedy.
+    /// Controls randomness. From zero up to `SAMPLING_EPS` normalizes to
+    /// greedy; a negative value rides as sent, for the engine to refuse.
     pub temperature: f64,
     /// Cumulative probability threshold for nucleus sampling.
     pub top_p: f64,
@@ -75,8 +78,8 @@ pub struct SamplingParams {
     pub custom_params: Option<OpaqueValue>,
     /// Streaming flush interval override. Not set by SMG.
     pub stream_interval: Option<u32>,
-    /// Per-token logit bias, keyed by stringified token id. SMG rejects
-    /// logit_bias upstream (no support on this backend).
+    /// Per-token logit bias, keyed by stringified token id, as the chat and
+    /// completion requests carry it (validated to -100..=100 at the gateway).
     pub logit_bias: Option<HashMap<String, f64>>,
     /// Random seed. `None` lets the engine derive one from the rid so all
     /// TP/DP ranks agree.
@@ -140,7 +143,8 @@ impl SamplingParams {
     /// would otherwise compute, and mark the struct normalized so the engine
     /// skips re-derivation on decode. Mirrors the Python semantics exactly:
     /// empty `stop_token_ids` collapses to `None`, a near-zero temperature
-    /// collapses to greedy, and `top_k = -1` becomes [`TOP_K_DISABLED`].
+    /// collapses to greedy, a greedy request pins its seed to 0, and
+    /// `top_k = -1` becomes [`TOP_K_DISABLED`].
     pub fn normalize(&mut self) {
         if self.is_normalized {
             return;
@@ -148,9 +152,21 @@ impl SamplingParams {
         if self.stop_token_ids.as_ref().is_some_and(Vec::is_empty) {
             self.stop_token_ids = None;
         }
-        if self.temperature < SAMPLING_EPS {
+        // The engine's bound has a floor too: a negative temperature is not
+        // greedy, it fails the engine's range check ("temperature must be
+        // non-negative") as it does on the in-process path.
+        if (0.0..SAMPLING_EPS).contains(&self.temperature) {
             self.temperature = 1.0;
             self.top_k = 1;
+        }
+        if self.top_k == 1 {
+            // Greedy sampling (from the temperature or asked for directly)
+            // ignores randomness by definition, so the engine pins the seed:
+            // its sampler breaks exact-tie logits with the request's random
+            // stream, and the seed it would otherwise derive from the request
+            // id makes two identical greedy requests disagree on tied tokens.
+            // A sender that skips the engine's derivation has to pin it too.
+            self.seed = Some(0);
         }
         if self.top_k == -1 {
             self.top_k = TOP_K_DISABLED;
@@ -227,14 +243,38 @@ mod tests {
         assert_eq!(params.top_k, TOP_K_DISABLED);
         assert!(params.is_normalized);
 
-        // Near-zero temperature collapses to greedy.
+        // Near-zero temperature collapses to greedy, and greedy pins the seed
+        // (the engine's rule: ties are broken by the request's random stream).
         let mut params = SamplingParams {
             temperature: 0.0,
+            seed: Some(7),
             ..SamplingParams::default()
         };
         params.normalize();
         assert_eq!(params.temperature, 1.0);
         assert_eq!(params.top_k, 1);
+        assert_eq!(params.seed, Some(0));
+
+        // An explicit top_k = 1 is greedy too and pins the seed the same way.
+        let mut params = SamplingParams {
+            top_k: 1,
+            ..SamplingParams::default()
+        };
+        params.normalize();
+        assert_eq!(params.seed, Some(0));
+
+        // A sampling request keeps its seed (or its None, which the engine
+        // derives from the request id).
+        let mut params = SamplingParams {
+            temperature: 0.7,
+            seed: Some(7),
+            ..SamplingParams::default()
+        };
+        params.normalize();
+        assert_eq!(params.seed, Some(7));
+        let mut params = SamplingParams::default();
+        params.normalize();
+        assert_eq!(params.seed, None);
 
         // Empty stop_token_ids collapses to None.
         let mut params = SamplingParams {
@@ -252,5 +292,32 @@ mod tests {
         params.normalize();
         params.normalize();
         assert_eq!(params.top_k, 40);
+    }
+
+    /// The engine collapses `0 <= temperature < eps` only: a negative one is
+    /// not greedy, it fails the engine's range check. The wire leaves it as
+    /// sent, with the request's seed, so the engine refuses it as it refuses
+    /// the in-process path's.
+    #[test]
+    fn a_negative_temperature_is_left_for_the_engine_to_refuse() {
+        let mut params = SamplingParams {
+            temperature: -0.5,
+            seed: Some(7),
+            ..SamplingParams::default()
+        };
+        params.normalize();
+        assert_eq!(
+            (params.temperature, params.top_k, params.seed),
+            (-0.5, TOP_K_DISABLED, Some(7))
+        );
+        assert!(params.is_normalized);
+
+        // Zero itself is greedy.
+        let mut params = SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        };
+        params.normalize();
+        assert_eq!((params.temperature, params.top_k), (1.0, 1));
     }
 }

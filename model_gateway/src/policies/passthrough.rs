@@ -7,7 +7,7 @@ use std::sync::{
 
 use tracing::warn;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{LoadBalancingPolicy, SelectWorkerInfo};
 use crate::worker::Worker;
 
 /// Passthrough selection policy for single-backend deployments.
@@ -36,11 +36,7 @@ impl PassthroughPolicy {
 }
 
 impl LoadBalancingPolicy for PassthroughPolicy {
-    fn select_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        _info: &SelectWorkerInfo,
-    ) -> Option<usize> {
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         if workers.len() > 1 && !self.warned_multi_worker.swap(true, Ordering::Relaxed) {
             warn!(
                 worker_count = workers.len(),
@@ -49,7 +45,9 @@ impl LoadBalancingPolicy for PassthroughPolicy {
             );
         }
 
-        get_healthy_worker_indices(workers).first().copied()
+        workers
+            .iter()
+            .position(|worker| info.admits(worker.routing_state()))
     }
 
     fn name(&self) -> &'static str {
@@ -63,31 +61,15 @@ impl LoadBalancingPolicy for PassthroughPolicy {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
-
-    fn worker(url: &str) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Regular)
-                .health_config(no_health_check())
-                .build(),
-        )
-    }
+    use crate::policies::test_support::make_worker;
 
     #[test]
     fn test_selects_only_worker() {
         let policy = PassthroughPolicy::new();
-        let workers = vec![worker("http://w1:8000")];
+        let workers = vec![make_worker("http://w1:8000")];
         for _ in 0..10 {
             assert_eq!(
                 policy.select_worker(&workers, &SelectWorkerInfo::default()),
@@ -99,7 +81,7 @@ mod tests {
     #[test]
     fn test_selects_first_healthy_with_two_workers() {
         let policy = PassthroughPolicy::new();
-        let workers = vec![worker("http://w1:8000"), worker("http://w2:8000")];
+        let workers = vec![make_worker("http://w1:8000"), make_worker("http://w2:8000")];
         // Deterministic: always the first healthy index.
         for _ in 0..10 {
             assert_eq!(
@@ -112,7 +94,7 @@ mod tests {
     #[test]
     fn test_skips_unhealthy_first_worker() {
         let policy = PassthroughPolicy::new();
-        let workers = vec![worker("http://w1:8000"), worker("http://w2:8000")];
+        let workers = vec![make_worker("http://w1:8000"), make_worker("http://w2:8000")];
         workers[0].set_status(WorkerStatus::NotReady);
         for _ in 0..10 {
             assert_eq!(
@@ -135,7 +117,7 @@ mod tests {
     #[test]
     fn test_none_when_all_unhealthy() {
         let policy = PassthroughPolicy::new();
-        let workers = vec![worker("http://w1:8000"), worker("http://w2:8000")];
+        let workers = vec![make_worker("http://w1:8000"), make_worker("http://w2:8000")];
         workers[0].set_status(WorkerStatus::NotReady);
         workers[1].set_status(WorkerStatus::NotReady);
         assert_eq!(

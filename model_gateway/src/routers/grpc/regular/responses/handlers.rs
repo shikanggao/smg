@@ -24,21 +24,22 @@
 
 use std::sync::Arc;
 
-use axum::{
-    http,
-    response::{IntoResponse, Response},
-};
-use openai_protocol::responses::ResponsesRequest;
+use axum::{http, response::Response};
+use openai_protocol::responses::{ResponsesRequest, ResponsesResponse};
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{
-    common::{load_conversation_history, ResponsesCallContext},
-    conversions, non_streaming, streaming,
-};
-use crate::routers::{
-    error,
-    grpc::common::responses::{ensure_mcp_connection, ResponsesContext},
+use super::{common::ResponsesCallContext, conversions, non_streaming, streaming};
+use crate::{
+    middleware::TenantRequestMeta,
+    routers::{
+        common::json_response,
+        error,
+        grpc::common::responses::{
+            ensure_mcp_connection, load_history, naming_parser, BackgroundStream, ReplayInto,
+            ResponsesContext,
+        },
+    },
 };
 
 /// Main handler for POST /v1/responses
@@ -48,7 +49,7 @@ pub(crate) async fn route_responses(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
     headers: Option<http::HeaderMap>,
-    tenant_request_meta: crate::middleware::TenantRequestMeta,
+    tenant_request_meta: TenantRequestMeta,
     model_id: String,
 ) -> Response {
     // Route based on execution mode
@@ -60,7 +61,7 @@ pub(crate) async fn route_responses(
             response_id: None,
             tenant_request_meta,
         };
-        route_responses_streaming(ctx, request, params).await
+        route_responses_streaming(ctx, request, params, None).await
     } else {
         let params = ResponsesCallContext {
             headers,
@@ -72,18 +73,65 @@ pub(crate) async fn route_responses(
     }
 }
 
+/// The work of a background response (`background: true` without a stream):
+/// the sync path under the id its `queued` record was stored under; the
+/// terminal object is persisted under that id by the path itself. Its client
+/// has the `queued` object before any read, so the parser that read the
+/// answer has no header to ride on here (the background stream names it).
+pub(crate) async fn route_responses_background(
+    ctx: &ResponsesContext,
+    request: Arc<ResponsesRequest>,
+    headers: Option<http::HeaderMap>,
+    tenant_request_meta: TenantRequestMeta,
+    model_id: String,
+    response_id: String,
+) -> Result<ResponsesResponse, Response> {
+    let params = ResponsesCallContext {
+        headers,
+        model_id,
+        response_id: Some(response_id),
+        tenant_request_meta,
+    };
+    non_streaming::route_responses_internal(ctx, request, params)
+        .await
+        .map(|(responses_response, _parser)| responses_response)
+}
+
+/// A background response the client streams: the stream runs under the id
+/// its `queued` record was stored under and carries `response.queued`.
+pub(crate) async fn route_responses_background_stream(
+    ctx: &ResponsesContext,
+    request: Arc<ResponsesRequest>,
+    headers: Option<http::HeaderMap>,
+    tenant_request_meta: TenantRequestMeta,
+    model_id: String,
+    background: BackgroundStream,
+) -> Response {
+    let params = ResponsesCallContext {
+        headers,
+        model_id,
+        response_id: Some(background.id().to_string()),
+        tenant_request_meta,
+    };
+    route_responses_streaming(ctx, request, params, Some(background)).await
+}
+
 // ============================================================================
 // Synchronous Entry Point
 // ============================================================================
 
-/// Execute synchronous responses request
+/// Execute synchronous responses request; the answer names the parser that
+/// read it, as the chat route does.
 async fn route_responses_sync(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
     params: ResponsesCallContext,
 ) -> Response {
     match non_streaming::route_responses_internal(ctx, request, params).await {
-        Ok(responses_response) => axum::Json(responses_response).into_response(),
+        Ok((responses_response, parser)) => naming_parser(
+            json_response(&responses_response),
+            parser.map(|parser| http::HeaderValue::from_static(parser.name())),
+        ),
         Err(response) => response, // Already a Response with proper status code
     }
 }
@@ -97,9 +145,18 @@ async fn route_responses_streaming(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
     params: ResponsesCallContext,
+    background: Option<BackgroundStream>,
 ) -> Response {
-    // 1. Load conversation history
-    let modified_request = match load_conversation_history(ctx, &request).await {
+    // 1. Load conversation history, as the caller's tenant may see it
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let modified_request = match load_history(
+        ctx.history_stores(),
+        &request,
+        tenant.as_deref(),
+        ReplayInto::Chat,
+    )
+    .await
+    {
         Ok(req) => req,
         Err(response) => return response, // Already a Response with proper status code
     };
@@ -125,20 +182,26 @@ async fn route_responses_streaming(
             &request,
             params,
             mcp_servers,
-        );
+            background,
+        )
+        .await;
     }
 
     // 3. Convert ResponsesRequest → ChatCompletionRequest
     let chat_request = match conversions::responses_to_chat(&modified_request) {
         Ok(req) => Arc::new(req),
         Err(e) => {
-            return error::bad_request(
-                "convert_request_failed",
-                format!("Failed to convert request: {e}"),
-            );
+            return error::bad_request(e.code(), format!("Failed to convert request: {e}"));
         }
     };
 
     // 4. Execute chat pipeline and convert streaming format (no MCP tools)
-    streaming::convert_chat_stream_to_responses_stream(ctx, chat_request, params, &request).await
+    streaming::convert_chat_stream_to_responses_stream(
+        ctx,
+        chat_request,
+        params,
+        &request,
+        background,
+    )
+    .await
 }

@@ -1,0 +1,991 @@
+//! Integration tests for the Redis backend against a live Redis server.
+//!
+//! Opt-in (`#[ignore]`) like the Postgres ones, since they need a real server.
+//! To run locally:
+//!
+//!   docker run -d -p 6379:6379 redis:7
+//!   DATA_CONNECTOR_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
+//!       cargo test -p data-connector --test redis_integration -- --ignored
+
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use data_connector::{
+    create_storage, AddedAtSequence, ConditionalStore, ConversationItemId, HistoryBackend,
+    ListParams, NewConversation, NewConversationItem, RedisConfig, ResponseId, ResponseStorage,
+    SchemaConfig, SortOrder, StorageBundle, StorageFactoryConfig, StoredResponse,
+};
+use redis::aio::MultiplexedConnection;
+use serde_json::json;
+
+mod common;
+use common::Relay;
+
+fn test_redis_url() -> Option<String> {
+    std::env::var("DATA_CONNECTOR_TEST_REDIS_URL").ok()
+}
+
+/// The retention the bundles below are built with: one day, in the days the
+/// configuration takes and in the milliseconds `PTTL` answers.
+const RETENTION_DAYS: u64 = 1;
+const RETENTION_MS: i64 = 86_400_000;
+
+async fn redis_bundle(url: &str) -> Result<StorageBundle, String> {
+    let redis_cfg = RedisConfig {
+        url: url.to_string(),
+        pool_max: 4,
+        op_timeout_secs: RedisConfig::default_op_timeout_secs(),
+        schema: None,
+        retention_days: Some(RETENTION_DAYS),
+    };
+    create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Redis,
+        oracle: None,
+        postgres: None,
+        redis: Some(&redis_cfg),
+        memory: None,
+        hook: None,
+    })
+    .await
+}
+
+/// A response with two output items whose ids are unique to this run (the
+/// server keeps the keys of earlier runs).
+fn response_with_output_items() -> (StoredResponse, String, String) {
+    let mut stored = StoredResponse::new(None);
+    let msg_id = format!("msg_{}", stored.id.0);
+    let rs_id = format!("rs_{}", stored.id.0);
+    stored.input = json!([{"type": "message", "role": "user", "content": "hi"}]);
+    stored.raw_response = json!({
+        "id": stored.id.0,
+        "output": [
+            {"type": "reasoning", "id": rs_id, "summary": []},
+            {"type": "message", "id": msg_id, "role": "assistant", "status": "completed",
+             "content": [{"type": "output_text", "text": "hello", "annotations": []}]}
+        ]
+    });
+    (stored, msg_id, rs_id)
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn find_response_by_output_item_follows_the_keys_written_at_store_time() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let resp = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage")
+        .response_storage;
+
+    let (stored, msg_id, rs_id) = response_with_output_items();
+    let response_id = resp.store_response(stored).await.expect("store response");
+
+    for item_id in [&msg_id, &rs_id] {
+        let found = resp
+            .find_response_by_output_item(item_id)
+            .await
+            .expect("lookup by output item id");
+        assert_eq!(found.map(|r| r.id), Some(response_id.clone()), "{item_id}");
+    }
+    let unknown = resp
+        .find_response_by_output_item(&format!("msg_unknown_{}", response_id.0))
+        .await
+        .expect("lookup of an unknown id");
+    assert!(unknown.is_none());
+
+    // The keys go with the response.
+    resp.delete_response(&response_id)
+        .await
+        .expect("delete response");
+    let gone = resp
+        .find_response_by_output_item(&msg_id)
+        .await
+        .expect("lookup after delete");
+    assert!(gone.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn deleting_the_responses_of_an_identifier_drops_their_output_item_keys() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let resp = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage")
+        .response_storage;
+
+    let (mut stored, msg_id, _) = response_with_output_items();
+    let identifier = format!("sid_{}", stored.id.0);
+    stored.safety_identifier = Some(identifier.clone());
+    resp.store_response(stored).await.expect("store response");
+    assert!(resp
+        .find_response_by_output_item(&msg_id)
+        .await
+        .expect("lookup by output item id")
+        .is_some());
+
+    let deleted = resp
+        .delete_identifier_responses(&identifier, None)
+        .await
+        .expect("delete the identifier's responses");
+    assert_eq!(deleted, 1);
+    let gone = resp
+        .find_response_by_output_item(&msg_id)
+        .await
+        .expect("lookup after delete");
+    assert!(gone.is_none());
+}
+
+/// A conversation longer than a listing's limit: under `Desc` the listing is
+/// the newest items, newest first (the window a request replays, put back in
+/// stored order by its loader); under `Asc` the oldest, oldest first (the
+/// public listing's default page). The same limit, the two ends of the
+/// conversation.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_conversation_longer_than_the_listing_lists_its_newest_items_under_desc_and_its_oldest_under_asc(
+) {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let bundle = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage");
+    let conversation = bundle
+        .conversation_storage
+        .create_conversation(NewConversation {
+            id: None,
+            metadata: None,
+            tenant: None,
+        })
+        .await
+        .expect("create conversation");
+    let items = bundle.conversation_item_storage;
+
+    // 150 items, their ids unique to this run (the server keeps the keys of earlier runs), linked
+    // in order and each stamped later than the one before, as the conversations API does.
+    let nonce = &conversation.id.0;
+    let mut stamps = AddedAtSequence::new();
+    let mut ids = Vec::new();
+    for n in 1..=150 {
+        let id = ConversationItemId::from(format!("msg_{n}_{nonce}").as_str());
+        items
+            .create_item(NewConversationItem {
+                id: Some(id.clone()),
+                response_id: None,
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([]),
+                status: Some("completed".to_string()),
+                tenant: None,
+            })
+            .await
+            .expect("create item");
+        items
+            .link_item(&conversation.id, &id, stamps.next_added_at())
+            .await
+            .expect("link item");
+        ids.push(id);
+    }
+
+    let list = |order: SortOrder| {
+        let items = items.clone();
+        let conversation_id = conversation.id.clone();
+        let params = ListParams {
+            limit: 101,
+            order,
+            after: None,
+        };
+        async move {
+            items
+                .list_items(&conversation_id, params)
+                .await
+                .expect("list items")
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let newest_first: Vec<ConversationItemId> = ids[49..].iter().rev().cloned().collect();
+    assert_eq!(list(SortOrder::Desc).await, newest_first);
+    assert_eq!(list(SortOrder::Asc).await, ids[..101].to_vec());
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn deleting_a_conversation_answers_once_whether_it_existed() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let bundle = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage");
+    let conversations = bundle.conversation_storage;
+    let created = conversations
+        .create_conversation(NewConversation::default())
+        .await
+        .expect("create conversation");
+
+    // The delete pipeline removes the conversation key and its item index
+    // (two counts); the store answers whether the conversation existed.
+    let deleted = conversations
+        .delete_conversation(&created.id)
+        .await
+        .expect("delete an existing conversation");
+    assert!(deleted, "the conversation existed");
+    let again = conversations
+        .delete_conversation(&created.id)
+        .await
+        .expect("delete a conversation that is gone");
+    assert!(!again, "a second delete finds nothing");
+    assert!(conversations
+        .get_conversation(&created.id)
+        .await
+        .expect("lookup after delete")
+        .is_none());
+}
+
+/// A store that accepts the connection and then stops answering (a frozen or
+/// partitioned server, a stalled proxy) fails the call at the configured
+/// bound, with an error that names the backend, the call and the bound; once
+/// the store answers again, the same pool serves the next call.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_store_that_stops_answering_fails_the_call_at_its_bound() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let (relay, relayed_url) = Relay::in_front_of(&url, 6379).expect("start the relay");
+    // The bound as an operator configures it; one second here.
+    let redis_cfg: RedisConfig = serde_json::from_value(json!({
+        "url": relayed_url,
+        "pool_max": 4,
+        "op_timeout_secs": 1,
+        "retention_days": 1,
+    }))
+    .expect("a Redis config with a call bound");
+    let resp = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Redis,
+        oracle: None,
+        postgres: None,
+        redis: Some(&redis_cfg),
+        memory: None,
+        hook: None,
+    })
+    .await
+    .expect("failed to initialize Redis storage")
+    .response_storage;
+    let mut stored = StoredResponse::new(None);
+    stored.raw_response = json!({"id": stored.id.0, "status": "completed"});
+    let id = resp.store_response(stored).await.expect("store response");
+
+    relay.hold();
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), resp.get_response(&id)).await;
+    let elapsed = started.elapsed();
+    relay.release();
+    let result = outcome.unwrap_or_else(|_| {
+        panic!("the read was still waiting on the store after 10 s: nothing bounds a store call")
+    });
+    let err = result.expect_err("a store that does not answer must fail the call");
+    assert!(
+        elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
+        "the call failed after {elapsed:?}; the bound is 1 s"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("redis get_response") && message.contains("bound of 1 s"),
+        "{message}"
+    );
+
+    // The store answers again: the pool serves the next call.
+    let read_back = tokio::time::timeout(Duration::from_secs(10), resp.get_response(&id))
+        .await
+        .expect("the read after the release must return")
+        .expect("the read after the release must succeed");
+    assert_eq!(read_back.map(|r| r.id), Some(id));
+}
+
+/// A store a few hundred milliseconds away still answers: the configured
+/// call bound, not the client library's own defaults, decides how slow is
+/// too slow.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_store_a_few_hundred_milliseconds_away_still_answers() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let (relay, relayed_url) = Relay::in_front_of(&url, 6379).expect("start the relay");
+    // 400 ms on each direction: about 0.8 s per round trip, connecting included.
+    relay.delay(Duration::from_millis(400));
+    // The default bound.
+    let redis_cfg: RedisConfig = serde_json::from_value(json!({
+        "url": relayed_url,
+        "pool_max": 4,
+        "retention_days": 1,
+    }))
+    .expect("a Redis config with the default call bound");
+    let resp = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Redis,
+        oracle: None,
+        postgres: None,
+        redis: Some(&redis_cfg),
+        memory: None,
+        hook: None,
+    })
+    .await
+    .expect("failed to initialize Redis storage")
+    .response_storage;
+    let mut stored = StoredResponse::new(None);
+    stored.raw_response = json!({"id": stored.id.0, "status": "completed"});
+    let started = Instant::now();
+    let id = resp
+        .store_response(stored)
+        .await
+        .expect("a store a few hundred milliseconds away must take the write");
+    let read_back = resp
+        .get_response(&id)
+        .await
+        .expect("a store a few hundred milliseconds away must answer the read");
+    assert_eq!(read_back.map(|r| r.id), Some(id));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "two calls took {:?}",
+        started.elapsed()
+    );
+}
+
+/// Under a schema that skips the object column there is no status to check:
+/// the conditional store writes while the record exists and answers
+/// `Missing` only for a record that is gone, as the SQL stores' plain update
+/// does for the same schema (it answered `Missing` for every record before
+/// and wrote nothing). Under the default schema a hash that lost its object
+/// field counts as open the same way, as a NULL object column does in the
+/// SQL stores.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_conditional_store_without_an_object_column_writes_while_the_record_exists() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let mut schema = SchemaConfig::default();
+    schema
+        .responses
+        .skip_columns
+        .insert("raw_response".to_string());
+    let redis_cfg = RedisConfig {
+        url: url.clone(),
+        pool_max: 4,
+        op_timeout_secs: RedisConfig::default_op_timeout_secs(),
+        schema: Some(schema),
+        retention_days: Some(1),
+    };
+    let resp = create_storage(StorageFactoryConfig {
+        backend: &HistoryBackend::Redis,
+        oracle: None,
+        postgres: None,
+        redis: Some(&redis_cfg),
+        memory: None,
+        hook: None,
+    })
+    .await
+    .expect("failed to initialize Redis storage")
+    .response_storage;
+
+    let mut queued = StoredResponse::new(None);
+    queued.model = Some("m".to_string());
+    queued.raw_response = json!({"id": queued.id.0, "status": "queued"});
+    let id = resp
+        .store_response(queued.clone())
+        .await
+        .expect("store response");
+    let mut result = queued.clone();
+    result.model = Some("m2".to_string());
+    result.raw_response = json!({"id": id.0, "status": "completed"});
+    assert!(
+        matches!(
+            resp.store_response_if_open(result)
+                .await
+                .expect("conditional store"),
+            ConditionalStore::Stored
+        ),
+        "the record exists: the write lands"
+    );
+    let read = resp
+        .get_response(&id)
+        .await
+        .expect("read")
+        .expect("the record");
+    assert_eq!(read.model.as_deref(), Some("m2"), "the write landed");
+    assert!(read.raw_response.is_null(), "no object column");
+    // Nothing closes a record without a status: a further write lands too,
+    // and a transition has nothing to move.
+    assert!(matches!(
+        resp.store_response_if_open(queued.clone())
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+    assert!(matches!(
+        resp.update_response_object_if_open(&id, json!({"id": id.0, "status": "cancelled"}))
+            .await
+            .expect("conditional update"),
+        ConditionalStore::Stored
+    ));
+    let mut unknown = queued.clone();
+    unknown.id = ResponseId::new();
+    assert!(
+        matches!(
+            resp.store_response_if_open(unknown)
+                .await
+                .expect("conditional store"),
+            ConditionalStore::Missing
+        ),
+        "a record that is gone takes nothing"
+    );
+    resp.delete_response(&id).await.expect("delete response");
+
+    // The default schema: a hash that lost its object field is open, not missing.
+    let resp = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage")
+        .response_storage;
+    let mut queued = StoredResponse::new(None);
+    queued.raw_response = json!({"id": queued.id.0, "status": "queued"});
+    let id = resp
+        .store_response(queued.clone())
+        .await
+        .expect("store response");
+    let client = redis::Client::open(url.as_str()).expect("a client for the test's own commands");
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect");
+    let removed: i64 = redis::cmd("HDEL")
+        .arg(format!("response:{}", id.0))
+        .arg("raw_response")
+        .query_async(&mut conn)
+        .await
+        .expect("drop the object field");
+    assert_eq!(removed, 1);
+    let mut completed = queued.clone();
+    completed.raw_response = json!({"id": id.0, "status": "completed"});
+    assert!(
+        matches!(
+            resp.store_response_if_open(completed)
+                .await
+                .expect("conditional store"),
+            ConditionalStore::Stored
+        ),
+        "a hash without the object field is open"
+    );
+    let read = resp
+        .get_response(&id)
+        .await
+        .expect("read")
+        .expect("the record");
+    assert_eq!(read.raw_response["status"], "completed");
+    resp.delete_response(&id).await.expect("delete response");
+}
+
+/// A background record on its way through the store, reached through a
+/// relay: stored as `queued`, moved to `in_progress` once (which leaves the
+/// conditional script in the server's cache, so the next conditional write
+/// is one `EVALSHA` whose answer the relay can drop), its retention
+/// shortened to 600 s so a refresh shows. With it the result that closes it
+/// (two output items) and a connection of the test's own to the server for
+/// what the storage does not expose.
+struct OpenRecord {
+    relay: Relay,
+    storage: Arc<dyn ResponseStorage>,
+    server: MultiplexedConnection,
+    result: StoredResponse,
+    msg_id: String,
+    rs_id: String,
+    hash_key: String,
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "the helpers of the tests below: a failure in one fails the test"
+)]
+impl OpenRecord {
+    async fn through_a_relay(url: &str) -> Self {
+        let (relay, relayed_url) = Relay::in_front_of(url, 6379).expect("start the relay");
+        let storage = redis_bundle(&relayed_url)
+            .await
+            .expect("failed to initialize Redis storage")
+            .response_storage;
+        let mut server = redis::Client::open(url)
+            .expect("a client for the test's own commands")
+            .get_multiplexed_async_connection()
+            .await
+            .expect("connect");
+
+        let (mut result, msg_id, rs_id) = response_with_output_items();
+        result.raw_response["status"] = json!("completed");
+        let id = result.id.clone();
+        let mut queued = result.clone();
+        queued.raw_response = json!({"id": id.0, "status": "queued", "output": []});
+        storage
+            .store_response(queued)
+            .await
+            .expect("store the queued record");
+        assert!(matches!(
+            storage
+                .update_response_object_if_open(
+                    &id,
+                    json!({"id": id.0, "status": "in_progress", "output": []})
+                )
+                .await
+                .expect("the first transition"),
+            ConditionalStore::Stored
+        ));
+        let hash_key = format!("response:{}", id.0);
+        let _: () = redis::cmd("EXPIRE")
+            .arg(&hash_key)
+            .arg(600)
+            .query_async(&mut server)
+            .await
+            .expect("shorten the record's retention");
+        Self {
+            relay,
+            storage,
+            server,
+            result,
+            msg_id,
+            rs_id,
+            hash_key,
+        }
+    }
+
+    /// The seconds left on `key` (`-2`: no such key).
+    async fn ttl(&mut self, key: &str) -> i64 {
+        redis::cmd("TTL")
+            .arg(key)
+            .query_async(&mut self.server)
+            .await
+            .expect("TTL")
+    }
+
+    /// The response the output-item key of `item_id` finds.
+    async fn found_by(&self, item_id: &str) -> Option<ResponseId> {
+        self.storage
+            .find_response_by_output_item(item_id)
+            .await
+            .expect("lookup by output item id")
+            .map(|response| response.id)
+    }
+
+    /// The record holds the object in `status`, each of its output items
+    /// finds it, the keys carry the retention and the hash has it afresh.
+    async fn assert_holds(&mut self, status: &str) {
+        let current = self
+            .storage
+            .get_response(&self.result.id)
+            .await
+            .expect("read")
+            .expect("the record");
+        assert_eq!(current.raw_response["status"], status);
+        for item_id in [self.msg_id.clone(), self.rs_id.clone()] {
+            assert_eq!(
+                self.found_by(&item_id).await.as_ref(),
+                Some(&self.result.id),
+                "{item_id}: the record holds the object, so the item's key finds it"
+            );
+            let left = self.ttl(&format!("output_item:{item_id}")).await;
+            assert!(
+                left > 0 && left <= 86_400,
+                "{item_id}: the key carries the retention ({left} s left)"
+            );
+        }
+        let left = self.ttl(&self.hash_key.clone()).await;
+        assert!(
+            left > 600,
+            "the write refreshes the record's retention ({left} s left)"
+        );
+    }
+}
+
+/// The connection drops once the conditional store's script has run and
+/// before its answer arrives: the call fails, the record holds the result,
+/// and the retry finds it closed. The output-item keys that find the
+/// response and the refreshed retention are there all the same: the script
+/// writes them with the record. Before, a pipeline after the script wrote
+/// them, the drop lost it, and the retry (refused: the record is closed)
+/// never redid it, so an item reference to the response's output found
+/// nothing for good.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_conditional_store_whose_answer_is_lost_has_written_its_output_item_keys() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let mut record = OpenRecord::through_a_relay(&url).await;
+
+    record.relay.cut_after("EVALSHA");
+    let lost = record
+        .storage
+        .store_response_if_open(record.result.clone())
+        .await;
+    assert!(
+        lost.is_err(),
+        "the answer went with the connection, so the call fails: {lost:?}"
+    );
+    record.assert_holds("completed").await;
+
+    // The retry finds the record closed with this very result and writes
+    // nothing more; the keys stay.
+    let ConditionalStore::Closed(current) = record
+        .storage
+        .store_response_if_open(record.result.clone())
+        .await
+        .expect("the retry")
+    else {
+        panic!("the retry finds the record closed");
+    };
+    assert_eq!(current.raw_response["status"], "completed");
+    record.assert_holds("completed").await;
+
+    record
+        .storage
+        .delete_response(&record.result.id)
+        .await
+        .expect("delete response");
+    assert!(record.found_by(&record.msg_id).await.is_none());
+}
+
+/// The same drop on a status transition that carries output items (a cancel
+/// with the output so far): the moved object's items find the response and
+/// the retention is refreshed, whatever became of the connection after the
+/// script.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn a_conditional_object_update_whose_answer_is_lost_has_written_its_output_item_keys() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let mut record = OpenRecord::through_a_relay(&url).await;
+    let mut cancelled = record.result.raw_response.clone();
+    cancelled["status"] = json!("cancelled");
+
+    record.relay.cut_after("EVALSHA");
+    let lost = record
+        .storage
+        .update_response_object_if_open(&record.result.id, cancelled.clone())
+        .await;
+    assert!(
+        lost.is_err(),
+        "the answer went with the connection, so the call fails: {lost:?}"
+    );
+    record.assert_holds("cancelled").await;
+
+    let ConditionalStore::Closed(current) = record
+        .storage
+        .update_response_object_if_open(&record.result.id, cancelled)
+        .await
+        .expect("the retry")
+    else {
+        panic!("the retry finds the record closed");
+    };
+    assert_eq!(current.raw_response["status"], "cancelled");
+    record.assert_holds("cancelled").await;
+
+    record
+        .storage
+        .delete_response(&record.result.id)
+        .await
+        .expect("delete response");
+    assert!(record.found_by(&record.msg_id).await.is_none());
+}
+
+/// The milliseconds left on `key` (`-1`: no expiry, `-2`: no such key),
+/// read through the test's own connection.
+#[expect(
+    clippy::expect_used,
+    reason = "a helper of the tests below: a failure in one fails the test"
+)]
+async fn pttl(server: &mut MultiplexedConnection, key: &str) -> i64 {
+    redis::cmd("PTTL")
+        .arg(key)
+        .query_async(server)
+        .await
+        .expect("PTTL")
+}
+
+/// The milliseconds left on `record` and on `index`, read in one round trip
+/// so the two are compared at one instant.
+#[expect(
+    clippy::expect_used,
+    reason = "a helper of the tests below: a failure in one fails the test"
+)]
+async fn pttl_pair(server: &mut MultiplexedConnection, record: &str, index: &str) -> (i64, i64) {
+    redis::pipe()
+        .cmd("PTTL")
+        .arg(record)
+        .cmd("PTTL")
+        .arg(index)
+        .query_async(server)
+        .await
+        .expect("PTTL")
+}
+
+/// With a retention every conversation hash and item hash expires, and the
+/// sorted set listing a conversation's items did not: it stayed, one member
+/// per item ever linked, after everything it pointed at was gone, so a
+/// conversation never deleted left its index behind for good. The index
+/// carries the retention from its newest link (the one write of the link
+/// and its expiry), so it goes by itself and no earlier than the newest
+/// item it lists; a listing skips the entry of an item the retention took,
+/// as the memory store lists only the items it holds.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn the_item_index_of_a_conversation_expires_with_its_items() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let bundle = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage");
+    let mut server = redis::Client::open(url.as_str())
+        .expect("a client for the test's own commands")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect");
+    let conversations = bundle.conversation_storage;
+    let conversation = conversations
+        .create_conversation(NewConversation::default())
+        .await
+        .expect("create conversation");
+    let items = bundle.conversation_item_storage;
+
+    // Four items, their ids unique to this run (the server keeps the keys of
+    // earlier runs): three linked as a batch, the fourth on its own later.
+    let nonce = &conversation.id.0;
+    let ids: Vec<ConversationItemId> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|s| ConversationItemId::from(format!("msg_{s}_{nonce}").as_str()))
+        .collect();
+    for id in &ids {
+        items
+            .create_item(NewConversationItem {
+                id: Some(id.clone()),
+                response_id: None,
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([]),
+                status: Some("completed".to_string()),
+                tenant: None,
+            })
+            .await
+            .expect("create item");
+    }
+    let mut stamps = AddedAtSequence::new();
+    let batch: Vec<_> = ids[..3]
+        .iter()
+        .map(|id| (id.clone(), stamps.next_added_at()))
+        .collect();
+    items
+        .link_items(&conversation.id, &batch)
+        .await
+        .expect("link items");
+
+    // The index expires as the newest item it lists does: its expiry was
+    // written after the item's with the same retention, so it goes no earlier
+    // (the two reads are one round trip, a millisecond apart at most).
+    let index_key = format!("conversation:{}:items", conversation.id.0);
+    let (item_left, index_left) =
+        pttl_pair(&mut server, &format!("item:{}", ids[2].0), &index_key).await;
+    assert!(
+        item_left > 0 && item_left <= RETENTION_MS,
+        "the item hash carries the retention ({item_left} ms left)"
+    );
+    assert!(
+        index_left > 0,
+        "the item index carries the retention too; with none ({index_left}) it outlives every item it lists"
+    );
+    assert!(
+        index_left <= RETENTION_MS && index_left + 50 >= item_left,
+        "the index ({index_left} ms left) goes with its newest item ({item_left} ms left), not before"
+    );
+
+    // A later link refreshes it: the index lives as long as its newest link.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    items
+        .link_item(&conversation.id, &ids[3], stamps.next_added_at())
+        .await
+        .expect("link item");
+    let refreshed = pttl(&mut server, &index_key).await;
+    assert!(
+        refreshed > RETENTION_MS - 1_000,
+        "a link refreshes the index's retention ({refreshed} ms left of {RETENTION_MS})"
+    );
+
+    // The retention takes the first item (brought forward here through the
+    // test's own connection): the listing skips its entry, as the memory
+    // store lists only the items it holds, and the item is gone.
+    let _: () = redis::cmd("PEXPIRE")
+        .arg(format!("item:{}", ids[0].0))
+        .arg(1)
+        .query_async(&mut server)
+        .await
+        .expect("bring the first item's retention forward");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let listed: Vec<ConversationItemId> = items
+        .list_items(
+            &conversation.id,
+            ListParams {
+                limit: 10,
+                order: SortOrder::Asc,
+                after: None,
+            },
+        )
+        .await
+        .expect("list items")
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    assert_eq!(listed, ids[1..].to_vec(), "the items the retention left");
+    assert!(items.get_item(&ids[0]).await.expect("get item").is_none());
+
+    conversations
+        .delete_conversation(&conversation.id)
+        .await
+        .expect("delete conversation");
+}
+
+/// The sorted set listing a safety identifier's responses had no expiry
+/// either: an identifier never listed again kept one member per response it
+/// ever made, after the records themselves were gone. The index carries the
+/// retention from its newest entry, written with the record's own writes and
+/// refreshed by the conditional writes that refresh the record's (a status
+/// transition's object update, the store of the result); the listing still
+/// drops the entry of a record the retention took, as the memory store lists
+/// only the records it holds.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn the_identifier_index_expires_with_the_responses_it_indexes() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let resp = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage")
+        .response_storage;
+    let mut server = redis::Client::open(url.as_str())
+        .expect("a client for the test's own commands")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect");
+
+    // Two responses under one safety identifier (unique to this run): the
+    // first stored whole, the second queued and then stored through the
+    // conditional write, a background response's way.
+    let mut first = StoredResponse::new(None);
+    let identifier = format!("sid_{}", first.id.0);
+    first.safety_identifier = Some(identifier.clone());
+    first.raw_response = json!({"id": first.id.0, "status": "completed", "output": []});
+    let first_id = resp.store_response(first).await.expect("store the first");
+    let mut second = StoredResponse::new(None);
+    second.safety_identifier = Some(identifier.clone());
+    second.raw_response = json!({"id": second.id.0, "status": "queued", "output": []});
+    let second_id = resp
+        .store_response(second.clone())
+        .await
+        .expect("store the second, queued");
+
+    let index_key = format!("safety:{identifier}:responses");
+    let (record_left, index_left) = pttl_pair(
+        &mut server,
+        &format!("response:{}", second_id.0),
+        &index_key,
+    )
+    .await;
+    assert!(
+        record_left > 0 && record_left <= RETENTION_MS,
+        "the record carries the retention ({record_left} ms left)"
+    );
+    assert!(
+        index_left > 0,
+        "the identifier index carries the retention too; with none ({index_left}) it outlives every response it lists"
+    );
+    assert!(
+        index_left <= RETENTION_MS && index_left + 50 >= record_left,
+        "the index ({index_left} ms left) goes with its newest record ({record_left} ms left), not before"
+    );
+
+    // A status transition's object update refreshes the index's expiry as
+    // its script refreshes the record's, so a record that ends in a failure
+    // or a cancel is listed under its identifier for as long as it exists.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(matches!(
+        resp.update_response_object_if_open(
+            &second_id,
+            json!({"id": second.id.0, "status": "in_progress", "output": []})
+        )
+        .await
+        .expect("conditional update"),
+        ConditionalStore::Stored
+    ));
+    let refreshed = pttl(&mut server, &index_key).await;
+    assert!(
+        refreshed > RETENTION_MS - 1_000,
+        "a status transition refreshes the index's retention ({refreshed} ms left of {RETENTION_MS})"
+    );
+
+    // So does the conditional store of the result.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    second.raw_response = json!({"id": second.id.0, "status": "completed", "output": []});
+    assert!(matches!(
+        resp.store_response_if_open(second)
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+    let refreshed = pttl(&mut server, &index_key).await;
+    assert!(
+        refreshed > RETENTION_MS - 1_000,
+        "a conditional store refreshes the index's retention ({refreshed} ms left of {RETENTION_MS})"
+    );
+
+    // The retention takes the first record (brought forward through the
+    // test's own connection): the listing answers the second alone and drops
+    // the first's entry from the index.
+    let _: () = redis::cmd("PEXPIRE")
+        .arg(format!("response:{}", first_id.0))
+        .arg(1)
+        .query_async(&mut server)
+        .await
+        .expect("bring the first record's retention forward");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let listed: Vec<ResponseId> = resp
+        .list_identifier_responses(&identifier, None, None)
+        .await
+        .expect("list the identifier's responses")
+        .into_iter()
+        .map(|response| response.id)
+        .collect();
+    assert_eq!(
+        listed,
+        vec![second_id.clone()],
+        "the record the retention left"
+    );
+    let members: i64 = redis::cmd("ZCARD")
+        .arg(&index_key)
+        .query_async(&mut server)
+        .await
+        .expect("ZCARD");
+    assert_eq!(
+        members, 1,
+        "the listing dropped the entry of the record that is gone"
+    );
+
+    resp.delete_response(&second_id)
+        .await
+        .expect("delete response");
+}

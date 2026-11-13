@@ -1,0 +1,384 @@
+//! Worker-side media processing (`media_refs`): the request names its media
+//! by reference, and this worker fetches and processes it instead of the
+//! Router. The processor is supplied by the lifecycle owner through
+//! [`MediaProcessor`]; the Python binding bridges to the processors the
+//! Python servicer runs (vLLM's in-process renderer, the Redis sidecar), so
+//! the engine's own input processor does the work either way. What it
+//! produces, the engine's `mm_features` as vLLM encoded them, is relayed to
+//! the engine untouched.
+
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+
+pub use engine_zmq_adapter::ProcessedMedia as MediaFeatures;
+use smg_grpc_client::{
+    common_proto as common, stamp_media_code, vllm_proto as vllm, WorkerMediaFault,
+};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tonic::Status;
+
+use super::State;
+use crate::metrics::{MediaOutcome, MediaStage};
+
+/// A `Send` boxed future, the shape a processor's calls take.
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+/// The reference modalities a processor of pixels takes, as `media_refs`
+/// names them.
+pub const PIXEL_MODALITIES: &[&str] = &["image", "video"];
+/// Every reference modality the wire names, for a processor that takes what
+/// the model takes.
+pub const ALL_MODALITIES: &[&str] = &["image", "video", "audio"];
+
+/// One `media_refs` item: the modality name (`image`, `video`, `audio`) and
+/// the reference to fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaRefItem {
+    pub modality: String,
+    pub url: String,
+}
+
+/// What a processor gets: the request's prompt as the Router sent it (one
+/// placeholder anchor per item, not yet expanded), its text when known, and
+/// the references in prompt order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaRequest {
+    pub request_id: String,
+    pub prompt_token_ids: Vec<u32>,
+    pub prompt_text: Option<String>,
+    pub items: Vec<MediaRefItem>,
+    pub arrival_time: f64,
+    /// Whether to also build the identity a PD prefill side returns on its
+    /// `Complete`, so the decode side is served without pixels or references.
+    pub want_identity: bool,
+}
+
+/// What a processor produced: the prompt with its placeholders expanded, the
+/// engine-side features in the shape its pipeline makes them (vLLM's own
+/// encoding of `mm_features`, or the Router's batches for smg's pipeline),
+/// and, when asked, the identity a PD prefill side returns.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProcessedMedia {
+    pub prompt_token_ids: Vec<u32>,
+    pub features: MediaFeatures,
+    pub media_identity: Option<vllm::MediaIdentity>,
+}
+
+/// Why a processor refused or failed a request, mapped to the status the
+/// Python servicer answers for the same failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaError {
+    /// The caller's: a bad reference, media the model cannot take, a prompt
+    /// the placeholders do not fit (`INVALID_ARGUMENT`).
+    Invalid(String),
+    /// Not this worker's fault right now: a fetch that timed out, a sidecar
+    /// saturated or unreachable; the Router re-selects a worker
+    /// (`UNAVAILABLE`).
+    Unavailable(String),
+    /// A processor failure (`INTERNAL`).
+    Internal(String),
+    /// The media the request names failed, by whose fault: the request's
+    /// own or its host's for now, never this worker's. The status carries
+    /// the report as trailers (see [`WorkerMediaFault`] and the code's,
+    /// `smg_grpc_client::MEDIA_CODE_METADATA_KEY`) under the gRPC code the
+    /// fault would have had without them (`INVALID_ARGUMENT`,
+    /// `UNAVAILABLE`), so a Router that reads the trailers answers the media
+    /// under `code` (a 400 for the request's own fault, a 502 for its host's)
+    /// and records no worker failure, and one that does not reads the gRPC
+    /// code as before.
+    Media {
+        fault: WorkerMediaFault,
+        /// The code the public API answers: `invalid_multimodal_request`,
+        /// `media_fetch_failed` or `media_too_large`.
+        code: &'static str,
+        message: String,
+    },
+}
+
+impl MediaError {
+    fn into_status(self) -> Status {
+        match self {
+            Self::Invalid(message) => Status::invalid_argument(message),
+            Self::Unavailable(message) => Status::unavailable(message),
+            Self::Internal(message) => Status::internal(message),
+            Self::Media {
+                fault,
+                code,
+                message,
+            } => stamp_media_code(
+                fault.stamp(match fault {
+                    WorkerMediaFault::Client => Status::invalid_argument(message),
+                    WorkerMediaFault::Transient => Status::unavailable(message),
+                }),
+                code,
+            ),
+        }
+    }
+}
+
+/// A worker-side media processor. Everything advertised to the Router
+/// (`GetServerInfo`) comes from here, and so does the per-worker in-flight
+/// cap the servicer enforces around [`process`](Self::process).
+pub trait MediaProcessor: Send + Sync + 'static {
+    /// The backend's advertised name (`mm_processor`), e.g. `inprocess`.
+    fn name(&self) -> &str;
+    /// The URL schemes it fetches (`mm_media_ref_schemes`), comma-separated;
+    /// read after [`probe`](Self::probe), since a sidecar announces its own.
+    fn schemes(&self) -> String;
+    /// Where the mode came from (`mm_processor_source`): `flag`, `env`,
+    /// `default`.
+    fn source(&self) -> &str;
+    /// How many requests it processes at once; as many again may wait.
+    fn max_inflight(&self) -> usize;
+    /// The modalities it takes references of, as `media_refs` names them
+    /// ([`ALL_MODALITIES`] for the engine's own processors, which take
+    /// whatever the model takes, audio included; [`PIXEL_MODALITIES`] for a
+    /// pipeline of pixels); a reference of another modality is refused
+    /// before any work, naming the modes that take it. Every processor
+    /// states its set: a default would let the next bridge refuse audio
+    /// without a word.
+    fn modalities(&self) -> &'static [&'static str];
+    /// Whether it can take requests now (a sidecar's liveness); the backend
+    /// is advertised only while this holds.
+    fn probe(&self) -> BoxFuture<bool>;
+    fn process(&self, request: MediaRequest) -> BoxFuture<Result<ProcessedMedia, MediaError>>;
+}
+
+/// The processor behind its in-flight cap, as the Python servicer runs it:
+/// `max_inflight` requests process at once, as many again may wait, and the
+/// ones behind those are shed with a retryable refusal rather than queued
+/// past their callers' patience.
+pub(crate) struct MediaGate {
+    pub(super) processor: Arc<dyn MediaProcessor>,
+    inflight: Arc<Semaphore>,
+    waiting: AtomicUsize,
+    limit: usize,
+}
+
+impl MediaGate {
+    pub(super) fn new(processor: Arc<dyn MediaProcessor>) -> Self {
+        let limit = processor.max_inflight().max(1);
+        Self {
+            processor,
+            inflight: Arc::new(Semaphore::new(limit)),
+            waiting: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    /// A slot, or the saturation refusal. The waiter count is checked and
+    /// taken in one step, and given back on every exit, a cancelled wait
+    /// included: a caller that gives up while queued must not leave a
+    /// phantom waiter behind, or enough of them would refuse every request
+    /// for the life of the process.
+    async fn acquire(&self) -> Result<OwnedSemaphorePermit, Status> {
+        let admitted = self
+            .waiting
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+                (waiting < self.limit).then_some(waiting + 1)
+            });
+        if admitted.is_err() {
+            return Err(Status::unavailable(format!(
+                "worker is saturated: {} multimodal requests in flight and as many waiting",
+                self.limit
+            )));
+        }
+        let _waiting = Waiting(&self.waiting);
+        let permit = Arc::clone(&self.inflight).acquire_owned().await;
+        permit.map_err(|_| Status::unavailable("media processing is shutting down"))
+    }
+}
+
+/// Counts a waiter down when it leaves the queue, however it leaves.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The Python servicer's refusal when references arrive with processing off.
+pub(super) const PROCESSOR_OFF: &str =
+    "media_refs sent but --mm-processor (SMG_VLLM_MM_PROCESSOR) \
+                                        is off on this worker; check the router's --mm-processing \
+                                        and this worker's mm_processor label";
+
+/// The outcome a processor's error counts under.
+fn outcome_of(error: &MediaError) -> MediaOutcome {
+    match error {
+        MediaError::Invalid(_) => MediaOutcome::Invalid,
+        MediaError::Unavailable(_) => MediaOutcome::Unavailable,
+        MediaError::Internal(_) => MediaOutcome::Internal,
+        MediaError::Media {
+            fault: WorkerMediaFault::Client,
+            ..
+        } => MediaOutcome::Client,
+        MediaError::Media {
+            fault: WorkerMediaFault::Transient,
+            ..
+        } => MediaOutcome::Transient,
+    }
+}
+
+/// The request's `media_refs` as processor items, checked as the Python
+/// servicer checks them (`parse_media_refs`): a fetchable modality and a
+/// non-empty reference each, at least one item; and, on this servicer, a
+/// modality the configured processor takes, so a reference it would refuse
+/// after the fetch is refused before it.
+fn parse_media_refs(
+    refs: &vllm::MediaRefs,
+    processor: &dyn MediaProcessor,
+) -> Result<Vec<MediaRefItem>, Status> {
+    let taken = processor.modalities();
+    let mut items = Vec::with_capacity(refs.items.len());
+    for (index, item) in refs.items.iter().enumerate() {
+        let modality = match common::Modality::try_from(item.modality) {
+            Ok(common::Modality::Image) => "image",
+            Ok(common::Modality::Video) => "video",
+            Ok(common::Modality::Audio) => "audio",
+            other => {
+                let name = other.map_or_else(
+                    |_| item.modality.to_string(),
+                    |m| m.as_str_name().to_string(),
+                );
+                return Err(Status::invalid_argument(format!(
+                    "media_refs[{index}]: unsupported modality {name}"
+                )));
+            }
+        };
+        if !taken.contains(&modality) {
+            return Err(Status::invalid_argument(format!(
+                "media_refs[{index}]: the {} media processor on this worker takes {} \
+                 references, not {modality}; --mm-processor inprocess or redis processes \
+                 {modality} with the engine's own processor",
+                processor.name(),
+                taken.join(" and "),
+            )));
+        }
+        if item.url.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "media_refs[{index}]: empty url"
+            )));
+        }
+        items.push(MediaRefItem {
+            modality: modality.to_string(),
+            url: item.url.clone(),
+        });
+    }
+    if items.is_empty() {
+        return Err(Status::invalid_argument(
+            "media_refs is set but carries no items",
+        ));
+    }
+    Ok(items)
+}
+
+/// Resolve a request's `media_refs` through the configured processor. The
+/// request leaves with its references consumed and its prompt expanded; what
+/// comes back is the engine-side media to attach and, for a PD prefill side,
+/// the identity its `Complete` carries. `None` when the request named no
+/// media.
+pub(super) async fn process_media_refs(
+    state: &State,
+    req: &mut vllm::GenerateRequest,
+) -> Result<Option<(MediaFeatures, Option<vllm::MediaIdentity>)>, Status> {
+    let Some(refs) = req.media_refs.take().filter(|refs| !refs.items.is_empty()) else {
+        return Ok(None);
+    };
+    // What the request carries, by modality, counted before the references
+    // are checked: a refused request's references count too.
+    let metrics = &state.shared.metrics;
+    let (mut images, mut videos, mut audios) = (0, 0, 0);
+    for item in &refs.items {
+        match common::Modality::try_from(item.modality) {
+            Ok(common::Modality::Image) => images += 1,
+            Ok(common::Modality::Video) => videos += 1,
+            Ok(common::Modality::Audio) => audios += 1,
+            _ => {}
+        }
+    }
+    metrics.media_items(images, videos, audios);
+    let refused = |status: Status| {
+        metrics.media_outcome(MediaOutcome::Refused);
+        status
+    };
+    let has_batches = req.mm_inputs.is_some() || !req.extra_mm_inputs.is_empty();
+    let tokenized = match req.input.as_ref() {
+        Some(vllm::generate_request::Input::Tokenized(tokenized)) if !has_batches => tokenized,
+        _ => {
+            return Err(refused(Status::invalid_argument(
+                "media_refs requires tokenized input and cannot be combined with preprocessed \
+                 multimodal inputs",
+            )))
+        }
+    };
+    let Some(gate) = state.media.as_ref() else {
+        return Err(refused(Status::invalid_argument(PROCESSOR_OFF)));
+    };
+    let items = parse_media_refs(&refs, gate.processor.as_ref()).map_err(refused)?;
+    let request = MediaRequest {
+        request_id: req.request_id.clone(),
+        prompt_token_ids: tokenized.input_ids.clone(),
+        prompt_text: (!tokenized.original_text.is_empty()).then(|| tokenized.original_text.clone()),
+        items,
+        arrival_time: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+        want_identity: req.kv_transfer_params_json.is_some()
+            || req.kv_transfer_params.is_some()
+            || super::generate::ec_transfer_params_sent(req),
+    };
+    let waited = Instant::now();
+    let permit = gate.acquire().await.map_err(refused)?;
+    metrics.media_stage(MediaStage::Wait, waited.elapsed());
+    // The processor runs in its own task holding the slot: a caller that
+    // gives up mid-fetch does not stop the work behind the bridge, so the
+    // slot comes back when that work ends, not when the caller stops
+    // waiting, and the cap bounds the work actually in flight.
+    let processor = Arc::clone(&gate.processor);
+    // The stage's time and the request's outcome are recorded by the task
+    // itself, before it answers: a caller that gave up while the work ran
+    // still counts, or the histogram would miss exactly the slow runs.
+    let task_metrics = Arc::clone(metrics);
+    let (tx, rx) = oneshot::channel();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the slot must outlive a caller that gives up; the task ends when the processor answers"
+    )]
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let outcome = processor.process(request).await;
+        let took = started.elapsed();
+        drop(permit);
+        task_metrics.media_stage(MediaStage::Process, took);
+        task_metrics.media_outcome(match &outcome {
+            Ok(_) => MediaOutcome::Ok,
+            Err(error) => outcome_of(error),
+        });
+        let _ = tx.send(outcome);
+    });
+    let processed = rx
+        .await
+        .map_err(|_| {
+            // The task ended without answering (it panicked or was cancelled
+            // before it recorded): a request that ended in processing,
+            // counted as one.
+            metrics.media_outcome(MediaOutcome::Internal);
+            Status::internal("media processing ended without a result")
+        })?
+        .map_err(|error| error.into_status())?;
+    // The expanded prompt replaces the anchors the Router sent.
+    if let Some(vllm::generate_request::Input::Tokenized(tokenized)) = req.input.as_mut() {
+        tokenized.input_ids = processed.prompt_token_ids;
+    }
+    Ok(Some((processed.features, processed.media_identity)))
+}

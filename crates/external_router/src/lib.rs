@@ -16,6 +16,8 @@ pub mod error;
 #[cfg(feature = "gemini")]
 pub mod gemini;
 pub mod header_utils;
+#[cfg(any(feature = "gemini", feature = "openai"))]
+mod json_utils;
 pub mod mcp_utils;
 pub mod metrics;
 #[cfg(feature = "openai")]
@@ -29,7 +31,11 @@ pub mod router;
 pub mod sglang_fields;
 pub mod sse;
 pub mod tenant;
+pub mod upstream_body;
 pub mod worker;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use context::ExternalContext;
 pub use retry_config::RetryConfig;

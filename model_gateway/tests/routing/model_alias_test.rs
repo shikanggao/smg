@@ -76,7 +76,7 @@ mod model_alias_tests {
 
         let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(WORKER_PORT)]).await;
         let app = ctx.create_app();
-        declare_alias(&ctx, &format!("http://127.0.0.1:{WORKER_PORT}"));
+        declare_alias(&ctx, ctx.worker_url_for(WORKER_PORT));
 
         let response = app
             .clone()
@@ -103,7 +103,7 @@ mod model_alias_tests {
 
         let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(WORKER_PORT + 1)]).await;
         let app = ctx.create_app();
-        declare_alias(&ctx, &format!("http://127.0.0.1:{}", WORKER_PORT + 1));
+        declare_alias(&ctx, ctx.worker_url_for(WORKER_PORT + 1));
 
         let response = app
             .clone()
@@ -120,9 +120,8 @@ mod model_alias_tests {
     /// rather than passing the worker's through, so it needs its own check
     /// that the reported model is the one that actually ran.
     ///
-    /// Uses `/rerank`, not `/v1/rerank`: the latter takes only `query` and
-    /// `documents` and hardcodes the model to the `unknown` wildcard, so no
-    /// alias can reach the router through it.
+    /// Uses `/rerank`, whose body carries the required `model`; `/v1/rerank`
+    /// reads an optional one and is covered by the http tests.
     #[tokio::test]
     async fn test_rerank_forwards_and_reports_the_canonical_model() {
         let recorder = RequestRecorder::new();
@@ -130,7 +129,7 @@ mod model_alias_tests {
 
         let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(WORKER_PORT + 3)]).await;
         let app = ctx.create_app();
-        declare_alias(&ctx, &format!("http://127.0.0.1:{}", WORKER_PORT + 3));
+        declare_alias(&ctx, ctx.worker_url_for(WORKER_PORT + 3));
 
         let request = Request::builder()
             .method("POST")
@@ -175,7 +174,7 @@ mod model_alias_tests {
 
         let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(WORKER_PORT + 4)]).await;
         let app = ctx.create_app();
-        declare_alias(&ctx, &format!("http://127.0.0.1:{}", WORKER_PORT + 4));
+        declare_alias(&ctx, ctx.worker_url_for(WORKER_PORT + 4));
 
         let boundary = "alias-test-boundary";
         let form = format!(
@@ -217,7 +216,7 @@ mod model_alias_tests {
 
         let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(WORKER_PORT + 5)]).await;
         let app = ctx.create_app();
-        declare_alias(&ctx, &format!("http://127.0.0.1:{}", WORKER_PORT + 5));
+        declare_alias(&ctx, ctx.worker_url_for(WORKER_PORT + 5));
 
         for (endpoint, payload) in [
             (
@@ -264,7 +263,7 @@ mod model_alias_tests {
 
         let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(WORKER_PORT + 2)]).await;
         let app = ctx.create_app();
-        declare_alias(&ctx, &format!("http://127.0.0.1:{}", WORKER_PORT + 2));
+        declare_alias(&ctx, ctx.worker_url_for(WORKER_PORT + 2));
 
         let response = app
             .clone()

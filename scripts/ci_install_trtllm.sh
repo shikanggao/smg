@@ -32,6 +32,13 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 sudo dpkg --configure -a --force-confnew 2>/dev/null || true
 
+# CPython dev headers: Triton (and torch's cpp_extension) compile against them
+# at engine startup. Fail here, not 20 minutes later inside a JIT build. Placed
+# after the dpkg repair above: the guard apt-installs python3.X-dev, and this
+# lane's runners can arrive with an interrupted dpkg state that only
+# `dpkg --configure -a` clears.
+bash "${SCRIPT_DIR}/ci_ensure_python_headers.sh"
+
 # Add NVIDIA apt repository if needed
 if ! dpkg -l cuda-keyring 2>/dev/null | grep -q '^ii'; then
     echo "Setting up NVIDIA apt repository..."
@@ -41,7 +48,13 @@ if ! dpkg -l cuda-keyring 2>/dev/null | grep -q '^ii'; then
 fi
 
 bash "${SCRIPT_DIR}/ci_apt_mirror.sh"
-$RETRY 3 10 sudo apt-get update
+# A partial refresh can otherwise succeed while leaving Ubuntu packages unavailable.
+# Refresh all sources because the install needs both Ubuntu and NVIDIA packages.
+if ! sudo apt-get -o APT::Update::Error-Mode=any update; then
+    $RETRY 2 10 bash -c '
+        bash "$1" --reprobe && sudo apt-get -o APT::Update::Error-Mode=any update
+    ' _ "${SCRIPT_DIR}/ci_apt_mirror.sh"
+fi
 # Runtime deps: wheel links against CUDA 13 + TensorRT libs
 $RETRY 3 10 sudo apt-get install -y libopenmpi-dev libnvinfer10 cuda-toolkit-13-0
 
@@ -99,9 +112,13 @@ if [ -n "$TRTLLM_LIB_DIR" ]; then
     export LD_LIBRARY_PATH="${TRTLLM_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 fi
 
-# Persist LD_LIBRARY_PATH for subsequent CI steps
+# Later CI steps run in a new shell, so retain the toolkit as well as its libraries.
 if [ -n "${GITHUB_ENV:-}" ]; then
+    echo "CUDA_HOME=$CUDA_HOME" >> "$GITHUB_ENV"
     echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+fi
+if [ -n "${GITHUB_PATH:-}" ]; then
+    echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
 fi
 
 # ── Verification ─────────────────────────────────────────────────────────────

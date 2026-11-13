@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::{media::FrameSampling, types::TransparencyPolicy};
+
 /// Domain tag for digests that mix media bytes with request parameters.
 ///
 /// Together with the length prefix this makes the `(bytes, params)` encoding
@@ -50,6 +52,28 @@ pub fn hash_image_with_resolution_cap(
     hasher.finalize().to_hex().to_string()
 }
 
+/// The hash of an image whose decoded pixels depend on the resolution cap and
+/// on the [`TransparencyPolicy`] the frame decodes under. `KeepAlpha` keeps
+/// [`hash_image_with_resolution_cap`]'s value (the identity before policies
+/// existed, so cached entries stay valid); another policy folds its name in,
+/// so the gateway's pixel cache and the `mm_hashes` the backend keys its own
+/// caches on never serve one policy's tensors for another's.
+pub fn hash_image_with_transparency(
+    raw_bytes: &[u8],
+    max_long_side_pixel: Option<u32>,
+    transparency: TransparencyPolicy,
+) -> String {
+    let base = hash_image_with_resolution_cap(raw_bytes, max_long_side_pixel);
+    if transparency == TransparencyPolicy::KeepAlpha {
+        return base;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MEDIA_PARAM_DOMAIN);
+    write_len_prefixed(&mut hasher, base.as_bytes());
+    hasher.update(transparency.as_str().as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 /// TODO(yechan): Decide whether video hashes should cover the full encoded
 /// payload or a normalized representation of the sampled frames.
 /// Compute a blake3 hex-digest hash for a single video's raw bytes.
@@ -65,13 +89,19 @@ pub fn hash_video(raw_bytes: &[u8]) -> String {
 /// fps, or capped to a different long side, yields different frames, and both
 /// the gateway's cache and the backend's `mm_hashes` key off this value.
 /// Default sampling keeps the plain byte hash so existing entries stay valid.
+/// The rate is absorbed as the 8 bytes of the double the picks are computed
+/// with, so two rates that pick differently never share a digest.
 pub fn hash_video_with_sampling(
     raw_bytes: &[u8],
-    sample_fps: f32,
+    sample_fps: f64,
     max_long_side_pixel: Option<u32>,
+    sampling: FrameSampling,
 ) -> String {
-    const DEFAULT_SAMPLE_FPS: f32 = 2.0;
-    if max_long_side_pixel.is_none() && sample_fps == DEFAULT_SAMPLE_FPS {
+    const DEFAULT_SAMPLE_FPS: f64 = 2.0;
+    if max_long_side_pixel.is_none()
+        && sample_fps == DEFAULT_SAMPLE_FPS
+        && sampling == FrameSampling::default()
+    {
         return hash_video(raw_bytes);
     }
     let mut hasher = blake3::Hasher::new();
@@ -80,6 +110,53 @@ pub fn hash_video_with_sampling(
     hasher.update(&sample_fps.to_le_bytes());
     // `0` marks "no cap" so it cannot alias a real cap value.
     hasher.update(&max_long_side_pixel.unwrap_or(0).to_le_bytes());
+    match sampling {
+        FrameSampling::Even => {
+            hasher.update(&[0]);
+        }
+        FrameSampling::Interval => {
+            hasher.update(&[1]);
+        }
+        FrameSampling::UpTo { max_frames } => {
+            hasher.update(&[2]);
+            hasher.update(&(max_frames as u64).to_le_bytes());
+        }
+        FrameSampling::EvenRounded => {
+            hasher.update(&[3]);
+        }
+        FrameSampling::TemporalGroups {
+            frame_factor,
+            max_frames,
+        } => {
+            hasher.update(&[4]);
+            hasher.update(&(frame_factor as u64).to_le_bytes());
+            hasher.update(&(max_frames as u64).to_le_bytes());
+        }
+        FrameSampling::UpToThenRate {
+            max_frames,
+            rate_max_frames,
+        } => {
+            hasher.update(&[5]);
+            hasher.update(&(max_frames as u64).to_le_bytes());
+            hasher.update(&(rate_max_frames as u64).to_le_bytes());
+        }
+        FrameSampling::RateWalk {
+            max_frames,
+            temporal_patch_size,
+        } => {
+            hasher.update(&[6]);
+            hasher.update(&(max_frames as u64).to_le_bytes());
+            hasher.update(&(temporal_patch_size as u64).to_le_bytes());
+        }
+        FrameSampling::SteppedGroups {
+            temporal_patch_size,
+            max_frames,
+        } => {
+            hasher.update(&[7]);
+            hasher.update(&(temporal_patch_size as u64).to_le_bytes());
+            hasher.update(&(max_frames as u64).to_le_bytes());
+        }
+    }
     hasher.finalize().to_hex().to_string()
 }
 
@@ -104,6 +181,31 @@ pub fn hash_images(raw_bytes: &[impl AsRef<[u8]>]) -> BTreeMap<String, Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_transparency_policy_is_part_of_the_hash_except_keep_alpha() {
+        let bytes = b"fake-encoded-image-bytes";
+        let keep = hash_image_with_transparency(bytes, Some(504), TransparencyPolicy::KeepAlpha);
+        assert_eq!(keep, hash_image_with_resolution_cap(bytes, Some(504)));
+        assert_eq!(
+            hash_image_with_transparency(bytes, None, TransparencyPolicy::KeepAlpha),
+            hash_image(bytes)
+        );
+        let white =
+            hash_image_with_transparency(bytes, Some(504), TransparencyPolicy::CompositeOverWhite);
+        let drop = hash_image_with_transparency(bytes, Some(504), TransparencyPolicy::DropAlpha);
+        assert_ne!(white, keep);
+        assert_ne!(drop, keep);
+        assert_ne!(white, drop);
+        assert_eq!(
+            white,
+            hash_image_with_transparency(bytes, Some(504), TransparencyPolicy::CompositeOverWhite)
+        );
+        assert_ne!(
+            white,
+            hash_image_with_transparency(bytes, Some(252), TransparencyPolicy::CompositeOverWhite)
+        );
+    }
 
     #[test]
     fn test_hash_deterministic() {
@@ -150,22 +252,71 @@ mod video_sampling_hash_tests {
 
     #[test]
     fn default_sampling_keeps_the_plain_byte_hash() {
-        assert_eq!(hash_video_with_sampling(CLIP, 2.0, None), hash_video(CLIP));
+        assert_eq!(
+            hash_video_with_sampling(CLIP, 2.0, None, FrameSampling::Even),
+            hash_video(CLIP)
+        );
     }
 
     #[test]
     fn different_fps_hashes_differently() {
         assert_ne!(
-            hash_video_with_sampling(CLIP, 1.0, None),
-            hash_video_with_sampling(CLIP, 5.0, None)
+            hash_video_with_sampling(CLIP, 1.0, None, FrameSampling::Even),
+            hash_video_with_sampling(CLIP, 5.0, None, FrameSampling::Even)
         );
+    }
+
+    #[test]
+    fn frame_budgets_hash_apart_from_each_other_and_from_rate_sampling() {
+        let up_to = |max_frames| {
+            hash_video_with_sampling(CLIP, 2.0, None, FrameSampling::UpTo { max_frames })
+        };
+        assert_ne!(up_to(32), up_to(16));
+        assert_ne!(up_to(32), hash_video(CLIP));
+        assert_ne!(
+            up_to(32),
+            hash_video_with_sampling(CLIP, 2.0, None, FrameSampling::Interval)
+        );
+        assert_eq!(up_to(32), up_to(32));
+    }
+
+    #[test]
+    fn the_rate_walk_hashes_apart_from_the_loader_budget_sharing_its_count() {
+        let walk = |max_frames, temporal_patch_size| {
+            hash_video_with_sampling(
+                CLIP,
+                2.0,
+                None,
+                FrameSampling::RateWalk {
+                    max_frames,
+                    temporal_patch_size,
+                },
+            )
+        };
+        assert_ne!(
+            walk(32, 2),
+            hash_video_with_sampling(CLIP, 2.0, None, FrameSampling::UpTo { max_frames: 32 })
+        );
+        assert_ne!(walk(2048, 2), walk(16, 2));
+        assert_ne!(walk(2048, 2), walk(2048, 1));
+        assert_eq!(walk(2048, 2), walk(2048, 2));
     }
 
     #[test]
     fn different_long_side_caps_hash_differently() {
         assert_ne!(
-            hash_video_with_sampling(CLIP, 2.0, Some(504)),
-            hash_video_with_sampling(CLIP, 2.0, Some(1008))
+            hash_video_with_sampling(CLIP, 2.0, Some(504), FrameSampling::Even),
+            hash_video_with_sampling(CLIP, 2.0, Some(1008), FrameSampling::Even)
+        );
+    }
+
+    /// Two rates binary32 cannot tell apart pick different frames, so they are
+    /// different clips to the caches.
+    #[test]
+    fn rates_binary32_cannot_tell_apart_hash_differently() {
+        assert_ne!(
+            hash_video_with_sampling(CLIP, 0.3, None, FrameSampling::Even),
+            hash_video_with_sampling(CLIP, 0.300_000_011_920_928_96, None, FrameSampling::Even)
         );
     }
 
@@ -176,11 +327,11 @@ mod video_sampling_hash_tests {
     fn crafted_trailing_bytes_do_not_collide() {
         let mut forged = CLIP.to_vec();
         forged.extend_from_slice(b"sample_fps=");
-        forged.extend_from_slice(&1.0f32.to_le_bytes());
+        forged.extend_from_slice(&1.0f64.to_le_bytes());
 
         assert_ne!(
-            hash_video_with_sampling(CLIP, 1.0, None),
-            hash_video_with_sampling(&forged, 2.0, None)
+            hash_video_with_sampling(CLIP, 1.0, None, FrameSampling::Even),
+            hash_video_with_sampling(&forged, 2.0, None, FrameSampling::Even)
         );
     }
 
@@ -206,7 +357,10 @@ mod video_sampling_hash_tests {
         // Same payload both sides, so this exercises the domain tag rather
         // than two different byte strings. It checks this one instance, not a
         // universal: see the note on `MEDIA_PARAM_DOMAIN`.
-        assert_ne!(hash_video_with_sampling(CLIP, 1.0, None), hash_video(CLIP));
+        assert_ne!(
+            hash_video_with_sampling(CLIP, 1.0, None, FrameSampling::Even),
+            hash_video(CLIP)
+        );
         assert_ne!(
             hash_image_with_resolution_cap(CLIP, Some(504)),
             hash_image(CLIP)
@@ -217,16 +371,30 @@ mod video_sampling_hash_tests {
     fn absent_cap_is_distinct_from_any_real_cap() {
         // "no cap" is encoded as 0, which is not a legal cap value.
         assert_ne!(
-            hash_video_with_sampling(CLIP, 1.0, None),
-            hash_video_with_sampling(CLIP, 1.0, Some(504))
+            hash_video_with_sampling(CLIP, 1.0, None, FrameSampling::Even),
+            hash_video_with_sampling(CLIP, 1.0, Some(504), FrameSampling::Even)
+        );
+    }
+
+    /// The two modes can pick different frames from one clip, so one digest
+    /// must not stand for both.
+    #[test]
+    fn the_two_frame_choices_hash_differently() {
+        assert_ne!(
+            hash_video_with_sampling(CLIP, 2.0, None, FrameSampling::Even),
+            hash_video_with_sampling(CLIP, 2.0, None, FrameSampling::Interval)
+        );
+        assert_ne!(
+            hash_video_with_sampling(CLIP, 1.0, Some(504), FrameSampling::Even),
+            hash_video_with_sampling(CLIP, 1.0, Some(504), FrameSampling::Interval)
         );
     }
 
     #[test]
     fn same_sampling_hashes_stably() {
         assert_eq!(
-            hash_video_with_sampling(CLIP, 1.0, Some(504)),
-            hash_video_with_sampling(CLIP, 1.0, Some(504))
+            hash_video_with_sampling(CLIP, 1.0, Some(504), FrameSampling::Even),
+            hash_video_with_sampling(CLIP, 1.0, Some(504), FrameSampling::Even)
         );
     }
 }

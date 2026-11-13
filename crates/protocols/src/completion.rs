@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use serde_json::{Map, Value};
 use validator::Validate;
 
@@ -8,43 +11,56 @@ use super::{
     common::*,
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
-use crate::validated::Normalizable;
+use crate::{common::invalid, validated::Normalizable};
 
 // ============================================================================
 // Completions API (v1/completions) - DEPRECATED but still supported
 // ============================================================================
 
+/// A request to the completions route: the model, the prompt (a text, texts,
+/// token ids or lists of them) and the sampling and streaming parameters,
+/// validated together before dispatch.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_completion_cross_parameters"))]
 pub struct CompletionRequest {
-    /// ID of the model to use (required for OpenAI, optional for some implementations, such as SGLang)
+    /// ID of the model to use (required for OpenAI, optional for some serving engines)
     pub model: String,
 
-    /// The prompt(s) to generate completions for
+    /// The prompt(s) to generate completions for: a string, an array of
+    /// strings, an array of token ids, or an array of token id arrays
     #[validate(custom(function = "validate_completion_prompt"))]
-    pub prompt: StringOrArray,
+    pub prompt: CompletionPrompt,
 
     /// Generates `best_of` completions server-side and returns the "best"
     #[validate(range(min = 0, max = 20))]
     pub best_of: Option<u32>,
 
-    /// Echo back the prompt in addition to the completion
-    #[serde(default)]
+    /// Echo back the prompt in addition to the completion. A `null` reads as
+    /// the default, as the public API allows.
+    #[serde(default, deserialize_with = "deserialize_null_as_false")]
     pub echo: bool,
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
     #[validate(range(min = -2.0, max = 2.0))]
     pub frequency_penalty: Option<f32>,
 
-    /// Modify the likelihood of specified tokens appearing in the completion
+    /// Modify the likelihood of specified tokens appearing in the completion:
+    /// token id to a bias in -100..=100, applied by the engine's sampler
+    #[validate(custom(function = "validate_logit_bias"))]
     pub logit_bias: Option<HashMap<String, f32>>,
 
     /// Include the log probabilities on the `logprobs` most likely tokens
-    #[validate(range(min = 0, max = 5))]
+    /// (0 to 20, as chat's `top_logprobs`)
+    #[validate(range(min = 0, max = 20))]
     pub logprobs: Option<u32>,
 
-    /// The maximum number of tokens to generate
+    /// The maximum number of tokens to generate. A zero is a request in its
+    /// own right, not a value to refuse: with `echo` and `logprobs` it scores
+    /// the prompt and generates nothing (the loglikelihood shape evaluation
+    /// harnesses send), a prefill-only turn for the engines that take one.
+    /// The bound starts at zero for that reason, where the chat route's
+    /// starts at one.
     #[validate(range(min = 0))]
     pub max_tokens: Option<u32>,
 
@@ -116,15 +132,28 @@ pub struct CompletionRequest {
     pub stop_token_ids: Option<Vec<u32>>,
 
     /// Skip trimming stop tokens from output
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub no_stop_trim: bool,
 
     /// Ignore end-of-sequence tokens during generation
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub ignore_eos: bool,
 
-    /// Skip special tokens during detokenization
-    #[serde(default = "default_true")]
+    /// Skip special tokens during detokenization. Serialized only when
+    /// `false`: `true` is what the engine applies without the field.
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_null_as_true",
+        skip_serializing_if = "is_true"
+    )]
     pub skip_special_tokens: bool,
 
     /// Path to LoRA adapter(s) for model customization
@@ -134,13 +163,17 @@ pub struct CompletionRequest {
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Return model hidden states
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
     pub return_hidden_states: bool,
 
     /// Sampling seed for deterministic outputs
     pub sampling_seed: Option<u64>,
 
-    /// Request ID forwarded to the backend for log correlation (SGLang extension)
+    /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
     /// Additional fields including bootstrap info for PD routing
@@ -150,65 +183,81 @@ pub struct CompletionRequest {
 
 impl Normalizable for CompletionRequest {}
 
-fn validate_completion_prompt(prompt: &StringOrArray) -> Result<(), validator::ValidationError> {
-    match prompt {
-        StringOrArray::String(_) => {}
-        StringOrArray::Array(arr) => {
-            if arr.is_empty() {
-                let mut error = validator::ValidationError::new("prompt_empty");
-                error.message = Some("prompt array cannot be empty".into());
-                return Err(error);
+fn validate_completion_prompt(prompt: &CompletionPrompt) -> Result<(), validator::ValidationError> {
+    let message = match prompt {
+        CompletionPrompt::Text(_) => None,
+        CompletionPrompt::Texts(texts) => {
+            texts.is_empty().then_some("prompt array cannot be empty")
+        }
+        CompletionPrompt::TokenIds(ids) => ids.is_empty().then_some("prompt array cannot be empty"),
+        CompletionPrompt::TokenIdBatches(batches) => {
+            if batches.is_empty() {
+                Some("prompt array cannot be empty")
+            } else if batches.iter().any(Vec::is_empty) {
+                Some("a token id prompt cannot be empty")
+            } else {
+                None
             }
         }
+    };
+    match message {
+        Some(message) => Err(invalid("prompt_empty", message)),
+        None => Ok(()),
     }
-
-    Ok(())
 }
 
 fn validate_completion_cross_parameters(
     req: &CompletionRequest,
 ) -> Result<(), validator::ValidationError> {
     if req.stream_options.is_some() && !req.stream {
-        let mut error = validator::ValidationError::new("stream_options_requires_stream");
-        error.message =
-            Some("The 'stream_options' parameter is only allowed when 'stream' is enabled".into());
-        return Err(error);
+        return Err(invalid(
+            "stream_options_requires_stream",
+            "The 'stream_options' parameter is only allowed when 'stream' is enabled",
+        ));
     }
 
     if let (Some(min), Some(max)) = (req.min_tokens, req.max_tokens) {
         if min > max {
-            let mut error = validator::ValidationError::new("min_tokens_exceeds_max");
-            error.message = Some("min_tokens cannot exceed max_tokens".into());
-            return Err(error);
+            return Err(invalid(
+                "min_tokens_exceeds_max",
+                "min_tokens cannot exceed max_tokens",
+            ));
         }
     }
 
     let constraint_count =
         req.regex.is_some() as u8 + req.ebnf.is_some() as u8 + req.json_schema.is_some() as u8;
     if constraint_count > 1 {
-        let mut error = validator::ValidationError::new("multiple_constraints");
-        error.message = Some(
-            "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time"
-                .into(),
-        );
-        return Err(error);
+        return Err(invalid(
+            "multiple_constraints",
+            "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
+        ));
     }
 
     if let (Some(best_of), Some(n)) = (req.best_of, req.n) {
         if best_of <= n {
-            let mut error = validator::ValidationError::new("best_of_less_than_n");
-            error.message = Some("best_of must be greater than n".into());
-            return Err(error);
+            return Err(invalid(
+                "best_of_less_than_n",
+                "best_of must be greater than n",
+            ));
         }
     }
 
     if req.stream && req.best_of.is_some() {
-        let mut error = validator::ValidationError::new("best_of_not_supported_with_stream");
-        error.message = Some("best_of is not supported when stream is enabled".into());
-        return Err(error);
+        return Err(invalid(
+            "best_of_not_supported_with_stream",
+            "best_of is not supported when stream is enabled",
+        ));
     }
 
     Ok(())
+}
+
+impl CompletionRequest {
+    /// The choices per prompt the request asks for: `n`, one when absent or zero.
+    pub fn choices(&self) -> u32 {
+        self.n.filter(|&n| n > 0).unwrap_or(1)
+    }
 }
 
 impl GenerationRequest for CompletionRequest {
@@ -223,7 +272,7 @@ impl GenerationRequest for CompletionRequest {
     fn cache_partition(&self) -> CachePartition<'_> {
         CachePartition {
             // Engine extensions carried in the passthrough map, not typed
-            // fields: vLLM/SGLang `cache_salt`, SGLang `extra_key`.
+            // fields: the engines' `cache_salt`, one engine's `extra_key`.
             cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
             extra_key: self.other.get("extra_key").and_then(Value::as_str),
             lora_path: self.lora_path.as_deref(),
@@ -236,9 +285,160 @@ impl GenerationRequest for CompletionRequest {
 
     fn extract_text_for_routing(&self) -> String {
         match &self.prompt {
-            StringOrArray::String(s) => s.clone(),
-            StringOrArray::Array(v) => v.join(" "),
+            CompletionPrompt::Text(s) => s.clone(),
+            CompletionPrompt::Texts(v) => v.join(" "),
+            // A prompt of ids routes on their decimal rendering, as `/generate`'s does.
+            CompletionPrompt::TokenIds(ids) => join_ids(ids),
+            CompletionPrompt::TokenIdBatches(batches) => join_ids(batches.iter().flatten()),
         }
+    }
+}
+
+// ============================================================================
+// Prompt
+// ============================================================================
+
+/// The `prompt` of a completion request, in the four shapes of the public
+/// API: one text, a batch of texts, one prompt of token ids, or a batch of
+/// token-id prompts. A prompt of ids bypasses the gateway's tokenizer and
+/// reaches the engine as sent.
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum CompletionPrompt {
+    Text(String),
+    Texts(Vec<String>),
+    TokenIds(Vec<u32>),
+    TokenIdBatches(Vec<Vec<u32>>),
+}
+
+impl CompletionPrompt {
+    /// The number of prompts: a batch counts its members, the others are one.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Text(_) | Self::TokenIds(_) => 1,
+            Self::Texts(texts) => texts.len(),
+            Self::TokenIdBatches(batches) => batches.len(),
+        }
+    }
+
+    /// Whether the prompt is an empty batch (validation refuses it).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Shape probe for the first element of an array `prompt`: it alone picks
+/// the variant, so the rest parses in place (as `InputIds` does) and a mixed
+/// array is refused with the element that breaks it.
+enum FirstPromptItem {
+    Text(String),
+    Id(u32),
+    Ids(Vec<u32>),
+}
+
+impl<'de> Deserialize<'de> for FirstPromptItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FirstPromptItemVisitor;
+
+        impl<'de> Visitor<'de> for FirstPromptItemVisitor {
+            type Value = FirstPromptItem;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string, a token id or an array of token ids")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(FirstPromptItem::Text(v.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(FirstPromptItem::Text(v))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                u32::try_from(v)
+                    .map(FirstPromptItem::Id)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Unsigned(v), &"a token id"))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                u32::try_from(v)
+                    .map(FirstPromptItem::Id)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Signed(v), &"a token id"))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+                Deserialize::deserialize(SeqAccessDeserializer::new(seq)).map(FirstPromptItem::Ids)
+            }
+        }
+
+        deserializer.deserialize_any(FirstPromptItemVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompletionPrompt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CompletionPromptVisitor;
+
+        impl<'de> Visitor<'de> for CompletionPromptVisitor {
+            type Value = CompletionPrompt;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a string, an array of strings, an array of token ids or an array of token id arrays",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(CompletionPrompt::Text(v.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(CompletionPrompt::Text(v))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                // An empty array parses; validation refuses it by name.
+                let Some(first) = seq.next_element::<FirstPromptItem>()? else {
+                    return Ok(CompletionPrompt::Texts(Vec::new()));
+                };
+                let capacity = seq.size_hint().unwrap_or(0).saturating_add(1);
+                match first {
+                    FirstPromptItem::Text(text) => {
+                        let mut texts = Vec::with_capacity(capacity);
+                        texts.push(text);
+                        while let Some(text) = seq.next_element()? {
+                            texts.push(text);
+                        }
+                        Ok(CompletionPrompt::Texts(texts))
+                    }
+                    FirstPromptItem::Id(id) => {
+                        let mut ids = Vec::with_capacity(capacity);
+                        ids.push(id);
+                        while let Some(id) = seq.next_element()? {
+                            ids.push(id);
+                        }
+                        Ok(CompletionPrompt::TokenIds(ids))
+                    }
+                    FirstPromptItem::Ids(head) => {
+                        let mut batches = Vec::with_capacity(capacity);
+                        batches.push(head);
+                        while let Some(ids) = seq.next_element()? {
+                            batches.push(ids);
+                        }
+                        Ok(CompletionPrompt::TokenIdBatches(batches))
+                    }
+                }
+            }
+        }
+
+        deserializer.deserialize_any(CompletionPromptVisitor)
     }
 }
 
@@ -246,6 +446,8 @@ impl GenerationRequest for CompletionRequest {
 // Response Types
 // ============================================================================
 
+/// The complete (non-streamed) answer of the completions route, object
+/// `text_completion`: the choices with their texts, and the usage.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionResponse {
@@ -258,11 +460,15 @@ pub struct CompletionResponse {
     pub system_fingerprint: Option<String>,
 }
 
+/// One generated alternative of a completion: its text, its index, the log
+/// probabilities when requested, the reason generation stopped and the stop
+/// condition it matched.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionChoice {
     pub text: String,
     pub index: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always present (`null` unless log probabilities were requested), as
+    /// the OpenAI API sends it.
     pub logprobs: Option<LogProbs>,
     pub finish_reason: Option<String>, // "stop", "length", "content_filter", etc.
     /// Information about which stop condition was matched
@@ -270,6 +476,8 @@ pub struct CompletionChoice {
     pub matched_stop: Option<Value>, // Can be string or integer
 }
 
+/// One chunk of a streamed completion, object `text_completion`: the choices'
+/// text pieces and, on the last chunk when requested, the usage.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionStreamResponse {
     pub id: String,
@@ -283,11 +491,15 @@ pub struct CompletionStreamResponse {
     pub usage: Option<Usage>,
 }
 
+/// One alternative's part of a streamed completion chunk: the text since the
+/// previous chunk, its index, the log probabilities when requested, and the
+/// finish reason once it stops.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompletionStreamChoice {
     pub text: String,
     pub index: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always present (`null` unless log probabilities were requested), as
+    /// the OpenAI API sends it.
     pub logprobs: Option<LogProbs>,
     pub finish_reason: Option<String>,
 }
@@ -305,10 +517,165 @@ mod tests {
         serde_json::from_value(value).expect("request must deserialize")
     }
 
+    fn logprobs_body(logprobs: u32) -> Value {
+        serde_json::json!({
+            "model": "m",
+            "prompt": "hello",
+            "echo": true,
+            "logprobs": logprobs,
+            "max_tokens": 1
+        })
+    }
+
+    /// `logit_bias` is keyed by token ids and bounded as on the chat route.
+    #[test]
+    fn logit_bias_is_keyed_by_token_ids_and_bounded() {
+        for (bias, code) in [
+            (
+                serde_json::json!({"not-a-token": 1}),
+                "logit_bias_invalid_key",
+            ),
+            (
+                serde_json::json!({"5": 1, "05": 2}),
+                "logit_bias_duplicate_key",
+            ),
+            (serde_json::json!({"1": 101}), "integer_above_max_value"),
+            (serde_json::json!({"1": -101}), "integer_below_min_value"),
+        ] {
+            let request = req(serde_json::json!({"logit_bias": bias}));
+            let errors = request.validate().expect_err(&bias.to_string());
+            assert_eq!(errors.field_errors()["logit_bias"][0].code, code, "{bias}");
+        }
+        let good = req(serde_json::json!({"logit_bias": {"50256": -100, "0": 1.5}}));
+        assert!(good.validate().is_ok());
+    }
+
+    /// `logprobs` takes up to 20 alternatives, the bound of chat's
+    /// `top_logprobs`; 21 crosses it.
+    #[test]
+    fn logprobs_takes_up_to_20_alternatives() {
+        for logprobs in [0, 5, 20] {
+            let request: CompletionRequest =
+                serde_json::from_value(logprobs_body(logprobs)).expect("request");
+            assert!(request.validate().is_ok(), "logprobs {logprobs}");
+        }
+        let request: CompletionRequest =
+            serde_json::from_value(logprobs_body(21)).expect("request");
+        let errors = request.validate().expect_err("logprobs 21 must be refused");
+        let error = &errors.field_errors()["logprobs"][0];
+        assert_eq!(error.code, "range");
+        assert_eq!(error.params["max"], 20);
+        assert_eq!(error.params["value"], 21);
+    }
+
+    /// Above 20 the body gets the public API's error for a crossed bound.
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn logprobs_above_20_is_refused_with_the_public_error() {
+        use axum::{
+            body::Body,
+            extract::{FromRequest, Request},
+            http::StatusCode,
+        };
+
+        use crate::validated::ValidatedJson;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(logprobs_body(21).to_string()))
+            .expect("request");
+        let Err(response) = ValidatedJson::<CompletionRequest>::from_request(request, &()).await
+        else {
+            panic!("logprobs 21 must be refused");
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("JSON body");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "integer_above_max_value");
+        assert_eq!(body["error"]["param"], "logprobs");
+    }
+
+    /// The public API allows `"echo": null`. It reads as the default and the
+    /// request is written back as one without the key is; a wrong type is
+    /// still refused.
+    #[test]
+    fn echo_null_reads_as_an_absent_echo_does() {
+        let nulled = req(serde_json::json!({"echo": null}));
+        assert!(!nulled.echo);
+        nulled.validate().expect("valid");
+        assert!(!nulled.other.contains_key("echo"));
+        assert_eq!(
+            serde_json::to_value(&nulled).expect("serialize"),
+            serde_json::to_value(req(serde_json::json!({}))).expect("serialize")
+        );
+        assert!(req(serde_json::json!({"echo": true})).echo);
+        assert!(serde_json::from_value::<CompletionRequest>(
+            serde_json::json!({"model": "m", "prompt": "hello", "echo": "yes"})
+        )
+        .is_err());
+    }
+
+    /// A client that writes an unset engine flag as `null` gets the request an
+    /// absent key gives, as the chat request does.
+    #[test]
+    fn engine_flags_read_null_as_their_default() {
+        let nulled = req(serde_json::json!({
+            "no_stop_trim": null,
+            "ignore_eos": null,
+            "skip_special_tokens": null,
+            "return_hidden_states": null
+        }));
+        assert!(!nulled.no_stop_trim);
+        assert!(!nulled.ignore_eos);
+        assert!(nulled.skip_special_tokens);
+        assert!(!nulled.return_hidden_states);
+        assert_eq!(
+            serde_json::to_value(&nulled).expect("serialize"),
+            serde_json::to_value(req(serde_json::json!({}))).expect("serialize")
+        );
+    }
+
+    /// Through the extractor every route uses, a body with `"echo": null` is
+    /// served, where it was a 400 `invalid_type`.
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn an_echo_null_body_passes_the_extractor() {
+        use axum::{
+            body::Body,
+            extract::{FromRequest, Request},
+        };
+
+        use crate::validated::ValidatedJson;
+
+        let body = serde_json::json!({"model": "m", "prompt": "hello", "echo": null});
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request");
+        let Ok(ValidatedJson(request)) =
+            ValidatedJson::<CompletionRequest>::from_request(request, &()).await
+        else {
+            panic!("an echo of null must be accepted");
+        };
+        assert!(!request.echo);
+    }
+
     #[test]
     fn default_sglang_flags_are_omitted_and_absent_reads_defaults() {
         let value = serde_json::to_value(req(serde_json::json!({}))).expect("serialize");
-        for field in ["no_stop_trim", "ignore_eos", "return_hidden_states"] {
+        for field in [
+            "no_stop_trim",
+            "ignore_eos",
+            "return_hidden_states",
+            "skip_special_tokens",
+        ] {
             assert!(value.get(field).is_none(), "{field} serialized at default");
         }
 
@@ -316,6 +683,7 @@ mod tests {
         assert!(!back.no_stop_trim);
         assert!(!back.ignore_eos);
         assert!(!back.return_hidden_states);
+        assert!(back.skip_special_tokens);
     }
 
     #[test]
@@ -323,16 +691,144 @@ mod tests {
         let value = serde_json::to_value(req(serde_json::json!({
             "no_stop_trim": true,
             "ignore_eos": true,
-            "return_hidden_states": true
+            "return_hidden_states": true,
+            "skip_special_tokens": false
         })))
         .expect("serialize");
         assert_eq!(value["no_stop_trim"], true);
         assert_eq!(value["ignore_eos"], true);
         assert_eq!(value["return_hidden_states"], true);
+        assert_eq!(value["skip_special_tokens"], false);
 
         let back: CompletionRequest = serde_json::from_value(value).expect("roundtrip");
         assert!(back.no_stop_trim);
         assert!(back.ignore_eos);
         assert!(back.return_hidden_states);
+        assert!(!back.skip_special_tokens);
+    }
+
+    /// A `max_tokens` of zero is the prompt-scoring request (`echo` with
+    /// `logprobs`, nothing generated): it validates, and the zero stays a
+    /// zero on the request that goes to the wire, so the bound keeps
+    /// starting at zero where the chat route's starts at one.
+    #[test]
+    fn max_tokens_zero_is_the_prompt_scoring_request_and_validates() {
+        let scoring = req(serde_json::json!({"echo": true, "logprobs": 1, "max_tokens": 0}));
+        assert!(
+            scoring.validate().is_ok(),
+            "max_tokens 0 with echo and logprobs is a request, not a refused value"
+        );
+        assert_eq!(scoring.max_tokens, Some(0), "the zero is kept as written");
+        assert!(scoring.echo, "echo rides with it");
+    }
+
+    fn prompt(value: Value) -> Result<CompletionPrompt, String> {
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    }
+
+    /// The public API's `prompt` takes token ids as well as text: a prompt of
+    /// ids and a batch of them are requests, not parse errors.
+    #[test]
+    fn a_prompt_of_token_ids_deserializes_in_both_shapes() {
+        for value in [
+            serde_json::json!([11, 22, 33]),
+            serde_json::json!([[11, 22], [33]]),
+        ] {
+            let body = serde_json::json!({"model": "m", "prompt": value, "max_tokens": 1});
+            let request: CompletionRequest = serde_json::from_value(body.clone())
+                .unwrap_or_else(|e| panic!("{body} must deserialize: {e}"));
+            assert!(request.validate().is_ok(), "{body}");
+        }
+    }
+
+    #[test]
+    fn every_prompt_shape_parses_and_round_trips() {
+        for (value, want) in [
+            (serde_json::json!("hi"), CompletionPrompt::Text("hi".into())),
+            (
+                serde_json::json!(["a", "b"]),
+                CompletionPrompt::Texts(vec!["a".into(), "b".into()]),
+            ),
+            (
+                serde_json::json!([1, 2, 3]),
+                CompletionPrompt::TokenIds(vec![1, 2, 3]),
+            ),
+            (
+                serde_json::json!([[1, 2], [3]]),
+                CompletionPrompt::TokenIdBatches(vec![vec![1, 2], vec![3]]),
+            ),
+        ] {
+            let parsed = prompt(value.clone()).expect("prompt must parse");
+            assert_eq!(parsed, want);
+            assert_eq!(serde_json::to_value(&parsed).expect("serialize"), value);
+        }
+        assert_eq!(
+            prompt(serde_json::json!([[1], [2], [3]])).map(|p| p.len()),
+            Ok(3)
+        );
+        assert_eq!(prompt(serde_json::json!([7, 8])).map(|p| p.len()), Ok(1));
+    }
+
+    /// The first element picks the shape; the element that breaks it names
+    /// the refusal, and a negative or oversized id is no token id.
+    #[test]
+    fn a_prompt_of_mixed_or_invalid_shape_is_refused_by_its_element() {
+        for (value, want) in [
+            (serde_json::json!(["a", 1]), "expected a string"),
+            (serde_json::json!([1, "a"]), "expected u32"),
+            (serde_json::json!([[1], "a"]), "expected a sequence"),
+            (serde_json::json!([[1], 2]), "expected a sequence"),
+            (serde_json::json!([-1]), "expected a token id"),
+            (serde_json::json!([1, -1]), "expected u32"),
+            (serde_json::json!([4294967296u64]), "expected a token id"),
+            (serde_json::json!([1.5]), "expected a string, a token id"),
+            (serde_json::json!(7), "expected a string, an array"),
+        ] {
+            let error = prompt(value.clone()).expect_err("prompt must be refused");
+            assert!(error.contains(want), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_empty_prompt_array_is_refused_by_validation() {
+        for (value, message) in [
+            (serde_json::json!([]), "prompt array cannot be empty"),
+            (
+                serde_json::json!([[1], []]),
+                "a token id prompt cannot be empty",
+            ),
+            (serde_json::json!([[]]), "a token id prompt cannot be empty"),
+        ] {
+            let request = req(serde_json::json!({"prompt": value}));
+            let error = request
+                .validate()
+                .expect_err("empty prompt must be refused");
+            assert!(error.to_string().contains(message), "{value}: {error}");
+        }
+        assert!(req(serde_json::json!({"prompt": [1, 2]}))
+            .validate()
+            .is_ok());
+    }
+
+    /// A prompt of ids routes on their decimal rendering, as `/generate`'s
+    /// `input_ids` do; a batch of them on every id in order.
+    #[test]
+    fn a_token_prompt_routes_on_its_ids() {
+        assert_eq!(
+            req(serde_json::json!({"prompt": [11, 22, 33, 44]})).extract_text_for_routing(),
+            "11 22 33 44"
+        );
+        assert_eq!(
+            req(serde_json::json!({"prompt": [[11, 22], [33]]})).extract_text_for_routing(),
+            "11 22 33"
+        );
+    }
+
+    /// `n` is the number of choices per prompt; absent and zero both mean one.
+    #[test]
+    fn a_completion_request_asks_for_at_least_one_choice() {
+        assert_eq!(req(serde_json::json!({})).choices(), 1);
+        assert_eq!(req(serde_json::json!({"n": 0})).choices(), 1);
+        assert_eq!(req(serde_json::json!({"n": 2})).choices(), 2);
     }
 }

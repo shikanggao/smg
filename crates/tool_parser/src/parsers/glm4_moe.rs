@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::{
     errors::{ParserError, ParserResult},
+    factory::GrammarStart,
     parsers::helpers,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
@@ -91,6 +92,104 @@ impl Glm4MoeParser {
         Self::new(r"(?s)<tool_call>\s*([^<\s]+)\s*(.*?)</tool_call>")
     }
 
+    /// The xgrammar structural tag for the GLM-4.7 / GLM-5 tool-call format,
+    /// mirroring xgrammar's built-in `glm_4_7` tag (the one the serving engine applies for
+    /// `required` and named tool choices). Each call is `<tool_call>{name}`,
+    /// the arguments rendered from the tool's JSON schema in xgrammar's
+    /// `glm_xml` style (`<arg_key>k</arg_key><arg_value>v</arg_value>`), then
+    /// `</tool_call>`; free text is allowed around the calls and `<tool_call>`
+    /// is the trigger. `at_least_one` forces a call, for `required` and named
+    /// choices.
+    ///
+    /// Wire shape: `{"type": "json_schema", "json_schema": …, "style":
+    /// "glm_xml"}` is xgrammar's `JSONSchemaFormat` (python/xgrammar/
+    /// structural_tag.py), present since the 0.2 line that also ships the
+    /// built-in `glm_4_7` tag; one serving engine pins 0.2.3, where the tag emitted
+    /// here compiles with `Grammar.from_structural_tag` and accepts the
+    /// model's real call syntax. The schema is passed through as written,
+    /// like the JSON-schema builders (mistral, kimik2, inkling): a tool with
+    /// no parameters, whether the field is absent or an explicit `null`,
+    /// arrives as `{}` (`Function::parameters` normalises both) and renders
+    /// as a call with an empty argument body.
+    ///
+    /// Thinking prompts: GLM-4.7 (`enable_thinking`, on by default) and GLM-5
+    /// (always) end the generation prompt with `<think>`, so a call forced
+    /// from the first token would land inside the thinking block, where the
+    /// reasoning parser swallows it. This builder is thinking-agnostic; when
+    /// the gateway reports that the prompt ends inside `<think>`, the
+    /// registry wraps the tag in [`Self::reasoning_prefix`] (see
+    /// `ParserRegistry::generate_tool_constraint`).
+    pub fn build_structural_tag(tools: &[Tool], at_least_one: bool) -> Value {
+        let tags: Vec<Value> = tools
+            .iter()
+            .filter(|tool| !tool.function.name.is_empty())
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "tag",
+                    "begin": format!("<tool_call>{}", tool.function.name),
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": tool.function.parameters_schema(),
+                        "style": "glm_xml",
+                    },
+                    "end": "</tool_call>",
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "format": {
+                "type": "triggered_tags",
+                "triggers": ["<tool_call>"],
+                "tags": tags,
+                "at_least_one": at_least_one,
+            }
+        })
+    }
+
+    /// What precedes a forced call on a thinking prompt, by where the engine
+    /// starts the grammar; the registry emits `sequence[prefix, calls]`.
+    ///
+    /// Where the engine applies the grammar only after its reasoning parser
+    /// has seen the model's own `</think>`, nothing precedes the calls: the first
+    /// constrained
+    /// token is the forced `<tool_call>`, as under the engine's own server.
+    /// Where it applies the grammar from the first token, the prefix is
+    /// xgrammar's built-in `glm_4_7` block (`reasoning=True`): the thought,
+    /// free of the think and call markers, closed by `</think>`, so the call
+    /// is not forced into the thought. Where the worker does not say, the
+    /// prefix is free text that writes none of the call markers, with
+    /// nothing owed at its end: the thought and its `</think>` on the one
+    /// kind of engine, a newline or nothing on the other. (A block closed by
+    /// `</think>` on an engine that has already consumed the model's
+    /// `</think>` holds the model to a second one, with a fabricated
+    /// observation and answer in between.)
+    pub fn reasoning_prefix(start: GrammarStart) -> Option<Value> {
+        const CALL_MARKERS: [&str; 6] = [
+            "<tool_call>",
+            "</tool_call>",
+            "<arg_key>",
+            "</arg_key>",
+            "<arg_value>",
+            "</arg_value>",
+        ];
+        match start {
+            GrammarStart::AfterReasoning => None,
+            GrammarStart::Unknown => Some(serde_json::json!({
+                "type": "any_text",
+                "excludes": CALL_MARKERS,
+            })),
+            GrammarStart::FirstToken => {
+                let excludes = [&["<think>", "</think>"][..], &CALL_MARKERS[..]].concat();
+                Some(serde_json::json!({
+                    "type": "tag",
+                    "begin": "",
+                    "content": { "type": "any_text", "excludes": excludes },
+                    "end": "</think>",
+                }))
+            }
+        }
+    }
+
     /// Parse arguments, coercing each value by its declared schema type and
     /// falling back to [`infer_value`] when the type is unknown.
     fn parse_arguments(
@@ -102,11 +201,11 @@ impl Glm4MoeParser {
 
         for capture in self.arg_extractor.captures_iter(args_text) {
             let key = capture.get(1).map_or("", |m| m.as_str()).trim();
-            let value_str = capture.get(2).map_or("", |m| m.as_str()).trim();
+            let value_str = capture.get(2).map_or("", |m| m.as_str());
 
             let value =
                 helpers::coerce_by_schema_type(value_str, param_types.get(key).map(String::as_str))
-                    .unwrap_or_else(|| infer_value(value_str));
+                    .unwrap_or_else(|| infer_value(value_str.trim()));
 
             arguments.insert(key.to_string(), value);
         }
@@ -380,14 +479,120 @@ mod tests {
 
     use super::*;
 
+    fn tool(name: &str, strict: Option<bool>, parameters: Value) -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: name.to_string(),
+                description: None,
+                parameters: Some(parameters),
+                strict,
+                extra: Default::default(),
+            },
+        }
+    }
+
+    /// The tag follows xgrammar's built-in `glm_4_7` shape: one `<tool_call>`
+    /// trigger, a `glm_xml`-styled schema per tool passed through as written
+    /// (a no-argument tool's `{}` included), and `at_least_one` forcing a call.
+    #[test]
+    fn structural_tag_mirrors_the_xgrammar_glm_4_7_model() {
+        let schema =
+            serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let tools = vec![
+            tool("get_weather", None, schema.clone()),
+            tool("lookup", Some(false), schema.clone()),
+            tool("ping", None, serde_json::json!({})),
+            tool("", None, schema.clone()),
+        ];
+        let tag = Glm4MoeParser::build_structural_tag(&tools, true);
+        let format = &tag["format"];
+        assert_eq!(format["type"], "triggered_tags");
+        assert_eq!(format["triggers"], serde_json::json!(["<tool_call>"]));
+        assert_eq!(format["at_least_one"], true);
+        let tags = format["tags"].as_array().unwrap();
+        assert_eq!(tags.len(), 3, "a nameless tool has no tag");
+        assert_eq!(tags[0]["begin"], "<tool_call>get_weather");
+        assert_eq!(tags[0]["end"], "</tool_call>");
+        assert_eq!(tags[0]["content"]["type"], "json_schema");
+        assert_eq!(tags[0]["content"]["style"], "glm_xml");
+        assert_eq!(tags[0]["content"]["json_schema"], schema);
+        assert_eq!(
+            tags[1]["content"]["json_schema"], schema,
+            "strict is not a constraint switch here, as in the other builders"
+        );
+        assert_eq!(
+            tags[2]["content"]["json_schema"],
+            serde_json::json!({}),
+            "a no-argument tool keeps its empty schema"
+        );
+
+        let tag = Glm4MoeParser::build_structural_tag(&tools, false);
+        assert_eq!(tag["format"]["at_least_one"], false);
+    }
+
+    #[test]
+    fn reasoning_prefix_is_free_text_that_owes_nothing_at_its_end() {
+        let prefix = Glm4MoeParser::reasoning_prefix(GrammarStart::Unknown).unwrap();
+        assert_eq!(prefix["type"], "any_text");
+        assert!(
+            prefix.get("end").is_none(),
+            "nothing the model must write before the calls: {prefix}"
+        );
+        let excludes = prefix["excludes"].as_array().unwrap();
+        for token in [
+            "<tool_call>",
+            "</tool_call>",
+            "<arg_key>",
+            "</arg_key>",
+            "<arg_value>",
+            "</arg_value>",
+        ] {
+            assert!(
+                excludes.contains(&Value::String(token.to_string())),
+                "{token} must not appear before the forced call"
+            );
+        }
+        assert!(
+            !excludes.contains(&Value::String("</think>".to_string())),
+            "the model closes its thought here when the engine applies the grammar from the first token"
+        );
+    }
+
+    /// Where the worker says where its engine starts the grammar, the prefix
+    /// is the one shape that engine needs: none at all behind a reasoning
+    /// parser's gate, the `</think>`-closed thought block (xgrammar's
+    /// `glm_4_7` with `reasoning=True`) from the first token.
+    #[test]
+    fn reasoning_prefix_follows_where_the_engine_starts_the_grammar() {
+        assert_eq!(
+            Glm4MoeParser::reasoning_prefix(GrammarStart::AfterReasoning),
+            None,
+            "the grammar starts at the engine's gate: the call is forced right there"
+        );
+        let block = Glm4MoeParser::reasoning_prefix(GrammarStart::FirstToken).unwrap();
+        assert_eq!(block["type"], "tag");
+        assert_eq!(block["begin"], "");
+        assert_eq!(block["end"], "</think>");
+        assert_eq!(block["content"]["type"], "any_text");
+        let excludes = block["content"]["excludes"].as_array().unwrap();
+        for token in ["<think>", "</think>", "<tool_call>", "</arg_value>"] {
+            assert!(
+                excludes.contains(&Value::String(token.to_string())),
+                "{token} must not appear inside the thought block"
+            );
+        }
+    }
+
     fn tool_with_props(props: Value) -> Vec<Tool> {
         vec![Tool {
             tool_type: "function".to_string(),
             function: Function {
                 name: "f".to_string(),
                 description: None,
-                parameters: serde_json::json!({"type": "object", "properties": props}),
+                parameters: Some(serde_json::json!({"type": "object", "properties": props})),
                 strict: None,
+                extra: Default::default(),
             },
         }]
     }
@@ -437,5 +642,68 @@ mod tests {
         let args: Value = serde_json::from_str(&result.calls[0].parameters).unwrap();
         assert_eq!(args["limit"], Value::String("4".to_string()));
         assert_eq!(args["count"], Value::Number(5.into()));
+    }
+
+    #[tokio::test]
+    async fn test_declared_strings_preserve_whitespace() {
+        let tools = tool_with_props(serde_json::json!({
+            "code": {"type": "string"},
+            "needle": {"type": "string"},
+            "blank": {"type": "string"},
+            "quoted": {"type": "string"},
+            "count": {"type": "integer"},
+        }));
+        let args_text = concat!(
+            "<arg_key>code</arg_key><arg_value>    return 1\n</arg_value>",
+            "<arg_key>needle</arg_key><arg_value>    total = 1\n</arg_value>",
+            "<arg_key>blank</arg_key><arg_value> \t\n</arg_value>",
+            "<arg_key>quoted</arg_key><arg_value> \"    return 1\\n\" </arg_value>",
+            "<arg_key>count</arg_key><arg_value> 42\n</arg_value>",
+            "<arg_key>unknown</arg_key><arg_value> legacy text\n</arg_value>",
+        );
+        let expected = serde_json::json!({
+            "code": "    return 1\n",
+            "needle": "    total = 1\n",
+            "blank": " \t\n",
+            "quoted": "    return 1\n",
+            "count": 42,
+            "unknown": "legacy text",
+        });
+
+        for (make_parser, name_separator) in [
+            (Glm4MoeParser::glm45 as fn() -> Glm4MoeParser, "\n"),
+            (Glm4MoeParser::glm47 as fn() -> Glm4MoeParser, ""),
+        ] {
+            let text = format!("<tool_call>f{name_separator}{args_text}</tool_call>");
+            let (_, calls) = make_parser()
+                .parse_complete_with_tools(&text, &tools)
+                .await
+                .unwrap();
+            assert_eq!(calls.len(), 1);
+            let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+            assert_eq!(args, expected);
+
+            // Keep the model's opening special token intact; split the argument
+            // text into small chunks, including inside values and closing tags.
+            let mut parser = make_parser();
+            let start = "<tool_call>".len();
+            let result = parser
+                .parse_incremental(&text[..start], &tools)
+                .await
+                .unwrap();
+            assert!(result.calls.is_empty());
+            let mut arguments = String::new();
+            for chunk in text.as_bytes()[start..].chunks(7) {
+                let result = parser
+                    .parse_incremental(std::str::from_utf8(chunk).unwrap(), &tools)
+                    .await
+                    .unwrap();
+                for call in result.calls {
+                    arguments.push_str(&call.parameters);
+                }
+            }
+            let args: Value = serde_json::from_str(&arguments).unwrap();
+            assert_eq!(args, expected);
+        }
     }
 }

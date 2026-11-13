@@ -1,11 +1,15 @@
 name: 'Setup Rust Environment'
-description: 'Install Rust, configure sccache and caching. Requires checkout to be done first.'
+description: 'Install Rust and the Rust cache. Requires checkout to be done first.'
 
 inputs:
-  sccache-version:
-    description: 'sccache version to use'
+  cache-key:
+    description: >-
+      rust-cache shared key. Every job saving under the same key races for
+      one cache entry per lockfile hash and only the first save wins, so a
+      job whose target dir differs from the rest (bench profile, other
+      features) should use its own key to keep its artifacts warm.
     required: false
-    default: 'v0.12.0'
+    default: 'rust-cache'
 
 runs:
   using: 'composite'
@@ -18,12 +22,10 @@ runs:
       shell: bash
       run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
-    - name: Configure sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
-      with:
-        version: ${{ inputs.sccache-version }}
-        disable_annotations: true
-
+    # No compiler cache in front of rustc: the units one would serve are the
+    # dependency units the Rust cache restores, a hosted runner's local disk
+    # cache never outlives its job, and the Actions-cache backend was taken out
+    # for its request volume. The Rust cache is the whole of the caching.
     - name: Rust cache
       uses: Swatinem/rust-cache@v2
       with:
@@ -34,14 +36,23 @@ runs:
         # so the Go FFI build is incremental across runs like the wheel build.
         cache-directories: |
           bindings/golang/target
-        shared-key: "rust-cache"
+        shared-key: ${{ inputs.cache-key }}
         cache-all-crates: true
-        cache-on-failure: true
-        save-if: true
-
-    - name: Start sccache
-      shell: bash
-      run: |
-        if command -v sccache &> /dev/null; then
-          sccache --start-server 2>/dev/null || true
-        fi
+        # Only a job that completed, on main, saves (smg-project/smg-lab#157):
+        # - cache-on-failure would widen the post step to failed AND cancelled
+        #   jobs, and a push to main cancels the run before it; the partial
+        #   target directory of a cancelled job was then saved under the exact
+        #   key, and every pull request restored that fragment.
+        # - an entry a pull request saves is visible only to that pull request,
+        #   and at a few hundred runs a day their 1-2.4 GB entries pushed every
+        #   entry out of the repository's 10 GB cache within about twenty
+        #   minutes, main's included.
+        # A pull request's run restores the newest entry main saved under the
+        # same key (the restore keys match on the prefix, so a different
+        # lockfile still restores). For the rust-lint and rust-tests jobs that
+        # entry comes from the Rust Cache Warmer workflow
+        # (rust-cache-warmer.yml), which builds every test shard and lint leg
+        # under the key `unit-tests` on a schedule, since main's own jobs
+        # seldom complete between merges.
+        cache-on-failure: false
+        save-if: ${{ github.ref == 'refs/heads/main' }}

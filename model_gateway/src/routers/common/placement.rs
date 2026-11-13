@@ -4,7 +4,7 @@
 //! routing pool for the model, narrow it to the retained wire on a retry,
 //! drop unavailable workers unless the policy does that itself, hand the
 //! survivors to the policy registry, record the selection; and for a
-//! disaggregated request, do that per leg from one snapshot under one
+//! disaggregated request, do that per role from one snapshot under one
 //! runtime. This module is those sequences written once. A family still
 //! decides which pools it draws from and what a failure means on its wire.
 //!
@@ -12,21 +12,35 @@
 //! refresh-on-miss that the provider and realtime paths use; this is the
 //! policy-registry path over the self-hosted routing pools.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc, time::Duration};
 
-use axum::{http::HeaderMap, response::Response};
+use axum::{
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
+    response::Response,
+};
+use rand::RngExt;
+use smg_policy_controller::{Decision, LeaseId, Phase, Side, Target, WorkerId, MAX_TARGETS};
 use tracing::{debug, warn};
 
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
-    policies::{
-        policy_filters_unavailable_workers, CacheNamespace, PolicyRegistry, SelectWorkerInfo,
-        WorkerLeg,
+    middleware::ReportedRefusal,
+    observability::{
+        cache_trace,
+        log_throttle::KeyedLogThrottle,
+        metrics::{metrics_labels, Metrics},
     },
-    routers::common::overload,
+    policies::{
+        as_consistent_hashing, engine_host::HostRequest, policy_filters_unavailable_workers,
+        CacheNamespace, Decider, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
+    },
+    routers::{
+        common::{header_utils, overload, pd_admission, retry::mark_non_retryable},
+        error,
+    },
     worker::{
-        ConnectionMode, ConnectionModeExt, PdPairIndex, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry,
+        overload::{BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION},
+        ConnectionMode, ConnectionModeExt, PdPairIndex, PrefillCandidateError,
+        PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerRegistry, WorkerType,
     },
 };
 
@@ -37,7 +51,63 @@ use crate::{
 pub(crate) struct WireConstraint {
     pub runtime: RuntimeType,
     pub connection: ConnectionMode,
+    /// The retained plan carries media references. Placement pins only the
+    /// runtime and transport; the gRPC selection helpers derive their
+    /// candidate predicate from this flag.
+    pub requires_media_refs: bool,
+    /// With `requires_media_refs`: which of the workers that process them the
+    /// plan may use; the gRPC selection helpers derive their candidate
+    /// predicate from it as from the flag above.
+    pub pipeline: PipelinePin,
 }
+
+/// Which of the workers that process media references a forwarded plan may
+/// use: those running the gateway's own pipeline alone (a family whose anchor
+/// only that pipeline expands), those running the engine's own processor
+/// alone (audio, which the pipeline does not take), or either.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PipelinePin {
+    #[default]
+    Any,
+    Only,
+    Never,
+}
+
+impl WireConstraint {
+    /// Whether `worker` is on `wire`: its runtime and its transport when a
+    /// retry pins one, any worker when none is pinned. The one predicate
+    /// every narrowing to a retained plan's wire goes through, so the pools
+    /// a placement searches and the ones it judges cannot drift apart.
+    pub(crate) fn admits(wire: Option<Self>, worker: &dyn Worker) -> bool {
+        wire.is_none_or(|wire| {
+            worker.metadata().spec.runtime_type == wire.runtime
+                && *worker.connection_mode() == wire.connection
+        })
+    }
+}
+
+/// Whether an explicit target under consistent hashing holds the request
+/// to that worker: it indexes the unfiltered candidate set and stays
+/// strict, so the request waits for that worker (checked after selection,
+/// or at the gate) instead of moving to another one. The one spelling of
+/// the rule for the admission pre-filters and the retry's narrowing.
+pub(crate) fn strict_target(policy: &dyn LoadBalancingPolicy, headers: Option<&HeaderMap>) -> bool {
+    as_consistent_hashing(policy).is_some()
+        && header_utils::extract_target_worker(headers).is_some()
+}
+
+/// Whether an admission pre-filter may drop full workers from a role's
+/// candidate set before `policy` runs over it (Prefill admission's capacity,
+/// the decode pick's rooms): never under a [`strict_target`].
+pub(crate) fn admission_prefilters(
+    policy: &dyn LoadBalancingPolicy,
+    headers: Option<&HeaderMap>,
+) -> bool {
+    !strict_target(policy, headers)
+}
+
+/// A per-request candidate predicate: a worker it rejects is never selected.
+pub(crate) type CandidateFilter<'a> = &'a (dyn Fn(&dyn Worker) -> bool + Sync);
 
 /// Everything a single-worker placement reads from the request.
 #[derive(Clone, Copy, Default)]
@@ -52,6 +122,24 @@ pub(crate) struct PlacementInputs<'a> {
     pub rid_key: Option<&'a str>,
     /// The request's cache partition, when set.
     pub cache_namespace: Option<CacheNamespace>,
+    /// Extra per-request candidate predicate; a worker it rejects is never
+    /// selected (e.g. only workers that process media references themselves,
+    /// or none that already answered this request definitively).
+    pub candidate_filter: Option<CandidateFilter<'a>>,
+    /// Engines (by base URL) a failed attempt of this request already
+    /// dispatched to. A retry skips them while another available candidate
+    /// is left to take the request, so a policy that would re-select the
+    /// same worker deterministically (a routing key, a cached prefix) moves
+    /// on instead of replaying on the worker that just failed. A pool with
+    /// nothing else left is used whole, so a single worker is retried as
+    /// before.
+    pub tried: &'a [String],
+    /// The lease sequence the caller drew ([`Decider::begin`]) before it
+    /// captured the candidates it hands [`select_from`], so a worker retired
+    /// between that capture and the decision is booked by no commit of the
+    /// request. `None` numbers the lease when its view is built;
+    /// [`select_single`] draws the sequence at its own capture.
+    pub sequence: Option<LeaseId>,
 }
 
 /// The pool a placement draws from, before the availability filter.
@@ -74,6 +162,7 @@ impl Candidates {
 
 /// Why a placement produced nothing, judged from exactly the pool selection
 /// drew from.
+#[derive(Debug)]
 pub(crate) enum PlacementFailure {
     /// Nothing serves the model on this wire.
     NoCandidates,
@@ -83,16 +172,25 @@ pub(crate) enum PlacementFailure {
     Unavailable,
     /// Available candidates existed but the named policy picked none.
     PolicyDeclined(&'static str),
-    /// Both legs have workers, whatever their availability, but no prefill
+    /// Both pools have workers, whatever their availability, but no prefill
     /// shares a KV transfer protocol with any decode (#2483): judged from
     /// membership alone, since it cannot change until membership does.
-    /// Carries each leg's pairing keys and the components the legs
+    /// Carries each pool's pairing keys and the components the pools
     /// disagreed on.
     NoCompatiblePair {
         prefill: Vec<String>,
         decode: Vec<String>,
         mismatches: Vec<String>,
     },
+    /// Every prefill worker that could serve the request is at its Prefill
+    /// admission limit. Selection was not run; the request waits for a slot.
+    PrefillAtCapacity,
+}
+
+impl PrefillCandidateError for PlacementFailure {
+    fn is_at_capacity(&self) -> bool {
+        matches!(self, Self::PrefillAtCapacity)
+    }
 }
 
 /// A selected prefill/decode pair.
@@ -100,15 +198,22 @@ pub(crate) struct Pair {
     pub prefill: Arc<dyn Worker>,
     pub decode: Arc<dyn Worker>,
     /// The selected prefill worker's runtime, which under a homogeneous
-    /// caller is the runtime both legs run.
+    /// caller is the runtime both pools run.
     pub runtime: RuntimeType,
 }
 
-/// Which leg of a pair placement failed, and why. Boxed at the `Err`
+/// Which role of a pair placement failed, and why. Boxed at the `Err`
 /// site: a shed verdict carries a whole response.
+#[derive(Debug)]
 pub(crate) struct PairFailure {
-    pub leg: WorkerLeg,
+    pub role: WorkerRole,
     pub verdict: PlacementFailure,
+}
+
+impl PrefillCandidateError for PairFailure {
+    fn is_at_capacity(&self) -> bool {
+        self.verdict.is_at_capacity()
+    }
 }
 
 /// The candidates for `model_id` in `pool`, narrowed to `wire` when a retry
@@ -122,12 +227,9 @@ pub(crate) fn candidates(
     let pool = registry.get_routing_pool(model_id, pool);
     match wire {
         None => Candidates::Shared(pool),
-        Some(wire) => Candidates::Pinned(
+        Some(_) => Candidates::Pinned(
             pool.iter()
-                .filter(|w| {
-                    w.metadata().spec.runtime_type == wire.runtime
-                        && *w.connection_mode() == wire.connection
-                })
+                .filter(|w| WireConstraint::admits(wire, w.as_ref()))
                 .cloned()
                 .collect(),
         ),
@@ -145,13 +247,24 @@ pub(crate) fn select_single(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
+    // The request's sequence comes before the pool read: a worker retired
+    // from here on is booked by no commit of this request, however the
+    // retirement interleaves with the capture and the decision.
+    let sequence = policies.decider().map(|decider| decider.begin());
     let candidates = candidates(registry, model_id, pool, wire);
-    select_from(registry, policies, model_id, candidates.as_slice(), inputs)
+    select_from(
+        registry,
+        policies,
+        model_id,
+        candidates.as_slice(),
+        PlacementInputs { sequence, ..inputs },
+    )
 }
 
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
 /// with a candidate rule the pools cannot express, such as dropping DP-aware
-/// workers from a path that cannot pin a rank.
+/// workers from a path that cannot pin a rank. Such a caller draws the
+/// request's sequence before its capture ([`PlacementInputs::sequence`]).
 pub(crate) fn select_from(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -160,6 +273,77 @@ pub(crate) fn select_from(
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
     let policy = policies.get_policy_or_default(model_id);
+
+    // The per-request predicate applies to every entry point, so a caller
+    // that sets it can never dispatch to a worker it rejects.
+    let accepted;
+    let candidates: &[Arc<dyn Worker>] = match inputs.candidate_filter {
+        Some(accepts) => {
+            accepted = candidates
+                .iter()
+                .filter(|w| accepts(w.as_ref()))
+                .cloned()
+                .collect::<Vec<_>>();
+            &accepted
+        }
+        None => candidates,
+    };
+
+    let mut info = SelectWorkerInfo {
+        request_text: inputs.text,
+        tokens: inputs.tokens,
+        headers: inputs.headers,
+        routing_key: policies.sticky_header_key(inputs.headers),
+        rid_key: inputs.rid_key,
+        cache_namespace: inputs.cache_namespace,
+        // Cached hash ring for consistent hashing (O(log n) lookup), when a
+        // policy of this registry may read one (`hash_ring_wanted`).
+        hash_ring: policies
+            .hash_ring_wanted()
+            .then(|| registry.get_hash_ring(model_id))
+            .flatten(),
+        role: WorkerRole::Single,
+        overload_lifted: false,
+    };
+    // A request its policy places by session key keeps a regular owner over
+    // the overload thresholds (`LoadBalancingPolicy::routes_by_session_key`);
+    // `--worker-overload-shed` keeps the veto.
+    info.overload_lifted = !registry.overload_shed_enabled()
+        && policy.routes_by_session_key(&info)
+        && candidates
+            .iter()
+            .all(|w| *w.worker_type() == WorkerType::Regular);
+    let eligible = |worker: &Arc<dyn Worker>| {
+        worker.is_available()
+            || (info.overload_lifted && overload::vetoed_by_overload_alone(worker.as_ref()))
+    };
+
+    // Under `--policy-engine engine` the engine decides over the bounded view
+    // of the pool and the commit re-validates each target under this host's
+    // eligibility; a model on another policy than the default keeps the
+    // legacy selection below. A keyed request is a session of the engine's
+    // binding (the sticky override's rule, or the manual policy's own), and
+    // the lift travels with it as the legacy keyed path lifts the veto.
+    if let Some(decider) = policies.engine_for(policy.as_ref()) {
+        return select_from_decided(RegularDecision {
+            decider,
+            registry,
+            model_id,
+            candidates,
+            request: HostRequest {
+                model: model_id,
+                prompt_tokens: decider.prompt_tokens(inputs.tokens),
+                session_key: info.routing_key.or(inputs.rid_key),
+                tried: inputs.tried,
+                overload_lifted: info.overload_lifted,
+                phase: Phase::Single,
+                has_capacity: None,
+                sequence: inputs.sequence,
+            },
+            eligible: &eligible,
+            policy: policy.name(),
+        });
+    }
 
     // Most policies already apply the complete availability predicate. Give
     // them the shared snapshot directly instead of cloning every available
@@ -171,35 +355,59 @@ pub(crate) fn select_from(
     } else {
         filtered = candidates
             .iter()
-            .filter(|worker| worker.is_available())
+            .filter(|worker| eligible(worker))
             .cloned()
             .collect::<Vec<_>>();
         &filtered
     };
+    // The engines this request already tried step aside for its retry while
+    // another available candidate remains; otherwise the pool is used whole.
+    // A strict target indexes this slice (as `admission_prefilters` keeps
+    // it), so it is never narrowed: the retry goes back to the targeted
+    // worker.
+    let keeps_target = strict_target(policy.as_ref(), inputs.headers);
+    let untried;
+    let available: &[Arc<dyn Worker>] = if inputs.tried.is_empty() || keeps_target {
+        available
+    } else {
+        untried = available
+            .iter()
+            .filter(|worker| {
+                eligible(worker)
+                    && !inputs
+                        .tried
+                        .iter()
+                        .any(|engine| engine == worker.base_url())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if untried.is_empty() {
+            available
+        } else {
+            &untried
+        }
+    };
     if available.is_empty() {
-        return None;
+        return overload_fallback(registry, policy.name(), model_id, candidates);
     }
-
-    // Cached hash ring for consistent hashing (O(log n) lookup).
-    let hash_ring = registry.get_hash_ring(model_id);
 
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
-    let idx = policies.select_worker(
-        &policy,
-        available,
-        &SelectWorkerInfo {
-            request_text: inputs.text,
-            tokens: inputs.tokens,
-            headers: inputs.headers,
-            routing_key: policies.resolve_routing_key(inputs.headers),
-            rid_key: inputs.rid_key,
-            cache_namespace: inputs.cache_namespace,
-            hash_ring,
-            leg: WorkerLeg::Single,
-        },
-    )?;
+    let Some(idx) = policies.select_worker_for_model(&policy, model_id, available, &info) else {
+        // A policy that filters availability itself misses on an
+        // all-overloaded pool the same way the pre-filter empties.
+        return overload_fallback(registry, policy.name(), model_id, candidates);
+    };
     let selected = available[idx].clone();
+    if info.overload_lifted && !candidates.iter().any(|w| w.is_available()) {
+        Metrics::record_worker_overload_fallback(STAGE_SELECTION);
+        debug!(
+            branch = BRANCH_ALL_OVERLOADED_FALLBACK,
+            worker = selected.redacted_url(),
+            model_id,
+            "Veto fallback: a pool over the overload thresholds placed by session key"
+        );
+    }
 
     Metrics::record_worker_selection(
         metrics_labels::WORKER_REGULAR,
@@ -211,6 +419,105 @@ pub(crate) fn select_from(
     Some(selected)
 }
 
+/// What [`select_from`] hands the engine seam: the pool after the host's
+/// per-request narrowing, the request as the host reads it, and the
+/// eligibility the commit re-validates each target under.
+struct RegularDecision<'a> {
+    decider: &'a Decider,
+    registry: &'a WorkerRegistry,
+    model_id: &'a str,
+    candidates: &'a [Arc<dyn Worker>],
+    request: HostRequest<'a>,
+    eligible: &'a dyn Fn(&Arc<dyn Worker>) -> bool,
+    /// The configured policy's name: the selection metric's label, as under
+    /// the legacy path, until the observability step relabels it.
+    policy: &'static str,
+}
+
+/// [`select_from`] through the policy engine: one decision over the view of
+/// the candidates, outside any lock of this host; the commit walks the
+/// ordered targets and takes the first one the eligibility re-validates.
+/// When every target misses, one re-decision with the misses excluded, then
+/// the host's own all-vetoed fallback, as the legacy path falls back.
+fn select_from_decided(rd: RegularDecision<'_>) -> Option<Arc<dyn Worker>> {
+    let RegularDecision {
+        decider,
+        registry,
+        model_id,
+        candidates,
+        request,
+        eligible,
+        policy,
+    } = rd;
+    cache_trace::begin_selection(candidates);
+    let accept = |target: &Target| eligible(&candidates[target.position as usize]);
+    let (decision, lease) = decider.decide(&request, candidates, &[]);
+    let committed = decider
+        .commit(&lease, &decision, Side::Single, accept)
+        .or_else(|| {
+            let (missed, count) = target_ids(&decision);
+            if count == 0 {
+                return None;
+            }
+            let (again, lease) = decider.decide(&request, candidates, &missed[..count]);
+            decider.commit(&lease, &again, Side::Single, accept)
+        });
+    let Some(target) = committed else {
+        cache_trace::selection(policy, "policy", candidates, None);
+        return overload_fallback(registry, policy, model_id, candidates);
+    };
+    let position = target.position as usize;
+    cache_trace::selection(policy, "policy", candidates, Some(position));
+    let selected = Arc::clone(&candidates[position]);
+    Metrics::record_worker_selection(
+        metrics_labels::WORKER_REGULAR,
+        selected.connection_mode().as_metric_label(),
+        model_id,
+        policy,
+    );
+    Some(selected)
+}
+
+/// The ids of a decision's targets, for the one re-decision after every one
+/// of them missed its commit; none for a shed.
+pub(crate) fn target_ids(decision: &Decision) -> ([WorkerId; MAX_TARGETS], usize) {
+    let targets = decision
+        .pick()
+        .map_or(&[][..], |pick| pick.targets.as_slice());
+    let mut ids = [WorkerId::default(); MAX_TARGETS];
+    for (id, target) in ids.iter_mut().zip(targets) {
+        *id = target.id;
+    }
+    (ids, targets.len().min(MAX_TARGETS))
+}
+
+/// The steering default for a pool whose every worker is vetoed, by the
+/// overload thresholds or by the liveness tracker: its least-loaded routable
+/// worker, recorded as a selection under `policy`. Under
+/// `--worker-overload-shed` an overloaded worker is never taken (the caller
+/// sheds an all-overloaded pool); `None` when the pool is not all-vetoed or
+/// has nothing routable.
+fn overload_fallback(
+    registry: &WorkerRegistry,
+    policy: &'static str,
+    model_id: &str,
+    candidates: &[Arc<dyn Worker>],
+) -> Option<Arc<dyn Worker>> {
+    let selected = overload::fallback_if_all_vetoed(
+        candidates,
+        model_id,
+        STAGE_SELECTION,
+        registry.overload_shed_enabled(),
+    )?;
+    Metrics::record_worker_selection(
+        metrics_labels::WORKER_REGULAR,
+        selected.connection_mode().as_metric_label(),
+        model_id,
+        policy,
+    );
+    Some(selected)
+}
+
 /// Classify a failed single-worker placement from the same pool it drew from.
 pub(crate) fn single_failure(
     registry: &WorkerRegistry,
@@ -219,33 +526,527 @@ pub(crate) fn single_failure(
     wire: Option<WireConstraint>,
 ) -> PlacementFailure {
     let candidates = candidates(registry, model_id, pool, wire);
-    failure_from(candidates.as_slice(), model_id)
+    failure_from(
+        candidates.as_slice(),
+        model_id,
+        registry.overload_shed_enabled(),
+    )
 }
 
-/// Classify a failed placement from the candidates it drew from.
-pub(crate) fn failure_from(candidates: &[Arc<dyn Worker>], model_id: &str) -> PlacementFailure {
+/// Classify a failed placement from the candidates it drew from. `shed` is
+/// `--worker-overload-shed`: without it an all-overloaded pool was already
+/// steered by the placement, so reaching here means nothing was routable.
+pub(crate) fn failure_from(
+    candidates: &[Arc<dyn Worker>],
+    model_id: &str,
+    shedding: bool,
+) -> PlacementFailure {
     if candidates.is_empty() {
         return PlacementFailure::NoCandidates;
     }
-    if let Some(shed) = overload::shed_if_all_overloaded(candidates, model_id) {
+    if let Some(shed) = overload::shed_if_all_overloaded(candidates, model_id, shedding) {
         return PlacementFailure::AllOverloaded(shed);
     }
     PlacementFailure::Unavailable
 }
 
-/// Pick a prefill/decode pair for `model_id`, one worker per leg, each under
+/// Seconds a client is told to wait before retrying a request every worker
+/// refused. A pacing hint, not a recovery estimate: the breaker timeout and
+/// the health interval are far longer, and the fleet may be back sooner.
+pub(crate) const NO_AVAILABLE_WORKERS_RETRY_AFTER_SECS: u32 = 1;
+
+/// The client-visible code of [`no_available_workers`], which the loggers
+/// downstream recognise the refusal by.
+pub(crate) const NO_AVAILABLE_WORKERS_CODE: &str = "no_available_workers";
+
+/// The client-visible code of the refusal for a model whose registered
+/// workers include none that processes media references, under a placement
+/// that forwards a request's media to the worker: preparation's verdict over
+/// the pool (`multimodal::resolve_mm_processing`) and worker selection's
+/// backstop of it answer under this code.
+pub(crate) const NO_MEDIA_REF_CAPABLE_WORKER_CODE: &str = "no_media_ref_capable_worker";
+
+/// The 503 for a pool whose every worker is unavailable (unhealthy or its
+/// circuit breaker open). Terminal for the retry layer: the verdict clears at
+/// the health interval or the breaker timeout, never inside a backoff window,
+/// so retrying it in-process only adds the backoffs to every client's latency
+/// while the pool is down. The client retries on its own schedule, paced by
+/// `Retry-After` like the gateway's other refusals (admission sheds, the
+/// overload shed, tenant limits): a client that honours the header does not
+/// hammer a fleet that is down and gets the same bounded hint on every path.
+pub(crate) fn no_available_workers(message: impl Into<String>) -> Response {
+    let message = message.into();
+    let reason = message.clone();
+    no_available_workers_because(message, reason)
+}
+
+/// [`no_available_workers`] whose line names a reason other than the
+/// client's message: the message stays the one the client has always read
+/// under the code, the line gets the verdict the router has (the policy
+/// that declined a role, the role at its admission limit), so the reason on
+/// the line never contradicts the pool state next to it.
+pub(crate) fn no_available_workers_because(
+    message: impl Into<String>,
+    reason: impl Into<String>,
+) -> Response {
+    let mut response = error::service_unavailable(NO_AVAILABLE_WORKERS_CODE, message.into());
+    response
+        .extensions_mut()
+        .insert(RefusalReason(reason.into()));
+    mark_non_retryable(&mut response);
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from(NO_AVAILABLE_WORKERS_RETRY_AFTER_SECS),
+    );
+    response
+}
+
+/// The 503 for a model whose registered workers include none that processes
+/// media references, under worker-side media placement. A capability
+/// verdict, not a pool state: terminal for the retry layer (what a worker
+/// advertises does not change within a backoff window) and without a
+/// `Retry-After` (a client's pacing fixes nothing here; the deployment's
+/// configuration does). The message is the caller's; the line's reason is
+/// the verdict.
+pub(crate) fn no_media_ref_capable_worker(message: impl Into<String>) -> Response {
+    let mut response = error::service_unavailable(NO_MEDIA_REF_CAPABLE_WORKER_CODE, message.into());
+    response.extensions_mut().insert(RefusalReason(
+        "no worker of the model processes media references".to_string(),
+    ));
+    mark_non_retryable(&mut response);
+    response
+}
+
+/// The reason a refusal's line names, when the router gave one (a
+/// `no_available_workers` 503; a 404 names none).
+pub(crate) fn refusal_reason(response: &Response) -> Option<&str> {
+    response
+        .extensions()
+        .get::<RefusalReason>()
+        .map(|reason| reason.0.as_str())
+}
+
+/// The workers of `pool` a placement may use: those on `wire` when a retry
+/// pins one, narrowed to the ones the request's candidate filter admits. A
+/// failed pool's veto fallback and its verdict are judged over these, so a
+/// filter that admits only vetoed workers reads as a vetoed pool (steered,
+/// or shed under `--worker-overload-shed`) and not as an unavailable one
+/// because a worker the request may not use is idle. A narrowing that
+/// admits nothing is left out: a wire no worker of the pool is on keeps the
+/// pool's own verdict as before, judged over every worker and without the
+/// filter (a filter narrowed over workers the retry cannot use would turn
+/// that verdict into a shed over another wire's overloaded workers), and a
+/// filter that admits none of the workers on the wire is the caller's to
+/// name.
+fn admitted_pool(
+    pool: &[Arc<dyn Worker>],
+    wire: Option<WireConstraint>,
+    inputs: &PlacementInputs<'_>,
+) -> Vec<Arc<dyn Worker>> {
+    if wire.is_none() && inputs.candidate_filter.is_none() {
+        return pool.to_vec();
+    }
+    let narrowed = |workers: &[Arc<dyn Worker>], keep: &dyn Fn(&Arc<dyn Worker>) -> bool| {
+        let kept: Vec<Arc<dyn Worker>> = workers.iter().filter(|w| keep(w)).cloned().collect();
+        (!kept.is_empty()).then_some(kept)
+    };
+    let Some(on_wire) = narrowed(pool, &|w| WireConstraint::admits(wire, w.as_ref())) else {
+        return pool.to_vec();
+    };
+    narrowed(&on_wire, &|w| {
+        inputs
+            .candidate_filter
+            .is_none_or(|accepts| accepts(w.as_ref()))
+    })
+    .unwrap_or(on_wire)
+}
+
+/// The client-visible code of [`error::model_not_found`], which the refusal
+/// line recognises the 404 by.
+pub(crate) const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
+
+/// The reason a `no_available_workers` refusal names (the role that is down,
+/// the policy that declined), carried on the response for its log line.
+#[derive(Clone, Debug)]
+struct RefusalReason(String);
+
+/// Lines per second the gateway writes for each refusal it answers on its
+/// own: a model whose workers are all unavailable (`no_available_workers`),
+/// a model nobody serves (`model_not_found`) and a model none of whose
+/// workers processes the media references forwarded to it
+/// (`no_media_ref_capable_worker`). One line per refusal, with
+/// the request id, the model and the pool's state, shows the condition and
+/// whom it hits; past this rate the lines are counted and the next one
+/// carries the count, while `smg_router_request_errors_total` keeps the
+/// volume. A client retrying at once drew four thousand refusals a second,
+/// up to three ERROR lines each, before. The allowance is per model, so one
+/// storming model never silences another's first line.
+pub(crate) const REFUSAL_LINES_PER_SECOND: u32 = 10;
+
+/// Models a refusal throttle tracks at once; past this the model seen least
+/// recently is forgotten (a model that is down keeps refusing, so it stays).
+pub(crate) const REFUSAL_LOG_MODELS: usize = 64;
+
+static NO_AVAILABLE_WORKERS_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    REFUSAL_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    REFUSAL_LOG_MODELS,
+);
+
+static MODEL_NOT_FOUND_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    REFUSAL_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    REFUSAL_LOG_MODELS,
+);
+
+static NO_MEDIA_REF_CAPABLE_WORKER_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    REFUSAL_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    REFUSAL_LOG_MODELS,
+);
+
+/// The router answering a refusal, as its line names it.
+#[derive(Clone, Copy)]
+pub(crate) struct RefusalSite<'a> {
+    /// The refusing function, e.g. `WorkerSelectionStage::execute`.
+    pub function: &'static str,
+    /// The router's mode: `Regular`, `PrefillDecode` or `EncodePrefillDecode`.
+    pub mode: &'static str,
+    /// The pools the router draws from for the model, named per role.
+    pub pools: &'a [(&'static str, RoutingPool)],
+}
+
+/// A refusal the gateway answers on its own, with the line it gets and the
+/// cap the line is under.
+#[derive(Clone, Copy)]
+enum Refusal {
+    NoAvailableWorkers,
+    ModelNotFound,
+    /// The model's workers process no media references, under a placement
+    /// that forwards them ([`no_media_ref_capable_worker`]): a configuration
+    /// verdict that holds until a capable worker registers, so it is keyed
+    /// and capped like the pool's 503.
+    NoMediaRefCapableWorker,
+}
+
+impl Refusal {
+    fn of(response: &Response) -> Option<Self> {
+        match error::extract_error_code_from_response(response) {
+            NO_AVAILABLE_WORKERS_CODE => Some(Self::NoAvailableWorkers),
+            MODEL_NOT_FOUND_CODE => Some(Self::ModelNotFound),
+            NO_MEDIA_REF_CAPABLE_WORKER_CODE => Some(Self::NoMediaRefCapableWorker),
+            _ => None,
+        }
+    }
+
+    fn throttle(self) -> &'static KeyedLogThrottle {
+        match self {
+            Self::NoAvailableWorkers => &NO_AVAILABLE_WORKERS_LOG,
+            Self::ModelNotFound => &MODEL_NOT_FOUND_LOG,
+            Self::NoMediaRefCapableWorker => &NO_MEDIA_REF_CAPABLE_WORKER_LOG,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::NoAvailableWorkers => "No available workers for model",
+            Self::ModelNotFound => "No worker serves model",
+            Self::NoMediaRefCapableWorker => "No worker processes media references for model",
+        }
+    }
+
+    /// The key the refusal's line is throttled under. A 503 for a model with
+    /// workers registered on some role is keyed by the model: those keys are
+    /// bounded by the registry, and one storming model never silences
+    /// another's first line. A 404's "model" is whatever name the client
+    /// sent, so every unknown name shares one allowance: a client varying
+    /// the name gets no fresh lines per name, and the one line still names
+    /// one of them while `suppressed` carries the rest. A 503 for a name
+    /// with no workers on any role (the HTTP PD router answers a name nobody
+    /// serves with its role's 503, not a 404) is an unknown name too and
+    /// shares one allowance with every other such name, for the same reason.
+    fn key(self, model_id: &str, registered: bool) -> &str {
+        match self {
+            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker if registered => model_id,
+            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker | Self::ModelNotFound => "",
+        }
+    }
+}
+
+/// The log line of a refusal the gateway answers on its own, and its marker.
+///
+/// A `no_available_workers` 503, a `no_media_ref_capable_worker` 503 or a
+/// `model_not_found` 404 gets one WARN with the request id, the model and
+/// the state of the pools `site` draws from, and the reason the refusal
+/// names when it has one (the role that is down, the policy that declined,
+/// the media references no worker processes), capped at
+/// [`REFUSAL_LINES_PER_SECOND`] per model with workers for the 503s and for
+/// all unknown names together
+/// (the 404, and a 503 for a name with no workers at all; see
+/// [`Refusal::key`]); a line past the cap is counted and the next
+/// admitted line of its key carries the count as `suppressed`. The response
+/// is marked [`ReportedRefusal`], so the
+/// pipeline's stage line and the access log's response line drop to DEBUG
+/// for it: a refusal is the gateway's normal answer to "no worker for this
+/// request", not a fault of its own, and up to three ERROR lines per refusal
+/// made a client's retry loop a log storm. The error counter
+/// (`smg_router_request_errors_total`) keeps the volume. A refusal already
+/// marked, and every other response, passes through unchanged.
+pub(crate) fn report_refusal(
+    registry: &WorkerRegistry,
+    site: RefusalSite<'_>,
+    request_id: Option<&str>,
+    model_id: &str,
+    refusal: Response,
+) -> Response {
+    match Refusal::of(&refusal) {
+        Some(kind) if refusal.extensions().get::<ReportedRefusal>().is_none() => {
+            report_refusal_under(
+                kind.throttle(),
+                registry,
+                site,
+                request_id,
+                model_id,
+                refusal,
+            )
+        }
+        _ => refusal,
+    }
+}
+
+/// [`report_refusal`] under an explicit throttle (a test's own, or the
+/// static of the refusal's kind), keyed as [`Refusal::key`] says.
+pub(crate) fn report_refusal_under(
+    throttle: &KeyedLogThrottle,
+    registry: &WorkerRegistry,
+    site: RefusalSite<'_>,
+    request_id: Option<&str>,
+    model_id: &str,
+    mut refusal: Response,
+) -> Response {
+    let Some(kind) = Refusal::of(&refusal) else {
+        return refusal;
+    };
+    let message = kind.message();
+    refusal.extensions_mut().insert(ReportedRefusal);
+    // Whether some role has workers for the model (see `Refusal::key`): one
+    // pool lookup per role, no walk over the workers; the 404 needs none.
+    let registered = matches!(
+        kind,
+        Refusal::NoAvailableWorkers | Refusal::NoMediaRefCapableWorker
+    ) && site
+        .pools
+        .iter()
+        .any(|(_, pool)| !registry.get_routing_pool(model_id, *pool).is_empty());
+    if let Some(admitted) = throttle.admit(kind.key(model_id, registered)) {
+        let pool = PoolState::of(registry, model_id, site.pools);
+        let reason = refusal_reason(&refusal);
+        // The request's span carries the id too; the field is for a line
+        // written outside it (a retry's re-selection) and is omitted when
+        // the router has no id of its own to give.
+        warn!(
+            function = site.function,
+            request_id = request_id,
+            mode = %site.mode,
+            model_id = %model_id,
+            reason = reason,
+            workers = pool.workers(),
+            available = pool.available(),
+            pool = %pool,
+            suppressed = admitted.suppressed,
+            "{message}"
+        );
+    }
+    refusal
+}
+
+/// What a refusal line says about the pools it drew from: per role, the
+/// workers registered for the model, those healthy, and those routable
+/// (healthy, circuit closed, not vetoed by load or liveness).
+struct PoolState {
+    roles: Vec<RoleState>,
+}
+
+struct RoleState {
+    role: &'static str,
+    workers: usize,
+    healthy: usize,
+    available: usize,
+}
+
+impl PoolState {
+    fn of(
+        registry: &WorkerRegistry,
+        model_id: &str,
+        pools: &[(&'static str, RoutingPool)],
+    ) -> Self {
+        PoolState {
+            roles: pools
+                .iter()
+                .map(|(role, pool)| {
+                    let workers = registry.get_routing_pool(model_id, *pool);
+                    RoleState {
+                        role,
+                        workers: workers.len(),
+                        healthy: workers.iter().filter(|w| w.is_healthy()).count(),
+                        available: workers.iter().filter(|w| w.is_available()).count(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn workers(&self) -> usize {
+        self.roles.iter().map(|role| role.workers).sum()
+    }
+
+    fn available(&self) -> usize {
+        self.roles.iter().map(|role| role.available).sum()
+    }
+}
+
+impl fmt::Display for PoolState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, role) in self.roles.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(
+                f,
+                "{} {}/{} available ({} healthy)",
+                role.role, role.available, role.workers, role.healthy
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The steering default for a disaggregated placement whose failed pool is
+/// vetoed on every worker the request may use (`failed_pool`, see
+/// [`admitted_pool`]), by the overload thresholds or by the liveness
+/// tracker, where the pool's policy does not place over a lifted overload
+/// veto (see [`select_pair`]): the least-loaded routable prefill that has a
+/// routable partner, paired with its least-loaded routable partner. Pairs
+/// vetoed by overload alone come first; a liveness veto is crossed only when
+/// nothing else pairs, and never onto an overloaded worker under
+/// `--worker-overload-shed`.
+/// `None` when the failed pool is not all-vetoed (an unhealthy pool keeps its
+/// unavailable answer), when it is all-overloaded under shedding (the caller
+/// sheds), or when nothing pairs; a prefill admission gate still has the last
+/// word.
+fn relaxed_pair(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    inputs: &PlacementInputs<'_>,
+    failed_pool: &[Arc<dyn Worker>],
+) -> Option<Result<Pair, Box<PairFailure>>> {
+    let shedding = registry.overload_shed_enabled();
+    if !overload::all_vetoed(failed_pool) || (shedding && overload::all_overloaded(failed_pool)) {
+        return None;
+    }
+    let eligible = |w: &Arc<dyn Worker>| {
+        w.is_healthy()
+            && w.circuit_breaker_can_execute()
+            && WireConstraint::admits(wire, w.as_ref())
+            && inputs
+                .candidate_filter
+                .is_none_or(|accepts| accepts(w.as_ref()))
+    };
+    // Equal loads draw uniformly (partner and pair alike), so an equally
+    // loaded pool does not send every fallback to its first pair.
+    let mut rng = rand::rng();
+    let mut search = |routable: &dyn Fn(&Arc<dyn Worker>) -> bool| {
+        let mut best: Option<(Arc<dyn Worker>, Arc<dyn Worker>)> = None;
+        let mut tied = 0u32;
+        for (i, prefill) in pairs.prefill.iter().enumerate() {
+            if !routable(prefill) {
+                continue;
+            }
+            let Some(decode) = overload::least_loaded_uniform(
+                pairs.partners[i].iter().filter(|d| routable(d)),
+                &mut rng,
+            ) else {
+                continue;
+            };
+            let loads = (prefill.load(), decode.load());
+            match best.as_ref().map(|(p, d)| (p.load(), d.load())) {
+                Some(best_loads) if loads > best_loads => {}
+                Some(best_loads) if loads == best_loads => {
+                    tied += 1;
+                    if rng.random_range(0..=tied) == 0 {
+                        best = Some((Arc::clone(prefill), Arc::clone(decode)));
+                    }
+                }
+                _ => {
+                    best = Some((Arc::clone(prefill), Arc::clone(decode)));
+                    tied = 0;
+                }
+            }
+        }
+        best
+    };
+    let overloaded_first = (!shedding)
+        .then(|| search(&|w| eligible(w) && w.stall_reason().is_none()))
+        .flatten();
+    let ((prefill, decode), branch) = match overloaded_first {
+        Some(pair) => (pair, BRANCH_ALL_OVERLOADED_FALLBACK),
+        None => (
+            search(&|w| eligible(w) && !(shedding && w.is_overloaded()))?,
+            BRANCH_ALL_STALLED_FALLBACK,
+        ),
+    };
+    if prefill_capacity.is_some_and(|capacity| !capacity.has_capacity(&prefill)) {
+        return Some(Err(Box::new(PairFailure {
+            role: WorkerRole::Prefill,
+            verdict: PlacementFailure::PrefillAtCapacity,
+        })));
+    }
+    if branch == BRANCH_ALL_OVERLOADED_FALLBACK {
+        Metrics::record_worker_overload_fallback(STAGE_SELECTION);
+    } else {
+        Metrics::record_worker_liveness_fallback(STAGE_SELECTION);
+    }
+    debug!(
+        branch,
+        prefill = %prefill.redacted_url(),
+        decode = %decode.redacted_url(),
+        model_id,
+        "Veto fallback"
+    );
+    let runtime = prefill.metadata().spec.runtime_type;
+    Some(Ok(Pair {
+        prefill,
+        decode,
+        runtime,
+    }))
+}
+
+/// Pick a prefill/decode pair for `model_id`, one worker per role, each under
 /// its own policy and sticky namespace.
 ///
 /// `pairs` is the snapshot's compatibility index (see [`PdPairIndex`]):
 /// which decodes each prefill may hand off to was decided when membership
-/// last changed, so this path compares no descriptors. Every leg is judged
+/// last changed, so this path compares no descriptors. Every pool is judged
 /// live for availability, and a prefill counts only while one of its
 /// partners is available, so the policy's pick can always be paired; `wire`
-/// pins both legs to the retained plan's runtime and transport on a retry;
-/// `homogeneous_runtime` narrows both legs to the runtime of the first
+/// pins both pools to the retained plan's runtime and transport on a retry;
+/// `homogeneous_runtime` narrows both pools to the runtime of the first
 /// prefill worker open under its own runtime, which the gRPC wire needs
-/// because its rendezvous is runtime-specific. A miss names the leg and carries the verdict judged
-/// from that leg's own candidates.
+/// because its rendezvous is runtime-specific. A miss names the role and carries the verdict judged
+/// from that role's candidates the request may use. A prefill pool whose
+/// policy balances load against cache affinity itself is never steered by
+/// the overload veto, and is placed by that policy even when every worker
+/// in it is over the thresholds. Any other pool whose every worker the
+/// request may use is over them is steered by load as before: a prefill
+/// pool by the least-loaded default ([`relaxed_pair`]), a decode pool to
+/// the least-loaded partner of the prefill its own policy picked.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pair placement threads every routing input plus the admission view"
+)]
 pub(crate) fn select_pair(
     registry: &WorkerRegistry,
     policies: &PolicyRegistry,
@@ -253,25 +1054,66 @@ pub(crate) fn select_pair(
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
     homogeneous_runtime: bool,
+    prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
 ) -> Result<Pair, Box<PairFailure>> {
-    let eligible = |w: &Arc<dyn Worker>| {
-        w.is_available()
-            && wire.is_none_or(|wire| {
-                w.metadata().spec.runtime_type == wire.runtime
-                    && *w.connection_mode() == wire.connection
-            })
+    let admitted = |w: &Arc<dyn Worker>| {
+        WireConstraint::admits(wire, w.as_ref())
+            && inputs
+                .candidate_filter
+                .is_none_or(|accepts| accepts(w.as_ref()))
     };
-    let fail = |leg: WorkerLeg, verdict: PlacementFailure| Box::new(PairFailure { leg, verdict });
+    // The overload thresholds steer a pool only while one of the workers the
+    // request may use in it is under them. A pool whose every such worker
+    // is over them (and some otherwise routable) has nowhere to be steered:
+    // the default steers it by load, as it steers a single-worker placement,
+    // and a decode pool over them pairs by load with the prefill its own
+    // policy picked rather than re-pick a prefill its pool never vetoed.
+    // Under `--worker-overload-shed` such a pool is shed instead.
+    let shedding = registry.overload_shed_enabled();
+    let vetoed_alone = |pool: &[Arc<dyn Worker>]| {
+        pool.iter()
+            .any(|w| admitted(w) && overload::vetoed_by_overload_alone(w.as_ref()))
+    };
+    let lifted = |pool: &[Arc<dyn Worker>]| {
+        !shedding && !pool.iter().any(|w| admitted(w) && w.is_available()) && vetoed_alone(pool)
+    };
+    // Independent prefill/decode policies so stateful ones (round robin) do
+    // not share a counter; each role tags the sticky key with its own prefix.
+    let prefill_policy = policies.get_prefill_policy();
+    let decode_policy = policies.get_decode_policy();
+    let prefill_over = lifted(&pairs.prefill);
+    // The veto does not steer a prefill pool whose policy weighs load
+    // against cache affinity itself (`SelectWorkerInfo::overload_lifted`):
+    // under sustained load the prefill workers take turns crossing the
+    // thresholds, and every crossing would send the sessions whose prefixes
+    // that worker holds to another one, discarding their cache and pushing
+    // that worker over in turn; a least-loaded pick over a pool all over
+    // them discards the same. The policy's own gate moves a request off a
+    // holder loaded well past the pool
+    // (`LoadBalancingPolicy::balances_load_against_affinity`). A policy
+    // without that affinity (load-blind, or one that hashes only over
+    // workers under the thresholds) keeps the veto and the default.
+    let lift_prefill = !shedding
+        && prefill_policy.balances_load_against_affinity()
+        && vetoed_alone(&pairs.prefill);
+    let lift_decode = lifted(&pairs.decode_pool);
+    let eligible = |w: &Arc<dyn Worker>, lift: bool| {
+        admitted(w)
+            && (w.is_available() || (lift && overload::vetoed_by_overload_alone(w.as_ref())))
+    };
+    let prefill_eligible = |w: &Arc<dyn Worker>| eligible(w, lift_prefill);
+    let fail =
+        |role: WorkerRole, verdict: PlacementFailure| Box::new(PairFailure { role, verdict });
 
-    // A leg with no worker at all names itself before pairing is judged.
+    // A role with no worker at all names itself before pairing is judged.
     if pairs.prefill_pool.is_empty() {
         debug!("No prefill workers");
-        return Err(fail(WorkerLeg::Prefill, PlacementFailure::NoCandidates));
+        return Err(fail(WorkerRole::Prefill, PlacementFailure::NoCandidates));
     }
     if pairs.decode_pool.is_empty() {
         debug!("No decode workers");
-        return Err(fail(WorkerLeg::Decode, PlacementFailure::NoCandidates));
+        return Err(fail(WorkerRole::Decode, PlacementFailure::NoCandidates));
     }
     if let Some(refusal) = &pairs.refusal {
         warn!(
@@ -283,7 +1125,7 @@ pub(crate) fn select_pair(
             "No prefill/decode pair shares a KV transfer protocol"
         );
         return Err(fail(
-            WorkerLeg::Decode,
+            WorkerRole::Decode,
             PlacementFailure::NoCompatiblePair {
                 prefill: refusal.prefill.clone(),
                 decode: refusal.decode.clone(),
@@ -294,117 +1136,213 @@ pub(crate) fn select_pair(
 
     // Live state: a prefill is open when it is available and so is one of
     // its partners, so the policy's pick can always be paired. Where the
-    // wire's rendezvous is runtime-specific, both legs must also share a
+    // wire's rendezvous is runtime-specific, both pools must also share a
     // runtime: that of the first prefill worker open under its own runtime,
     // so a prefill whose partners are all down never shuts out a healthy
     // pair on another runtime. The index keeps runtimes apart already
     // unless pairing is off or a runtime is unknown.
     let partner_open = |d: &Arc<dyn Worker>, runtime: Option<RuntimeType>| {
-        eligible(d) && runtime.is_none_or(|r| d.metadata().spec.runtime_type == r)
+        eligible(d, lift_decode) && runtime.is_none_or(|r| d.metadata().spec.runtime_type == r)
     };
     let can_pair_on = |i: usize, runtime: Option<RuntimeType>| {
         pairs.partners[i].iter().any(|d| partner_open(d, runtime))
     };
-    if !pairs.prefill.iter().any(&eligible) {
+    if !pairs.prefill.iter().any(&prefill_eligible) {
+        let admitted = admitted_pool(&pairs.prefill, wire, &inputs);
+        if let Some(pair) = relaxed_pair(
+            registry,
+            model_id,
+            pairs,
+            wire,
+            prefill_capacity,
+            &inputs,
+            &admitted,
+        ) {
+            return pair;
+        }
         debug!("No available prefill workers");
         return Err(fail(
-            WorkerLeg::Prefill,
-            failure_from(&pairs.prefill, model_id),
+            WorkerRole::Prefill,
+            failure_from(&admitted, model_id, registry.overload_shed_enabled()),
         ));
     }
-    let leg_runtime = homogeneous_runtime
+    let pair_runtime = homogeneous_runtime
         .then(|| {
             pairs.prefill.iter().enumerate().find_map(|(i, p)| {
                 let runtime = p.metadata().spec.runtime_type;
-                (eligible(p) && can_pair_on(i, Some(runtime))).then_some(runtime)
+                (prefill_eligible(p) && can_pair_on(i, Some(runtime))).then_some(runtime)
             })
         })
         .flatten();
-    // One pass: the open prefills on the leg's runtime, counting the
+    // One pass: the open prefills on the pair's runtime, counting the
     // pairable ones the narrowing excluded so the exclusion leaves a trace.
     let mut excluded = 0usize;
-    let open: Vec<usize> = (0..pairs.prefill.len())
+    let mut open: Vec<usize> = (0..pairs.prefill.len())
         .filter(|&i| {
             let p = &pairs.prefill[i];
-            if !eligible(p) {
+            if !prefill_eligible(p) {
                 return false;
             }
             let own = p.metadata().spec.runtime_type;
-            if leg_runtime.is_some_and(|runtime| own != runtime) {
+            if pair_runtime.is_some_and(|runtime| own != runtime) {
                 if can_pair_on(i, Some(own)) {
                     excluded += 1;
                 }
                 return false;
             }
-            can_pair_on(i, leg_runtime)
+            can_pair_on(i, pair_runtime)
         })
         .collect();
     if excluded > 0 {
         warn!(
             model_id,
-            ?leg_runtime,
+            ?pair_runtime,
             excluded,
             "Mixed runtime types in PD workers; pairable prefill workers on another runtime were excluded"
         );
     }
     if open.is_empty() {
-        debug!(?leg_runtime, "No available PD pair");
+        // A lifted prefill pool with every worker vetoed had no prefill free
+        // of the vetoes: the default is judged over it, as it was before the
+        // lift. Otherwise the decode pool left the open prefills nothing to
+        // pair with.
+        let (role, failed_pool) = if prefill_over {
+            (WorkerRole::Prefill, &pairs.prefill)
+        } else {
+            (WorkerRole::Decode, &pairs.decode_pool)
+        };
+        let admitted = admitted_pool(failed_pool, wire, &inputs);
+        if let Some(pair) = relaxed_pair(
+            registry,
+            model_id,
+            pairs,
+            wire,
+            prefill_capacity,
+            &inputs,
+            &admitted,
+        ) {
+            return pair;
+        }
+        debug!(?pair_runtime, "No available PD pair");
         return Err(fail(
-            WorkerLeg::Decode,
-            failure_from(&pairs.decode_pool, model_id),
+            role,
+            failure_from(&admitted, model_id, registry.overload_shed_enabled()),
         ));
+    }
+
+    // Under Prefill admission, workers at their limit leave the candidate set
+    // before the policy runs, so a stateful policy never commits a choice
+    // the reservation then refuses.
+    if let Some(capacity) =
+        prefill_capacity.filter(|_| admission_prefilters(prefill_policy.as_ref(), inputs.headers))
+    {
+        open.retain(|&i| capacity.has_capacity(&pairs.prefill[i]));
+        if open.is_empty() {
+            return Err(fail(
+                WorkerRole::Prefill,
+                PlacementFailure::PrefillAtCapacity,
+            ));
+        }
     }
     let prefill: Vec<Arc<dyn Worker>> = open
         .iter()
         .map(|&i| Arc::clone(&pairs.prefill[i]))
         .collect();
-
-    // Independent prefill/decode policies so stateful ones (round robin) do
-    // not share a counter; each leg tags the sticky key with its own prefix.
-    let prefill_policy = policies.get_prefill_policy();
-    let decode_policy = policies.get_decode_policy();
-    let hash_ring = registry.get_hash_ring(model_id);
+    let hash_ring = policies
+        .hash_ring_wanted()
+        .then(|| registry.get_hash_ring(model_id))
+        .flatten();
     let mut info = SelectWorkerInfo {
         request_text: inputs.text,
         tokens: inputs.tokens,
         headers: inputs.headers,
-        routing_key: policies.resolve_routing_key(inputs.headers),
+        routing_key: policies.sticky_header_key(inputs.headers),
         rid_key: inputs.rid_key,
         cache_namespace: inputs.cache_namespace,
         hash_ring,
-        leg: WorkerLeg::Prefill,
+        role: WorkerRole::Prefill,
+        overload_lifted: lift_prefill,
     };
-    // Both legs were filtered for availability above, so a miss here is the
-    // policy's own decision, never an overloaded pool.
-    let declined = |leg: WorkerLeg, policy: &'static str| {
+    // Both pools were filtered for availability above (a pool the overload
+    // veto cannot steer counting as available), so a miss here is the
+    // policy's own decision.
+    let declined = |role: WorkerRole, policy: &'static str| {
         Box::new(PairFailure {
-            leg,
+            role,
             verdict: PlacementFailure::PolicyDeclined(policy),
         })
     };
-    let Some(prefill_idx) = policies.select_worker(&prefill_policy, &prefill, &info) else {
-        return Err(declined(WorkerLeg::Prefill, prefill_policy.name()));
+    let Some(prefill_idx) =
+        policies.select_worker_for_model(&prefill_policy, model_id, &prefill, &info)
+    else {
+        // A policy that declines a lifted pool all over the thresholds: the
+        // least-loaded default steers it, as it steers any other such pool.
+        if lift_prefill {
+            let admitted = admitted_pool(&pairs.prefill, wire, &inputs);
+            if let Some(pair) = relaxed_pair(
+                registry,
+                model_id,
+                pairs,
+                wire,
+                prefill_capacity,
+                &inputs,
+                &admitted,
+            ) {
+                return pair;
+            }
+        }
+        return Err(declined(WorkerRole::Prefill, prefill_policy.name()));
     };
     let selected_prefill = prefill[prefill_idx].clone();
+    if prefill_capacity.is_some_and(|capacity| !capacity.has_capacity(&selected_prefill)) {
+        return Err(fail(
+            WorkerRole::Prefill,
+            PlacementFailure::PrefillAtCapacity,
+        ));
+    }
     // The pick's open partners: non-empty by construction, short of an
     // availability flip between the two reads.
-    let decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
+    let mut decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
         .iter()
-        .filter(|d| partner_open(d, leg_runtime))
+        .filter(|d| partner_open(d, pair_runtime))
         .cloned()
         .collect();
     if decode.is_empty() {
         debug!(
-            ?leg_runtime,
+            ?pair_runtime,
             "The selected prefill's partners went unavailable"
         );
-        return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
+        return Err(fail(WorkerRole::Decode, PlacementFailure::Unavailable));
     }
-    info.leg = WorkerLeg::Decode;
-    let Some(decode_idx) = policies.select_worker(&decode_policy, &decode, &info) else {
-        return Err(declined(WorkerLeg::Decode, decode_policy.name()));
+    retain_decodes_with_a_room(decode_policy.as_ref(), inputs.headers, &mut decode);
+    // A decode pool all over the thresholds pairs by load, as the default
+    // paired it: the least-loaded of the pick's partners, counted as a veto
+    // fallback and not as a selection of the decode policy. Any other keeps
+    // the veto for its policy.
+    let selected_decode = if lift_decode {
+        overload::least_loaded_uniform(decode.iter(), &mut rand::rng())
+            .cloned()
+            .ok_or_else(|| fail(WorkerRole::Decode, PlacementFailure::Unavailable))?
+    } else {
+        info.role = WorkerRole::Decode;
+        info.overload_lifted = false;
+        match policies.select_worker_for_model(&decode_policy, model_id, &decode, &info) {
+            Some(decode_idx) => decode[decode_idx].clone(),
+            None => return Err(declined(WorkerRole::Decode, decode_policy.name())),
+        }
     };
-    let selected_decode = decode[decode_idx].clone();
+    if prefill_over || lift_decode {
+        Metrics::record_worker_overload_fallback(STAGE_SELECTION);
+        debug!(
+            branch = BRANCH_ALL_OVERLOADED_FALLBACK,
+            prefill_pool = prefill_over,
+            decode_pool = lift_decode,
+            prefill = %selected_prefill.redacted_url(),
+            decode = %selected_decode.redacted_url(),
+            model_id,
+            "Veto fallback: a prefill pool over the overload thresholds placed by its policy, or a decode pool by load"
+        );
+    }
     let runtime = selected_prefill.metadata().spec.runtime_type;
     Metrics::record_worker_selection(
         metrics_labels::WORKER_PREFILL,
@@ -412,16 +1350,18 @@ pub(crate) fn select_pair(
         model_id,
         prefill_policy.name(),
     );
-    Metrics::record_worker_selection(
-        metrics_labels::WORKER_DECODE,
-        selected_decode.connection_mode().as_metric_label(),
-        model_id,
-        decode_policy.name(),
-    );
+    if !lift_decode {
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_DECODE,
+            selected_decode.connection_mode().as_metric_label(),
+            model_id,
+            decode_policy.name(),
+        );
+    }
 
     debug!(
-        prefill = %selected_prefill.url(),
-        decode = %selected_decode.url(),
+        prefill = %selected_prefill.redacted_url(),
+        decode = %selected_decode.redacted_url(),
         "Selected PD pair"
     );
     Ok(Pair {
@@ -431,22 +1371,78 @@ pub(crate) fn select_pair(
     })
 }
 
+/// Narrow a decode pick's candidates to the workers whose admission gate
+/// would seat one more room now ([`pd_admission::has_free_room`]), when some
+/// have one and some do not; with every candidate full, or none reporting a
+/// window, the list is left as it is and the policy chooses as before, the
+/// dispatch waiting on its pick. An explicit target under consistent hashing
+/// indexes the unfiltered list and is never narrowed ([`admission_prefilters`]),
+/// so it waits at its own gate as before.
+///
+/// The pick reads the rooms the gate claims against because the policies
+/// cannot: a load report never carries the places parked at the gateway, and
+/// the router's in-flight count rises only on admission, so a load-scoring
+/// policy kept picking the full side whose queue it was growing while its
+/// siblings had rooms. Each candidate's gate is read once (a room taken
+/// between two reads of the same worker could otherwise narrow the list to
+/// nothing), the kept candidates stay in their order, and nothing is
+/// allocated.
+pub(crate) fn retain_decodes_with_a_room(
+    decode_policy: &dyn LoadBalancingPolicy,
+    headers: Option<&HeaderMap>,
+    decode: &mut Vec<Arc<dyn Worker>>,
+) {
+    if !admission_prefilters(decode_policy, headers) {
+        return;
+    }
+    // The candidates with a room move to the front, in their order; the
+    // ones without end up behind them and are cut off only when there is
+    // someone to keep and someone to cut.
+    let mut kept = 0;
+    for at in 0..decode.len() {
+        if pd_admission::has_free_room(decode[at].as_ref()) {
+            decode.swap(kept, at);
+            kept += 1;
+        }
+    }
+    if kept > 0 && kept < decode.len() {
+        decode.truncate(kept);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::Mutex,
+        time::Duration,
+    };
 
+    use axum::http::StatusCode;
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use tracing_subscriber::Layer;
 
     use super::*;
     use crate::{
-        config::types::{PdPairingMode, PolicyConfig},
-        policies::RoundRobinPolicy,
-        worker::{BasicWorkerBuilder, ModelCard, PdWire, WorkerType},
+        config::types::{
+            ManualAssignmentMode, PdPairingMode, PolicyConfig, PolicyEngineMode,
+            RoutingKeyOverrideConfig,
+        },
+        observability::logging::test_support::test_subscriber,
+        policies::{
+            CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy,
+            PowerOfTwoPolicy, RoundRobinPolicy,
+        },
+        worker::{
+            load_state::{one_rank_load, TestFeed},
+            runtime::StallReason,
+            BasicWorkerBuilder, ModelCard, PdWire, WorkerType,
+        },
     };
 
     const MODEL: &str = "m";
 
-    /// A vLLM gRPC PD fleet whose legs carry the given KV connectors
+    /// A vLLM gRPC PD fleet whose workers carry the given KV connectors
     /// (`None` leaves the transport unknown).
     fn pd_registry(workers: &[(&str, WorkerType, Option<&str>)]) -> WorkerRegistry {
         let registry = WorkerRegistry::new();
@@ -487,12 +1483,13 @@ mod tests {
             &pairs_of(registry, policies),
             None,
             true,
+            None,
             PlacementInputs::default(),
         )
     }
 
-    /// Two PD cohorts (here by KV transport) under round robin on both legs,
-    /// as production configures them: one policy instance per leg.
+    /// Two PD cohorts (here by KV transport) under round robin on both roles,
+    /// as production configures them: one policy instance per role.
     fn cohort_policies() -> PolicyRegistry {
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
@@ -516,14 +1513,215 @@ mod tests {
                 &pairs,
                 None,
                 true,
+                None,
                 PlacementInputs::default(),
             )
-            .ok()
             .expect("a pair is open");
             *hits.entry(pair.prefill.url().to_string()).or_insert(0) += 1;
             *hits.entry(pair.decode.url().to_string()).or_insert(0) += 1;
         }
         hits
+    }
+
+    /// One prefill and two decode workers, each decode with a running window
+    /// of `window` rooms, so the admission gate's rooms count in the pick.
+    fn gated_pd_registry(window: u16) -> WorkerRegistry {
+        let registry = WorkerRegistry::new();
+        for (url, worker_type) in [
+            ("grpc://p:1", WorkerType::Prefill),
+            ("grpc://d:1", WorkerType::Decode),
+            ("grpc://d:2", WorkerType::Decode),
+        ] {
+            let mut labels = HashMap::new();
+            if matches!(worker_type, WorkerType::Decode) {
+                labels.insert("max_running_requests".to_string(), window.to_string());
+            }
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(MODEL))
+                        .worker_type(worker_type)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::Vllm)
+                        .kv_connector("NixlConnector")
+                        .labels(labels)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ))
+                .expect("worker registers");
+        }
+        registry
+    }
+
+    /// A decode partner whose window is full, or whose free room a place
+    /// waiting at its gate is in line for, is left out of the pick while its
+    /// sibling has a room; with both full the policy chooses as before.
+    #[test]
+    fn a_full_decode_window_sends_the_pick_to_the_partner_with_a_room() {
+        let registry = gated_pd_registry(2);
+        let policies = cohort_policies();
+        let full = registry.get_by_url("grpc://d:1").expect("registered");
+        assert!(full.try_admit_pd(2, 2), "both rooms claimed");
+        let picks = hits(&registry, &policies, 10);
+        assert_eq!(
+            picks.get("grpc://d:1").copied().unwrap_or(0),
+            0,
+            "{picks:?}"
+        );
+        assert_eq!(picks["grpc://d:2"], 10, "{picks:?}");
+
+        // One room freed, but a place already waits for it.
+        full.release_pd(1);
+        let place = full.pd_enqueue(1);
+        let picks = hits(&registry, &policies, 10);
+        assert_eq!(
+            picks.get("grpc://d:1").copied().unwrap_or(0),
+            0,
+            "{picks:?}"
+        );
+        full.pd_dequeue(place);
+        let picks = hits(&registry, &policies, 10);
+        assert_eq!(picks["grpc://d:1"], 5, "{picks:?}");
+        assert_eq!(picks["grpc://d:2"], 5, "{picks:?}");
+
+        // Every partner full: the policy's own rotation, and the dispatch
+        // waits on its pick as before.
+        let other = registry.get_by_url("grpc://d:2").expect("registered");
+        assert!(full.try_admit_pd(1, 2) && other.try_admit_pd(2, 2));
+        let picks = hits(&registry, &policies, 10);
+        assert_eq!(picks["grpc://d:1"], 5, "{picks:?}");
+        assert_eq!(picks["grpc://d:2"], 5, "{picks:?}");
+    }
+
+    /// The narrowing keeps the candidates with a room in their order (a
+    /// policy that rotates over its list, or indexes it, sees the same
+    /// sequence minus the full ones) and leaves a list alone when every
+    /// candidate is full or every one has a room.
+    #[test]
+    fn the_narrowing_keeps_the_candidates_with_a_room_in_their_order() {
+        let decode = |url: &str| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new(MODEL))
+                    .worker_type(WorkerType::Decode)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .labels(HashMap::from([(
+                        "max_running_requests".to_string(),
+                        "1".to_string(),
+                    )]))
+                    .build(),
+            )
+        };
+        let policy = RoundRobinPolicy::new();
+        let mut candidates: Vec<Arc<dyn Worker>> =
+            ["grpc://d:1", "grpc://d:2", "grpc://d:3", "grpc://d:4"]
+                .map(decode)
+                .into();
+        assert!(candidates[0].try_admit_pd(1, 1) && candidates[2].try_admit_pd(1, 1));
+        retain_decodes_with_a_room(&policy, None, &mut candidates);
+        let urls: Vec<&str> = candidates.iter().map(|d| d.url()).collect();
+        assert_eq!(urls, ["grpc://d:2", "grpc://d:4"]);
+
+        // Every candidate full, then every one with a room: the list as it was.
+        assert!(candidates[0].try_admit_pd(1, 1) && candidates[1].try_admit_pd(1, 1));
+        retain_decodes_with_a_room(&policy, None, &mut candidates);
+        assert_eq!(candidates.len(), 2, "nothing to keep: the policy's list");
+        candidates[0].release_pd(1);
+        candidates[1].release_pd(1);
+        retain_decodes_with_a_room(&policy, None, &mut candidates);
+        let urls: Vec<&str> = candidates.iter().map(|d| d.url()).collect();
+        assert_eq!(urls, ["grpc://d:2", "grpc://d:4"], "nothing to cut");
+    }
+
+    /// An explicit target under consistent hashing indexes the partners the
+    /// policy is given, so a full partner is never dropped from under it: the
+    /// targeted full worker is picked and waits at its gate as before, and a
+    /// target past the full one keeps its index.
+    #[test]
+    fn an_explicit_target_under_consistent_hashing_keeps_its_full_decode_partner() {
+        let registry = gated_pd_registry(2);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+        policies.set_decode_policy(Arc::new(ConsistentHashingPolicy::new()));
+        let full = registry.get_by_url("grpc://d:1").expect("registered");
+        assert!(full.try_admit_pd(2, 2), "both rooms claimed");
+        let pairs = pairs_of(&registry, &policies);
+        for (index, expected) in [(0, "grpc://d:1"), (1, "grpc://d:2")] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", index.to_string().parse().unwrap());
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                true,
+                None,
+                PlacementInputs {
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+            )
+            .expect("the targeted pair is open");
+            assert_eq!(pair.decode.url(), expected, "target {index}");
+        }
+    }
+
+    /// The load-scoring decode policies price a side by its report and
+    /// their own dispatch credit, neither of which holds a request parked at
+    /// the gate, and a fuller batch reports the higher aggregate rate, so a
+    /// full decode side read as the cheaper pick while its queue grew. With
+    /// the gate's rooms in the selection the full side is not offered.
+    #[test]
+    fn the_load_scoring_policies_are_not_offered_a_full_decode_window() {
+        let scorers: [Arc<dyn LoadBalancingPolicy>; 2] = [
+            Arc::new(LeastLoadPolicy::new()),
+            Arc::new(PowerOfTwoPolicy::new()),
+        ];
+        for decode_policy in scorers {
+            let name = decode_policy.name();
+            let registry = gated_pd_registry(8);
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+            let feed = TestFeed::attached_to(decode_policy.as_ref());
+            policies.set_decode_policy(decode_policy);
+            // d:1 runs its whole window of eight at 160 tokens/s and holds
+            // every room; d:2 runs one request at 20 tokens/s.
+            let mut full_report = one_rank_load(0, 0.0, 160.0);
+            full_report.loads[0].num_running_reqs = 8;
+            feed.publish(&HashMap::from([
+                ("grpc://d:1".to_string(), full_report),
+                ("grpc://d:2".to_string(), one_rank_load(0, 0.0, 20.0)),
+            ]));
+            let full = registry.get_by_url("grpc://d:1").expect("registered");
+            assert!(full.try_admit_pd(8, 8));
+            let tokens: Vec<u32> = (0..512).collect();
+            let pairs = pairs_of(&registry, &policies);
+            for _ in 0..20 {
+                let pair = select_pair(
+                    &registry,
+                    &policies,
+                    MODEL,
+                    &pairs,
+                    None,
+                    true,
+                    None,
+                    PlacementInputs {
+                        tokens: Some(&tokens),
+                        ..Default::default()
+                    },
+                )
+                .expect("a pair is open");
+                assert_eq!(
+                    pair.decode.url(),
+                    "grpc://d:2",
+                    "{name} picked the full side"
+                );
+            }
+        }
     }
 
     #[test]
@@ -553,12 +1751,12 @@ mod tests {
     }
 
     #[test]
-    fn a_two_prefill_cohort_beside_a_one_prefill_cohort_keeps_each_decode_leg_even() {
+    fn a_two_prefill_cohort_beside_a_one_prefill_cohort_keeps_each_decode_pool_even() {
         // 2P1D beside 1P2D. Today the prefill policy sees all three prefills,
-        // so the cohorts split 2:1 by prefill count (the decode legs then
+        // so the cohorts split 2:1 by prefill count (the decode pools then
         // carry 120 and 30/30 of 180); weighting cohorts by their bottleneck
-        // leg is a separate change. Whatever the split, a cohort's decodes
-        // must share its traffic evenly and the legs must balance.
+        // pool is a separate change. Whatever the split, a cohort's decodes
+        // must share its traffic evenly and the pools must balance.
         let registry = pd_registry(&[
             ("grpc://p:a1", WorkerType::Prefill, Some("NixlConnector")),
             ("grpc://p:a2", WorkerType::Prefill, Some("NixlConnector")),
@@ -601,9 +1799,7 @@ mod tests {
         assert!(Arc::ptr_eq(&pairs, &pairs_of(&registry, &policies)));
 
         // And a placement lands on a matching pair.
-        let pair = pair_from(&registry, &policies)
-            .ok()
-            .expect("the fleet has matching pairs");
+        let pair = pair_from(&registry, &policies).expect("the fleet has matching pairs");
         assert_eq!(
             pair.prefill.pd_pairing().transport(),
             pair.decode.pd_pairing().transport()
@@ -613,7 +1809,7 @@ mod tests {
     #[test]
     fn a_homogeneous_pair_skips_a_prefill_whose_only_partner_runs_another_runtime() {
         // P1 (NIXL) pairs only with D1, whose runtime probe failed; P2
-        // (Mooncake) pairs with D1 and D2. On the gRPC wire both legs must
+        // (Mooncake) pairs with D1 and D2. On the gRPC wire both pools must
         // share a runtime, so P1 is never open and every placement lands on
         // P2/D2 instead of failing every other request.
         let registry = pd_registry(&[
@@ -638,9 +1834,7 @@ mod tests {
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
         for _ in 0..4 {
-            let pair = pair_from(&registry, &policies)
-                .ok()
-                .expect("P2 and D2 pair on one runtime");
+            let pair = pair_from(&registry, &policies).expect("P2 and D2 pair on one runtime");
             assert_eq!(pair.prefill.url(), "grpc://p:2");
             assert_eq!(pair.decode.url(), "grpc://d:2");
             assert_eq!(pair.runtime, RuntimeType::Vllm);
@@ -687,9 +1881,7 @@ mod tests {
         vllm_decode.set_status(WorkerStatus::NotReady);
 
         for _ in 0..3 {
-            let pair = pair_from(&registry, &policies)
-                .ok()
-                .expect("the SGLang pair is healthy");
+            let pair = pair_from(&registry, &policies).expect("the SGLang pair is healthy");
             assert_eq!(pair.prefill.url(), "grpc://p:sglang");
             assert_eq!(pair.decode.url(), "grpc://d:sglang");
             assert_eq!(pair.runtime, RuntimeType::Sglang);
@@ -697,7 +1889,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fleet_without_a_shared_transport_names_both_legs() {
+    fn a_fleet_without_a_shared_transport_names_both_roles() {
         let registry = pd_registry(&[
             ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
             ("grpc://d:1", WorkerType::Decode, Some("MooncakeConnector")),
@@ -707,7 +1899,7 @@ mod tests {
         let failure = pair_from(&registry, &policies)
             .err()
             .expect("no pair shares a transport");
-        assert_eq!(failure.leg, WorkerLeg::Decode);
+        assert_eq!(failure.role, WorkerRole::Decode);
         match failure.verdict {
             PlacementFailure::NoCompatiblePair {
                 prefill,
@@ -826,6 +2018,8 @@ mod tests {
         let wire = Some(WireConstraint {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
+            pipeline: PipelinePin::Any,
         });
 
         assert_eq!(
@@ -840,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pair_shares_the_first_prefill_runtime_and_names_a_missing_leg() {
+    fn a_pair_shares_the_first_prefill_runtime_and_names_a_missing_role() {
         let registry = registry_of(&[
             (
                 "grpc://p:1",
@@ -869,13 +2063,11 @@ mod tests {
         ]);
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
-        let pair = pair_from(&registry, &policies)
-            .ok()
-            .expect("a pair exists under either runtime");
+        let pair = pair_from(&registry, &policies).expect("a pair exists under either runtime");
         assert_eq!(pair.prefill.metadata().spec.runtime_type, pair.runtime);
         assert_eq!(pair.decode.metadata().spec.runtime_type, pair.runtime);
 
-        // A model with no decode worker at all names the leg.
+        // A model with no decode worker at all names the role.
         let only_prefill = registry_of(&[(
             "grpc://p:1",
             WorkerType::Prefill,
@@ -885,13 +2077,13 @@ mod tests {
         let failure = pair_from(&only_prefill, &policies)
             .err()
             .expect("no decode worker exists");
-        assert_eq!(failure.leg, WorkerLeg::Decode);
+        assert_eq!(failure.role, WorkerRole::Decode);
         assert!(matches!(failure.verdict, PlacementFailure::NoCandidates));
     }
 
     #[test]
     fn a_pinned_pair_keeps_the_retained_runtime_and_transport() {
-        // Same runtime on both legs, but the only decode worker speaks ZMQ.
+        // Same runtime on both pools, but the only decode worker speaks ZMQ.
         let registry = registry_of(&[
             (
                 "grpc://p:1",
@@ -914,7 +2106,7 @@ mod tests {
                 .filter(|w| *w.worker_type() == worker_type)
                 .collect()
         };
-        // Built from raw legs, as a caller with its own candidate lists would.
+        // Built from raw pools, as a caller with its own candidate lists would.
         let pairs = PdPairIndex::build(
             by_type(WorkerType::Prefill).into(),
             by_type(WorkerType::Decode).into(),
@@ -929,6 +2121,7 @@ mod tests {
             &pairs,
             None,
             false,
+            None,
             PlacementInputs::default(),
         )
         .is_ok());
@@ -942,13 +2135,16 @@ mod tests {
             Some(WireConstraint {
                 runtime: RuntimeType::Sglang,
                 connection: ConnectionMode::Grpc,
+                requires_media_refs: false,
+                pipeline: PipelinePin::Any,
             }),
             false,
+            None,
             PlacementInputs::default(),
         )
         .err()
         .expect("the retained transport has no decode worker");
-        assert_eq!(failure.leg, WorkerLeg::Decode);
+        assert_eq!(failure.role, WorkerRole::Decode);
         assert!(matches!(failure.verdict, PlacementFailure::Unavailable));
     }
 
@@ -976,9 +2172,187 @@ mod tests {
         .expect("the narrowed slice still has a worker");
         assert_eq!(selected.url(), "http://h:2");
         assert!(matches!(
-            failure_from(&[], MODEL),
+            failure_from(&[], MODEL, false),
             PlacementFailure::NoCandidates
         ));
+    }
+
+    /// A caller's filter narrows the veto fallback and the verdict too: a
+    /// decode pool whose only admitted worker is over the thresholds is
+    /// steered to it by default and shed under `--worker-overload-shed`,
+    /// instead of being refused as unavailable because a worker the request
+    /// may not use is idle.
+    #[test]
+    fn a_filtered_decode_pool_is_judged_over_the_workers_the_request_may_use() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let d1 = registry.get_by_url("grpc://d:1").expect("registered");
+        let not_d2 = |w: &dyn Worker| w.url() != "grpc://d:2";
+        let inputs = PlacementInputs {
+            candidate_filter: Some(&not_d2),
+            ..Default::default()
+        };
+        let place = |inputs: PlacementInputs<'_>| {
+            select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs_of(&registry, &policies),
+                None,
+                true,
+                None,
+                inputs,
+            )
+        };
+
+        let pair = place(inputs).expect("the admitted decode worker is open");
+        assert_eq!(pair.decode.url(), "grpc://d:1");
+
+        registry.set_worker_overloaded(&d1, true);
+        let pair = place(inputs).expect("the only admitted decode worker is vetoed: steered");
+        assert_eq!(pair.decode.url(), "grpc://d:1");
+        let pair = place(PlacementInputs::default())
+            .expect("the idle worker takes a request without the filter");
+        assert_eq!(pair.decode.url(), "grpc://d:2");
+
+        registry.set_overload_shed(true);
+        let failure = place(inputs)
+            .err()
+            .expect("under shedding the admitted pool is all-overloaded");
+        assert_eq!(failure.role, WorkerRole::Decode);
+        assert!(
+            matches!(failure.verdict, PlacementFailure::AllOverloaded(_)),
+            "{:?}",
+            failure.verdict
+        );
+        let pair = place(PlacementInputs::default())
+            .expect("the idle worker still takes a request without the filter");
+        assert_eq!(pair.decode.url(), "grpc://d:2");
+    }
+
+    /// The prefill pool's mirror of the case above.
+    #[test]
+    fn a_filtered_prefill_pool_is_judged_over_the_workers_the_request_may_use() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let p1 = registry.get_by_url("grpc://p:1").expect("registered");
+        let not_p2 = |w: &dyn Worker| w.url() != "grpc://p:2";
+        let inputs = PlacementInputs {
+            candidate_filter: Some(&not_p2),
+            ..Default::default()
+        };
+        let place = |inputs: PlacementInputs<'_>| {
+            select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs_of(&registry, &policies),
+                None,
+                true,
+                None,
+                inputs,
+            )
+        };
+
+        registry.set_worker_overloaded(&p1, true);
+        let pair = place(inputs).expect("the only admitted prefill worker is vetoed: steered");
+        assert_eq!(pair.prefill.url(), "grpc://p:1");
+        let pair = place(PlacementInputs::default())
+            .expect("the idle prefill worker takes a request without the filter");
+        assert_eq!(pair.prefill.url(), "grpc://p:2");
+
+        registry.set_overload_shed(true);
+        let failure = place(inputs)
+            .err()
+            .expect("under shedding the admitted pool is all-overloaded");
+        assert_eq!(failure.role, WorkerRole::Prefill);
+        assert!(
+            matches!(failure.verdict, PlacementFailure::AllOverloaded(_)),
+            "{:?}",
+            failure.verdict
+        );
+    }
+
+    /// A retry whose pinned wire no prefill worker is on keeps the pool's own
+    /// verdict (unavailable: nothing the retry can use), whatever the filter
+    /// would keep of the other wire's workers: an overloaded worker the retry
+    /// cannot use is no reason to shed.
+    #[test]
+    fn a_pool_with_no_worker_on_the_pinned_wire_keeps_its_verdict_under_a_filter() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let p1 = registry.get_by_url("grpc://p:1").expect("registered");
+        registry.set_worker_overloaded(&p1, true);
+        registry.set_overload_shed(true);
+        // The retry's plan was built for a runtime none of the workers run.
+        let other_wire = Some(WireConstraint {
+            runtime: RuntimeType::Sglang,
+            connection: ConnectionMode::Grpc,
+            requires_media_refs: false,
+            pipeline: PipelinePin::Any,
+        });
+        let only_p1 = |w: &dyn Worker| w.url() == "grpc://p:1";
+        let failure = select_pair(
+            &registry,
+            &policies,
+            MODEL,
+            &pairs_of(&registry, &policies),
+            other_wire,
+            true,
+            None,
+            PlacementInputs {
+                candidate_filter: Some(&only_p1),
+                ..Default::default()
+            },
+        )
+        .err()
+        .expect("no worker on the wire: the pair fails");
+        assert_eq!(failure.role, WorkerRole::Prefill);
+        assert!(
+            matches!(failure.verdict, PlacementFailure::Unavailable),
+            "the verdict is the pool's own, not a shed over the other wire's overloaded worker: {:?}",
+            failure.verdict
+        );
+    }
+
+    /// The single-worker placement already judges its fallback over the
+    /// candidates the filter admits: the only admitted worker, vetoed, is
+    /// taken by default.
+    #[test]
+    fn a_filtered_single_placement_steers_to_its_only_admitted_worker() {
+        let registry = registry_with(&[
+            ("http://h:1", ConnectionMode::Http, RuntimeType::Sglang),
+            ("http://h:2", ConnectionMode::Http, RuntimeType::Sglang),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let h1 = registry.get_by_url("http://h:1").expect("registered");
+        registry.set_worker_overloaded(&h1, true);
+        let only_h1 = |w: &dyn Worker| w.url() == "http://h:1";
+        let selected = select_single(
+            &registry,
+            &policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs {
+                candidate_filter: Some(&only_h1),
+                ..Default::default()
+            },
+        )
+        .expect("steered to the admitted worker");
+        assert_eq!(selected.url(), "http://h:1");
     }
 
     #[test]
@@ -1012,5 +2386,1750 @@ mod tests {
             single_failure(&registry, MODEL, RoutingPool::GrpcPipelineRegular, None),
             PlacementFailure::NoCandidates
         ));
+    }
+
+    fn cache_aware_policy() -> PolicyConfig {
+        PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096)
+    }
+
+    fn http_registry(urls: &[&str]) -> WorkerRegistry {
+        let typed: Vec<_> = urls
+            .iter()
+            .map(|url| (*url, ConnectionMode::Http, RuntimeType::Sglang))
+            .collect();
+        registry_with(&typed)
+    }
+
+    fn pick(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+        inputs: PlacementInputs<'_>,
+    ) -> Arc<dyn Worker> {
+        select_single(
+            registry,
+            policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            inputs,
+        )
+        .expect("a worker is selectable")
+    }
+
+    /// A routing key pins consistent hashing to one worker; once that worker
+    /// was tried, the retry falls through to the next node on the ring, and
+    /// a pool with nothing untried left is used whole.
+    #[test]
+    fn a_retry_under_consistent_hashing_falls_through_to_the_next_ring_node() {
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", "session-7".parse().unwrap());
+        let inputs = PlacementInputs {
+            headers: Some(&headers),
+            ..Default::default()
+        };
+
+        let owner = pick(&registry, &policies, inputs);
+        assert_eq!(
+            pick(&registry, &policies, inputs).url(),
+            owner.url(),
+            "the key re-selects its owner deterministically"
+        );
+
+        let tried = vec![owner.base_url().to_string()];
+        let moved = pick(
+            &registry,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..inputs
+            },
+        );
+        assert_ne!(
+            moved.url(),
+            owner.url(),
+            "the retry leaves the tried worker"
+        );
+        assert_eq!(
+            pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &tried,
+                    ..inputs
+                },
+            )
+            .url(),
+            moved.url(),
+            "the fall-through is deterministic too"
+        );
+
+        let all: Vec<String> = ["http://h:1", "http://h:2", "http://h:3"]
+            .iter()
+            .map(|url| (*url).to_string())
+            .collect();
+        assert_eq!(
+            pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &all,
+                    ..inputs
+                },
+            )
+            .url(),
+            owner.url(),
+            "with every worker tried the pool is used whole again"
+        );
+    }
+
+    /// Cache-aware routing pins a prompt to the worker holding its prefix;
+    /// a retry moves to the next-best worker and comes back only when no
+    /// other worker is left.
+    #[test]
+    fn a_retry_under_cache_aware_routing_moves_to_the_next_best_worker() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(cache_aware_policy());
+        let text = "the one prompt whose prefix lives on a single worker after the first request";
+        let inputs = PlacementInputs {
+            text: Some(text),
+            ..Default::default()
+        };
+
+        let holder = pick(&registry, &policies, inputs);
+        assert_eq!(
+            pick(&registry, &policies, inputs).url(),
+            holder.url(),
+            "the prefix pins the prompt to its holder"
+        );
+
+        let tried = vec![holder.base_url().to_string()];
+        let moved = pick(
+            &registry,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..inputs
+            },
+        );
+        assert_ne!(moved.url(), holder.url(), "the retry leaves the holder");
+
+        let both = vec![holder.base_url().to_string(), moved.base_url().to_string()];
+        assert!(select_single(
+            &registry,
+            &policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs {
+                tried: &both,
+                ..inputs
+            },
+        )
+        .is_some());
+    }
+
+    /// An explicit target under consistent hashing indexes the unfiltered
+    /// set and stays strict: its retry goes back to the targeted worker
+    /// (never to whichever worker a narrowed slice puts at that index), even
+    /// though that worker was tried.
+    #[test]
+    fn an_explicit_target_under_consistent_hashing_keeps_its_worker_on_retry() {
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        for index in 0..3 {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", index.to_string().parse().unwrap());
+            let inputs = PlacementInputs {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+
+            let target = pick(&registry, &policies, inputs);
+            let tried = vec![target.base_url().to_string()];
+            let retried = pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &tried,
+                    ..inputs
+                },
+            );
+            assert_eq!(
+                retried.url(),
+                target.url(),
+                "target {index}: the retry stays on the targeted worker"
+            );
+        }
+    }
+
+    /// An explicit target counts the workers available when the request
+    /// arrives. With the worker at index 1 out (not ready, overloaded, or
+    /// its breaker open), index 1 names the worker that was at index 2 and
+    /// index 2 names nobody. Back in, the indexes read as before.
+    #[test]
+    fn an_explicit_target_indexes_the_available_workers() {
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let target = |index: usize| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", index.to_string().parse().unwrap());
+            select_single(
+                &registry,
+                &policies,
+                MODEL,
+                RoutingPool::HttpRegular,
+                None,
+                PlacementInputs {
+                    headers: Some(&headers),
+                    ..Default::default()
+                },
+            )
+        };
+        let by_index: Vec<Arc<dyn Worker>> = (0..3)
+            .map(|index| target(index).expect("a healthy pool answers every index"))
+            .collect();
+        assert_ne!(by_index[0].url(), by_index[1].url());
+        assert_ne!(by_index[1].url(), by_index[2].url());
+        assert_ne!(by_index[0].url(), by_index[2].url());
+
+        let out = &by_index[1];
+        let shifted = |veto: &str| {
+            assert_eq!(
+                target(1).map(|worker| worker.url().to_string()),
+                Some(by_index[2].url().to_string()),
+                "{veto}: index 1 names the next available worker"
+            );
+            assert!(
+                target(2).is_none(),
+                "{veto}: index 2 is past the available workers"
+            );
+            assert_eq!(target(0).unwrap().url(), by_index[0].url(), "{veto}");
+        };
+        out.set_status(WorkerStatus::NotReady);
+        shifted("not ready");
+        out.set_status(WorkerStatus::Ready);
+        assert!(registry.set_worker_overloaded(out, true));
+        shifted("overloaded");
+        assert!(registry.set_worker_overloaded(out, false));
+        for _ in 0..16 {
+            out.record_circuit_breaker_outcome(false);
+        }
+        assert!(!out.circuit_breaker_can_execute());
+        shifted("breaker open");
+        out.reset_circuit_breaker();
+        assert!(out.circuit_breaker_can_execute());
+        assert_eq!(target(1).unwrap().url(), by_index[1].url());
+        assert_eq!(target(2).unwrap().url(), by_index[2].url());
+
+        // The documented exception: a pool with every worker vetoed is served
+        // by the all-vetoed fallback, which does not read the header.
+        for worker in &by_index {
+            assert!(registry.set_worker_overloaded(worker, true));
+        }
+        assert!(
+            target(5).is_some(),
+            "an all-vetoed pool serves an index past the pool through the fallback"
+        );
+        for worker in &by_index {
+            assert!(registry.set_worker_overloaded(worker, false));
+        }
+        assert_eq!(target(1).unwrap().url(), by_index[1].url());
+    }
+
+    /// Round robin never re-selects a tried worker while another is left,
+    /// and a single-worker pool keeps retrying its one worker.
+    #[test]
+    fn a_retry_under_round_robin_skips_the_tried_worker_and_a_lone_worker_is_kept() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let tried = vec!["http://h:1".to_string()];
+        for _ in 0..4 {
+            let selected = pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &tried,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(selected.url(), "http://h:2");
+        }
+
+        let lone = http_registry(&["http://h:9"]);
+        let tried = vec!["http://h:9".to_string()];
+        let selected = pick(
+            &lone,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            selected.url(),
+            "http://h:9",
+            "nothing else is left: the one worker takes the retry"
+        );
+    }
+
+    /// The all-unavailable 503 tells the client when to come back, like the
+    /// gateway's other refusals.
+    #[test]
+    fn no_available_workers_answers_503_with_retry_after() {
+        let response = no_available_workers("every worker is down");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    // ---- the refusal line -------------------------------------------------------------------
+
+    /// Collects, on this thread's subscriber, the events of one level as
+    /// `field=value` renderings (the message among them).
+    struct EventLines(tracing::Level, Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for EventLines {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != self.0 {
+                return;
+            }
+            struct Render(String);
+            impl tracing::field::Visit for Render {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                    use fmt::Write;
+                    let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                }
+            }
+            let mut rendered = Render(String::new());
+            event.record(&mut rendered);
+            self.1.lock().unwrap().push(rendered.0);
+        }
+    }
+
+    /// A refusal the gateway answers on its own is marked for the loggers
+    /// downstream and written once, at WARN, with the refusing router, the
+    /// request id, the model, its reason and the pool's state; past the cap
+    /// the lines are counted onto the key's next admitted one: a model's own
+    /// for the 503, one for all unknown names for the 404; a refusal already
+    /// reported and any other answer pass through silently.
+    #[test]
+    fn a_refusal_is_marked_and_written_once_at_warn_with_the_pools_state() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
+        let registry = WorkerRegistry::new();
+        let down = BasicWorkerBuilder::new("http://worker-down:8080")
+            .model(ModelCard::new("m1"))
+            .worker_type(WorkerType::Regular)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        down.set_status(WorkerStatus::NotReady);
+        registry.register(Arc::new(down)).unwrap();
+        let site = RefusalSite {
+            function: "Router::route_typed_request",
+            mode: "Regular",
+            pools: &[("regular", RoutingPool::HttpRegular)],
+        };
+        let window = Duration::from_millis(100);
+        let throttle = KeyedLogThrottle::new(2, window, REFUSAL_LOG_MODELS);
+        let refuse = |model: &str, refusal: Response| {
+            report_refusal_under(&throttle, &registry, site, Some("req-1"), model, refusal)
+        };
+        let count = || lines.lock().unwrap().len();
+        let line = |i: usize| lines.lock().unwrap()[i].clone();
+
+        // The 503, five times in one window: two lines, the model's own.
+        for _ in 0..5 {
+            let refused = refuse("m1", no_available_workers("every worker is down"));
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                refused.extensions().get::<ReportedRefusal>().is_some(),
+                "the refusal is marked as reported"
+            );
+        }
+        assert_eq!(count(), 2, "two lines per window, not five: {:?}", line(1));
+        for expected in [
+            "message=No available workers for model",
+            "function=\"Router::route_typed_request\"",
+            "request_id=\"req-1\"",
+            "mode=Regular",
+            "model_id=m1",
+            "reason=\"every worker is down\"",
+            "workers=1",
+            "available=0",
+            "pool=regular 0/1 available (0 healthy)",
+            "suppressed=0",
+        ] {
+            assert!(
+                line(0).contains(expected),
+                "{expected} missing from {:?}",
+                line(0)
+            );
+        }
+
+        // The 404s share one key: m2 and m3 take the window's two lines, m4
+        // is counted, whatever the name.
+        let gone = report_refusal_under(
+            &throttle,
+            &registry,
+            site,
+            None,
+            "m2",
+            error::model_not_found("m2"),
+        );
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+        assert!(gone.extensions().get::<ReportedRefusal>().is_some());
+        assert_eq!(count(), 3, "{:?}", line(2));
+        assert!(
+            line(2).contains("message=No worker serves model"),
+            "{:?}",
+            line(2)
+        );
+        assert!(line(2).contains("model_id=m2"), "{:?}", line(2));
+        assert!(
+            !line(2).contains("request_id="),
+            "no id of its own, no field: {:?}",
+            line(2)
+        );
+        assert!(
+            !line(2).contains("reason="),
+            "a 404 names no reason: {:?}",
+            line(2)
+        );
+        assert!(
+            line(2).contains("pool=regular 0/0 available (0 healthy)"),
+            "{:?}",
+            line(2)
+        );
+        refuse("m3", error::model_not_found("m3"));
+        assert_eq!(count(), 4);
+        refuse("m4", error::model_not_found("m4"));
+        assert_eq!(count(), 4, "a new unknown name opens no fresh allowance");
+
+        // The next window: the model's 503 line carries its three hidden
+        // refusals, the unknown names' line carries the one of theirs. A full
+        // window from here: both keys' windows opened before this point, so
+        // both are over however long the assertions above took.
+        std::thread::sleep(window + Duration::from_millis(10));
+        refuse("m1", no_available_workers("every worker is down"));
+        assert!(line(4).contains("suppressed=3"), "{:?}", line(4));
+        refuse("m5", error::model_not_found("m5"));
+        assert!(line(5).contains("model_id=m5"), "{:?}", line(5));
+        assert!(line(5).contains("suppressed=1"), "{:?}", line(5));
+
+        // Already reported: no second line, whatever the throttle says.
+        let again = report_refusal(&registry, site, None, "m2", gone);
+        assert!(again.extensions().get::<ReportedRefusal>().is_some());
+        assert_eq!(count(), 6, "a reported refusal is not reported again");
+
+        // Another answer is neither marked nor written.
+        let unrelated = report_refusal(
+            &registry,
+            site,
+            None,
+            "m1",
+            error::service_unavailable("no_compatible_pd_pair", "no pair"),
+        );
+        assert!(unrelated.extensions().get::<ReportedRefusal>().is_none());
+        assert_eq!(count(), 6);
+    }
+
+    /// A `no_available_workers` 503 for a name with no workers on any role
+    /// (the HTTP PD router's answer for a name nobody serves) is an unknown
+    /// name: it shares one allowance with every other such name, as the 404
+    /// does, so a client rotating names opens no fresh lines per name and
+    /// the counts are not lost to the key eviction; a model with workers
+    /// keeps a key of its own.
+    #[test]
+    fn a_503_for_a_name_without_workers_shares_one_allowance_with_the_other_unknown_names() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
+        let registry = WorkerRegistry::new();
+        let down = BasicWorkerBuilder::new("http://worker-down:8080")
+            .model(ModelCard::new("m1"))
+            .worker_type(WorkerType::Regular)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        down.set_status(WorkerStatus::NotReady);
+        registry.register(Arc::new(down)).unwrap();
+        let site = RefusalSite {
+            function: "PDRouter::execute_dual_dispatch_attempt",
+            mode: "PrefillDecode",
+            pools: &[("regular", RoutingPool::HttpRegular)],
+        };
+        let window = Duration::from_millis(100);
+        let throttle = KeyedLogThrottle::new(2, window, REFUSAL_LOG_MODELS);
+        let refuse = |model: &str| {
+            report_refusal_under(
+                &throttle,
+                &registry,
+                site,
+                None,
+                model,
+                no_available_workers("No available servers: No prefill workers available"),
+            )
+        };
+        let count = || lines.lock().unwrap().len();
+        let line = |i: usize| lines.lock().unwrap()[i].clone();
+
+        // Three names nobody serves in one window: two lines, the third counted.
+        for name in ["x1", "x2", "x3"] {
+            let refused = refuse(name);
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(refused.extensions().get::<ReportedRefusal>().is_some());
+        }
+        assert_eq!(
+            count(),
+            2,
+            "a new name opens no fresh allowance: {:?}",
+            line(1)
+        );
+        assert!(line(0).contains("model_id=x1"), "{:?}", line(0));
+        assert!(line(1).contains("model_id=x2"), "{:?}", line(1));
+        assert!(
+            line(0).contains("pool=regular 0/0 available (0 healthy)"),
+            "{:?}",
+            line(0)
+        );
+
+        // The model with a worker registered keeps an allowance of its own.
+        refuse("m1");
+        assert_eq!(count(), 3, "{:?}", line(2));
+        assert!(line(2).contains("model_id=m1"), "{:?}", line(2));
+        assert!(
+            line(2).contains("pool=regular 0/1 available (0 healthy)"),
+            "{:?}",
+            line(2)
+        );
+
+        // The next window: the unknown names' line carries the one counted.
+        std::thread::sleep(window + Duration::from_millis(10));
+        refuse("x4");
+        assert!(line(3).contains("model_id=x4"), "{:?}", line(3));
+        assert!(line(3).contains("suppressed=1"), "{:?}", line(3));
+    }
+
+    /// A refusal's line names the reason the router gives, which may differ
+    /// from the message the client reads: the message stays the one under
+    /// the code, the line gets the verdict (here the policy that declined a
+    /// role), so the reason never contradicts the pool state next to it.
+    #[test]
+    fn the_refusal_line_names_the_reason_the_router_gives_not_the_clients_message() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
+        let registry = WorkerRegistry::new();
+        let idle = BasicWorkerBuilder::new("http://worker-idle:8080")
+            .model(ModelCard::new("m1"))
+            .worker_type(WorkerType::Regular)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        registry.register(Arc::new(idle)).unwrap();
+        let site = RefusalSite {
+            function: "WorkerSelectionStage::execute",
+            mode: "PrefillDecode",
+            pools: &[("regular", RoutingPool::HttpRegular)],
+        };
+        let throttle = KeyedLogThrottle::new(2, Duration::from_secs(60), REFUSAL_LOG_MODELS);
+        let refused = no_available_workers_because(
+            "All workers for model 'm1' are unavailable (unhealthy or circuit breaker open)",
+            "Policy cache_aware failed to select a prefill worker",
+        );
+        assert_eq!(
+            refusal_reason(&refused),
+            Some("Policy cache_aware failed to select a prefill worker")
+        );
+        assert_eq!(
+            refusal_reason(&no_available_workers("every worker is down")),
+            Some("every worker is down"),
+            "without a reason of its own the line names the message"
+        );
+        assert_eq!(refusal_reason(&error::model_not_found("m2")), None);
+
+        report_refusal_under(&throttle, &registry, site, Some("req-2"), "m1", refused);
+        let line = lines.lock().unwrap()[0].clone();
+        assert!(
+            line.contains("reason=\"Policy cache_aware failed to select a prefill worker\""),
+            "{line:?}"
+        );
+        assert!(line.contains("workers=1"), "{line:?}");
+    }
+
+    /// A 2P1D gRPC fleet under cache-aware routing on both roles, as the
+    /// disaggregated benchmarks run it.
+    fn cache_aware_pd() -> (WorkerRegistry, PolicyRegistry) {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.set_prefill_policy(Arc::new(CacheAwarePolicy::new()));
+        policies.set_decode_policy(Arc::new(CacheAwarePolicy::new()));
+        (registry, policies)
+    }
+
+    fn place_prompt(registry: &WorkerRegistry, policies: &PolicyRegistry, tokens: &[u32]) -> Pair {
+        select_pair(
+            registry,
+            policies,
+            MODEL,
+            &pairs_of(registry, policies),
+            None,
+            true,
+            None,
+            PlacementInputs {
+                tokens: Some(tokens),
+                ..Default::default()
+            },
+        )
+        .expect("a pair")
+    }
+
+    /// A session's first turn placed, and its prefill worker made the busier
+    /// of the two by three requests: not enough for cache-aware's own spill
+    /// gate (a margin of four above a mean of 1.5), so the policy keeps the
+    /// next turn there, while a least-loaded pick would take the other
+    /// prefill. Returns the session's next turn and its prefill worker.
+    fn a_session_on_the_busier_prefill(
+        registry: &WorkerRegistry,
+        policies: &PolicyRegistry,
+    ) -> (Vec<u32>, Arc<dyn Worker>) {
+        let first_turn: Vec<u32> = (0..8_192).collect();
+        let next_turn: Vec<u32> = (0..9_216).collect();
+        let home = place_prompt(registry, policies, &first_turn).prefill;
+        for _ in 0..3 {
+            home.increment_load();
+        }
+        assert_eq!(
+            place_prompt(registry, policies, &next_turn).prefill.url(),
+            home.url(),
+            "the prefix keeps the session on its prefill worker"
+        );
+        (next_turn, home)
+    }
+
+    /// The only decode worker over the overload thresholds vetoes nothing it
+    /// could steer around: the pair still needs it. The veto must not take
+    /// the prefill pick from the prefill policy either: the session stays
+    /// on the prefill worker holding its prefix, paired with the decode.
+    #[test]
+    fn an_overloaded_decode_pool_leaves_the_prefill_pick_to_the_prefill_policy() {
+        let (registry, policies) = cache_aware_pd();
+        let (next_turn, home) = a_session_on_the_busier_prefill(&registry, &policies);
+        let decode = registry.get_by_url("grpc://d:1").expect("registered");
+        registry.set_worker_overloaded(&decode, true);
+        for _ in 0..4 {
+            let pair = place_prompt(&registry, &policies, &next_turn);
+            assert_eq!(
+                pair.prefill.url(),
+                home.url(),
+                "a decode-side veto re-picked the prefill"
+            );
+            assert_eq!(pair.decode.url(), "grpc://d:1");
+        }
+    }
+
+    /// Every prefill worker over the overload thresholds: the veto has
+    /// nowhere to steer, so the prefill pool is placed by its policy as if
+    /// none were over them, and the session stays on the prefill worker
+    /// holding its prefix rather than going to the least-loaded one.
+    #[test]
+    fn an_all_overloaded_prefill_pool_is_placed_by_the_prefill_policy() {
+        let (registry, policies) = cache_aware_pd();
+        let (next_turn, home) = a_session_on_the_busier_prefill(&registry, &policies);
+        for url in ["grpc://p:1", "grpc://p:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, true);
+        }
+        for _ in 0..4 {
+            assert_eq!(
+                place_prompt(&registry, &policies, &next_turn).prefill.url(),
+                home.url(),
+                "an all-overloaded prefill pool was re-picked by load"
+            );
+        }
+        // Both pools over the thresholds: the same.
+        let decode = registry.get_by_url("grpc://d:1").expect("registered");
+        registry.set_worker_overloaded(&decode, true);
+        assert_eq!(
+            place_prompt(&registry, &policies, &next_turn).prefill.url(),
+            home.url()
+        );
+    }
+
+    /// One prefill worker over the thresholds beside one under them, as the
+    /// two take turns under sustained load: cache-aware prefill placement is
+    /// not steered by the veto, so the session stays on the prefill worker
+    /// holding its prefix.
+    #[test]
+    fn an_overloaded_prefill_holding_the_prefix_keeps_the_session_under_cache_aware() {
+        let (registry, policies) = cache_aware_pd();
+        let (next_turn, home) = a_session_on_the_busier_prefill(&registry, &policies);
+        registry.set_worker_overloaded(&home, true);
+        for _ in 0..4 {
+            assert_eq!(
+                place_prompt(&registry, &policies, &next_turn).prefill.url(),
+                home.url(),
+                "the veto moved the session off the prefill holding its prefix"
+            );
+        }
+    }
+
+    /// The session's prefill worker and the only decode worker over the
+    /// thresholds, the other prefill under them: the decode pool pairs by
+    /// load, and the cache-aware prefill pick is not steered by the veto, so
+    /// the session stays on the prefill worker holding its prefix.
+    #[test]
+    fn an_overloaded_prefill_holding_the_prefix_keeps_the_session_beside_an_overloaded_decode() {
+        let (registry, policies) = cache_aware_pd();
+        let (next_turn, home) = a_session_on_the_busier_prefill(&registry, &policies);
+        registry.set_worker_overloaded(&home, true);
+        let decode = registry.get_by_url("grpc://d:1").expect("registered");
+        registry.set_worker_overloaded(&decode, true);
+        for _ in 0..4 {
+            let pair = place_prompt(&registry, &policies, &next_turn);
+            assert_eq!(
+                pair.prefill.url(),
+                home.url(),
+                "the veto moved the session off the prefill holding its prefix"
+            );
+            assert_eq!(pair.decode.url(), "grpc://d:1");
+        }
+    }
+
+    /// Cache-aware's own gate still moves a request off an overloaded holder
+    /// loaded well past the pool: the spill the veto no longer forces.
+    #[test]
+    fn a_saturated_overloaded_holder_still_spills_under_cache_aware() {
+        let (registry, policies) = cache_aware_pd();
+        let (next_turn, home) = a_session_on_the_busier_prefill(&registry, &policies);
+        registry.set_worker_overloaded(&home, true);
+        for _ in 0..27 {
+            home.increment_load();
+        }
+        assert_ne!(
+            place_prompt(&registry, &policies, &next_turn).prefill.url(),
+            home.url(),
+            "the count-pressure gate spills off the saturated holder"
+        );
+    }
+
+    /// A prefill policy that does not weigh load against affinity keeps the
+    /// veto: with one prefill worker over the thresholds and the other under
+    /// them, every pick goes to the one under them.
+    #[test]
+    fn an_overloaded_prefill_beside_one_under_the_thresholds_is_still_steered_around() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let over = registry.get_by_url("grpc://p:1").expect("registered");
+        registry.set_worker_overloaded(&over, true);
+        let prompt: Vec<u32> = (0..8_192).collect();
+        for _ in 0..4 {
+            assert_eq!(
+                place_prompt(&registry, &policies, &prompt).prefill.url(),
+                "grpc://p:2",
+                "the veto steers to the prefill under the thresholds"
+            );
+        }
+    }
+
+    /// A prefill pool the liveness tracker vetoes in full keeps the
+    /// least-loaded fallback: a suspected worker is crossed by load, not by
+    /// the policy.
+    #[test]
+    fn a_prefill_pool_vetoed_by_liveness_keeps_the_least_loaded_fallback() {
+        let (registry, policies) = cache_aware_pd();
+        let (next_turn, home) = a_session_on_the_busier_prefill(&registry, &policies);
+        for url in ["grpc://p:1", "grpc://p:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            worker.set_stall(Some(StallReason::Wedged));
+        }
+        assert_ne!(
+            place_prompt(&registry, &policies, &next_turn).prefill.url(),
+            home.url(),
+            "the least-loaded stalled prefill serves"
+        );
+    }
+
+    /// Every prefill worker over the thresholds under a load-blind prefill
+    /// policy: it has no affinity a load pick would discard, so the pool is
+    /// steered to its least-loaded worker as before, and the busier worker
+    /// takes none of the placements.
+    #[test]
+    fn an_all_overloaded_prefill_pool_under_a_load_blind_policy_goes_to_the_least_loaded() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = cohort_policies();
+        let busier = registry.get_by_url("grpc://p:1").expect("registered");
+        for _ in 0..10 {
+            busier.increment_load();
+        }
+        for url in ["grpc://p:1", "grpc://p:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, true);
+        }
+        let prompt: Vec<u32> = (0..8_192).collect();
+        for _ in 0..4 {
+            assert_eq!(
+                place_prompt(&registry, &policies, &prompt).prefill.url(),
+                "grpc://p:2",
+                "the least-loaded prefill"
+            );
+        }
+    }
+
+    /// The same under a hash policy, which hashes only over workers under
+    /// the thresholds: it is not asked to place a pool all over them (no
+    /// `no_healthy_workers` decision of its own), and the least-loaded
+    /// default steers the request.
+    #[test]
+    fn an_all_overloaded_prefill_pool_under_a_hash_policy_goes_to_the_least_loaded() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.set_prefill_policy(Arc::new(ConsistentHashingPolicy::new()));
+        registry
+            .get_by_url("grpc://p:1")
+            .expect("registered")
+            .increment_load();
+        for url in ["grpc://p:1", "grpc://p:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, true);
+        }
+        let pair = metrics::with_local_recorder(&recorder, || pair_from(&registry, &policies))
+            .expect("steered by load");
+        assert_eq!(pair.prefill.url(), "grpc://p:2", "the less loaded prefill");
+        assert_eq!(pair.decode.url(), "grpc://d:1");
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("no_healthy_workers"),
+            "the hash policy was asked to place a pool all over the thresholds:\n{rendered}"
+        );
+    }
+
+    /// Both decode workers over the thresholds, the session's decode the
+    /// busier: the decode pool is paired by load with the prefill pick, as
+    /// before, not by the decode policy's affinity, so every placement goes
+    /// to the less loaded decode worker.
+    #[test]
+    fn an_all_overloaded_decode_pool_pairs_the_prefill_pick_with_its_least_loaded_partner() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("NixlConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.set_prefill_policy(Arc::new(CacheAwarePolicy::new()));
+        policies.set_decode_policy(Arc::new(CacheAwarePolicy::new()));
+        let first_turn: Vec<u32> = (0..8_192).collect();
+        let next_turn: Vec<u32> = (0..9_216).collect();
+        let home = place_prompt(&registry, &policies, &first_turn).decode;
+        for _ in 0..3 {
+            home.increment_load();
+        }
+        for url in ["grpc://d:1", "grpc://d:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, true);
+        }
+        for _ in 0..4 {
+            let pair = place_prompt(&registry, &policies, &next_turn);
+            assert_eq!(pair.prefill.url(), "grpc://p:1");
+            assert_ne!(
+                pair.decode.url(),
+                home.url(),
+                "the busier decode kept its session over the thresholds"
+            );
+        }
+    }
+
+    /// A cache-aware prefill pool whose only worker is over the thresholds,
+    /// and pairs only with a decode worker over them too, while the decode
+    /// worker free of them is on another KV transport: no pair is open, and
+    /// the least-loaded default pairs the two over the thresholds, as it did
+    /// before the veto was lifted, instead of the placement failing on the
+    /// decode pool.
+    #[test]
+    fn a_lifted_prefill_pool_without_an_open_pair_keeps_the_least_loaded_fallback() {
+        let registry = pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:2", WorkerType::Decode, Some("MooncakeConnector")),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        policies.set_prefill_policy(Arc::new(CacheAwarePolicy::new()));
+        for url in ["grpc://p:1", "grpc://d:1"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, true);
+        }
+        let pair = pair_from(&registry, &policies).expect("steered to the overloaded pair");
+        assert_eq!(pair.prefill.url(), "grpc://p:1");
+        assert_eq!(pair.decode.url(), "grpc://d:1");
+    }
+
+    /// A long conversation's next turn, its ~99,000-token context held by
+    /// its prefill worker, at 25 requests in flight there against 7 on the
+    /// other prefill worker, under the launcher's spill thresholds (64
+    /// requests and 1.5 times the mean): the cache-aware prefill policy
+    /// keeps the turn with its cache. Priced at 0, the swing-sized margin (8
+    /// at a mean of 16) moves it to the other prefill worker, which prefills
+    /// the whole context again.
+    #[test]
+    fn a_cache_aware_prefill_pool_keeps_a_long_session_at_a_small_skew() {
+        for (price, stays) in [(1_024, true), (0, false)] {
+            let registry = pd_registry(&[
+                ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://p:2", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
+            ]);
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            let config = CacheAwareConfig {
+                balance_abs_threshold: 64,
+                balance_rel_threshold: 1.5,
+                balance_prefix_margin_tokens: price,
+                eviction_interval_secs: 0,
+                ..Default::default()
+            };
+            policies.set_prefill_policy(Arc::new(CacheAwarePolicy::with_config(config.clone())));
+            policies.set_decode_policy(Arc::new(CacheAwarePolicy::with_config(config)));
+            let first_turn: Vec<u32> = (0..99_000).collect();
+            let next_turn: Vec<u32> = (0..100_000).collect();
+            let home = place_prompt(&registry, &policies, &first_turn).prefill;
+            let other_url = if home.url() == "grpc://p:1" {
+                "grpc://p:2"
+            } else {
+                "grpc://p:1"
+            };
+            let other = registry.get_by_url(other_url).expect("registered");
+            for _ in 0..25 {
+                home.increment_load();
+            }
+            for _ in 0..7 {
+                other.increment_load();
+            }
+            let pair = place_prompt(&registry, &policies, &next_turn);
+            assert_eq!(
+                pair.prefill.url() == home.url(),
+                stays,
+                "price {price}: the turn went to {}",
+                pair.prefill.url()
+            );
+        }
+    }
+
+    fn keyed_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", "session-7".parse().unwrap());
+        headers
+    }
+
+    fn with_headers(headers: &HeaderMap) -> PlacementInputs<'_> {
+        PlacementInputs {
+            headers: Some(headers),
+            ..Default::default()
+        }
+    }
+
+    /// A two-worker fleet and the worker that owns the session in `inputs`.
+    fn a_keyed_owner(
+        policies: &PolicyRegistry,
+        inputs: PlacementInputs<'_>,
+    ) -> (WorkerRegistry, Arc<dyn Worker>) {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let owner = pick(&registry, policies, inputs);
+        (registry, owner)
+    }
+
+    /// One worker over the overload thresholds beside one under them, as the
+    /// two take turns under sustained load: a session key (the routing-key
+    /// header, a configured routing-key header, or the rid-derived key) keeps
+    /// its ring owner without counting a fallback, while a request without a
+    /// key is still steered around the owner, and so is the session under
+    /// `--worker-overload-shed`.
+    #[test]
+    fn a_session_key_keeps_its_overloaded_owner_under_consistent_hashing() {
+        let routing_key = keyed_headers();
+        let mut configured = HeaderMap::new();
+        configured.insert("x-session-id", "session-7".parse().unwrap());
+        let configured_policies = PolicyRegistry::with_override(
+            PolicyConfig::ConsistentHashing,
+            RoutingKeyOverrideConfig {
+                headers: vec!["x-session-id".to_string()],
+                ..Default::default()
+            },
+        );
+        let cases = [
+            (
+                PolicyRegistry::new(PolicyConfig::ConsistentHashing),
+                with_headers(&routing_key),
+            ),
+            (configured_policies, with_headers(&configured)),
+            (
+                PolicyRegistry::new(PolicyConfig::ConsistentHashing),
+                PlacementInputs {
+                    rid_key: Some("session-7"),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (policies, inputs) in cases {
+            let (registry, owner) = a_keyed_owner(&policies, inputs);
+            registry.set_worker_overloaded(&owner, true);
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let selected =
+                metrics::with_local_recorder(&recorder, || pick(&registry, &policies, inputs));
+            assert_eq!(selected.url(), owner.url(), "the veto moved the session");
+            assert!(!handle
+                .render()
+                .contains("smg_worker_overload_fallback_total"));
+            let unkeyed = pick(&registry, &policies, PlacementInputs::default());
+            assert_ne!(
+                unkeyed.url(),
+                owner.url(),
+                "an unkeyed request reached the owner"
+            );
+            registry.set_overload_shed(true);
+            assert_ne!(pick(&registry, &policies, inputs).url(), owner.url());
+        }
+    }
+
+    /// A header key with turn and retry suffixes under the routing-key
+    /// override: placement derives the key once, lineage-stripped, so the
+    /// policies that place by the key themselves (consistent hashing, the
+    /// sticky map) see the key the load guard counts, and every turn of
+    /// `conv` lands on the owner of `conv`. Without the override the key is
+    /// raw: a new turn is a new key.
+    #[test]
+    fn a_header_keys_turns_share_one_owner_under_the_override() {
+        let keyed = |key: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-routing-key", key.parse().unwrap());
+            headers
+        };
+        let manual = || PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::MinLoad,
+        };
+        let turns = ["conv_t1", "conv_t2", "conv_t3_r1", "conv_r2"];
+        for config in [PolicyConfig::ConsistentHashing, manual()] {
+            let policies = PolicyRegistry::with_override(
+                config,
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            let name = policies.get_default_policy().name();
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let base = keyed("conv");
+            let owner = pick(&registry, &policies, with_headers(&base));
+            // A vacant sticky key would go to a lighter worker.
+            owner.increment_load();
+            for turn in turns {
+                let headers = keyed(turn);
+                assert_eq!(
+                    pick(&registry, &policies, with_headers(&headers)).url(),
+                    owner.url(),
+                    "{name}: {turn} left the owner of conv"
+                );
+            }
+        }
+
+        // Override off: the sticky map pins each raw key on its own.
+        let policies = PolicyRegistry::new(manual());
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let first = keyed("conv_t1");
+        let owner = pick(&registry, &policies, with_headers(&first));
+        owner.increment_load();
+        let second = keyed("conv_t2");
+        assert_ne!(
+            pick(&registry, &policies, with_headers(&second)).url(),
+            owner.url(),
+            "without the override a new turn is a new key"
+        );
+    }
+
+    /// Every worker over the thresholds, the owner the busier: the session
+    /// stays on its owner instead of going to the least-loaded worker, and
+    /// the placement counts as the overload fallback it replaces.
+    #[test]
+    fn a_pool_all_over_the_thresholds_keeps_a_routing_key_on_its_owner() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let headers = keyed_headers();
+        let inputs = with_headers(&headers);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let (registry, owner) = a_keyed_owner(&policies, inputs);
+        owner.increment_load();
+        for worker in registry.get_all() {
+            registry.set_worker_overloaded(&worker, true);
+        }
+        let selected =
+            metrics::with_local_recorder(&recorder, || pick(&registry, &policies, inputs));
+        assert_eq!(selected.url(), owner.url(), "the session went by load");
+        assert_one_overload_fallback(&handle.render());
+    }
+
+    fn assert_one_overload_fallback(rendered: &str) {
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_worker_overload_fallback_total{")
+                    && line.contains("stage=\"selection\"")
+                    && line.ends_with(" 1")
+            }),
+            "the placement is not counted as the overload fallback:\n{rendered}"
+        );
+    }
+
+    /// No worker is fully available, but one is only over the thresholds,
+    /// beside one that is not ready: a keyed request takes it, whether it is
+    /// the owner or the owner's ring successor, and counts as the overload
+    /// fallback.
+    #[test]
+    fn a_keyed_request_takes_a_worker_only_over_the_thresholds() {
+        let headers = keyed_headers();
+        let inputs = with_headers(&headers);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        for owner_over_the_thresholds in [true, false] {
+            let (registry, owner) = a_keyed_owner(&policies, inputs);
+            let other = registry
+                .get_all()
+                .into_iter()
+                .find(|worker| worker.url() != owner.url())
+                .expect("a second worker");
+            let (over, not_ready) = if owner_over_the_thresholds {
+                (&owner, &other)
+            } else {
+                (&other, &owner)
+            };
+            registry.set_worker_overloaded(over, true);
+            not_ready.set_status(WorkerStatus::NotReady);
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let selected =
+                metrics::with_local_recorder(&recorder, || pick(&registry, &policies, inputs));
+            assert_eq!(selected.url(), over.url());
+            assert_one_overload_fallback(&handle.render());
+        }
+    }
+
+    /// Only the overload veto is lifted: an owner over the thresholds that is
+    /// also not ready, behind an open circuit breaker, or stalled loses the
+    /// session.
+    #[test]
+    fn a_session_key_still_leaves_an_owner_vetoed_for_another_reason() {
+        let headers = keyed_headers();
+        let inputs = with_headers(&headers);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        for veto in ["not ready", "circuit open", "stalled"] {
+            let (registry, owner) = a_keyed_owner(&policies, inputs);
+            registry.set_worker_overloaded(&owner, true);
+            match veto {
+                "not ready" => owner.set_status(WorkerStatus::NotReady),
+                "circuit open" => {
+                    for _ in 0..5 {
+                        owner.record_circuit_breaker_outcome(false);
+                    }
+                    assert!(!owner.circuit_breaker_can_execute());
+                }
+                _ => {
+                    owner.set_stall(Some(StallReason::Wedged));
+                }
+            }
+            assert_ne!(
+                pick(&registry, &policies, inputs).url(),
+                owner.url(),
+                "{veto}"
+            );
+        }
+    }
+
+    /// A keyed retry leaves the owner it was tried on for the next worker
+    /// even when that worker is over the thresholds, instead of replaying on
+    /// the owner.
+    #[test]
+    fn a_keyed_retry_moves_to_a_worker_over_the_thresholds() {
+        let headers = keyed_headers();
+        let inputs = with_headers(&headers);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let (registry, owner) = a_keyed_owner(&policies, inputs);
+        for worker in registry.get_all() {
+            if worker.url() != owner.url() {
+                registry.set_worker_overloaded(&worker, true);
+            }
+        }
+        let tried = vec![owner.base_url().to_string()];
+        let retry = PlacementInputs {
+            tried: &tried,
+            ..inputs
+        };
+        assert_ne!(pick(&registry, &policies, retry).url(), owner.url());
+    }
+
+    /// The lift is for regular workers: a keyed placement over a prefill pool
+    /// (the HTTP PD router's token count) keeps the overload veto.
+    #[test]
+    fn a_session_key_over_a_prefill_pool_keeps_the_overload_veto() {
+        let registry = registry_of(&[
+            (
+                "http://p:1",
+                WorkerType::Prefill,
+                ConnectionMode::Http,
+                RuntimeType::Sglang,
+            ),
+            (
+                "http://p:2",
+                WorkerType::Prefill,
+                ConnectionMode::Http,
+                RuntimeType::Sglang,
+            ),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let headers = keyed_headers();
+        let inputs = with_headers(&headers);
+        let place = || {
+            select_single(
+                &registry,
+                &policies,
+                MODEL,
+                RoutingPool::HttpPrefill,
+                None,
+                inputs,
+            )
+            .expect("a prefill worker")
+        };
+        let owner = place();
+        registry.set_worker_overloaded(&owner, true);
+        assert_ne!(place().url(), owner.url());
+    }
+
+    /// Round robin under `--policy-engine engine`, the shape every test of the
+    /// switch starts from.
+    fn engine_round_robin() -> PolicyRegistry {
+        let round_robin = PolicyConfig::RoundRobin;
+        let policies = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
+            PolicyEngineMode::Engine,
+            &round_robin,
+            &round_robin,
+        );
+        assert!(
+            policies.decider().is_some(),
+            "the engine serves round robin"
+        );
+        policies
+    }
+
+    /// Under `--policy-engine engine` a preset the engine serves decides over
+    /// the engine's view and commits under the host's eligibility: round robin
+    /// rotates the pool it is given, and a worker that is not ready is never
+    /// placed. Under `legacy`, the default, the engine is not built.
+    #[test]
+    fn with_the_engine_switch_select_from_rotates_the_pool_it_is_given() {
+        let registry = registry_with(&[
+            ("grpc://r:1", ConnectionMode::Grpc, RuntimeType::Vllm),
+            ("grpc://r:2", ConnectionMode::Grpc, RuntimeType::Vllm),
+            ("grpc://r:3", ConnectionMode::Grpc, RuntimeType::Vllm),
+        ]);
+        let round_robin = PolicyConfig::RoundRobin;
+        let legacy = PolicyRegistry::new(round_robin.clone()).with_policy_engine(
+            PolicyEngineMode::Legacy,
+            &round_robin,
+            &round_robin,
+        );
+        assert!(
+            legacy.decider().is_none(),
+            "the default leaves the engine out"
+        );
+        let policies = engine_round_robin();
+        let candidates: Vec<Arc<dyn Worker>> = ["grpc://r:1", "grpc://r:2", "grpc://r:3"]
+            .iter()
+            .map(|url| registry.get_by_url(url).expect("registered"))
+            .collect();
+        let picks = |policies: &PolicyRegistry| {
+            let mut picks = BTreeMap::new();
+            for _ in 0..9 {
+                let worker = select_from(
+                    &registry,
+                    policies,
+                    MODEL,
+                    &candidates,
+                    PlacementInputs::default(),
+                )
+                .expect("a worker is picked");
+                *picks.entry(worker.url().to_string()).or_insert(0) += 1;
+            }
+            picks
+        };
+        let counts = |picks: BTreeMap<String, usize>| picks.into_values().collect::<Vec<_>>();
+        assert_eq!(counts(picks(&policies)), [3, 3, 3]);
+        assert_eq!(
+            policies.decider().expect("the engine").decisions(),
+            9,
+            "every placement was decided through the engine"
+        );
+        assert_eq!(counts(picks(&legacy)), [3, 3, 3]);
+
+        candidates[1].set_status(WorkerStatus::NotReady);
+        let picks = picks(&policies);
+        assert_eq!(picks.get("grpc://r:2"), None, "{picks:?}");
+        assert!(
+            picks["grpc://r:1"] > 0 && picks["grpc://r:3"] > 0,
+            "{picks:?}"
+        );
+    }
+
+    /// Under the switch the engines a retry already tried step aside while
+    /// another candidate remains, and a lone tried worker takes the retry, as
+    /// the legacy narrowing does; the HTTP entry decides through the engine
+    /// too.
+    #[test]
+    fn with_the_engine_switch_a_tried_worker_steps_aside_while_another_remains() {
+        let policies = engine_round_robin();
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let tried = vec!["http://h:1".to_string()];
+        for _ in 0..4 {
+            let selected = pick(
+                &registry,
+                &policies,
+                PlacementInputs {
+                    tried: &tried,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(selected.url(), "http://h:2");
+        }
+
+        let lone = http_registry(&["http://h:9"]);
+        let tried = vec!["http://h:9".to_string()];
+        let selected = pick(
+            &lone,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            selected.url(),
+            "http://h:9",
+            "nothing else is left: the one worker takes the retry"
+        );
+    }
+
+    /// The HTTP entry draws the request's sequence before it reads the pool:
+    /// a worker retired after that read and before the decision (here from
+    /// the per-request candidate filter, which runs after the read) is booked
+    /// by no commit of the request, so the rows its retirement pruned stay
+    /// gone.
+    #[test]
+    fn with_the_engine_switch_select_single_draws_the_sequence_before_its_capture() {
+        use std::{
+            collections::HashMap,
+            sync::atomic::{AtomicBool, Ordering},
+        };
+
+        let least_load = PolicyConfig::LeastLoad {
+            kv_pressure_weight: 0.0,
+            mean_prefill_tokens: 100,
+            default_throughput: 1000.0,
+        };
+        let policies = PolicyRegistry::new(least_load.clone()).with_policy_engine(
+            PolicyEngineMode::Engine,
+            &least_load,
+            &least_load,
+        );
+        let decider = policies.decider().expect("the engine serves least load");
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let workers: Vec<Arc<dyn Worker>> = ["http://h:1", "http://h:2"]
+            .iter()
+            .map(|url| registry.get_by_url(url).expect("registered"))
+            .collect();
+        // Two workers under the same idle report, so only the engine's own
+        // credit tells them apart.
+        let feed = TestFeed::attached_to(policies.get_policy_or_default(MODEL).as_ref());
+        decider.set_load_receiver(Some(feed.receiver()));
+        feed.publish(&HashMap::from([
+            ("http://h:1".to_string(), one_rank_load(0, 0.1, 2000.0)),
+            ("http://h:2".to_string(), one_rank_load(0, 0.1, 2000.0)),
+        ]));
+        let leader = || {
+            let request = HostRequest {
+                model: MODEL,
+                ..HostRequest::default()
+            };
+            let (decision, _) = decider.decide(&request, &workers, &[]);
+            decision
+                .pick()
+                .expect("a pick")
+                .targets
+                .first()
+                .map(|t| t.position)
+        };
+        // One small booking on the second worker first, so the first one
+        // leads strictly and the request below is placed on it.
+        let small = HostRequest {
+            model: MODEL,
+            prompt_tokens: 1,
+            ..HostRequest::default()
+        };
+        let (decision, lease) = decider.decide(&small, &workers, &[]);
+        decider
+            .commit(&lease, &decision, Side::Single, |t| t.position == 1)
+            .expect("the second worker is booked");
+        assert_eq!(leader(), Some(0), "the first worker leads while idle");
+        // The filter runs after the pool read: the first worker's retirement
+        // lands there, once, and the captured pool still holds its handle.
+        let retired = AtomicBool::new(false);
+        let retire_the_first = |_: &dyn Worker| {
+            if !retired.swap(true, Ordering::Relaxed) {
+                policies.on_worker_removed(workers[0].as_ref());
+            }
+            true
+        };
+        let selected = pick(
+            &registry,
+            &policies,
+            PlacementInputs {
+                candidate_filter: Some(&retire_the_first),
+                ..Default::default()
+            },
+        );
+        assert!(
+            retired.load(Ordering::Relaxed),
+            "the retirement landed after the capture"
+        );
+        assert_eq!(
+            selected.url(),
+            "http://h:1",
+            "the request is placed on the leading worker, retired or not"
+        );
+        // The retired handle still leads: the request's mean-size booking
+        // would have lost it to the one-token booking on the other worker.
+        assert_eq!(
+            leader(),
+            Some(0),
+            "the retired handle reads idle: the request's commit booked nothing on it"
+        );
+    }
+
+    /// Under the switch a keyed request is a session of the engine's default
+    /// binding, pinned to its owner by the sticky routing-key override's
+    /// rule, while an unkeyed one rotates through the engine.
+    #[test]
+    fn with_the_engine_switch_the_sticky_override_keeps_its_owner() {
+        let round_robin = PolicyConfig::RoundRobin;
+        let policies = PolicyRegistry::with_override(
+            round_robin.clone(),
+            RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .with_policy_engine(PolicyEngineMode::Engine, &round_robin, &round_robin);
+        assert!(policies.decider().is_some());
+        let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+        let headers = keyed_headers();
+        let owner = pick(&registry, &policies, with_headers(&headers));
+        // A vacant sticky key would go to a lighter worker.
+        owner.increment_load();
+        for _ in 0..4 {
+            assert_eq!(
+                pick(&registry, &policies, with_headers(&headers)).url(),
+                owner.url(),
+                "the key left its owner"
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            seen.insert(
+                pick(&registry, &policies, PlacementInputs::default())
+                    .url()
+                    .to_string(),
+            );
+        }
+        assert_eq!(seen.len(), 3, "an unkeyed request rotates: {seen:?}");
+        assert_eq!(
+            policies.decider().expect("the engine").decisions(),
+            8,
+            "the keyed placements were decided through the engine too"
+        );
+    }
+
+    /// Under the switch the manual policy and the sticky override decide
+    /// through the engine with the legacy outcomes, under the same inputs: a
+    /// key pins its first worker, every turn of a conversation shares that
+    /// owner under the override, and a new turn is a new key without it.
+    #[test]
+    fn with_the_engine_switch_the_manual_policy_and_the_override_pin_like_legacy() {
+        let keyed = |key: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-routing-key", key.parse().unwrap());
+            headers
+        };
+        let manual = || PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::MinLoad,
+        };
+        let turns = ["conv_t1", "conv_t2", "conv_t3_r1", "conv_r2"];
+        let modes = [PolicyEngineMode::Legacy, PolicyEngineMode::Engine];
+        for (config, mode) in [PolicyConfig::RoundRobin, manual()]
+            .iter()
+            .flat_map(|config| modes.iter().map(move |mode| (config, *mode)))
+        {
+            let policies = PolicyRegistry::with_override(
+                config.clone(),
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .with_policy_engine(mode, config, config);
+            assert_eq!(
+                policies.decider().is_some(),
+                mode == PolicyEngineMode::Engine
+            );
+            let name = policies.get_default_policy().name();
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let base = keyed("conv");
+            let owner = pick(&registry, &policies, with_headers(&base));
+            // A vacant key would go to a lighter worker.
+            owner.increment_load();
+            for turn in turns {
+                let headers = keyed(turn);
+                assert_eq!(
+                    pick(&registry, &policies, with_headers(&headers)).url(),
+                    owner.url(),
+                    "{name} under {mode:?}: {turn} left the owner of conv"
+                );
+            }
+            if let Some(decider) = policies.decider() {
+                assert_eq!(
+                    decider.decisions(),
+                    1 + turns.len() as u64,
+                    "{name}: every keyed placement was decided through the engine"
+                );
+            }
+        }
+
+        // Override off: the manual policy pins each raw key on its own.
+        for mode in modes {
+            let policies =
+                PolicyRegistry::new(manual()).with_policy_engine(mode, &manual(), &manual());
+            let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+            let first = keyed("conv_t1");
+            let owner = pick(&registry, &policies, with_headers(&first));
+            owner.increment_load();
+            let second = keyed("conv_t2");
+            assert_ne!(
+                pick(&registry, &policies, with_headers(&second)).url(),
+                owner.url(),
+                "{mode:?}: without the override a new turn is a new key"
+            );
+        }
+    }
+
+    /// Under the switch a key whose owner is not ready takes a failover and
+    /// returns to its first owner once that worker is back under the manual
+    /// policy, as under legacy; under the override it stays on the failover,
+    /// as the legacy override pins the newest worker first.
+    #[test]
+    fn with_the_engine_switch_a_key_recovers_as_the_legacy_paths_do() {
+        let headers = keyed_headers();
+        let manual = PolicyConfig::Manual {
+            eviction_interval_secs: 0,
+            max_idle_secs: 0,
+            assignment_mode: ManualAssignmentMode::Random,
+        };
+        let cases = [
+            (manual, false, true),
+            (PolicyConfig::RoundRobin, true, false),
+        ];
+        for (config, override_on, returns) in cases {
+            for mode in [PolicyEngineMode::Legacy, PolicyEngineMode::Engine] {
+                let policies = PolicyRegistry::with_override(
+                    config.clone(),
+                    RoutingKeyOverrideConfig {
+                        enabled: override_on,
+                        ..Default::default()
+                    },
+                )
+                .with_policy_engine(mode, &config, &config);
+                let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
+                let owner = pick(&registry, &policies, with_headers(&headers));
+                owner.set_status(WorkerStatus::NotReady);
+                let failover = pick(&registry, &policies, with_headers(&headers));
+                assert_ne!(failover.url(), owner.url(), "{mode:?}");
+                for _ in 0..3 {
+                    assert_eq!(
+                        pick(&registry, &policies, with_headers(&headers)).url(),
+                        failover.url(),
+                        "{mode:?}: the failover holds the key"
+                    );
+                }
+                owner.set_status(WorkerStatus::Ready);
+                let back = pick(&registry, &policies, with_headers(&headers));
+                assert_eq!(
+                    back.url() == owner.url(),
+                    returns,
+                    "{} under {mode:?}: the key went to {}",
+                    config.name(),
+                    back.url()
+                );
+            }
+        }
+    }
+
+    /// Under the switch a pool whose every worker is over the overload
+    /// thresholds is steered to its least-loaded worker by the host's fallback
+    /// and counted as such, as the legacy path does once its pre-filter
+    /// empties; a placement that commits keeps the configured policy's name
+    /// as the selection metric's label.
+    #[test]
+    fn with_the_engine_switch_an_all_overloaded_pool_keeps_the_least_loaded_fallback() {
+        let policies = engine_round_robin();
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            pick(&registry, &policies, PlacementInputs::default())
+        });
+        assert!(
+            handle.render().lines().any(|line| {
+                line.starts_with("smg_worker_selection_total{")
+                    && line.contains("policy=\"round_robin\"")
+                    && line.ends_with(" 1")
+            }),
+            "the selection keeps the policy label:\n{}",
+            handle.render()
+        );
+
+        let busier = registry.get_by_url("http://h:1").expect("registered");
+        for _ in 0..10 {
+            busier.increment_load();
+        }
+        for worker in registry.get_all() {
+            registry.set_worker_overloaded(&worker, true);
+        }
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let selected = metrics::with_local_recorder(&recorder, || {
+            pick(&registry, &policies, PlacementInputs::default())
+        });
+        assert_eq!(
+            selected.url(),
+            "http://h:2",
+            "the least-loaded worker of the vetoed pool"
+        );
+        assert_one_overload_fallback(&handle.render());
+    }
+    /// The engine's view already leaves out a worker the host vetoes, so a
+    /// commit miss needs the eligibility to turn between the view and the
+    /// commit. Handed one that refuses targets the view kept, the seam takes
+    /// the next target of the same decision; when every target misses, one
+    /// re-decision runs with the misses excluded; when that misses too, the
+    /// host's own fallback answers, nothing here since the host vetoed no
+    /// one, and no third decision runs.
+    #[test]
+    fn with_the_engine_switch_a_commit_miss_walks_the_targets_then_re_decides_once() {
+        let passthrough = PolicyConfig::Passthrough;
+        let policies = PolicyRegistry::new(passthrough.clone()).with_policy_engine(
+            PolicyEngineMode::Engine,
+            &passthrough,
+            &passthrough,
+        );
+        let decider = policies.decider().expect("the engine serves passthrough");
+        let urls = [
+            "grpc://p:1",
+            "grpc://p:2",
+            "grpc://p:3",
+            "grpc://p:4",
+            "grpc://p:5",
+        ];
+        let registry = registry_with(
+            &urls
+                .iter()
+                .map(|url| (*url, ConnectionMode::Grpc, RuntimeType::Vllm))
+                .collect::<Vec<_>>(),
+        );
+        let candidates: Vec<Arc<dyn Worker>> = urls
+            .iter()
+            .map(|url| registry.get_by_url(url).expect("registered"))
+            .collect();
+        let place = |refused: &[&str]| {
+            let eligible = |worker: &Arc<dyn Worker>| !refused.contains(&worker.url());
+            select_from_decided(RegularDecision {
+                decider,
+                registry: &registry,
+                model_id: MODEL,
+                candidates: &candidates,
+                request: HostRequest {
+                    model: MODEL,
+                    phase: Phase::Single,
+                    ..HostRequest::default()
+                },
+                eligible: &eligible,
+                policy: "passthrough",
+            })
+        };
+
+        // Passthrough lists the pool in order: the first target misses, the
+        // second one of the same decision is taken.
+        assert_eq!(
+            place(&["grpc://p:1"]).expect("a worker").url(),
+            "grpc://p:2"
+        );
+        assert_eq!(decider.decisions(), 1, "the walk needs no second decision");
+
+        // Four misses exhaust the decision's targets: one re-decision with the
+        // misses excluded reaches the fifth worker.
+        let four = ["grpc://p:1", "grpc://p:2", "grpc://p:3", "grpc://p:4"];
+        assert_eq!(place(&four).expect("a worker").url(), "grpc://p:5");
+        assert_eq!(decider.decisions(), 3, "one decision and one re-decision");
+
+        // Every target refused: the re-decision misses too, the host's
+        // fallback has nothing vetoed to steer to, and no third decision runs.
+        assert!(
+            place(&urls).is_none(),
+            "no fallback outside the host's veto"
+        );
+        assert_eq!(decider.decisions(), 5, "one re-decision, never a second");
     }
 }

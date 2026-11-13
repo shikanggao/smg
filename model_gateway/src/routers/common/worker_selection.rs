@@ -17,7 +17,10 @@ use crate::{
         },
         error,
     },
-    worker::{ProviderType, RuntimeType, Worker, WorkerRegistry},
+    worker::{
+        endpoint::Endpoint, overload::STAGE_SELECTION, ProviderType, RuntimeType, Worker,
+        WorkerRegistry,
+    },
 };
 
 /// Holds references to shared infrastructure needed for worker selection.
@@ -69,8 +72,8 @@ impl<'a> WorkerSelector<'a> {
         // each of these requests into three registry walks and up to 5 s of
         // network wait to reach a 503 that carries neither the shed error code
         // nor the shed counter.
-        if let Some(shed) = self.shed_if_all_overloaded(req) {
-            return Err(shed);
+        if let Some(verdict) = self.all_overloaded_verdict(req) {
+            return verdict;
         }
 
         tracing::debug!(
@@ -130,11 +133,23 @@ impl<'a> WorkerSelector<'a> {
             .min_by_key(|w| w.load())
     }
 
-    /// Shed when every worker this request could have selected is vetoed.
-    /// Runs only on the miss path.
-    fn shed_if_all_overloaded(&self, req: &SelectWorkerRequest<'_>) -> Option<Response> {
+    /// The verdict on a pool whose every worker is vetoed, judged on the miss
+    /// path only: a shed when the pool is all-overloaded under
+    /// `--worker-overload-shed`, else the least-loaded routable worker (an
+    /// overloaded one never under shedding; a liveness veto steers either
+    /// way). `None` when the pool is not all-vetoed (or nothing in it is
+    /// routable), so the usual miss handling continues.
+    fn all_overloaded_verdict(
+        &self,
+        req: &SelectWorkerRequest<'_>,
+    ) -> Option<Result<Arc<dyn Worker>, Response>> {
         let candidates = self.candidate_pool(req, false);
-        overload::shed_if_all_overloaded(&candidates, req.model_id)
+        let shedding = self.registry.overload_shed_enabled();
+        if let Some(shed) = overload::shed_if_all_overloaded(&candidates, req.model_id, shedding) {
+            return Some(Err(shed));
+        }
+        overload::fallback_if_all_vetoed(&candidates, req.model_id, STAGE_SELECTION, shedding)
+            .map(Ok)
     }
 
     /// Check if any healthy worker supports the model (regardless of circuit breaker).
@@ -242,7 +257,7 @@ async fn refresh_worker_models(
     worker: &Arc<dyn Worker>,
     auth_header: Option<&HeaderValue>,
 ) -> bool {
-    let url = format!("{}/v1/models", worker.url());
+    let url = worker.endpoint_url("/v1/models");
     let mut backend_req = worker.http_client().get(&url);
 
     // Use caller's auth if provided, otherwise fall back to worker's configured API key.
@@ -267,7 +282,7 @@ async fn refresh_worker_models(
                         tracing::info!(
                             "Model refresh: found {} models from {}",
                             model_cards.len(),
-                            url
+                            Endpoint::redacted_str(&url)
                         );
                         worker.set_models(model_cards);
                         return true;
@@ -284,7 +299,7 @@ async fn refresh_worker_models(
             tracing::debug!(
                 "Model refresh returned non-success status {} from {}",
                 response.status(),
-                url
+                Endpoint::redacted_str(&url)
             );
             false
         }
@@ -297,18 +312,11 @@ async fn refresh_worker_models(
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, WorkerSpec};
+    use openai_protocol::worker::WorkerSpec;
     use smg_external_router::known;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
 
     // Wildcard model support (no `.models()`), so `supports_model` is always true;
     // this isolates the realtime-capability gate.
@@ -426,5 +434,87 @@ mod tests {
     #[test]
     fn default_request_does_not_require_realtime() {
         assert!(!SelectWorkerRequest::default().require_realtime_capable);
+    }
+
+    /// Every candidate over the thresholds: by default the least-loaded one
+    /// serves; under `--worker-overload-shed` the request is refused.
+    #[tokio::test]
+    async fn all_overloaded_steers_to_the_least_loaded_unless_shedding() {
+        let registry = WorkerRegistry::new();
+        let busy = worker("http://127.0.0.1:18180", false);
+        let quiet = worker("http://127.0.0.1:18181", false);
+        for _ in 0..4 {
+            busy.increment_load();
+        }
+        quiet.increment_load();
+        registry.register_or_replace(Arc::clone(&busy));
+        registry.register_or_replace(Arc::clone(&quiet));
+        registry.set_worker_overloaded(&busy, true);
+        registry.set_worker_overloaded(&quiet, true);
+
+        let picked = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "m",
+                ..Default::default()
+            })
+            .await
+            .expect("steered to the least-loaded worker");
+        assert_eq!(picked.url(), "http://127.0.0.1:18181");
+
+        registry.set_overload_shed(true);
+        let refused = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "m",
+                ..Default::default()
+            })
+            .await
+            .expect_err("shedding refuses the all-overloaded pool");
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            "worker_overload_protection_shed"
+        );
+    }
+
+    /// One of the five production joins, on a worker registered with a
+    /// trailing slash: the model refresh asks the engine for `/v1/models`,
+    /// not `//v1/models`, and the registered form stays the registry's key.
+    #[tokio::test]
+    async fn the_model_refresh_joins_to_a_slashed_registration_with_one_slash() {
+        use std::sync::Mutex;
+
+        use axum::{
+            http::{header::CONTENT_TYPE, Uri},
+            Router,
+        };
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let app = Router::new().fallback(move |uri: Uri| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                recorder.lock().unwrap().push(uri.path().to_owned());
+                (
+                    [(CONTENT_TYPE, "application/json")],
+                    r#"{"object":"list","data":[{"id":"m1","object":"model"}]}"#,
+                )
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let slashed = worker(&format!("http://{addr}/"), false);
+        assert!(
+            refresh_worker_models(&slashed, None).await,
+            "the refresh reads the stub's one model"
+        );
+        assert_eq!(seen.lock().unwrap().as_slice(), ["/v1/models"]);
+        assert_eq!(slashed.url(), format!("http://{addr}/"));
     }
 }

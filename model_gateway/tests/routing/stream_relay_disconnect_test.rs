@@ -14,22 +14,20 @@ use std::{
 use axum::{
     response::sse::{Event, Sse},
     routing::post,
-    Router as AxumRouter,
+    Json, Router as AxumRouter,
 };
 use futures_util::{stream, StreamExt};
 use http_body_util::BodyExt;
-use openai_protocol::{
-    chat::ChatCompletionRequest,
-    transcription::{AudioFile, TranscriptionRequest},
-};
+use openai_protocol::transcription::{AudioFile, TranscriptionRequest};
 use serde_json::json;
 use smg::{
-    routers::{router::Router as HttpRouter, RouterTrait},
+    routers::{pd_router::PDRouter, router::Router as HttpRouter, RouterTrait},
     tenant::{RouteRequestMeta, TenantKey},
-    worker::{BasicWorkerBuilder, ModelCard, Worker},
+    worker::{BasicWorkerBuilder, ModelCard, Worker, WorkerType},
 };
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 
+use super::streaming_chat_request;
 use crate::common::test_app::create_test_app_context;
 
 /// Sends on drop, so the test observes the moment the upstream response body
@@ -43,6 +41,11 @@ impl Drop for DropSignal {
         }
     }
 }
+
+/// The bound on a step the gateway owes at once: the routed response and the
+/// first relayed chunk. A relay that never streams fails its test within this
+/// bound instead of hanging the binary.
+const RELAY_STEP: Duration = Duration::from_secs(10);
 
 /// Upstream that answers with SSE headers, optionally one chunk, then stalls
 /// forever. Returns the base URL and a receiver that completes when the
@@ -87,6 +90,68 @@ async fn spawn_stalling_upstream(send_first_chunk: bool) -> (String, oneshot::Re
     (format!("http://{addr}"), dropped_rx)
 }
 
+/// Upstream that answers any chat request at once with a small JSON body:
+/// the prefill side of a disaggregated pair, whose answer the router reads
+/// before it relays the decode stream.
+#[expect(
+    clippy::disallowed_methods,
+    clippy::unwrap_used,
+    reason = "test infrastructure - panicking on failure is intentional"
+)]
+async fn spawn_prompt_upstream() -> String {
+    let app = AxumRouter::new().route(
+        "/v1/chat/completions",
+        post(|| async { Json(json!({"text": "", "meta_info": {}})) }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// The port an upstream URL names.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test infrastructure - panicking on failure is intentional"
+)]
+fn port_of(url: &str) -> u16 {
+    url.rsplit(':').next().unwrap().parse().unwrap()
+}
+
+/// Build a disaggregated router over one prefill worker and one decode
+/// worker, each the given upstream.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test infrastructure - panicking on failure is intentional"
+)]
+async fn pd_router_for(prefill_url: &str, decode_url: &str) -> PDRouter {
+    let ctx = create_test_app_context().await;
+    let health = openai_protocol::worker::HealthCheckConfig {
+        disable_health_check: true,
+        ..Default::default()
+    };
+    let prefill: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(prefill_url)
+            .worker_type(WorkerType::Prefill)
+            .bootstrap_port(Some(port_of(prefill_url)))
+            .models(vec![ModelCard::new("mock-model")])
+            .health_config(health.clone())
+            .build(),
+    );
+    let decode: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(decode_url)
+            .worker_type(WorkerType::Decode)
+            .models(vec![ModelCard::new("mock-model")])
+            .health_config(health)
+            .build(),
+    );
+    ctx.worker_registry.register(prefill);
+    ctx.worker_registry.register(decode);
+    PDRouter::new(&ctx).await.unwrap()
+}
+
 /// Build an HTTP router whose only worker is the given upstream.
 #[expect(
     clippy::unwrap_used,
@@ -111,19 +176,6 @@ fn tenant_meta() -> smg::middleware::TenantRequestMeta {
     RouteRequestMeta::new(TenantKey::from("test-tenant"))
 }
 
-#[expect(
-    clippy::unwrap_used,
-    reason = "test infrastructure - panicking on failure is intentional"
-)]
-fn streaming_chat_request() -> ChatCompletionRequest {
-    serde_json::from_value(json!({
-        "model": "mock-model",
-        "messages": [{"role": "user", "content": "Hello"}],
-        "stream": true
-    }))
-    .unwrap()
-}
-
 /// Client disconnects while the upstream has produced no chunk yet (the
 /// prefill window). The relay must not wait for a first token that may be
 /// tens of seconds away — or never come.
@@ -132,9 +184,12 @@ async fn chat_relay_closes_upstream_when_client_disconnects_during_prefill() {
     let (upstream_url, dropped_rx) = spawn_stalling_upstream(false).await;
     let router = http_router_for(&upstream_url).await;
 
-    let response = router
-        .route_chat(None, &tenant_meta(), streaming_chat_request(), "mock-model")
-        .await;
+    let response = timeout(
+        RELAY_STEP,
+        router.route_chat(None, &tenant_meta(), streaming_chat_request(), "mock-model"),
+    )
+    .await
+    .expect("no routed response within the bound: the relay never started");
     assert_eq!(response.status(), 200);
 
     // Client disconnect: the response body (and its relay channel receiver)
@@ -154,13 +209,18 @@ async fn chat_relay_closes_upstream_when_client_disconnects_mid_stream() {
     let (upstream_url, mut dropped_rx) = spawn_stalling_upstream(true).await;
     let router = http_router_for(&upstream_url).await;
 
-    let response = router
-        .route_chat(None, &tenant_meta(), streaming_chat_request(), "mock-model")
-        .await;
+    let response = timeout(
+        RELAY_STEP,
+        router.route_chat(None, &tenant_meta(), streaming_chat_request(), "mock-model"),
+    )
+    .await
+    .expect("no routed response within the bound: the relay never started");
     assert_eq!(response.status(), 200);
 
     let mut body = response.into_body();
-    let first = body.frame().await;
+    let first = timeout(RELAY_STEP, body.frame())
+        .await
+        .expect("no first relayed chunk within the bound: the relay never streamed");
     assert!(
         matches!(first, Some(Ok(_))),
         "expected a first streamed chunk, got {first:?}"
@@ -199,13 +259,18 @@ async fn transcription_relay_closes_upstream_when_client_disconnects() {
         content_type: Some("audio/wav".to_string()),
     };
 
-    let response = router
-        .route_audio_transcriptions(None, &tenant_meta(), &request, audio, "mock-model")
-        .await;
+    let response = timeout(
+        RELAY_STEP,
+        router.route_audio_transcriptions(None, &tenant_meta(), &request, audio, "mock-model"),
+    )
+    .await
+    .expect("no routed response within the bound: the relay never started");
     assert_eq!(response.status(), 200);
 
     let mut body = response.into_body();
-    let first = body.frame().await;
+    let first = timeout(RELAY_STEP, body.frame())
+        .await
+        .expect("no first relayed chunk within the bound: the relay never streamed");
     assert!(
         matches!(first, Some(Ok(_))),
         "expected a first streamed chunk, got {first:?}"
@@ -220,5 +285,33 @@ async fn transcription_relay_closes_upstream_when_client_disconnects() {
     timeout(Duration::from_secs(5), dropped_rx)
         .await
         .expect("upstream response body was not dropped: relay did not notice client disconnect")
+        .expect("drop signal sender vanished without firing");
+}
+
+/// The decode side of a disaggregated pair: the client disconnects while the
+/// decode worker has produced no chunk yet (the prefill side answered at
+/// once). The decode relay must end its upstream read, as the regular relay
+/// does, instead of waiting for a first token that may never come.
+#[tokio::test]
+async fn pd_decode_relay_closes_upstream_when_client_disconnects_during_prefill() {
+    let prefill_url = spawn_prompt_upstream().await;
+    let (decode_url, dropped_rx) = spawn_stalling_upstream(false).await;
+    let router = pd_router_for(&prefill_url, &decode_url).await;
+
+    let response = timeout(
+        RELAY_STEP,
+        router.route_chat(None, &tenant_meta(), streaming_chat_request(), "mock-model"),
+    )
+    .await
+    .expect("no routed response within the bound: the relay never started");
+    assert_eq!(response.status(), 200);
+
+    // Client disconnect: the response body (and its relay channel receiver)
+    // is dropped before any decode chunk arrived.
+    drop(response);
+
+    timeout(Duration::from_secs(5), dropped_rx)
+        .await
+        .expect("decode response body was not dropped: the decode relay did not notice the client disconnect")
         .expect("drop signal sender vanished without firing");
 }

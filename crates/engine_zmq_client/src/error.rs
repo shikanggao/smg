@@ -2,6 +2,9 @@
 // Apache-2.0 reference `vllm-engine-core-client` (vllm-project/vllm,
 // rust/src/engine-core-client/src/error.rs). See crate root for provenance.
 
+//! The crate's `Error` variants (encode, decode, transport, a dead engine, the handshake's
+//! deadlines) and its `Result` alias.
+
 use std::{sync::Arc, time::Duration};
 
 use thiserror::Error;
@@ -36,10 +39,20 @@ pub enum Error {
         stage: &'static str,
         timeout: Duration,
     },
+    #[error("startup handshake reached its ceiling of {ceiling:?} while waiting for {stage}")]
+    StartupCeiling {
+        stage: &'static str,
+        ceiling: Duration,
+    },
     #[error("engine input registration timed out after {timeout:?}")]
     InputRegistrationTimeout { timeout: Duration },
     #[error("unexpected startup handshake message: {message}")]
     UnexpectedHandshakeMessage { message: String },
+    /// The field order the engine declared for a positional struct at its
+    /// handshake differs from the prefix this client encodes for it: no
+    /// request goes out to be refused one by one.
+    #[error("wire layout mismatch: {message}")]
+    WireLayoutMismatch { message: String },
     #[error("unsupported field `{field}` in {context}")]
     UnsupportedField {
         context: &'static str,
@@ -55,6 +68,33 @@ pub enum Error {
     RequestStreamClosed { request_id: String },
     #[error("engine ZMQ client is closed: {message}")]
     ClientClosed { message: String },
+    #[error("engine did not accept the request within {timeout:?}: its input is not being read")]
+    EngineInputBlocked { timeout: Duration },
+    #[error(
+        "engine is not reading its input: this request's {request_bytes} bytes and the {frames} request frames ({bytes} bytes) already waiting for it would pass the bound of {limit_frames} frames or {limit_bytes} bytes; request refused"
+    )]
+    EngineInputFull {
+        frames: usize,
+        bytes: usize,
+        request_bytes: usize,
+        limit_frames: usize,
+        limit_bytes: usize,
+    },
+    /// Queued and actively sending payloads would exceed the client's byte budget.
+    #[error(
+        "engine input retains {retained_bytes} bytes; request of {request_bytes} bytes exceeds the {limit_bytes} byte budget"
+    )]
+    EngineInputBytesFull {
+        retained_bytes: usize,
+        request_bytes: usize,
+        limit_bytes: usize,
+    },
+    #[error("engine utility call failed: {message}")]
+    UtilityCallFailed { message: String },
+    #[error("utility call `{method}` got no reply within {timeout:?}")]
+    UtilityTimeout { method: String, timeout: Duration },
+    #[error("utility call `{method}` is not available on this engine protocol")]
+    UtilityUnsupported { method: String },
 
     /// Allows cloning the same error across multiple request streams.
     #[error(transparent)]

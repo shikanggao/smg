@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
-    registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
+    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{Llama4VisionProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct Llama4Spec;
@@ -83,6 +84,11 @@ impl ModelProcessorSpec for Llama4Spec {
         "llama4"
     }
 
+    /// `<|image|>` is vLLM's single-token target for Llama 4.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(modality, Modality::Image)
+    }
+
     fn matches(&self, metadata: &ModelMetadata) -> bool {
         let id = metadata.model_id.to_ascii_lowercase();
         id.contains("llama-4")
@@ -110,8 +116,21 @@ impl ModelProcessorSpec for Llama4Spec {
         Ok(HashMap::from([(Modality::Image, 8)]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(Llama4VisionProcessor::from_preprocessor_config(
+                preprocessor_config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(
@@ -194,21 +213,29 @@ mod tests {
         types::ImageSize,
     };
 
-    #[test]
-    fn llama4_single_tile_token_count() {
-        let tokenizer = TestTokenizer::new(&[
+    fn tokenizer() -> TestTokenizer {
+        TestTokenizer::new(&[
             ("<|image|>", 200090),
             ("<|image_start|>", 200088),
             ("<|image_end|>", 200089),
             ("<|patch|>", 200092),
             ("<|tile_x_separator|>", 200093),
             ("<|tile_y_separator|>", 200094),
-        ]);
-        let config = json!({
+        ])
+    }
+
+    fn config() -> serde_json::Value {
+        json!({
             "model_type": "llama4",
             "image_token_index": 200092,
             "vision_config": {"image_size": 336, "patch_size": 14}
-        });
+        })
+    }
+
+    #[test]
+    fn llama4_single_tile_token_count() {
+        let tokenizer = tokenizer();
+        let config = config();
         let metadata = ModelMetadata {
             model_id: "/models/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
             tokenizer: &tokenizer,
@@ -232,19 +259,8 @@ mod tests {
 
     #[test]
     fn llama4_multi_tile_adds_global() {
-        let tokenizer = TestTokenizer::new(&[
-            ("<|image|>", 200090),
-            ("<|image_start|>", 200088),
-            ("<|image_end|>", 200089),
-            ("<|patch|>", 200092),
-            ("<|tile_x_separator|>", 200093),
-            ("<|tile_y_separator|>", 200094),
-        ]);
-        let config = json!({
-            "model_type": "llama4",
-            "image_token_index": 200092,
-            "vision_config": {"image_size": 336, "patch_size": 14}
-        });
+        let tokenizer = tokenizer();
+        let config = config();
         let metadata = ModelMetadata {
             model_id: "Llama-4-Scout-Vision",
             tokenizer: &tokenizer,
@@ -273,19 +289,8 @@ mod tests {
 
     #[test]
     fn llama4_matches_alias_via_model_type() {
-        let tokenizer = TestTokenizer::new(&[
-            ("<|image|>", 200090),
-            ("<|image_start|>", 200088),
-            ("<|image_end|>", 200089),
-            ("<|patch|>", 200092),
-            ("<|tile_x_separator|>", 200093),
-            ("<|tile_y_separator|>", 200094),
-        ]);
-        let config = json!({
-            "model_type": "llama4",
-            "image_token_index": 200092,
-            "vision_config": {"image_size": 336, "patch_size": 14}
-        });
+        let tokenizer = tokenizer();
+        let config = config();
         let metadata = ModelMetadata {
             model_id: "custom-model",
             tokenizer: &tokenizer,

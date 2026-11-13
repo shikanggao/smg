@@ -7,12 +7,16 @@ use axum::response::Response;
 use tracing::error;
 
 use super::super::{HarmonyResponseProcessor, HarmonyStreamingProcessor};
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::{helpers, ProcessStage, RateLimitCell},
-        context::{DispatchContext, FinalResponse},
-        spec::{HarmonyResponseSpec, ResponseSpec},
+use crate::{
+    observability::metrics::metrics_labels,
+    routers::{
+        error,
+        grpc::{
+            common::stages::{ProcessStage, RateLimitCell},
+            context::{DispatchContext, FinalResponse},
+            spec::{HarmonyResponseSpec, ResponseSpec},
+            utils::StreamSource,
+        },
     },
 };
 
@@ -93,14 +97,19 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                 if is_streaming {
                     // Reserved (if tenant rate limiting is enabled): settled
                     // with real usage inside the streaming processor on
-                    // success, or abandoned via the attached
-                    // ReservationAttachment's Drop below on early
-                    // disconnect/error.
+                    // success, or abandoned on early disconnect/error by the
+                    // reservation's safety net the processor hands the
+                    // response body (ReservationAttachment's Drop).
                     let reservation = ctx
                         .rate_limit_cell
                         .as_deref()
                         .and_then(RateLimitCell::take_for_streaming_handoff);
 
+                    let source = StreamSource::new(
+                        ctx.workers.as_ref(),
+                        &dispatch,
+                        metrics_labels::ENDPOINT_CHAT,
+                    );
                     let response = self
                         .streaming_processor
                         .clone()
@@ -109,24 +118,17 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                             chat_request,
                             dispatch,
                             router_stops,
-                            reservation.clone(),
+                            reservation,
+                            ctx.load_guards.take(),
+                            source,
                         )
                         .await;
-
-                    // Attach load guards (and the reservation's
-                    // disconnect/error safety net) to the response body for
-                    // proper RAII lifecycle.
-                    let response = helpers::attach_response_guards(
-                        response,
-                        ctx.load_guards.take(),
-                        reservation,
-                    );
 
                     return Ok(Some(response));
                 }
 
                 // For non-streaming, delegate to Harmony response processor to build ChatCompletionResponse
-                let response = self
+                let (response, counts) = self
                     .processor
                     .process_non_streaming_chat_response(
                         execution_result,
@@ -137,11 +139,13 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                     .await?;
 
                 ctx.response.final_response = Some(FinalResponse::Chat(response));
+                ctx.response.engine_counts = Some(counts);
                 Ok(None)
             }
             HarmonyResponseSpec::Responses(responses_request) => {
-                // For streaming Responses API, leave execution_result in context
-                // for external streaming processor (serve_harmony_responses_stream)
+                // For streaming Responses API, leave execution_result (and the
+                // router's stop obligations beside it) in context for the
+                // external streaming processor (serve_harmony_responses_stream)
                 if is_streaming {
                     // Don't take execution_result - let the caller handle it
                     return Ok(None);
@@ -166,12 +170,20 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                     error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
                 })?;
 
-                let iteration_result = self
+                let (iteration_result, counts) = self
                     .processor
-                    .process_responses_iteration(execution_result, responses_request, dispatch)
+                    .process_responses_iteration(
+                        execution_result,
+                        responses_request,
+                        dispatch,
+                        &router_stops,
+                    )
                     .await?;
 
-                ctx.response.responses_iteration_result = Some(iteration_result);
+                ctx.response.responses_iteration_result = Some(Box::new(iteration_result));
+                // The engine's counts, for the settlement of the iteration's
+                // reservation, as the chat branch records them.
+                ctx.response.engine_counts = Some(counts);
                 Ok(None)
             }
         }

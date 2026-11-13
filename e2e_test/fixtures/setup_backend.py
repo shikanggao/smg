@@ -6,6 +6,10 @@ needs the same backend. The pool keys reuse on
 ``(engine, model_id, mode, worker_type, count)`` and gates reuse on
 worker liveness.
 
+Reviewed functional classes can opt into ``gateway(reuse=True)`` to keep a
+ZMQ gateway and its bound engines together across identical configurations.
+Unmarked classes keep a fresh gateway and fresh ZMQ engines.
+
 PD-disaggregation paths run through the pool too (so it can evict a
 stale cached worker holding their GPUs) but the caller owns teardown of
 the prefill/decode workers via ``stop_workers``. The function-scoped
@@ -33,15 +37,21 @@ from infra import (
     Gateway,
     Runtime,
     WorkerType,
+    effective_startup_timeout,
     get_connection_mode_override,
     get_runtime,
     launch_cloud_gateway,
 )
+from infra.cloud_credentials import resolve_cloud_credentials
+from infra.constants import vllm_kv_backend, zmq_backend
 from infra.model_specs import get_model_spec
+from infra.process_utils import ProcessExitedError
 from infra.worker import stop_workers
 from infra.worker_pool import get_pool
 
+from .hooks import FINALIZED_ZMQ_GATEWAY_KEY, SERVING_CLASS_FAILED_KEY
 from .markers import get_marker_kwargs, get_marker_value, model_id_for_engine, resolve_class_marker
+from .mock_answers import clear_class_workers, set_class_workers
 
 logger = logging.getLogger(__name__)
 
@@ -49,35 +59,43 @@ _GW_DEFAULTS = {
     "policy": "round_robin",
     "timeout": DEFAULT_ROUTER_TIMEOUT,
     "extra_args": None,
+    # Variables added to the gateway process's environment (a gateway-side
+    # test hook a class arms); None adds nothing.
+    "env": None,
     "log_level": None,
     "log_dir": None,
+    "reuse": False,
 }
 
 _WORKER_DEFAULTS = {
     "count": 1,
     "prefill": None,
     "decode": None,
-    # PD only: per-leg tensor parallelism (None = the model spec's tp).
+    # PD only: per-pool tensor parallelism (None = the model spec's tp).
     "prefill_tp": None,
     "decode_tp": None,
-    # PD only: KV transfer backend per worker of each leg ("nixl" /
-    # "mooncake"), a list one entry per worker; None = the lane's default.
+    # PD only: KV transfer backend per worker of each pool ("nixl" /
+    # "mooncake" / "moriio"), a list one entry per worker; None = the lane's default.
     "prefill_kv": None,
     "decode_kv": None,
     "gpus": None,
     "extra_engine_args": None,
     # PD only: spawn every prefill/decode worker first and wait afterwards.
-    "parallel_start": False,
+    "parallel_start": True,
 }
 
 # Track worker startup failures — fail fast after repeated failures
 _worker_start_failures: dict[str, int] = {}  # engine -> count
 _MAX_WORKER_START_FAILURES = 3  # fail fast after this many failures (matches --reruns 2)
 
-# Engines that speak the direct-ZMQ backend wire in e2e. Pairing ZMQ with any
-# other engine can't work, so we reject it up front instead of timing out on a
-# worker that never becomes ready.
-ZMQ_CAPABLE_ENGINES = frozenset({Runtime.VLLM.value, Runtime.TOKENSPEED.value})
+# Engines that speak the direct-ZMQ backend wire in e2e: the three engines and
+# the mock worker, whose ZMQ ranks speak the vLLM wire (the gateway is pinned
+# to it, ``zmq_backend``). Pairing ZMQ with any other engine can't work, so we
+# reject it up front instead of timing out on a worker that never becomes
+# ready.
+ZMQ_CAPABLE_ENGINES = frozenset(
+    {Runtime.VLLM.value, Runtime.TOKENSPEED.value, Runtime.SGLANG.value, Runtime.MOCK.value}
+)
 
 
 def _validate_connection_mode(connection_mode: ConnectionMode, engine: str) -> None:
@@ -117,6 +135,7 @@ def _start_gateway(gateway: Gateway, gateway_config: dict, **mode_kwargs) -> Non
         policy=gateway_config["policy"],
         timeout=gateway_config["timeout"],
         extra_args=gateway_config["extra_args"],
+        env=gateway_config.get("env"),
         log_level=gateway_config.get("log_level"),
         log_dir=gateway_config.get("log_dir"),
     )
@@ -129,15 +148,20 @@ def _gateway_readiness_timeout(
 
     gRPC/HTTP workers are health-checked (model fully loaded) by the pool
     before the gateway starts, so the gateway only has to connect — the short
-    router timeout suffices. ZMQ engines instead spawn and return immediately;
+    router timeout suffices on a warm host. On a cold one, the gateway's own
+    health check of an SGLang worker generates a token, the worker's first,
+    which may still be compiling kernels, so ``E2E_STARTUP_TIMEOUT`` floors this
+    wait too. ZMQ engines instead spawn and return immediately;
     their model load happens *inside* the gateway's readiness gate, so that gate
     must cover model load too. Use the model's ``startup_timeout`` (what the
     worker gate would have applied), never shrinking an explicitly larger
     gateway timeout.
     """
     if connection_mode != ConnectionMode.ZMQ:
-        return base_timeout
-    startup_timeout = get_model_spec(model_id).get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+        return effective_startup_timeout(base_timeout)
+    startup_timeout = effective_startup_timeout(
+        get_model_spec(model_id).get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+    )
     return max(base_timeout, startup_timeout)
 
 
@@ -193,7 +217,7 @@ def _wait_for_serving(
         except openai.APIStatusError as exc:
             code = _error_code_of(exc)
             if code in _SETTLED_VERDICTS:
-                # A fleet still registering shows one worker per leg and can
+                # A fleet still registering shows one worker per pool and can
                 # refuse a pair it accepts moments later; only a verdict the
                 # gateway has held for a few seconds is the fleet's.
                 if code != settled_code:
@@ -242,11 +266,13 @@ def setup_backend(request: pytest.FixtureRequest):
         GPU count and extra engine CLI args (local workers only)
       - ``@pytest.mark.workers(prefill=1, decode=1)``: PD worker counts
       - ``("pd_grpc", (n_prefill, n_decode[, prefill_tp, decode_tp]))`` as
-        the param: PD counts, optionally with asymmetric per-leg tp; a
+        the param: PD counts, optionally with asymmetric per-pool tp; a
         trailing dict may add ``prefill_kv`` / ``decode_kv`` lists naming
         each worker's KV transfer backend, so one fleet can mix transports,
         and ``prefill_env`` / ``decode_env`` dicts of engine environment
-        for one leg (a deployment-injected ``SMG_PAIRING_PROTOCOL``)
+        for one role (a deployment-injected ``SMG_PAIRING_PROTOCOL``) or
+        ``prefill_args`` / ``decode_args`` lists of engine CLI flags for one
+        pool (a ``--language-model-only`` decode pool)
       - ``@pytest.mark.gateway(policy=..., timeout=..., extra_args=...)``: Gateway config
 
     Returns:
@@ -254,9 +280,9 @@ def setup_backend(request: pytest.FixtureRequest):
     """
     raw_param = request.param
     if isinstance(raw_param, tuple):
-        backend_name, leg_counts = raw_param
+        backend_name, pool_counts = raw_param
     else:
-        backend_name, leg_counts = raw_param, None
+        backend_name, pool_counts = raw_param, None
 
     if os.environ.get(ENV_SKIP_BACKEND_SETUP, "").lower() in ("1", "true", "yes"):
         pytest.skip(f"{ENV_SKIP_BACKEND_SETUP} is set")
@@ -286,34 +312,39 @@ def setup_backend(request: pytest.FixtureRequest):
     _validate_connection_mode(connection_mode, engine)
     model_path = get_model_spec(model_id)["model"]
     workers_config = get_marker_kwargs(request, "workers", defaults=_WORKER_DEFAULTS)
-    if is_pd and leg_counts is not None:
+    if is_pd and pool_counts is not None:
         # ``("pd_grpc", (n_prefill, n_decode))`` lets one class sweep PD
         # topologies; setup_backend is class-scoped, so counts ride in the param.
-        leg_options: dict = {}
-        if leg_counts and isinstance(leg_counts[-1], dict):
-            leg_options = dict(leg_counts[-1])
-            leg_counts = tuple(leg_counts[:-1])
-        if len(leg_counts) not in (2, 4):
+        pool_options: dict = {}
+        if pool_counts and isinstance(pool_counts[-1], dict):
+            pool_options = dict(pool_counts[-1])
+            pool_counts = tuple(pool_counts[:-1])
+        if len(pool_counts) not in (2, 4):
             raise ValueError(
                 "pd_* backend params take (n_prefill, n_decode) or "
                 "(n_prefill, n_decode, prefill_tp, decode_tp), optionally followed by "
                 "a dict of per-worker options"
             )
-        if any(not isinstance(n, int) or isinstance(n, bool) or n < 1 for n in leg_counts):
-            raise ValueError(f"pd_* leg counts and tp must be positive integers, got {leg_counts}")
-        workers_config = {**workers_config, "prefill": leg_counts[0], "decode": leg_counts[1]}
-        if len(leg_counts) == 4:
+        if any(not isinstance(n, int) or isinstance(n, bool) or n < 1 for n in pool_counts):
+            raise ValueError(
+                f"pd_* pool counts and tp must be positive integers, got {pool_counts}"
+            )
+        workers_config = {**workers_config, "prefill": pool_counts[0], "decode": pool_counts[1]}
+        if len(pool_counts) == 4:
             workers_config = {
                 **workers_config,
-                "prefill_tp": leg_counts[2],
-                "decode_tp": leg_counts[3],
+                "prefill_tp": pool_counts[2],
+                "decode_tp": pool_counts[3],
             }
         for key in ("prefill_kv", "decode_kv"):
-            if key in leg_options:
-                workers_config = {**workers_config, key: list(leg_options[key])}
+            if key in pool_options:
+                workers_config = {**workers_config, key: list(pool_options[key])}
         for key in ("prefill_env", "decode_env"):
-            if key in leg_options:
-                workers_config = {**workers_config, key: dict(leg_options[key])}
+            if key in pool_options:
+                workers_config = {**workers_config, key: dict(pool_options[key])}
+        for key in ("prefill_args", "decode_args"):
+            if key in pool_options:
+                workers_config = {**workers_config, key: list(pool_options[key])}
     log_dir = os.environ.get("E2E_LOG_DIR") or gateway_config.get("log_dir")
 
     fail_count = _worker_start_failures.get(engine, 0)
@@ -323,6 +354,24 @@ def setup_backend(request: pytest.FixtureRequest):
             returncode=1,
         )
 
+    if (
+        not is_pd
+        and not is_epd
+        and connection_mode == ConnectionMode.ZMQ
+        and gateway_config["reuse"]
+    ):
+        yield from _setup_pooled_zmq(
+            request.node,
+            model_id,
+            model_path,
+            engine,
+            workers_config,
+            gateway_config,
+            backend_name,
+            log_dir,
+        )
+        return
+
     gateway = Gateway()
     try:
         if is_epd:
@@ -331,7 +380,8 @@ def setup_backend(request: pytest.FixtureRequest):
                 model_path,
                 engine,
                 connection_mode,
-                leg_counts,
+                pool_counts,
+                workers_config,
                 gateway_config,
                 gateway,
                 log_dir,
@@ -367,6 +417,57 @@ def setup_backend(request: pytest.FixtureRequest):
 # ---------------------------------------------------------------------------
 # Local (non-PD) backend
 # ---------------------------------------------------------------------------
+
+
+def _setup_pooled_zmq(
+    class_node,
+    model_id,
+    model_path,
+    engine,
+    workers_config,
+    gateway_config,
+    backend_name,
+    log_dir,
+):
+    """Reuse only explicitly compatible classes; failed classes evict the pair."""
+    class_node.stash[SERVING_CLASS_FAILED_KEY] = False
+    class_node.stash[FINALIZED_ZMQ_GATEWAY_KEY] = None
+    pool = get_pool()
+    try:
+        gateway = pool.acquire_zmq(
+            model_id=model_id,
+            model_path=model_path,
+            engine=engine,
+            count=workers_config.get("count") or 1,
+            gpus=workers_config.get("gpus"),
+            extra_engine_args=workers_config.get("extra_engine_args"),
+            gateway_config={
+                **gateway_config,
+                "timeout": _gateway_readiness_timeout(
+                    ConnectionMode.ZMQ, model_id, gateway_config["timeout"]
+                ),
+            },
+            log_dir=log_dir,
+        )
+    except (TimeoutError, RuntimeError):
+        _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
+        raise
+    # The pair's engines, for the answers a test states on the mock engine
+    # (a pool double without the accessor names none).
+    current_workers = getattr(pool, "current_workers", None)
+    set_class_workers(current_workers() if current_workers else [])
+    try:
+        yield backend_name, model_path, _make_openai_client(gateway), gateway
+    except BaseException:
+        pool.discard_zmq(gateway)
+        raise
+    finally:
+        clear_class_workers()
+        # Keep the service for the remaining methods of a failed class, then
+        # start the next class fresh rather than carrying potentially bad state.
+        class_node.stash[FINALIZED_ZMQ_GATEWAY_KEY] = gateway
+        if class_node.stash[SERVING_CLASS_FAILED_KEY]:
+            pool.discard_zmq(gateway)
 
 
 def _setup_local(
@@ -409,17 +510,35 @@ def _setup_local(
         **gateway_config,
         "timeout": _gateway_readiness_timeout(connection_mode, model_id, gateway_config["timeout"]),
     }
+    # The class's workers, cached or not, for the answers a test states on
+    # the mock engine.
+    set_class_workers(workers)
     try:
-        _start_gateway(
-            gateway,
-            gateway_config,
-            worker_urls=[w.base_url for w in workers],
-            model_path=model_path,
-            backend=engine if is_zmq else None,
-        )
+        try:
+            _start_gateway(
+                gateway,
+                gateway_config,
+                worker_urls=[w.base_url for w in workers],
+                workers=workers,
+                model_path=model_path,
+                backend=zmq_backend(engine) if is_zmq else None,
+            )
+        except ProcessExitedError:
+            raise
+        except (TimeoutError, RuntimeError):
+            # A ZMQ engine's start-up wait is this gate (its spawn returned
+            # at once), so an engine that died in it, or that it waited out,
+            # failed to start. Counted as the pool counts a worker that fails
+            # its own gate, a death or the bound alike: the session stops
+            # after _MAX_WORKER_START_FAILURES such failures instead of
+            # running every later class of the engine into the same one.
+            if is_zmq:
+                _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
+            raise
         logger.info("%s backend ready at %s", backend_name, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
+        clear_class_workers()
         logger.info(
             "Tearing down %s backend (%s)",
             backend_name,
@@ -435,17 +554,24 @@ def _setup_local(
 # ---------------------------------------------------------------------------
 
 
-def _per_worker_kv(raw, count: int, leg: str) -> list[str] | None:
-    """Normalise a per-worker KV backend list for one PD leg (None = lane default)."""
+def _per_worker_kv(raw, count: int, role: str) -> list[str] | None:
+    """Normalise a per-worker KV backend list for one PD role (None = lane default)."""
     if raw is None:
         return None
     backends = [str(b).lower() for b in raw]
     if len(backends) != count:
-        raise ValueError(f"{leg}_kv names {len(backends)} backends for {count} {leg} workers")
+        raise ValueError(f"{role}_kv names {len(backends)} backends for {count} {role} workers")
     return backends
 
 
-def _start_pd_leg(
+def _merge_engine_args(shared: list[str] | None, pool_only: list[str] | None) -> list[str] | None:
+    """Combine the class-wide engine flags with one PD pool's own flags."""
+    if not pool_only:
+        return shared
+    return [*(shared or []), *pool_only]
+
+
+def _start_pd_pool(
     *,
     model_id: str,
     engine: str,
@@ -460,8 +586,8 @@ def _start_pd_leg(
     extra_engine_args: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> list:
-    """Start one PD leg; a per-worker KV backend list starts the workers one by one."""
-    if kv_backends is None:
+    """Start one PD pool; a per-worker KV backend list starts the workers one by one."""
+    if kv_backends is None and not wait_ready:
         return _start_workers_tracked(
             model_id=model_id,
             engine=engine,
@@ -477,24 +603,60 @@ def _start_pd_leg(
         )
     spec_tp = tp or get_model_spec(model_id).get("tp", 1)
     workers: list = []
-    for i, backend in enumerate(kv_backends):
-        workers.extend(
-            _start_workers_tracked(
-                model_id=model_id,
-                engine=engine,
-                mode=mode,
-                count=1,
-                worker_type=worker_type,
-                log_dir=log_dir,
-                gpu_offset=gpu_offset + i * spec_tp,
-                wait_ready=wait_ready,
-                tp=tp,
-                kv_backend=backend,
-                extra_engine_args=extra_engine_args,
-                extra_env=extra_env,
+    try:
+        for i, backend in enumerate(kv_backends or [None] * count):
+            workers.extend(
+                _start_workers_tracked(
+                    model_id=model_id,
+                    engine=engine,
+                    mode=mode,
+                    count=1,
+                    worker_type=worker_type,
+                    log_dir=log_dir,
+                    gpu_offset=gpu_offset + i * spec_tp,
+                    wait_ready=wait_ready,
+                    tp=tp,
+                    kv_backend=backend,
+                    extra_engine_args=extra_engine_args,
+                    extra_env=extra_env,
+                )
             )
-        )
+    except Exception:
+        stop_workers(workers)
+        raise
     return workers
+
+
+def _moriio_fleet(engine: str, prefill_kv: list[str] | None, decode_kv: list[str] | None) -> bool:
+    """Whether this PD fleet moves its KV over MoRI-IO; a fleet cannot mix it with others."""
+    if engine != Runtime.VLLM.value:
+        return False
+    backends = {*(prefill_kv or []), *(decode_kv or [])}
+    if prefill_kv is None or decode_kv is None:
+        backends.add(vllm_kv_backend())
+    if "moriio" not in backends:
+        return False
+    if backends != {"moriio"}:
+        raise ValueError(f"a MoRI-IO PD fleet cannot mix KV backends: {sorted(backends)}")
+    return True
+
+
+def _register_moriio_workers(gateway: Gateway, prefill_workers: list, decode_workers: list) -> None:
+    """Register MoRI-IO workers through the API, with the fields SMG's handoff reads.
+
+    Registered by URL on the command line, a worker carries no kv_connector, so
+    the HTTP PD router would pass requests through and decode would recompute
+    the prompt.
+    """
+    for workers, worker_type in ((prefill_workers, "prefill"), (decode_workers, "decode")):
+        for worker in workers:
+            ok, detail = gateway.add_worker(
+                worker.base_url, worker_type=worker_type, spec=worker.moriio_registration()
+            )
+            if not ok:
+                raise RuntimeError(f"registering {worker_type} {worker.base_url} failed: {detail}")
+    gateway.prefill_workers = list(prefill_workers)
+    gateway.decode_workers = list(decode_workers)
 
 
 def _setup_pd(
@@ -515,6 +677,11 @@ def _setup_pd(
     decode_tp = workers_config.get("decode_tp")
     prefill_kv = _per_worker_kv(workers_config.get("prefill_kv"), num_prefill, "prefill")
     decode_kv = _per_worker_kv(workers_config.get("decode_kv"), num_decode, "decode")
+    moriio = _moriio_fleet(engine, prefill_kv, decode_kv)
+    if moriio:
+        # SMG speaks the MoRI-IO handoff only on its HTTP PD router (the gRPC
+        # one answers 501), so a MoRI-IO lane runs every topology over HTTP.
+        connection_mode = ConnectionMode.HTTP
     backend_name = f"pd_{connection_mode.value}"
     runtime_label = RUNTIME_LABELS.get(engine, engine)
 
@@ -532,11 +699,15 @@ def _setup_pd(
 
     parallel_start = bool(workers_config.get("parallel_start"))
     # The class marker's engine flags (a decode window, a context length)
-    # reach every leg, as they do for regular workers.
+    # reach every pool, as they do for regular workers. The ``prefill_args`` /
+    # ``decode_args`` pool options add flags to one pool only (a
+    # ``--language-model-only`` decode pool, say).
     extra_engine_args = workers_config.get("extra_engine_args")
+    prefill_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("prefill_args"))
+    decode_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("decode_args"))
     all_workers: list = []
     try:
-        prefill_workers = _start_pd_leg(
+        prefill_workers = _start_pd_pool(
             model_id=model_id,
             engine=engine,
             mode=connection_mode,
@@ -547,14 +718,14 @@ def _setup_pd(
             wait_ready=not parallel_start,
             tp=prefill_tp,
             kv_backends=prefill_kv,
-            extra_engine_args=extra_engine_args,
+            extra_engine_args=prefill_engine_args,
             extra_env=workers_config.get("prefill_env"),
         )
         all_workers.extend(prefill_workers)
 
         # Decode workers start on GPUs after prefill workers
         decode_gpu_offset = num_prefill * (prefill_tp or spec.get("tp", 1))
-        decode_workers = _start_pd_leg(
+        decode_workers = _start_pd_pool(
             model_id=model_id,
             engine=engine,
             mode=connection_mode,
@@ -565,35 +736,60 @@ def _setup_pd(
             wait_ready=not parallel_start,
             tp=decode_tp,
             kv_backends=decode_kv,
-            extra_engine_args=extra_engine_args,
+            extra_engine_args=decode_engine_args,
             extra_env=workers_config.get("decode_env"),
         )
         all_workers.extend(decode_workers)
         if parallel_start:
             # Each worker loads on its own GPUs, so spawning them all first
             # makes a topology cost one model load instead of one per worker.
-            # It also brings the legs up in no particular order, which is what
+            # It also brings the pools up in no particular order, which is what
             # a user launching a fleet does.
             # One deadline for the fleet, and a failed load still counts toward
             # the session's fail-fast budget as it does on the sequential path.
-            deadline = time.monotonic() + spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            # Evicting the previous pool and staggering new launches must not
+            # consume the replacement fleet's readiness budget.
+            deadline = time.monotonic() + effective_startup_timeout(
+                spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            )
             try:
                 for worker in all_workers:
-                    worker.wait_ready(max(1, int(deadline - time.monotonic())))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"Workers for {model_id} did not become healthy within the startup bound"
+                        )
+                    worker.wait_ready(max(1, int(remaining)))
             except (TimeoutError, RuntimeError):
                 _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
                 raise
 
-        _start_gateway(
-            gateway,
-            gateway_config,
-            prefill_workers=prefill_workers,
-            decode_workers=decode_workers,
-        )
+        # The class's workers, for the answers a test states on the mock
+        # engine (the fixture picks the decode side's).
+        set_class_workers(all_workers)
+        # The launch's readiness wait covers each worker's tokenizer autoload,
+        # so the gateway's timeout takes the floor the regular path applies.
+        gateway_config = {
+            **gateway_config,
+            "timeout": _gateway_readiness_timeout(
+                connection_mode, model_id, gateway_config["timeout"]
+            ),
+        }
+        if moriio:
+            _start_gateway(gateway, gateway_config, prefill_workers=[], decode_workers=[])
+            _register_moriio_workers(gateway, prefill_workers, decode_workers)
+        else:
+            _start_gateway(
+                gateway,
+                gateway_config,
+                prefill_workers=prefill_workers,
+                decode_workers=decode_workers,
+            )
         _wait_for_serving(gateway, model_id, model_path)
         logger.info("%s PD backend ready at %s", runtime_label, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
+        clear_class_workers()
         logger.info("Tearing down %s PD backend", runtime_label)
         gateway.shutdown()
         stop_workers(all_workers)
@@ -610,6 +806,7 @@ def _setup_epd(
     engine,
     connection_mode,
     epd_counts,
+    workers_config,
     gateway_config,
     gateway,
     log_dir,
@@ -636,6 +833,9 @@ def _setup_epd(
         n_decode,
     )
 
+    # The class marker's engine flags (a scheduler wire, a context length)
+    # reach every pool, as they do for the prefill-decode pools.
+    extra_engine_args = workers_config.get("extra_engine_args")
     all_workers: list = []
     try:
         encode_workers = _start_workers_tracked(
@@ -647,6 +847,7 @@ def _setup_epd(
             log_dir=log_dir,
             gpu_offset=0,
             gpus=1,  # vision tower runs on one GPU regardless of LM tp
+            extra_engine_args=extra_engine_args,
         )
         all_workers.extend(encode_workers)
 
@@ -658,6 +859,7 @@ def _setup_epd(
             worker_type=WorkerType.PREFILL,
             log_dir=log_dir,
             gpu_offset=n_encode,
+            extra_engine_args=extra_engine_args,
         )
         all_workers.extend(prefill_workers)
 
@@ -669,9 +871,21 @@ def _setup_epd(
             worker_type=WorkerType.DECODE,
             log_dir=log_dir,
             gpu_offset=n_encode + n_prefill * tp,
+            extra_engine_args=extra_engine_args,
         )
         all_workers.extend(decode_workers)
 
+        # The class's workers, for the answers a test states on the mock
+        # engine (the fixture picks the decode side's) and for a test that
+        # reads one worker's own admin API.
+        set_class_workers(all_workers)
+        # The same floor as the prefill-decode launch above.
+        gateway_config = {
+            **gateway_config,
+            "timeout": _gateway_readiness_timeout(
+                connection_mode, model_id, gateway_config["timeout"]
+            ),
+        }
         _start_gateway(
             gateway,
             gateway_config,
@@ -679,9 +893,11 @@ def _setup_epd(
             prefill_workers=prefill_workers,
             decode_workers=decode_workers,
         )
+        _wait_for_serving(gateway, model_id, model_path)
         logger.info("%s EPD backend ready at %s", runtime_label, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
+        clear_class_workers()
         logger.info("Tearing down %s EPD backend", runtime_label)
         gateway.shutdown()
         stop_workers(all_workers)
@@ -695,10 +911,9 @@ def _setup_epd(
 def _setup_cloud(backend_name, request, gateway_config):
     """Launch cloud gateway (no local workers), yield result tuple, tear down."""
     cfg = THIRD_PARTY_MODELS[backend_name]
-    api_key_env = cfg.get("api_key_env")
-
-    if api_key_env and not os.environ.get(api_key_env):
-        pytest.fail(f"{api_key_env} not set for {backend_name} tests")
+    credentials = resolve_cloud_credentials(backend_name, require_key=False)
+    if not credentials.api_key:
+        pytest.fail(f"{credentials.api_key_env} not set for {backend_name} tests")
 
     storage_backend = get_marker_value(request, "storage", default="memory")
 
@@ -709,7 +924,7 @@ def _setup_cloud(backend_name, request, gateway_config):
         extra_args=gateway_config.get("extra_args"),
     )
 
-    api_key = os.environ.get(api_key_env) if api_key_env else "not-used"
+    api_key = credentials.api_key
     model_path = cfg["model"]
 
     client: openai.OpenAI | anthropic.Anthropic
@@ -768,8 +983,9 @@ def backend_router(request: pytest.FixtureRequest):
     try:
         gateway.start(
             worker_urls=[w.base_url for w in workers],
+            workers=workers,
             model_path=model_path,
-            backend=engine if is_zmq else None,
+            backend=zmq_backend(engine) if is_zmq else None,
             # ZMQ loads the model inside the gateway's readiness gate; cover it.
             timeout=_gateway_readiness_timeout(connection_mode, model_id, DEFAULT_ROUTER_TIMEOUT),
         )

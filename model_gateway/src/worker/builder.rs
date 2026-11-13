@@ -1,25 +1,29 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use openai_protocol::{
     model_card::ModelCard,
-    worker::{HealthCheckConfig, OverloadUpdate, WorkerModels, WorkerSpec, WorkerStatus},
+    worker::{
+        ConstrainedDecoding, HealthCheckConfig, OverloadUpdate, WorkerModels, WorkerSpec,
+        WorkerStatus,
+    },
 };
 use tokio::sync::mpsc;
 
 use super::{
+    basic::{BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime, WorkerType},
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+    endpoint::Endpoint,
     event::WorkerConnected,
+    http_client::LazyHttpClient,
+    metadata::DecodingLabels,
     overload::OverloadThresholds,
     resilience::ResolvedResilience,
-    worker::{
-        BasicWorker, ConnectionMode, LazyHttpClient, RuntimeType, WorkerMetadata, WorkerRuntime,
-        WorkerType,
-    },
+    Worker,
 };
 use crate::{
-    observability::metrics::Metrics, routers::grpc::backend_client::BackendClient,
-    worker::pd_pairing::PdPairing,
+    config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS, observability::metrics::Metrics,
+    routers::grpc::backend_client::BackendClient, worker::pd_pairing::PdPairing,
 };
 
 /// Builder for creating BasicWorker instances with fluent API.
@@ -32,6 +36,14 @@ pub struct BasicWorkerBuilder {
     /// If not set, falls back to `HealthCheckConfig::default()`.
     health_config: Option<HealthCheckConfig>,
     health_endpoint: String,
+    /// The per-stage silence bound of a ZMQ engine's startup handshake; the
+    /// router config's default when not set.
+    zmq_startup_timeout: Option<Duration>,
+    /// The bound on a request over the worker's ZMQ link, from its dispatch
+    /// to its last message (the worker's own `http_pool.timeout_secs`, else
+    /// the router config's `request_timeout_secs`, as the registration step
+    /// resolves it); the link's streams are unbounded when not set.
+    zmq_request_timeout: Option<Duration>,
     circuit_breaker_config: CircuitBreakerConfig,
     backend_client: Option<BackendClient>,
     /// Pre-built worker-directed HTTP client (if not set, a default is created).
@@ -51,32 +63,27 @@ pub struct BasicWorkerBuilder {
     /// against. Default empty: a spec block alone still enables protection
     /// for this worker.
     overload_defaults: OverloadThresholds,
+    /// The labels discovery read from the engine, recorded on the worker so a
+    /// later refresh replaces exactly these; empty when none were discovered.
+    discovered_labels: HashMap<String, String>,
 }
 
 impl BasicWorkerBuilder {
     /// Create a new builder with only the URL (uses default WorkerSpec)
     pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            spec: WorkerSpec::new(url),
-            health_config: None,
-            health_endpoint: "/health".to_string(),
-            circuit_breaker_config: CircuitBreakerConfig::default(),
-            backend_client: None,
-            http_client: None,
-            http2: false,
-            resilience: None,
-            initial_status: None,
-            connect_signal_tx: None,
-            overload_defaults: OverloadThresholds::default(),
-        }
+        Self::from_spec(WorkerSpec::new(url))
     }
 
-    /// Create a builder from an existing WorkerSpec.
+    /// Create a builder from an existing WorkerSpec, every other field at its default: no health
+    /// config and `/health` as the endpoint, the default circuit breaker and overload thresholds,
+    /// no clients, HTTP/1, no resilience, no initial status, no connect signal.
     pub fn from_spec(spec: WorkerSpec) -> Self {
         Self {
             spec,
             health_config: None,
             health_endpoint: "/health".to_string(),
+            zmq_startup_timeout: None,
+            zmq_request_timeout: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             backend_client: None,
             http_client: None,
@@ -85,26 +92,56 @@ impl BasicWorkerBuilder {
             initial_status: None,
             connect_signal_tx: None,
             overload_defaults: OverloadThresholds::default(),
+            discovered_labels: HashMap::new(),
         }
     }
 
-    /// Create a new builder with URL and worker type (for backwards compatibility)
-    pub fn new_with_type(url: impl Into<String>, worker_type: WorkerType) -> Self {
-        let mut spec = WorkerSpec::new(url);
-        spec.worker_type = worker_type;
-        Self {
-            spec,
-            health_config: None,
-            health_endpoint: "/health".to_string(),
-            circuit_breaker_config: CircuitBreakerConfig::default(),
-            backend_client: None,
-            http_client: None,
-            http2: false,
-            resilience: None,
-            initial_status: None,
-            connect_signal_tx: None,
-            overload_defaults: OverloadThresholds::default(),
+    /// A builder over a live worker's resolved state: the spec, HTTP/2, the
+    /// discovered labels, the health config and endpoint, the resilience,
+    /// the breaker config, the ZMQ bounds, the overload block, a
+    /// materialized HTTP client and the current status, so a rebuild keeps
+    /// what registration resolved. The caller applies its own changes, the
+    /// gateway's overload defaults and the connect signal, then shares the
+    /// KV engine state with the worker it replaces.
+    pub(crate) fn carrying(worker: &Arc<dyn Worker>) -> Self {
+        let metadata = worker.metadata();
+        let mut builder = Self::from_spec((*metadata.spec).clone())
+            .http2(worker.http2())
+            .discovered_labels((*metadata.discovered_labels).clone())
+            .health_config(metadata.health_config.clone())
+            .health_endpoint(metadata.health_endpoint.clone())
+            .resilience(worker.resilience().clone())
+            // The resolved thresholds stand as the defaults the spec's block
+            // re-resolves against, so a rebuild without the gateway config at
+            // hand keeps the effective thresholds.
+            .overload(metadata.spec.overload)
+            .overload_defaults(metadata.overload)
+            .zmq_startup_timeout(metadata.zmq_startup_timeout)
+            .status(worker.status());
+        // `from_spec` starts on the built-in breaker config; with the live one
+        // the registry's replacement adopts the live breaker and its state.
+        if let Some(config) = worker
+            .as_any()
+            .downcast_ref::<BasicWorker>()
+            .map(BasicWorker::circuit_breaker_config)
+        {
+            builder = builder.circuit_breaker_config(config);
         }
+        if let Some(timeout) = metadata.zmq_request_timeout {
+            builder = builder.zmq_request_timeout(timeout);
+        }
+        // A never-HTTP worker keeps a deferred client slot.
+        if let Some(client) = worker.http_client_handle_if_initialized() {
+            builder = builder.http_client(client);
+        }
+        builder
+    }
+
+    /// The engine's KV block size in tokens as a registration states it;
+    /// `None` leaves it to what the engine's streams report.
+    pub fn kv_block_size(mut self, tokens: Option<usize>) -> Self {
+        self.spec.kv_block_size = tokens;
+        self
     }
 
     /// Set the bootstrap port (for prefill workers in PD disaggregation)
@@ -150,6 +187,14 @@ impl BasicWorkerBuilder {
         self
     }
 
+    /// Record the labels discovery read from the engine for this worker
+    /// (before the operator's labels were merged over them). A later refresh
+    /// replaces exactly these; `labels` stays the merged set the worker shows.
+    pub fn discovered_labels(mut self, labels: HashMap<String, String>) -> Self {
+        self.discovered_labels = labels;
+        self
+    }
+
     /// Add a single label
     pub fn label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.spec.labels.insert(key.into(), value.into());
@@ -181,6 +226,26 @@ impl BasicWorkerBuilder {
     /// Set health check endpoint path (internal-only, from router config).
     pub fn health_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.health_endpoint = endpoint.into();
+        self
+    }
+
+    /// Set the longest any one stage of a ZMQ engine's startup handshake may
+    /// stay silent (internal-only, from router config): it alone covers the
+    /// engine's init between its HELLO and its READY.
+    pub fn zmq_startup_timeout(mut self, timeout: Duration) -> Self {
+        self.zmq_startup_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the bound on a request over the worker's ZMQ link, from its
+    /// dispatch to its last message (internal-only: the registration step
+    /// resolves it as the HTTP worker client resolves its per-request
+    /// timeout, the worker's own `http_pool.timeout_secs` else the router's
+    /// `--request-timeout-secs`): a stream the engine leaves silent ends at
+    /// it with the gateway's timeout and the engine request is aborted. Unset
+    /// leaves the link's streams open for as long as the client reads them.
+    pub fn zmq_request_timeout(mut self, timeout: Duration) -> Self {
+        self.zmq_request_timeout = Some(timeout);
         self
     }
 
@@ -255,6 +320,14 @@ impl BasicWorkerBuilder {
         self
     }
 
+    /// Set when the gateway hands this worker's engine a grammar: on every turn,
+    /// or only when the request asks ([`ConstrainedDecoding`]). Unset, the
+    /// worker's `constrained_decoding` label decides.
+    pub fn constrained_decoding(mut self, policy: ConstrainedDecoding) -> Self {
+        self.spec.constrained_decoding = Some(policy);
+        self
+    }
+
     /// Set worker priority (higher value = higher priority)
     pub fn priority(mut self, priority: u32) -> Self {
         self.spec.priority = priority;
@@ -323,10 +396,17 @@ impl BasicWorkerBuilder {
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
             pd_pairing: PdPairing::derive(&self.spec),
+            redacted_url: Endpoint::redacted_url(&self.spec.url),
+            decoding: DecodingLabels::of(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,
+            zmq_startup_timeout: self
+                .zmq_startup_timeout
+                .unwrap_or(Duration::from_secs(DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS)),
+            zmq_request_timeout: self.zmq_request_timeout,
             http2: self.http2,
+            discovered_labels: Arc::new(self.discovered_labels),
         };
 
         // OnceCell for lock-free client access after initialization; ArcSwap so
@@ -363,8 +443,10 @@ impl BasicWorkerBuilder {
         let resilience = self.resilience.unwrap_or_default();
 
         BasicWorker {
-            kv_engine_id: ArcSwapOption::new(metadata.spec.kv_engine_id.clone().map(Arc::new)),
-            kv_engine_id_unconfirmed: AtomicBool::new(false),
+            kv_engine_id: Arc::new(ArcSwapOption::new(
+                metadata.spec.kv_engine_id.clone().map(Arc::new),
+            )),
+            kv_engine_id_unconfirmed: Arc::new(AtomicBool::new(false)),
             runtime: ArcSwap::from_pointee(WorkerRuntime::new(&metadata.spec.url, initial_status)),
             circuit_breaker: ArcSwap::from_pointee(CircuitBreaker::with_config_and_label(
                 self.circuit_breaker_config,
@@ -374,10 +456,12 @@ impl BasicWorkerBuilder {
             backend_client,
             zmq_connect_started: Arc::new(AtomicBool::new(false)),
             zmq_connect_abort: Arc::new(ArcSwapOption::empty()),
+            superseded: AtomicBool::new(false),
             connect_signal_tx: self.connect_signal_tx,
             models_override: Arc::new(ArcSwap::from_pointee(WorkerModels::Wildcard)),
             http_client,
             resilience,
+            completion_sink: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 }
@@ -412,11 +496,17 @@ fn parse_bootstrap_host(url: &str) -> String {
         host
     } else if !clean_url.contains("://") {
         try_parse(&format!("http://{clean_url}")).unwrap_or_else(|| {
-            tracing::warn!("Failed to parse URL '{}', defaulting to localhost", url);
+            tracing::warn!(
+                "Failed to parse URL '{}', defaulting to localhost",
+                Endpoint::redacted_str(url)
+            );
             "localhost".to_string()
         })
     } else {
-        tracing::warn!("Failed to parse URL '{}', defaulting to localhost", url);
+        tracing::warn!(
+            "Failed to parse URL '{}', defaulting to localhost",
+            Endpoint::redacted_str(url)
+        );
         "localhost".to_string()
     }
 }
@@ -426,7 +516,44 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::worker::worker::Worker;
+    use crate::worker::basic::Worker;
+
+    /// `new(url)` is `from_spec` of the default spec for `url`: the two constructors give the same
+    /// worker, every default written once.
+    #[test]
+    fn a_builder_from_a_url_is_the_builder_from_its_default_spec() {
+        let from_url = BasicWorkerBuilder::new("http://w:1").build();
+        let from_spec = BasicWorkerBuilder::from_spec(WorkerSpec::new("http://w:1")).build();
+        assert_eq!(
+            format!("{:?}", from_url.metadata().spec),
+            format!("{:?}", from_spec.metadata().spec)
+        );
+        assert_eq!(
+            format!("{:?}", from_url.metadata().health_config),
+            format!("{:?}", from_spec.metadata().health_config)
+        );
+        assert_eq!(from_url.metadata().health_endpoint, "/health");
+        assert_eq!(
+            from_url.metadata().health_endpoint,
+            from_spec.metadata().health_endpoint
+        );
+        assert_eq!(from_url.worker_type(), from_spec.worker_type());
+        assert_eq!(from_url.is_healthy(), from_spec.is_healthy());
+    }
+
+    /// The rendered URL is computed once at build: a URL without userinfo is
+    /// the URL byte for byte (its spelling kept), one with userinfo masks it
+    /// whole and keeps the DP rank.
+    #[test]
+    fn the_rendered_url_masks_a_userinfo_and_keeps_a_plain_url_byte_for_byte() {
+        let plain = BasicWorkerBuilder::new("http://Worker:8080/").build();
+        assert_eq!(plain.redacted_url(), plain.url());
+        let with_secret = BasicWorkerBuilder::new("http://user:secret@worker:8080")
+            .dp_config(2, 4)
+            .build();
+        assert_eq!(with_secret.url(), "http://user:secret@worker:8080@2");
+        assert_eq!(with_secret.redacted_url(), "http://***@worker:8080@2");
+    }
 
     #[test]
     fn zmq_engine_group_sets_size_without_rank_or_url_rewrite() {
@@ -439,15 +566,17 @@ mod tests {
         assert_eq!(worker.metadata().spec.url, "ipc:///tmp/w.ipc");
         assert_eq!(worker.metadata().spec.dp_size, Some(4));
         assert_eq!(worker.metadata().spec.dp_rank, None);
-        assert_eq!(worker.metadata().zmq_engine_count(), 4);
+        assert_eq!(worker.metadata().zmq_engine_count(), Some(4));
     }
 
     #[test]
-    fn ungrouped_worker_awaits_one_engine() {
+    fn ungrouped_worker_awaits_the_engines_it_is_dialed_by() {
+        // No count: the handshake awaits the group the first engine declares
+        // (one engine for an engine that declares none).
         let worker = BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
             .connection_mode(ConnectionMode::Zmq)
             .build();
-        assert_eq!(worker.metadata().zmq_engine_count(), 1);
+        assert_eq!(worker.metadata().zmq_engine_count(), None);
     }
 
     #[test]
@@ -468,7 +597,7 @@ mod tests {
     #[test]
     fn provided_http_client_is_used_as_is() {
         let worker = BasicWorkerBuilder::new("http://localhost:8080")
-            .http_client(Arc::new(reqwest::Client::new()))
+            .http_client(Arc::new(crate::server::http_client()))
             .build();
         assert!(!worker.http_client.cell_is_empty());
     }
@@ -525,6 +654,24 @@ mod tests {
         );
     }
 
+    /// The connect driver reads the request bound from the built worker's
+    /// metadata; a builder that sets none leaves the link's streams unbounded.
+    #[test]
+    fn zmq_request_timeout_reaches_the_built_metadata() {
+        let bounded = BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
+            .connection_mode(ConnectionMode::Zmq)
+            .zmq_request_timeout(Duration::from_secs(90))
+            .build();
+        assert_eq!(
+            bounded.metadata().zmq_request_timeout,
+            Some(Duration::from_secs(90))
+        );
+        let unbounded = BasicWorkerBuilder::new("ipc:///tmp/w2.ipc")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert_eq!(unbounded.metadata().zmq_request_timeout, None);
+    }
+
     #[test]
     fn test_basic_worker_builder_minimal() {
         let worker = BasicWorkerBuilder::new("http://localhost:8080").build();
@@ -547,6 +694,27 @@ mod tests {
         assert_eq!(worker.worker_type(), &WorkerType::Decode);
         assert_eq!(worker.connection_mode(), &ConnectionMode::Http);
         assert!(!worker.is_healthy());
+    }
+
+    /// The built worker's health check reads back `health_config`'s timeout,
+    /// interval and thresholds.
+    fn assert_health_config(worker: &BasicWorker, health_config: &HealthCheckConfig) {
+        assert_eq!(
+            worker.metadata().health_config.timeout_secs,
+            health_config.timeout_secs
+        );
+        assert_eq!(
+            worker.metadata().health_config.check_interval_secs,
+            health_config.check_interval_secs
+        );
+        assert_eq!(
+            worker.metadata().health_config.failure_threshold,
+            health_config.failure_threshold
+        );
+        assert_eq!(
+            worker.metadata().health_config.success_threshold,
+            health_config.success_threshold
+        );
     }
 
     #[test]
@@ -585,22 +753,7 @@ mod tests {
         assert_eq!(worker.connection_mode(), &ConnectionMode::Grpc);
         assert_eq!(worker.metadata().spec.labels, labels);
         assert_eq!(worker.metadata().health_endpoint, "/health");
-        assert_eq!(
-            worker.metadata().health_config.timeout_secs,
-            health_config.timeout_secs
-        );
-        assert_eq!(
-            worker.metadata().health_config.check_interval_secs,
-            health_config.check_interval_secs
-        );
-        assert_eq!(
-            worker.metadata().health_config.failure_threshold,
-            health_config.failure_threshold
-        );
-        assert_eq!(
-            worker.metadata().health_config.success_threshold,
-            health_config.success_threshold
-        );
+        assert_health_config(&worker, &health_config);
     }
 
     #[test]
@@ -663,22 +816,7 @@ mod tests {
         assert_eq!(worker.dp_size(), Some(16));
         assert_eq!(worker.metadata().spec.labels, labels);
         assert_eq!(worker.metadata().health_endpoint, "/status");
-        assert_eq!(
-            worker.metadata().health_config.timeout_secs,
-            health_config.timeout_secs
-        );
-        assert_eq!(
-            worker.metadata().health_config.check_interval_secs,
-            health_config.check_interval_secs
-        );
-        assert_eq!(
-            worker.metadata().health_config.failure_threshold,
-            health_config.failure_threshold
-        );
-        assert_eq!(
-            worker.metadata().health_config.success_threshold,
-            health_config.success_threshold
-        );
+        assert_health_config(&worker, &health_config);
     }
 
     #[test]
@@ -737,5 +875,56 @@ mod tests {
 
         // bootstrap_host should be "prefill1", not "3"
         assert_eq!(worker.metadata().spec.bootstrap_host, "prefill1");
+    }
+
+    /// A URL registered with a trailing slash keeps it as the registry's key
+    /// (`url()`), and every join reads one slash: the base URL carries none,
+    /// for the worker and for a data-parallel rank of it.
+    #[test]
+    fn a_trailing_slash_on_the_registered_url_is_not_in_the_join_base() {
+        let worker = BasicWorkerBuilder::new("http://h:8000/").build();
+        assert_eq!(worker.url(), "http://h:8000/");
+        assert_eq!(worker.base_url(), "http://h:8000");
+        assert_eq!(
+            worker.endpoint_url("/get_server_info"),
+            "http://h:8000/get_server_info"
+        );
+        assert_eq!(
+            format!("{}/{}", worker.base_url(), "get_server_info"),
+            "http://h:8000/get_server_info"
+        );
+
+        let rank = BasicWorkerBuilder::new("http://h:8000/")
+            .dp_config(3, 8)
+            .build();
+        assert_eq!(rank.base_url(), "http://h:8000");
+        assert_eq!(
+            rank.endpoint_url("/get_server_info"),
+            "http://h:8000/get_server_info"
+        );
+    }
+
+    /// A socket address is not a base routes join to: the ZMQ adapter hashes
+    /// the exact path for its handshake port and socket files, so a trailing
+    /// slash on an `ipc://` or `tcp://` registration stays in `base_url()`,
+    /// for the worker and for a data-parallel rank of it.
+    #[test]
+    fn a_trailing_slash_on_a_socket_address_stays_in_the_base() {
+        let ipc = BasicWorkerBuilder::new("ipc:///tmp/engine/")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert_eq!(ipc.url(), "ipc:///tmp/engine/");
+        assert_eq!(ipc.base_url(), "ipc:///tmp/engine/");
+
+        let rank = BasicWorkerBuilder::new("ipc:///tmp/engine/")
+            .connection_mode(ConnectionMode::Zmq)
+            .dp_config(3, 8)
+            .build();
+        assert_eq!(rank.base_url(), "ipc:///tmp/engine/");
+
+        let tcp = BasicWorkerBuilder::new("tcp://127.0.0.1:5555/")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert_eq!(tcp.base_url(), "tcp://127.0.0.1:5555/");
     }
 }

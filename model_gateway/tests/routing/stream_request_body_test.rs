@@ -64,30 +64,14 @@ async fn spawn_capture_worker() -> (String, Captured) {
 
 fn least_load_policy() -> PolicyConfig {
     PolicyConfig::LeastLoad {
-        load_check_interval_secs: 10,
         kv_pressure_weight: 0.15,
         mean_prefill_tokens: 1024,
         default_throughput: 2000.0,
-        max_waiting_requests: 0,
     }
 }
 
 fn cache_aware_policy() -> PolicyConfig {
-    PolicyConfig::CacheAware {
-        cache_threshold: 0.5,
-        balance_abs_threshold: 32,
-        balance_rel_threshold: 1.1,
-        eviction_interval_secs: 0,
-        max_tree_size: 4096,
-        block_size: 16,
-        balance_token_usage_threshold: 1.0,
-        overload_token_usage_threshold: 1.0,
-        overlap_decay: 0.0,
-        selection_temperature: 0.0,
-        cache_index: Default::default(),
-        cache_ttl_secs: 180,
-        cache_boundaries: Vec::new(),
-    }
+    PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096)
 }
 
 fn base_config(max_payload_size: usize) -> RouterConfig {
@@ -231,6 +215,57 @@ async fn large_chat_body_streams_to_worker_chunked() {
     ctx.shutdown().await;
 }
 
+/// The buffered typed path re-serializes a chat request: one with tools and
+/// `tool_choice: "none"` reaches the worker with both as sent, so an upstream
+/// that renders the prompt itself declares the tools, as the engine's own
+/// server does for such a request.
+#[tokio::test]
+async fn tool_choice_none_forwards_the_tools_to_the_worker() {
+    let (app, captured, ctx) =
+        streaming_app(least_load_policy(), 64 * 1024, 64 * 1024 * 1024).await;
+    let payload = serde_json::to_vec(&json!({
+        "model": "mock-model",
+        "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        }],
+        "tool_choice": "none"
+    }))
+    .unwrap();
+
+    let req = chunked_json_request(
+        "/v1/chat/completions",
+        payload.clone(),
+        Some(payload.len() as u64),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let captured = captured.lock().await;
+    let (headers, body) = captured.first().unwrap();
+    assert!(
+        headers.get(CONTENT_LENGTH).is_some(),
+        "the buffered typed path re-serializes the request"
+    );
+    let forwarded: Value = serde_json::from_slice(body).unwrap();
+    assert_eq!(forwarded["tool_choice"], json!("none"), "{forwarded}");
+    assert_eq!(
+        forwarded["tools"].as_array().map(Vec::len),
+        Some(1),
+        "the tools reach the upstream under none: {forwarded}"
+    );
+    assert_eq!(
+        forwarded["tools"][0]["function"]["name"],
+        json!("get_weather")
+    );
+    drop(captured);
+    ctx.shutdown().await;
+}
+
 #[tokio::test]
 async fn body_under_retry_buffer_cap_stays_buffered() {
     let (app, captured, ctx) =
@@ -274,7 +309,7 @@ async fn retries_disabled_streams_a_small_body() {
 }
 
 #[tokio::test]
-async fn routing_key_override_buffers_and_prefers_body_rid() {
+async fn routing_key_override_buffers_and_prefers_header_over_fresh_rids() {
     let (url_a, captured_a) = spawn_capture_worker().await;
     let (url_b, captured_b) = spawn_capture_worker().await;
 
@@ -299,7 +334,11 @@ async fn routing_key_override_buffers_and_prefers_body_rid() {
     }
     let app = ctx.create_app();
 
-    for (rid, header_key) in [("conv_t1", "request-1"), ("conv_t2", "request-2")] {
+    let rids = [
+        "request:group:59bc514bcf6d43a7b523563a1e9769a0",
+        "request:group:9045ab50ac21477aa6b4f6bd29c475b0",
+    ];
+    for rid in rids {
         let payload = serde_json::to_vec(&json!({
             "input_ids": [1, 2, 3],
             "stream": false,
@@ -309,7 +348,7 @@ async fn routing_key_override_buffers_and_prefers_body_rid() {
         let mut req =
             chunked_json_request("/generate", payload.clone(), Some(payload.len() as u64));
         req.headers_mut()
-            .insert("x-smg-routing-key", header_key.parse().unwrap());
+            .insert("x-smg-routing-key", "conversation-42".parse().unwrap());
         req.headers_mut()
             .insert("x-smg-routing-tokens", "1,2,3".parse().unwrap());
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -320,13 +359,9 @@ async fn routing_key_override_buffers_and_prefers_body_rid() {
     let captured_b = captured_b.lock().await;
     assert!(
         matches!((captured_a.len(), captured_b.len()), (2, 0) | (0, 2)),
-        "body rid must override distinct per-request header keys"
+        "the conversation header must override fresh per-request IDs"
     );
-    for ((headers, body), rid) in captured_a
-        .iter()
-        .chain(captured_b.iter())
-        .zip(["conv_t1", "conv_t2"])
-    {
+    for ((headers, body), rid) in captured_a.iter().chain(captured_b.iter()).zip(rids) {
         assert!(
             headers.get(CONTENT_LENGTH).is_some(),
             "routing-key override must use the buffered typed path"

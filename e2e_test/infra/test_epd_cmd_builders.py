@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from infra.constants import ConnectionMode, WorkerType
 from infra.gateway import build_epd_mode_args
@@ -42,7 +44,6 @@ def test_tokenspeed_disagg_flags(worker_type, role):
     assert cmd[cmd.index("--disaggregation-transfer-backend") + 1] == "mooncake"
     assert "--dist-init-addr" in cmd
     assert cmd[cmd.index("--dist-init-addr") + 1] == "127.0.0.1:29500"
-    assert "--skip-server-warmup" in cmd
 
 
 def test_encode_and_prefill_carry_bootstrap_port():
@@ -64,6 +65,14 @@ def test_prefill_is_eager_decode_and_prefill_cache():
 def test_regular_tokenspeed_worker_has_no_disagg_flags():
     cmd = _ts_worker(WorkerType.REGULAR)._build_cmd()
     assert "--disaggregation-mode" not in cmd
+
+
+def test_tokenspeed_worker_passes_no_rl_control_flags():
+    # The pinned engine has no in-engine control app; its parser, which gets
+    # every flag the servicer entrypoint does not own, rejects the flags.
+    cmd = _ts_worker(WorkerType.REGULAR)._build_cmd()
+    assert "--rl-control-port" not in cmd
+    assert "--rl-control-host" not in cmd
 
 
 def _w(port, worker_type, bootstrap_port=None):
@@ -116,3 +125,37 @@ def test_qwen35_9b_spec_present_and_multimodal():
     # transfer; the spec must pin it off or PD/EPD workers die at startup.
     idx = ts_args.index("--disaggregation-layerwise-interval")
     assert ts_args[idx + 1] == "0"
+
+
+def _vllm_pd_worker(worker_type, kv_backend):
+    return Worker(
+        model_id="meta-llama/Llama-3.1-8B-Instruct",
+        engine="vllm",
+        port=50105,
+        gpu_ids=[0],
+        mode=ConnectionMode.GRPC,
+        worker_type=worker_type,
+        kv_backend=kv_backend,
+    )
+
+
+def _kv_transfer_config(cmd):
+    return json.loads(cmd[cmd.index("--kv-transfer-config") + 1])
+
+
+@pytest.mark.parametrize(
+    "worker_type,role",
+    [(WorkerType.PREFILL, "kv_producer"), (WorkerType.DECODE, "kv_consumer")],
+)
+def test_vllm_nixl_pd_workers_forget_idle_peers_quickly(worker_type, role):
+    config = _kv_transfer_config(_vllm_pd_worker(worker_type, "nixl")._build_cmd())
+    assert config["kv_connector"] == "NixlConnector"
+    assert config["kv_role"] == role
+    # A dead prefill's KV region stays resident until its readers forget it;
+    # a restart on the same GPU needs that to happen within the test's wait.
+    assert 0 < config["kv_connector_extra_config"]["engine_ttl"] <= 5
+
+
+def test_vllm_mooncake_pd_config_carries_no_nixl_knobs():
+    config = _kv_transfer_config(_vllm_pd_worker(WorkerType.DECODE, "mooncake")._build_cmd())
+    assert config == {"kv_connector": "MooncakeConnector", "kv_role": "kv_consumer"}

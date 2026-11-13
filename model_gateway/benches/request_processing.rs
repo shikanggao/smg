@@ -9,8 +9,7 @@ use std::{hint::black_box, time::Instant};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-    common::StringOrArray,
-    completion::CompletionRequest,
+    completion::{CompletionPrompt, CompletionRequest},
     generate::GenerateRequest,
     sampling_params::SamplingParams,
 };
@@ -19,6 +18,15 @@ use smg::{
     routers::http::pd_types::{generate_room_id, RequestWithBootstrap},
     worker::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType},
 };
+
+// The gateway binary runs on jemalloc (see `src/main.rs`). The benchmark links
+// the same allocator so that its numbers describe the binary that ships rather
+// than the system allocator: the request path allocates on every JSON
+// (de)serialization and bootstrap injection, so the allocator shows up
+// directly in these timings.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn create_test_worker() -> BasicWorker {
     BasicWorkerBuilder::new("http://test-server:8000")
@@ -93,7 +101,7 @@ fn default_chat_completion_request() -> ChatCompletionRequest {
 fn default_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: String::new(),
-        prompt: StringOrArray::String(String::new()),
+        prompt: CompletionPrompt::Text(String::new()),
         suffix: None,
         max_tokens: None,
         temperature: None,
@@ -161,6 +169,7 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
                 name: None,
             },
             ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Text(
                     "Explain quantum computing in simple terms".to_string(),
                 ),
@@ -182,7 +191,7 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
 fn create_sample_completion_request() -> CompletionRequest {
     CompletionRequest {
         model: "text-davinci-003".to_string(),
-        prompt: StringOrArray::String("Complete this sentence: The future of AI is".to_string()),
+        prompt: CompletionPrompt::Text("Complete this sentence: The future of AI is".to_string()),
         max_tokens: Some(50),
         temperature: Some(0.8),
         top_p: Some(1.0),
@@ -207,14 +216,19 @@ fn create_large_chat_completion_request() -> ChatCompletionRequest {
     // Add many user/assistant pairs to simulate a long conversation
     for i in 0..50 {
         messages.push(ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text(format!("Question {}: What do you think about topic number {} which involves complex reasoning about multiple interconnected systems and their relationships?", i, i)),
             name: None,
         });
         messages.push(ChatMessage::Assistant {
+            ext: Default::default(),
             content: Some(MessageContent::Text(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i))),
             name: None,
+            refusal: None,
+            audio: None,
+            function_call: None,
             tool_calls: None,
-            reasoning_content: None,
+            reasoning: Default::default(),
         });
     }
 

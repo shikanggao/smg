@@ -6,27 +6,17 @@
 
 use std::{
     collections::HashMap,
-    fs::{read_dir, remove_file, OpenOptions},
     future::Future,
-    io::Write,
-    path::{Path, PathBuf},
     pin::Pin,
-    process,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        OnceLock,
-    },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    task::Poll,
+    time::{Duration, Instant},
 };
 
 use futures::future::select_all;
 use futures_util::StreamExt;
-use memmap2::MmapOptions;
-use rand::RngExt;
-#[cfg(target_os = "linux")]
-use rustix::fs::FallocateFlags;
 use smg_grpc_client::{
-    common_proto::{self as common},
+    abort_on_drop::DEFERRED_ABORT_MAX_WAIT,
     mlx_engine::AbortOnDropStream as MlxStream,
     mlx_proto::{self as mlx},
     sglang_proto::{self as sglang, generate_complete::MatchedStop as SglangMatchedStop},
@@ -39,1038 +29,50 @@ use smg_grpc_client::{
     trtllm_service::AbortOnDropStream as TrtllmStream,
     vllm_engine::AbortOnDropStream as VllmStream,
     vllm_proto::{self as vllm, generate_complete::MatchedStop as VllmMatchedStop},
+    RequestDeadline,
 };
-use smg_mm_rdma::RdmaExporter;
-
-use crate::routers::grpc::{multimodal::mm_rdma_exporter, zmq_client::ZmqGenerateStream};
-
-/// How a streaming response's per-token payloads (token ids, sampled
-/// logprobs, token counts) relate across the responses of one stream.
-///
-/// This is a property of the response *shape*, not of the engine behind it: a
-/// TokenSpeed worker reached over ZMQ emits vLLM-shaped responses and so
-/// carries `Delta` semantics, while the same engine reached over gRPC carries
-/// `Cumulative`. Response-side accumulation must key on this, never on the
-/// engine variant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChunkSemantics {
-    /// Each chunk carries only what is new since the previous one, so the
-    /// consumer accumulates; the terminal `Complete` repeats the totals.
-    Delta,
-    /// Each chunk carries the run's totals so far, so the consumer replaces;
-    /// the terminal `Complete` is authoritative.
-    Cumulative,
-}
-
-impl ChunkSemantics {
-    /// Whether chunks must be accumulated rather than replaced.
-    pub fn is_delta(self) -> bool {
-        matches!(self, Self::Delta)
-    }
-}
-
-/// Backend-neutral encode->prefill bootstrap info for one multimodal item.
-///
-/// Backend wrappers translate this into their own proto shape when supported.
-#[derive(Clone, Debug)]
-pub(crate) struct EncodeItemBootstrapInfo {
-    pub item_index: u32,
-    pub bootstrap_host: String,
-    pub bootstrap_port: i32,
-    pub bootstrap_room: i64,
-}
-
-// =====================
-// Multimodal Data
-// =====================
-
-/// Backend-specific multimodal data produced by the assembly stage.
-///
-/// Each variant carries only the fields its backend needs:
-/// - SGLang: preprocessed vision tensor + model-specific tensors + patch-only placeholders
-/// - vLLM: preprocessed vision tensor + model-specific tensors + structural placeholders + hashes + field keys
-/// - TRT-LLM: raw image bytes only (preprocessing handled server-side)
-/// - TokenSpeed: encoder_input + model_specific_tensors + patch-only placeholders
-#[derive(Debug)]
-pub enum MultimodalData {
-    Sglang(SglangMultimodalData),
-    Vllm(VllmMultimodalData),
-    Trtllm(TrtllmMultimodalData),
-    TokenSpeed(TokenSpeedMultimodalData),
-}
-
-/// SGLang multimodal data: preprocessed tensors with patch-only placeholders.
-#[derive(Debug)]
-pub struct SglangMultimodalData {
-    pub image_data: Vec<Vec<u8>>,
-    pub pixel_values: Vec<u8>,
-    pub pixel_values_shape: Vec<u32>,
-    pub model_specific_tensors: HashMap<String, TensorBytes>,
-    pub im_token_id: Option<u32>,
-    /// Patch-only placeholder offsets aligned 1:1 with vision encoder output.
-    pub mm_placeholders: Vec<(u32, u32)>,
-}
-
-/// vLLM multimodal data: preprocessed tensors with hashing and field layout metadata.
-#[derive(Debug)]
-pub struct VllmMultimodalData {
-    pub pixel_values: Vec<u8>,
-    pub pixel_values_shape: Vec<u32>,
-    pub model_specific_tensors: HashMap<String, TensorBytes>,
-    pub im_token_id: Option<u32>,
-    /// Full structural placeholder offsets (vLLM filters via is_embed mask).
-    pub mm_placeholders: Vec<(u32, u32)>,
-    pub mm_hashes: Vec<String>,
-    pub batched_keys: Vec<String>,
-    pub flat_keys: HashMap<String, String>,
-    /// Tensor keys that should remain on CPU (`keep_on_cpu=True` in vLLM).
-    pub keep_on_cpu_keys: Vec<String>,
-    /// Input modality (image/video). Selects the video modality
-    /// (`pixel_values_videos` / `video_grid_thw`) on the servicer side.
-    pub modality: common::Modality,
-    /// Resolved per-request SHM transport decision + size threshold (bytes),
-    /// computed upstream (transport mode / worker locality / config). `into_proto`
-    /// uses these to place each tensor inline or in /dev/shm without re-reading
-    /// config or the environment.
-    pub shm_enabled: bool,
-    pub shm_min_bytes: usize,
-    /// Whether `pixel_values` may use the RDMA lane. Gated on the worker being able
-    /// to pull, so SMG never emits a `remote` payload a worker would reject.
-    pub rdma_enabled: bool,
-}
-
-/// TRT-LLM multimodal data: raw image bytes only.
-#[derive(Debug)]
-pub struct TrtllmMultimodalData {
-    pub image_data: Vec<Vec<u8>>,
-}
-
-/// TokenSpeed multimodal data: preprocessed encoder input with patch-only placeholders.
-#[derive(Debug)]
-pub struct TokenSpeedMultimodalData {
-    pub items: Vec<TokenSpeedMultimodalItem>,
-    /// Resolved per-request decision: may large multimodal tensors use the SHM
-    /// transport? Computed upstream from the transport mode and (for `auto`)
-    /// worker locality, so `into_proto` does not re-read the environment.
-    pub shm_enabled: bool,
-    /// Resolved per-request SHM size threshold (bytes): tensors smaller than this
-    /// stay inline even when `shm_enabled`. Computed upstream (worker override →
-    /// router config → env → default) so `into_proto` does not re-read the env.
-    pub shm_min_bytes: usize,
-}
-
-#[derive(Debug)]
-pub struct TokenSpeedMultimodalItem {
-    pub modality: TokenSpeedModality,
-    pub encoder_input: TokenSpeedTensor,
-    pub model_specific_tensors: HashMap<String, TensorBytes>,
-    pub placeholder_token_id: Option<u32>,
-    pub mm_placeholders: Vec<(u32, u32)>,
-    pub content_hash: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenSpeedModality {
-    Image,
-    Audio,
-    Video,
-}
-
-/// Raw tensor bytes with shape and dtype metadata.
-#[derive(Debug, Clone)]
-pub struct TensorBytes {
-    pub data: Vec<u8>,
-    pub shape: Vec<u32>,
-    pub dtype: String,
-}
-
-/// TokenSpeed tensor with an explicit payload transport. Inline, SHM, and
-/// remote descriptors all converge here before becoming generated proto fields,
-/// so stages do not need to mutate `TensorData` oneofs directly.
-#[derive(Debug, Clone)]
-pub struct TokenSpeedTensor {
-    pub storage: TokenSpeedTensorStorage,
-    pub shape: Vec<u32>,
-    pub dtype: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum TokenSpeedTensorStorage {
-    Inline(Vec<u8>),
-    Shm(common::ShmHandle),
-    Remote(common::RemoteTensorHandle),
-}
-
-impl TokenSpeedTensor {
-    pub fn inline(data: Vec<u8>, shape: Vec<u32>, dtype: String) -> Self {
-        Self {
-            storage: TokenSpeedTensorStorage::Inline(data),
-            shape,
-            dtype,
-        }
-    }
-
-    pub fn shm(handle: common::ShmHandle, shape: Vec<u32>, dtype: String) -> Self {
-        Self {
-            storage: TokenSpeedTensorStorage::Shm(handle),
-            shape,
-            dtype,
-        }
-    }
-
-    pub fn remote(handle: common::RemoteTensorHandle, shape: Vec<u32>, dtype: String) -> Self {
-        Self {
-            storage: TokenSpeedTensorStorage::Remote(handle),
-            shape,
-            dtype,
-        }
-    }
-
-    pub fn nbytes(&self) -> usize {
-        match &self.storage {
-            TokenSpeedTensorStorage::Inline(data) => data.len(),
-            TokenSpeedTensorStorage::Shm(handle) => handle.nbytes as usize,
-            TokenSpeedTensorStorage::Remote(handle) => handle.nbytes as usize,
-        }
-    }
-}
-
-impl SglangMultimodalData {
-    /// Convert to SGLang proto MultimodalInputs.
-    pub fn into_proto(self) -> sglang::MultimodalInputs {
-        let model_specific_tensors = self
-            .model_specific_tensors
-            .into_iter()
-            .map(|(k, v)| {
-                (
-                    k,
-                    sglang::TensorData {
-                        data: v.data,
-                        shape: v.shape,
-                        dtype: v.dtype,
-                    },
-                )
-            })
-            .collect();
-
-        let mm_placeholders = self
-            .mm_placeholders
-            .into_iter()
-            .map(|(offset, length)| sglang::PlaceholderRange { offset, length })
-            .collect();
-
-        sglang::MultimodalInputs {
-            image_urls: vec![],
-            video_urls: vec![],
-            audio_urls: vec![],
-            image_data: self.image_data,
-            video_data: vec![],
-            audio_data: vec![],
-            modalities: vec!["image".to_string()],
-            pixel_values: Some(sglang::TensorData {
-                data: self.pixel_values,
-                shape: self.pixel_values_shape,
-                dtype: "float32".to_string(),
-            }),
-            model_specific_tensors,
-            im_token_id: self.im_token_id,
-            mm_placeholders,
-        }
-    }
-}
-
-impl VllmMultimodalData {
-    /// Convert to vLLM proto MultimodalInputs.
-    pub fn into_proto(self) -> vllm::MultimodalInputs {
-        let shm_enabled = self.shm_enabled;
-        let shm_min_bytes = self.shm_min_bytes;
-        // RDMA only for pixel_values (see TokenSpeed item conversion).
-        let pixel_rdma = if self.rdma_enabled {
-            mm_rdma_exporter().map(|exporter| MmRdmaExport {
-                exporter,
-                slot_key: rand::rng().random_range(0..i64::MAX),
-            })
-        } else {
-            None
-        };
-        let model_specific_tensors = self
-            .model_specific_tensors
-            .into_iter()
-            .map(|(k, v)| {
-                // Grid tensors are a few ints and must survive the PD decode
-                // clone's inline-only retention: never route them via SHM.
-                let via_shm = shm_enabled && !VLLM_MROPE_GRID_KEYS.contains(&k.as_str());
-                let payload = vllm_tensor_payload(v.data, via_shm, shm_min_bytes, None);
-                (
-                    k,
-                    vllm::TensorData {
-                        shape: v.shape,
-                        dtype: v.dtype,
-                        payload: Some(payload),
-                    },
-                )
-            })
-            .collect();
-
-        let mm_placeholders = self
-            .mm_placeholders
-            .into_iter()
-            .map(|(offset, length)| vllm::PlaceholderRange { offset, length })
-            .collect();
-
-        vllm::MultimodalInputs {
-            pixel_values: Some(vllm::TensorData {
-                shape: self.pixel_values_shape,
-                dtype: "float32".to_string(),
-                payload: Some(vllm_tensor_payload(
-                    self.pixel_values,
-                    shm_enabled,
-                    shm_min_bytes,
-                    pixel_rdma,
-                )),
-            }),
-            model_specific_tensors,
-            im_token_id: self.im_token_id,
-            mm_placeholders,
-            mm_hashes: self.mm_hashes,
-            batched_keys: self.batched_keys,
-            flat_keys: self.flat_keys,
-            keep_on_cpu_keys: self.keep_on_cpu_keys,
-            modality: self.modality as i32,
-        }
-    }
-}
-
-impl TrtllmMultimodalData {
-    /// Convert to TRT-LLM proto MultimodalInput.
-    pub fn into_proto(self) -> trtllm::MultimodalInput {
-        trtllm::MultimodalInput {
-            image_data: self.image_data,
-        }
-    }
-}
-
-impl TokenSpeedMultimodalData {
-    /// Convert to TokenSpeed proto MultimodalInputs. `rdma_enabled` stages each
-    /// inline encoder_input over RDMA with a random slot key (the general path); EPD
-    /// passes `false` since it stages explicitly with `bootstrap_room` first.
-    pub fn into_proto(self, rdma_enabled: bool) -> tokenspeed::MultimodalInputs {
-        let shm_enabled = self.shm_enabled;
-        let shm_min_bytes = self.shm_min_bytes;
-        let rdma_exporter = if rdma_enabled {
-            mm_rdma_exporter()
-        } else {
-            None
-        };
-        let items = self
-            .items
-            .into_iter()
-            .map(|item| item.into_proto(shm_enabled, shm_min_bytes, rdma_exporter))
-            .collect();
-        tokenspeed::MultimodalInputs { items }
-    }
-}
-
-impl TokenSpeedMultimodalItem {
-    fn into_proto(
-        self,
-        shm_enabled: bool,
-        shm_min_bytes: usize,
-        rdma_exporter: Option<&RdmaExporter>,
-    ) -> tokenspeed::MultimodalItem {
-        let placeholders = self
-            .mm_placeholders
-            .into_iter()
-            .map(|(offset, length)| tokenspeed::PlaceholderRange { offset, length })
-            .collect::<Vec<_>>();
-
-        // No RDMA for the small model-specific side tensors: keeps the fixed slot
-        // pool for the pixel-heavy encoder_input.
-        let model_specific_tensors = self
-            .model_specific_tensors
-            .into_iter()
-            .map(|(k, v)| (k, tensor_bytes_to_tokenspeed(v, shm_enabled, shm_min_bytes)))
-            .collect::<HashMap<_, _>>();
-
-        let encoder_rdma = rdma_exporter.map(|exporter| MmRdmaExport {
-            exporter,
-            slot_key: rand::rng().random_range(0..i64::MAX),
-        });
-        let encoder_input = Some(tokenspeed_tensor_to_proto(
-            self.encoder_input,
-            shm_enabled,
-            shm_min_bytes,
-            encoder_rdma,
-        ));
-
-        tokenspeed::MultimodalItem {
-            modality: match self.modality {
-                TokenSpeedModality::Image => common::Modality::Image as i32,
-                TokenSpeedModality::Audio => common::Modality::Audio as i32,
-                TokenSpeedModality::Video => common::Modality::Video as i32,
-            },
-            content_hash: self.content_hash,
-            encoder_input,
-            model_specific_tensors,
-            placeholders,
-            placeholder_token_id: self.placeholder_token_id,
-        }
-    }
-}
-
-fn tokenspeed_tensor_to_proto(
-    value: TokenSpeedTensor,
-    shm_enabled: bool,
-    shm_min_bytes: usize,
-    rdma: Option<MmRdmaExport<'_>>,
-) -> tokenspeed::TensorData {
-    use crate::observability::metrics::Metrics;
-    let TokenSpeedTensor {
-        storage,
-        shape,
-        dtype,
-    } = value;
-    let payload = match storage {
-        // Inline storage: RDMA/SHM/inline is resolved (and metered) here.
-        TokenSpeedTensorStorage::Inline(data) => {
-            tokenspeed_tensor_payload(data, shm_enabled, shm_min_bytes, rdma)
-        }
-        // Encoder input already written directly to SHM upstream — meter it here.
-        TokenSpeedTensorStorage::Shm(handle) => {
-            Metrics::record_mm_tensor("tokenspeed", "shm", handle.nbytes as usize);
-            tokenspeed::tensor_data::Payload::Shm(handle)
-        }
-        TokenSpeedTensorStorage::Remote(handle) => {
-            Metrics::record_mm_tensor("tokenspeed", "remote", handle.nbytes as usize);
-            tokenspeed::tensor_data::Payload::Remote(handle)
-        }
-    };
-
-    tokenspeed::TensorData {
-        shape,
-        dtype,
-        payload: Some(payload),
-    }
-}
-
-fn tensor_bytes_to_tokenspeed(
-    value: TensorBytes,
-    shm_enabled: bool,
-    shm_min_bytes: usize,
-) -> tokenspeed::TensorData {
-    let TensorBytes { data, shape, dtype } = value;
-
-    tokenspeed::TensorData {
-        shape,
-        dtype,
-        payload: Some(tokenspeed_tensor_payload(
-            data,
-            shm_enabled,
-            shm_min_bytes,
-            None,
-        )),
-    }
-}
-
-/// Transport decision for one multimodal tensor; each backend maps it onto its
-/// own `TensorData` oneof.
-enum MmTensorPayload {
-    Inline(Vec<u8>),
-    Shm(common::ShmHandle),
-    Remote(common::RemoteTensorHandle),
-}
-
-/// A request to stage one tensor over RDMA. `slot_key` tags the descriptor: the
-/// general path mints a random key, EPD uses the load-bearing `bootstrap_room`.
-#[derive(Clone, Copy)]
-struct MmRdmaExport<'a> {
-    exporter: &'a RdmaExporter,
-    slot_key: i64,
-}
-
-/// Stage `data` into the RDMA arena under `slot_key`; `Ok(handle)`, or the bytes
-/// back on failure (empty tensors are never staged).
-fn export_rdma_tensor(
-    exporter: &RdmaExporter,
-    slot_key: i64,
-    data: Vec<u8>,
-) -> Result<common::RemoteTensorHandle, Vec<u8>> {
-    if data.is_empty() {
-        return Err(data);
-    }
-    let nbytes = data.len() as u64;
-    exporter
-        .export(slot_key, data)
-        .map(|descriptor| common::RemoteTensorHandle {
-            transport: "nixl".to_string(),
-            descriptor,
-            nbytes,
-        })
-}
-
-/// Stage an inline TokenSpeed encoder input over RDMA under an explicit `slot_key`
-/// (EPD uses `bootstrap_room`). Non-inline tensors pass through untouched.
-pub(crate) fn stage_tokenspeed_tensor_rdma(
-    exporter: &RdmaExporter,
-    slot_key: i64,
-    tensor: TokenSpeedTensor,
-) -> TokenSpeedTensor {
-    let TokenSpeedTensor {
-        storage,
-        shape,
-        dtype,
-    } = tensor;
-    let TokenSpeedTensorStorage::Inline(data) = storage else {
-        return TokenSpeedTensor {
-            storage,
-            shape,
-            dtype,
-        };
-    };
-    match export_rdma_tensor(exporter, slot_key, data) {
-        Ok(handle) => TokenSpeedTensor::remote(handle, shape, dtype),
-        Err(data) => TokenSpeedTensor::inline(data, shape, dtype),
-    }
-}
-
-fn resolve_mm_tensor_payload(
-    data: Vec<u8>,
-    shm_enabled: bool,
-    min_bytes: usize,
-    engine: &'static str,
-    rdma: Option<MmRdmaExport<'_>>,
-) -> MmTensorPayload {
-    use crate::observability::metrics::Metrics;
-    let log_timing = log_tokenspeed_mm_timing_enabled();
-
-    // RDMA first; on export failure the bytes are handed back so we fall through to
-    // SHM/inline rather than drop the payload.
-    let data = match rdma {
-        Some(rdma) => {
-            let nbytes = data.len();
-            match export_rdma_tensor(rdma.exporter, rdma.slot_key, data) {
-                Ok(handle) => {
-                    Metrics::record_mm_tensor(engine, "remote", nbytes);
-                    return MmTensorPayload::Remote(handle);
-                }
-                Err(data) => data,
-            }
-        }
-        None => data,
-    };
-
-    let nbytes = data.len();
-    if !shm_enabled || nbytes < min_bytes {
-        if log_timing {
-            tracing::info!(
-                engine,
-                nbytes,
-                min_bytes,
-                "smg_mm_timing mm_tensor_payload_inline"
-            );
-        }
-        Metrics::record_mm_tensor(engine, "inline", nbytes);
-        return MmTensorPayload::Inline(data);
-    }
-
-    let started = Instant::now();
-    match write_tokenspeed_shm(&data) {
-        Ok(handle) => {
-            if log_timing {
-                tracing::info!(
-                    engine,
-                    nbytes,
-                    elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-                    "smg_mm_timing mm_shm_write"
-                );
-            }
-            Metrics::record_mm_tensor(engine, "shm", nbytes);
-            MmTensorPayload::Shm(handle)
-        }
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                engine,
-                nbytes,
-                "Failed to write multimodal SHM tensor; falling back to inline"
-            );
-            Metrics::record_mm_shm_write_failure(engine);
-            Metrics::record_mm_tensor(engine, "inline", nbytes);
-            MmTensorPayload::Inline(data)
-        }
-    }
-}
-
-fn tokenspeed_tensor_payload(
-    data: Vec<u8>,
-    shm_enabled: bool,
-    min_bytes: usize,
-    rdma: Option<MmRdmaExport<'_>>,
-) -> tokenspeed::tensor_data::Payload {
-    match resolve_mm_tensor_payload(data, shm_enabled, min_bytes, "tokenspeed", rdma) {
-        MmTensorPayload::Inline(data) => tokenspeed::tensor_data::Payload::Inline(data),
-        MmTensorPayload::Shm(handle) => tokenspeed::tensor_data::Payload::Shm(handle),
-        MmTensorPayload::Remote(handle) => tokenspeed::tensor_data::Payload::Remote(handle),
-    }
-}
-
-fn vllm_tensor_payload(
-    data: Vec<u8>,
-    shm_enabled: bool,
-    min_bytes: usize,
-    rdma: Option<MmRdmaExport<'_>>,
-) -> vllm::tensor_data::Payload {
-    match resolve_mm_tensor_payload(data, shm_enabled, min_bytes, "vllm", rdma) {
-        MmTensorPayload::Inline(data) => vllm::tensor_data::Payload::Inline(data),
-        MmTensorPayload::Shm(handle) => vllm::tensor_data::Payload::Shm(handle),
-        MmTensorPayload::Remote(handle) => vllm::tensor_data::Payload::Remote(handle),
-    }
-}
-
-fn log_tokenspeed_mm_timing_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SMG_LOG_MM_TIMING")
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
-    })
-}
-
-static TOKENSPEED_SHM_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn write_tokenspeed_shm(data: &[u8]) -> std::io::Result<common::ShmHandle> {
-    write_tokenspeed_shm_with(data.len(), |output| {
-        output.copy_from_slice(data);
-        Ok(())
-    })
-}
-
-/// Whether SMG can actually create+write files under `/dev/shm`. Probed once;
-/// when false the SHM transport cannot work, so `auto`/`shm` must stay inline.
-pub fn mm_shm_dev_writable() -> bool {
-    static WRITABLE: OnceLock<bool> = OnceLock::new();
-    *WRITABLE.get_or_init(|| {
-        let name = format!("smg-tokenspeed-probe-{}", process::id());
-        let path = tokenspeed_shm_path(&name);
-        // `create_new` (no clobber) + owner-only mode: /dev/shm is world-writable,
-        // so plain create(truncate) is open to symlink/clobber attacks and the
-        // file would otherwise inherit umask and be world-readable.
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let ok = opts
-            .open(&path)
-            .and_then(|mut file| file.write_all(b"x"))
-            .is_ok();
-        let _ = remove_file(&path);
-        if !ok {
-            tracing::warn!(
-                path = %path.display(),
-                "/dev/shm is not writable; TokenSpeed SHM tensor transport will fall back to inline"
-            );
-        }
-        ok
-    })
-}
-
-/// Best-effort, run-once sweep of `/dev/shm` for TokenSpeed payload files left
-/// behind by a *previous* SMG process that crashed between writing a segment and
-/// the consumer unlinking it. Files are named `smg-tokenspeed-<pid>-...`; we only
-/// remove those whose producer pid is no longer alive (and never our own).
-fn sweep_orphan_tokenspeed_shm_once() {
-    static SWEEP: OnceLock<()> = OnceLock::new();
-    SWEEP.get_or_init(|| {
-        let dir = Path::new("/dev/shm");
-        let Ok(entries) = read_dir(dir) else {
-            return;
-        };
-        let my_pid = process::id();
-        let mut removed = 0u32;
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
-                continue;
-            };
-            let Some(rest) = name.strip_prefix("smg-tokenspeed-") else {
-                continue;
-            };
-            // pid is the first '-'-separated field after the prefix.
-            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
-                continue;
-            };
-            // Skip our own files and any still-live producer (pid recycling is a
-            // safe miss: we just keep the file rather than risk deleting a live one).
-            if pid == my_pid || Path::new(&format!("/proc/{pid}")).exists() {
-                continue;
-            }
-            if remove_file(dir.join(name)).is_ok() {
-                removed += 1;
-            }
-        }
-        if removed > 0 {
-            tracing::warn!(
-                count = removed,
-                "Swept orphaned TokenSpeed SHM files from dead producer processes"
-            );
-        }
-    });
-}
-
-// TODO: pack all of a request's tensors (encoder_input + model_specific) into
-// ONE /dev/shm segment at running offsets instead of one file per tensor
-// (ShmHandle.offset already exists, always 0 here). Needs consumer
-// ShmTensorHandle offset support + a per-segment refcount so the segment is
-// unlinked exactly once after all its tensors are consumed. Cleanliness / fewer
-// files, not a measured speed win (tmpfs makes per-file syscalls negligible).
-#[expect(
-    unsafe_code,
-    reason = "mapping a new, exclusively owned, fixed-length SHM file"
-)]
-pub fn write_tokenspeed_shm_with(
-    nbytes: usize,
-    write_fn: impl FnOnce(&mut [u8]) -> std::io::Result<()>,
-) -> std::io::Result<common::ShmHandle> {
-    sweep_orphan_tokenspeed_shm_once();
-    let name = next_tokenspeed_shm_name();
-    let path = tokenspeed_shm_path(&name);
-    // create_new (no clobber) + owner-only mode in world-writable /dev/shm.
-    let mut opts = OpenOptions::new();
-    opts.read(true).write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let file = opts.open(&path)?;
-    let result = if nbytes == 0 {
-        write_fn(&mut [])
-    } else {
-        reserve_tokenspeed_shm_file(&file, nbytes).and_then(|()| {
-            // SAFETY: this process exclusively owns the newly created file,
-            // reserves its full length before mapping, and does not expose or
-            // truncate it until the callback and mapping have both dropped.
-            let mut mapping = unsafe { MmapOptions::new().len(nbytes).map_mut(&file)? };
-            write_fn(&mut mapping)
-        })
-    };
-    if let Err(error) = result {
-        let _ = remove_file(&path);
-        return Err(error);
-    }
-
-    Ok(common::ShmHandle {
-        name,
-        offset: 0,
-        nbytes: nbytes as u64,
-        owner_id: format!("smg:{}", process::id()),
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn reserve_tokenspeed_shm_file(file: &std::fs::File, nbytes: usize) -> std::io::Result<()> {
-    match rustix::fs::fallocate(file, FallocateFlags::empty(), 0, nbytes as u64) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if error == rustix::io::Errno::OPNOTSUPP || error == rustix::io::Errno::NOSYS =>
-        {
-            file.set_len(nbytes as u64)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn reserve_tokenspeed_shm_file(file: &std::fs::File, nbytes: usize) -> std::io::Result<()> {
-    file.set_len(nbytes as u64)
-}
-
-pub fn collect_tokenspeed_multimodal_inputs_shm_handles(
-    inputs: &tokenspeed::MultimodalInputs,
-) -> Vec<common::ShmHandle> {
-    let mut handles = Vec::new();
-    for item in &inputs.items {
-        collect_optional_tokenspeed_tensor_shm_handles(item.encoder_input.as_ref(), &mut handles);
-        for tensor in item.model_specific_tensors.values() {
-            collect_tokenspeed_tensor_shm_handles(tensor, &mut handles);
-        }
-    }
-    handles
-}
-
-pub fn collect_tokenspeed_generate_request_shm_handles(
-    request: &tokenspeed::GenerateRequest,
-) -> Vec<common::ShmHandle> {
-    request
-        .mm_inputs
-        .as_ref()
-        .map(collect_tokenspeed_multimodal_inputs_shm_handles)
-        .unwrap_or_default()
-}
-
-pub fn cleanup_mm_shm_handles(handles: &[common::ShmHandle]) {
-    for handle in handles {
-        let Some(name) = validate_tokenspeed_shm_name_for_cleanup(&handle.name) else {
-            tracing::warn!(
-                name = %handle.name,
-                "Skipping cleanup for invalid TokenSpeed SHM name"
-            );
-            continue;
-        };
-        let path = tokenspeed_shm_path(name);
-        match remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    path = %path.display(),
-                    "Failed to cleanup TokenSpeed SHM file"
-                );
-            }
-        }
-    }
-}
-
-/// Build a TokenSpeed proto `GenerateRequest` from the already-converted
-/// multimodal proto, unlinking any `/dev/shm` segments it references if `build`
-/// fails — so a build error doesn't leak SHM files before the send-path cleanup
-/// can run. Keeping this engine-specific SHM lifecycle in the protocol layer
-/// lets the per-engine dispatch in `client.rs` stay a thin, neutral wrapper.
-pub(crate) fn finish_tokenspeed_request(
-    tokenspeed_mm: Option<tokenspeed::MultimodalInputs>,
-    build: impl FnOnce(
-        Option<tokenspeed::MultimodalInputs>,
-    ) -> Result<tokenspeed::GenerateRequest, String>,
-) -> Result<ProtoGenerateRequest, String> {
-    let shm_handles = tokenspeed_mm
-        .as_ref()
-        .map(collect_tokenspeed_multimodal_inputs_shm_handles)
-        .unwrap_or_default();
-    match build(tokenspeed_mm) {
-        Ok(req) => Ok(ProtoGenerateRequest::TokenSpeed(Box::new(req))),
-        Err(error) => {
-            cleanup_mm_shm_handles(&shm_handles);
-            Err(error)
-        }
-    }
-}
-
-/// Build a vLLM generate request, cleaning up any `/dev/shm` segments backing
-/// `vllm_mm` if the build fails. `into_proto` may write SHM files before the
-/// request is fully assembled (sampling/tool validation), so a build error must
-/// unlink them or the worker — which never receives the request — leaks them.
-pub(crate) fn finish_vllm_request(
-    vllm_mm: Option<vllm::MultimodalInputs>,
-    build: impl FnOnce(Option<vllm::MultimodalInputs>) -> Result<vllm::GenerateRequest, String>,
-) -> Result<ProtoGenerateRequest, String> {
-    let shm_handles = vllm_mm
-        .as_ref()
-        .map(collect_vllm_multimodal_inputs_shm_handles)
-        .unwrap_or_default();
-    match build(vllm_mm) {
-        Ok(req) => Ok(ProtoGenerateRequest::Vllm(Box::new(req))),
-        Err(error) => {
-            cleanup_mm_shm_handles(&shm_handles);
-            Err(error)
-        }
-    }
-}
-
-/// Unlink the `/dev/shm` segments backing the encoder inputs of intermediate
-/// `items` (plus an optional just-built `pending` tensor that hasn't been pushed
-/// yet). Used when multimodal assembly aborts partway: the successfully built
-/// `TokenSpeedTensor::Shm` segments would otherwise be dropped without their
-/// handles ever reaching the send-path cleanup hooks, leaking files until the
-/// next process sweep. Only the encoder input uses SHM (model-specific tensors
-/// stay inline). MUST run on the error path only — the success path keeps the
-/// files alive for the worker and unlinks them after the RPC.
-pub(crate) fn cleanup_tokenspeed_items_encoder_shm(
-    items: &[TokenSpeedMultimodalItem],
-    pending: Option<&TokenSpeedTensor>,
-) {
-    let mut handles = Vec::new();
-    let mut push = |tensor: &TokenSpeedTensor| {
-        if let TokenSpeedTensorStorage::Shm(handle) = &tensor.storage {
-            handles.push(handle.clone());
-        }
-    };
-    for item in items {
-        push(&item.encoder_input);
-    }
-    if let Some(tensor) = pending {
-        push(tensor);
-    }
-    if !handles.is_empty() {
-        cleanup_mm_shm_handles(&handles);
-    }
-}
-
-fn collect_optional_tokenspeed_tensor_shm_handles(
-    tensor: Option<&tokenspeed::TensorData>,
-    handles: &mut Vec<common::ShmHandle>,
-) {
-    let Some(tensor) = tensor else {
-        return;
-    };
-    collect_tokenspeed_tensor_shm_handles(tensor, handles);
-}
-
-fn collect_tokenspeed_tensor_shm_handles(
-    tensor: &tokenspeed::TensorData,
-    handles: &mut Vec<common::ShmHandle>,
-) {
-    if let Some(tokenspeed::tensor_data::Payload::Shm(handle)) = &tensor.payload {
-        handles.push(handle.clone());
-    }
-}
-
-pub fn collect_vllm_multimodal_inputs_shm_handles(
-    inputs: &vllm::MultimodalInputs,
-) -> Vec<common::ShmHandle> {
-    let mut handles = Vec::new();
-    collect_optional_vllm_tensor_shm_handles(inputs.pixel_values.as_ref(), &mut handles);
-    for tensor in inputs.model_specific_tensors.values() {
-        collect_vllm_tensor_shm_handles(tensor, &mut handles);
-    }
-    handles
-}
-
-pub fn collect_vllm_generate_request_shm_handles(
-    request: &vllm::GenerateRequest,
-) -> Vec<common::ShmHandle> {
-    request
-        .mm_inputs
-        .as_ref()
-        .map(collect_vllm_multimodal_inputs_shm_handles)
-        .unwrap_or_default()
-}
-
-fn collect_optional_vllm_tensor_shm_handles(
-    tensor: Option<&vllm::TensorData>,
-    handles: &mut Vec<common::ShmHandle>,
-) {
-    if let Some(tensor) = tensor {
-        collect_vllm_tensor_shm_handles(tensor, handles);
-    }
-}
-
-fn collect_vllm_tensor_shm_handles(
-    tensor: &vllm::TensorData,
-    handles: &mut Vec<common::ShmHandle>,
-) {
-    if let Some(vllm::tensor_data::Payload::Shm(handle)) = &tensor.payload {
-        handles.push(handle.clone());
-    }
-}
-
-/// Prefix for every `/dev/shm` payload this transport creates
-/// (see [`next_tokenspeed_shm_name`]). Cleanup only ever unlinks names
-/// carrying this prefix so it cannot remove unrelated `/dev/shm` entries.
-const TOKENSPEED_SHM_NAME_PREFIX: &str = "smg-tokenspeed-";
-
-fn validate_tokenspeed_shm_name_for_cleanup(name: &str) -> Option<&str> {
-    let name = name.strip_prefix('/').unwrap_or(name);
-    if name.is_empty() || name.contains('/') || name == "." || name == ".." || name.contains('\0') {
-        return None;
-    }
-    // Only unlink names this transport created; never touch arbitrary
-    // top-level /dev/shm entries.
-    if !name.starts_with(TOKENSPEED_SHM_NAME_PREFIX) {
-        return None;
-    }
-    Some(name)
-}
-
-fn next_tokenspeed_shm_name() -> String {
-    let seq = TOKENSPEED_SHM_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!(
-        "{}{}-{}-{}",
-        TOKENSPEED_SHM_NAME_PREFIX,
-        process::id(),
-        nanos,
-        seq
-    )
-}
-
-fn tokenspeed_shm_path(name: &str) -> PathBuf {
-    PathBuf::from("/dev/shm").join(name)
-}
-
-// =====================
-// Unified Logprobs Types
-// =====================
-
-/// Unified output logprobs (backend-agnostic)
-#[derive(Clone, Debug)]
-pub struct ProtoOutputLogProbs {
-    pub token_logprobs: Vec<f32>,
-    pub token_ids: Vec<u32>,
-    pub top_logprobs: Vec<ProtoTopLogProbs>,
-}
-
-/// Unified top logprobs per position
-#[derive(Clone, Debug)]
-pub struct ProtoTopLogProbs {
-    pub values: Vec<f32>,
-    pub token_ids: Vec<u32>,
-}
-
-/// Unified input (prompt) logprobs
-#[derive(Clone, Debug)]
-pub struct ProtoInputLogProbs {
-    pub token_logprobs: Vec<Option<f32>>, // First token is None
-    pub token_ids: Vec<u32>,
-    pub top_logprobs: Vec<ProtoTopLogProbs>,
-}
-
-/// Convert TRT-LLM TokenLogprob slice to unified ProtoOutputLogProbs.
-fn convert_trtllm_output_logprobs(
-    logprobs: &[trtllm::TokenLogprob],
-) -> Option<ProtoOutputLogProbs> {
-    if logprobs.is_empty() {
-        return None;
-    }
-    Some(ProtoOutputLogProbs {
-        token_logprobs: logprobs.iter().map(|lp| lp.logprob).collect(),
-        token_ids: logprobs.iter().map(|lp| lp.token_id).collect(),
-        top_logprobs: logprobs
-            .iter()
-            .map(|lp| ProtoTopLogProbs {
-                values: lp.top_logprobs.iter().map(|t| t.logprob).collect(),
-                token_ids: lp.top_logprobs.iter().map(|t| t.token_id).collect(),
-            })
-            .collect(),
-    })
-}
-
-/// Helper macro to convert output logprobs from proto types to unified type.
-/// Both SGLang and vLLM have identical OutputLogProbs structure.
-/// Note: Cloning is necessary as we convert from borrowed proto types to owned unified types.
-/// OOM risk is mitigated by capping top_logprobs at 20 in sampling params.
-macro_rules! convert_output_logprobs {
-    ($lp:expr) => {
-        ProtoOutputLogProbs {
-            token_logprobs: $lp.token_logprobs.clone(),
-            token_ids: $lp.token_ids.clone(),
-            top_logprobs: $lp
-                .top_logprobs
-                .iter()
-                .map(|t| ProtoTopLogProbs {
-                    values: t.values.clone(),
-                    token_ids: t.token_ids.clone(),
-                })
-                .collect(),
-        }
-    };
-}
+use tokio::time::error::Elapsed;
+
+use crate::{
+    routers::{
+        common::sse::SseSender,
+        grpc::{
+            multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
+            zmq_client::ZmqGenerateStream,
+        },
+    },
+    worker::{liveness, Worker},
+};
+
+mod embed;
+mod logprobs;
+mod multimodal;
+mod request;
+mod shm;
+
+pub(crate) use smg_grpc_client::media_identity::identity as vllm_mm_identity;
+
+use self::shm::vllm_mm_hash_identity;
+pub use self::{
+    embed::{ProtoEmbedComplete, ProtoEmbedRequest},
+    logprobs::{ProtoInputLogProbs, ProtoOutputLogProbs, ProtoTopLogProbs},
+    multimodal::{
+        ChunkSemantics, MultimodalData, SglangMultimodalData, TensorBytes, TokenSpeedModality,
+        TokenSpeedMultimodalData, TokenSpeedMultimodalItem, TokenSpeedTensor,
+        TokenSpeedTensorStorage, TrtllmMultimodalData, VllmMultimodalData,
+    },
+    request::{AnswerConstraint, ProtoGenerateRequest, ProtoRequest},
+    shm::{
+        cleanup_mm_shm_handles, collect_tokenspeed_generate_request_shm_handles,
+        collect_tokenspeed_multimodal_inputs_shm_handles,
+        collect_vllm_generate_request_shm_handles, mm_shm_dev_writable, write_tokenspeed_shm_with,
+    },
+};
+pub(crate) use self::{
+    multimodal::{stage_tokenspeed_tensor_rdma, EncodeItemBootstrapInfo},
+    request::VLLM_MROPE_GRID_KEYS,
+    shm::{cleanup_tokenspeed_items_encoder_shm, finish_tokenspeed_request, finish_vllm_request},
+};
 
 /// Helper macro to convert input logprobs from proto types to unified type.
 macro_rules! convert_input_logprobs {
@@ -1088,558 +90,6 @@ macro_rules! convert_input_logprobs {
                 .collect(),
         }
     };
-}
-
-/// Unified ProtoRequest
-#[derive(Clone)]
-pub enum ProtoRequest {
-    Generate(ProtoGenerateRequest),
-    Embed(ProtoEmbedRequest),
-}
-
-impl ProtoRequest {
-    /// Serialized wire size, for the release metric.
-    pub fn wire_len(&self) -> usize {
-        match self {
-            Self::Generate(request) => request.wire_len(),
-            Self::Embed(request) => request.wire_len(),
-        }
-    }
-
-    /// Get request ID from either variant
-    pub fn request_id(&self) -> &str {
-        match self {
-            Self::Generate(req) => req.request_id(),
-            Self::Embed(req) => req.request_id(),
-        }
-    }
-}
-
-/// Unified GenerateRequest that works with all backends
-#[derive(Clone)]
-pub enum ProtoGenerateRequest {
-    Sglang(Box<sglang::GenerateRequest>),
-    Vllm(Box<vllm::GenerateRequest>),
-    Trtllm(Box<trtllm::GenerateRequest>),
-    Mlx(Box<mlx::GenerateRequest>),
-    TokenSpeed(Box<tokenspeed::GenerateRequest>),
-}
-
-/// Per-item grid metadata the engine reads to compute M-RoPE positions
-/// (`_get_mrope_input_positions` in vLLM); a few ints per item.
-const VLLM_MROPE_GRID_KEYS: [&str; 3] = ["image_grid_thw", "video_grid_thw", "second_per_grid_ts"];
-
-impl ProtoGenerateRequest {
-    /// Append stop token ids to the request's sampling params (TRT-LLM keeps
-    /// them on the request itself). Requests without sampling params are left
-    /// unchanged, matching the per-engine injection this replaces.
-    pub fn extend_stop_token_ids(&mut self, ids: &[u32]) {
-        match self {
-            Self::Sglang(req) => {
-                if let Some(params) = req.sampling_params.as_mut() {
-                    params.stop_token_ids.extend_from_slice(ids);
-                }
-            }
-            Self::Vllm(req) => {
-                if let Some(params) = req.sampling_params.as_mut() {
-                    params.stop_token_ids.extend_from_slice(ids);
-                }
-            }
-            Self::Mlx(req) => {
-                if let Some(params) = req.sampling_params.as_mut() {
-                    params.stop_token_ids.extend_from_slice(ids);
-                }
-            }
-            Self::TokenSpeed(req) => {
-                if let Some(params) = req.sampling_params.as_mut() {
-                    params.stop_token_ids.extend_from_slice(ids);
-                }
-            }
-            Self::Trtllm(req) => req.stop_token_ids.extend_from_slice(ids),
-        }
-    }
-
-    /// Get SGLang variant (panics if not SGLang)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang(&self) -> &sglang::GenerateRequest {
-        match self {
-            Self::Sglang(req) => req,
-            _ => panic!("Expected SGLang GenerateRequest"),
-        }
-    }
-
-    /// Get mutable SGLang variant (panics if not SGLang)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang_mut(&mut self) -> &mut sglang::GenerateRequest {
-        match self {
-            Self::Sglang(req) => req,
-            _ => panic!("Expected SGLang GenerateRequest"),
-        }
-    }
-
-    /// Get vLLM variant (panics if not vLLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_vllm() check"
-    )]
-    pub fn as_vllm(&self) -> &vllm::GenerateRequest {
-        match self {
-            Self::Vllm(req) => req,
-            _ => panic!("Expected vLLM GenerateRequest"),
-        }
-    }
-
-    /// Get mutable vLLM variant (panics if not vLLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_vllm() check"
-    )]
-    pub fn as_vllm_mut(&mut self) -> &mut vllm::GenerateRequest {
-        match self {
-            Self::Vllm(req) => req,
-            _ => panic!("Expected vLLM GenerateRequest"),
-        }
-    }
-
-    /// Get TensorRT-LLM variant (panics if not TensorRT-LLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_trtllm() check"
-    )]
-    pub fn as_trtllm(&self) -> &trtllm::GenerateRequest {
-        match self {
-            Self::Trtllm(req) => req,
-            _ => panic!("Expected TensorRT-LLM GenerateRequest"),
-        }
-    }
-
-    /// Get mutable TensorRT-LLM variant (panics if not TensorRT-LLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_trtllm() check"
-    )]
-    pub fn as_trtllm_mut(&mut self) -> &mut trtllm::GenerateRequest {
-        match self {
-            Self::Trtllm(req) => req,
-            _ => panic!("Expected TensorRT-LLM GenerateRequest"),
-        }
-    }
-
-    /// Get TokenSpeed variant (panics if not TokenSpeed)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_tokenspeed() check"
-    )]
-    pub fn as_tokenspeed(&self) -> &tokenspeed::GenerateRequest {
-        match self {
-            Self::TokenSpeed(req) => req,
-            _ => panic!("Expected TokenSpeed GenerateRequest"),
-        }
-    }
-
-    /// Get mutable TokenSpeed variant (panics if not TokenSpeed)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_tokenspeed() check"
-    )]
-    pub fn as_tokenspeed_mut(&mut self) -> &mut tokenspeed::GenerateRequest {
-        match self {
-            Self::TokenSpeed(req) => req,
-            _ => panic!("Expected TokenSpeed GenerateRequest"),
-        }
-    }
-
-    /// Check if this is SGLang
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
-    /// Check if this is vLLM
-    pub fn is_vllm(&self) -> bool {
-        matches!(self, Self::Vllm(_))
-    }
-
-    /// Check if this is TensorRT-LLM
-    pub fn is_trtllm(&self) -> bool {
-        matches!(self, Self::Trtllm(_))
-    }
-
-    /// Check if this is TokenSpeed
-    pub fn is_tokenspeed(&self) -> bool {
-        matches!(self, Self::TokenSpeed(_))
-    }
-
-    /// Sanitize sampling params for the prefill-only leg (vLLM PD mode).
-    /// max_tokens=1 computes KV without generating; min_tokens is cleared so the
-    /// engine accepts it; n=1 so the prefill returns a single kv_transfer_params dict.
-    /// Stop criteria are cleared and EOS ignored so the leg always finishes
-    /// length-capped — vLLM < 0.20 returns the NIXL handoff only for that status.
-    pub fn sanitize_sampling_for_prefill(&mut self, max_tokens: u32) {
-        match self {
-            Self::Vllm(req) => {
-                let params = req.sampling_params.get_or_insert_with(Default::default);
-                params.max_tokens = Some(max_tokens);
-                params.min_tokens = 0;
-                params.n = 1;
-                params.stop.clear();
-                params.stop_token_ids.clear();
-                params.ignore_eos = true;
-            }
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
-                tracing::warn!(
-                    "sanitize_sampling_for_prefill called on non-vLLM request, ignoring"
-                );
-            }
-        }
-    }
-
-    /// Set stream mode on the request.
-    pub fn set_stream(&mut self, stream: bool) {
-        match self {
-            Self::Vllm(req) => req.stream = stream,
-            Self::Sglang(req) => req.stream = stream,
-            Self::Trtllm(req) => req.streaming = stream,
-            Self::Mlx(req) => req.stream = stream,
-            Self::TokenSpeed(req) => req.stream = stream,
-        }
-    }
-
-    /// Serialized wire size, for the release metric.
-    pub fn wire_len(&self) -> usize {
-        use prost::Message;
-        match self {
-            Self::Sglang(req) => req.encoded_len(),
-            Self::Vllm(req) => req.encoded_len(),
-            Self::Trtllm(req) => req.encoded_len(),
-            Self::Mlx(req) => req.encoded_len(),
-            Self::TokenSpeed(req) => req.encoded_len(),
-        }
-    }
-
-    /// Clone for a PD leg that carries no multimodal pixels (see
-    /// `clear_mm_pixel_values`), without ever duplicating them: detach,
-    /// clone, reattach to `self`. vLLM keeps `mm_hashes`/placeholders and the
-    /// M-RoPE grid tensors in the clone: the servicer rebuilds pixel-less
-    /// mm features from them, so the decode worker computes grid-aware
-    /// positions and per-image block hashes instead of treating the prompt
-    /// as text (which mis-rotates every generated token on Qwen-VL models
-    /// and lets different images alias in the decode prefix cache).
-    pub fn clone_without_mm_pixels(&mut self) -> Self {
-        match self {
-            Self::Sglang(req) => {
-                let mm = req.mm_inputs.take();
-                let clone = Self::Sglang(req.clone());
-                req.mm_inputs = mm;
-                clone
-            }
-            Self::Vllm(req) => {
-                let mm = req.mm_inputs.take();
-                let mut clone = Self::Vllm(req.clone());
-                // Rebuild the identity (no pixel tensors) on the clone; a
-                // hash-less payload carries no identity worth keeping.
-                if let (Self::Vllm(clone_req), Some(mm_ref)) = (&mut clone, mm.as_ref()) {
-                    if !mm_ref.mm_hashes.is_empty() {
-                        // M-RoPE models (Qwen-VL) need the grid tensors to
-                        // compute decode-side positions; they are a few ints
-                        // per item, so keep them (inline payloads only — an
-                        // SHM segment is unreadable after the prefill send).
-                        let inline_tensor = |key: &str| {
-                            mm_ref
-                                .model_specific_tensors
-                                .get(key)
-                                .filter(|tensor| {
-                                    matches!(
-                                        tensor.payload,
-                                        Some(vllm::tensor_data::Payload::Inline(_))
-                                    )
-                                })
-                                .cloned()
-                        };
-                        let mut grid_tensors: HashMap<String, vllm::TensorData> =
-                            VLLM_MROPE_GRID_KEYS
-                                .iter()
-                                .filter_map(|key| {
-                                    inline_tensor(key).map(|tensor| (key.to_string(), tensor))
-                                })
-                                .collect();
-                        // A flat-classified grid key needs its sizes tensor to
-                        // keep per-item slicing on the decode leg.
-                        let mut flat_keys = HashMap::new();
-                        for (key, sizes_key) in &mm_ref.flat_keys {
-                            if !grid_tensors.contains_key(key) {
-                                continue;
-                            }
-                            match inline_tensor(sizes_key) {
-                                Some(sizes) => {
-                                    grid_tensors.insert(sizes_key.clone(), sizes);
-                                    flat_keys.insert(key.clone(), sizes_key.clone());
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        grid_key = %key,
-                                        sizes_key = %sizes_key,
-                                        "dropping grid tensor from the PD decode leg: its \
-                                         sizes tensor is not inline"
-                                    );
-                                    grid_tensors.remove(key);
-                                }
-                            }
-                        }
-                        let retained = |keys: &[String]| {
-                            keys.iter()
-                                .filter(|key| grid_tensors.contains_key(*key))
-                                .cloned()
-                                .collect()
-                        };
-                        clone_req.mm_inputs = Some(vllm::MultimodalInputs {
-                            im_token_id: mm_ref.im_token_id,
-                            mm_placeholders: mm_ref.mm_placeholders.clone(),
-                            mm_hashes: mm_ref.mm_hashes.clone(),
-                            modality: mm_ref.modality,
-                            batched_keys: retained(&mm_ref.batched_keys),
-                            keep_on_cpu_keys: retained(&mm_ref.keep_on_cpu_keys),
-                            flat_keys,
-                            model_specific_tensors: grid_tensors,
-                            ..Default::default()
-                        });
-                    }
-                }
-                req.mm_inputs = mm;
-                clone
-            }
-            Self::TokenSpeed(req) => {
-                let detached: Vec<_> = req
-                    .mm_inputs
-                    .as_mut()
-                    .map(|mm| {
-                        mm.items
-                            .iter_mut()
-                            .map(|item| item.encoder_input.take())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let clone = Self::TokenSpeed(req.clone());
-                if let Some(mm) = req.mm_inputs.as_mut() {
-                    for (item, encoder_input) in mm.items.iter_mut().zip(detached) {
-                        item.encoder_input = encoder_input;
-                    }
-                }
-                clone
-            }
-            Self::Trtllm(req) => Self::Trtllm(req.clone()),
-            Self::Mlx(req) => Self::Mlx(req.clone()),
-        }
-    }
-
-    /// Drop raw multimodal encoder tensors while keeping item metadata.
-    ///
-    /// Used by the EPD prefill leg: multimodal embeddings arrive from encode workers,
-    /// but prefill still needs placeholders/model-specific metadata to slot them.
-    pub fn clear_mm_pixel_values(&mut self) {
-        match self {
-            Self::Sglang(req) => req.mm_inputs = None,
-            Self::Vllm(req) => req.mm_inputs = None,
-            Self::TokenSpeed(req) => {
-                if let Some(mm) = req.mm_inputs.as_mut() {
-                    for item in &mut mm.items {
-                        item.encoder_input = None;
-                    }
-                }
-            }
-            Self::Trtllm(_) | Self::Mlx(_) => {}
-        }
-    }
-
-    /// Get request ID
-    pub fn request_id(&self) -> &str {
-        match self {
-            Self::Sglang(req) => &req.request_id,
-            Self::Vllm(req) => &req.request_id,
-            Self::Trtllm(req) => &req.request_id,
-            Self::Mlx(req) => &req.request_id,
-            Self::TokenSpeed(req) => &req.request_id,
-        }
-    }
-
-    /// Set request ID (retry attempts re-mint per-execution engine ids on
-    /// the retained plan).
-    pub fn set_request_id(&mut self, request_id: String) {
-        match self {
-            Self::Sglang(req) => req.request_id = request_id,
-            Self::Vllm(req) => req.request_id = request_id,
-            Self::Trtllm(req) => req.request_id = request_id,
-            Self::Mlx(req) => req.request_id = request_id,
-            Self::TokenSpeed(req) => req.request_id = request_id,
-        }
-    }
-
-    /// Set KV transfer parameters for Mooncake PD disaggregation (vLLM only).
-    /// These parameters tell the decode worker where to fetch KV cache from the prefill worker.
-    pub fn set_kv_transfer_params(&mut self, remote_host: String, remote_port: u32) {
-        match self {
-            Self::Vllm(req) => {
-                req.kv_transfer_params = Some(vllm::KvTransferParams {
-                    remote_host,
-                    remote_port,
-                });
-            }
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
-                tracing::warn!("set_kv_transfer_params called on non-vLLM request, ignoring");
-            }
-        }
-    }
-
-    /// Pin the request to a data-parallel rank (engines without the field ignore it).
-    pub fn set_data_parallel_rank(&mut self, rank: i32) {
-        match self {
-            Self::Vllm(req) => req.data_parallel_rank = Some(rank),
-            Self::Sglang(req) => req.data_parallel_rank = rank,
-            Self::TokenSpeed(req) => req.data_parallel_rank = Some(rank),
-            Self::Trtllm(_) | Self::Mlx(_) => {}
-        }
-    }
-
-    /// Number of parallel samples requested (1 when unset). vLLM, SGLang
-    /// and TokenSpeed carry it in their sampling params; the others have no
-    /// per-request sample count.
-    pub fn sampling_n(&self) -> u32 {
-        let n = match self {
-            Self::Vllm(req) => req.sampling_params.as_ref().map(|p| p.n),
-            Self::Sglang(req) => req.sampling_params.as_ref().map(|p| p.n),
-            Self::TokenSpeed(req) => req.sampling_params.as_ref().map(|p| p.n),
-            Self::Trtllm(_) | Self::Mlx(_) => None,
-        };
-        n.filter(|&n| n > 0).unwrap_or(1)
-    }
-
-    /// Set the number of parallel samples (engines without the field ignore it).
-    pub fn set_sampling_n(&mut self, n: u32) {
-        match self {
-            Self::Vllm(req) => {
-                if let Some(params) = req.sampling_params.as_mut() {
-                    params.n = n;
-                }
-            }
-            Self::Sglang(req) => {
-                if let Some(params) = req.sampling_params.as_mut() {
-                    params.n = n;
-                }
-            }
-            Self::TokenSpeed(req) => {
-                if let Some(params) = req.sampling_params.as_mut() {
-                    params.n = n;
-                }
-            }
-            Self::Trtllm(_) | Self::Mlx(_) => {}
-        }
-    }
-
-    /// Offset an explicit sampling seed so fanned-out samples stay distinct
-    /// yet deterministic; an unset seed stays unset (the engine then seeds
-    /// each request on its own). Engines without a seed field ignore it.
-    pub fn offset_sampling_seed(&mut self, offset: u32) {
-        match self {
-            Self::Vllm(req) => {
-                if let Some(params) = req.sampling_params.as_mut() {
-                    let offset = i32::try_from(offset).unwrap_or(i32::MAX);
-                    params.seed = params.seed.map(|seed| seed.wrapping_add(offset));
-                }
-            }
-            Self::TokenSpeed(req) => {
-                if let Some(params) = req.sampling_params.as_mut() {
-                    params.sampling_seed = params
-                        .sampling_seed
-                        .map(|seed| seed.wrapping_add(u64::from(offset)));
-                }
-            }
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => {}
-        }
-    }
-
-    /// Whether the request carries multimodal inputs.
-    pub fn has_mm_inputs(&self) -> bool {
-        match self {
-            Self::Sglang(req) => req.mm_inputs.is_some(),
-            Self::Vllm(req) => req.mm_inputs.is_some(),
-            Self::TokenSpeed(req) => req.mm_inputs.is_some(),
-            Self::Trtllm(_) | Self::Mlx(_) => false,
-        }
-    }
-
-    /// Set opaque connector KV-transfer params as JSON (vLLM only).
-    /// Passed verbatim to the engine (NIXL handoff, etc.).
-    pub fn set_kv_transfer_params_json(&mut self, json: String) {
-        match self {
-            Self::Vllm(req) => req.kv_transfer_params_json = Some(json),
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
-                tracing::warn!("set_kv_transfer_params_json called on non-vLLM request, ignoring");
-            }
-        }
-    }
-
-    /// Set encode->prefill bootstrap info for backends that receive multimodal embeddings
-    /// out-of-band from encode workers.
-    pub(crate) fn set_encode_bootstrap_info(&mut self, items: Vec<EncodeItemBootstrapInfo>) {
-        match self {
-            Self::TokenSpeed(req) => {
-                let items = items
-                    .into_iter()
-                    .map(|item| tokenspeed::EncodeItemBootstrapInfo {
-                        item_index: item.item_index,
-                        bootstrap_host: item.bootstrap_host,
-                        bootstrap_port: item.bootstrap_port,
-                        bootstrap_room: item.bootstrap_room,
-                    })
-                    .collect();
-                req.encode_bootstrap_info = Some(tokenspeed::EncodeBootstrapInfo { items });
-            }
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {
-                tracing::warn!(
-                    "set_encode_bootstrap_info called on a backend without encode bootstrap info, ignoring"
-                );
-            }
-        }
-    }
-
-    /// Clear prefill-only encode bootstrap info from the decode-side request.
-    pub(crate) fn clear_encode_bootstrap_info(&mut self) {
-        match self {
-            Self::TokenSpeed(req) => req.encode_bootstrap_info = None,
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {}
-        }
-    }
-
-    /// Set the PD prefill->decode KV rendezvous params (TokenSpeed only).
-    ///
-    /// The gateway sends identical params to both the prefill and decode worker:
-    /// the prefill hosts the Mooncake bootstrap server at (`bootstrap_host`,
-    /// `bootstrap_port`) and the decode worker discovers it there, keyed by
-    /// `bootstrap_room`.
-    pub fn set_kv_bootstrap_info(
-        &mut self,
-        bootstrap_host: String,
-        bootstrap_port: i32,
-        bootstrap_room: i64,
-    ) {
-        match self {
-            Self::TokenSpeed(req) => {
-                req.kv_bootstrap_info = Some(tokenspeed::KvBootstrapInfo {
-                    bootstrap_host,
-                    bootstrap_port,
-                    bootstrap_room,
-                });
-            }
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {
-                tracing::warn!("set_kv_bootstrap_info called on non-TokenSpeed request, ignoring");
-            }
-        }
-    }
 }
 
 /// Unified GenerateResponse from stream
@@ -1699,6 +149,160 @@ impl ProtoGenerateResponse {
         }
     }
 
+    /// Stamp a disaggregated request's decode-side response with the prefill
+    /// side's prefix-cache hit (see [`PrefillCachedTokens`]). The decode side
+    /// loads the prefix it was handed and reports it as cached, so its own
+    /// number is the transfer's size, not the request's cache hit; a chunk or
+    /// complete whose sample the prefill side did not report keeps its own.
+    pub fn restamp_cached_tokens(&mut self, prefill: &PrefillCachedTokens) {
+        match self {
+            Self::Sglang(resp) => match resp.response.as_mut() {
+                Some(sglang::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.index, &mut chunk.cached_tokens);
+                }
+                Some(sglang::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+            Self::Vllm(resp) => match resp.response.as_mut() {
+                Some(vllm::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.index, &mut chunk.cached_tokens);
+                }
+                Some(vllm::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+            Self::Trtllm(resp) => match resp.response.as_mut() {
+                Some(trtllm::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.sequence_index, &mut chunk.cached_tokens);
+                }
+                Some(trtllm::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.sequence_index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+            Self::Mlx(resp) => match resp.response.as_mut() {
+                Some(mlx::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.index, &mut chunk.cached_tokens);
+                }
+                Some(mlx::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+            Self::TokenSpeed(resp) => match resp.response.as_mut() {
+                Some(tokenspeed::generate_response::Response::Chunk(chunk)) => {
+                    prefill.restamp(chunk.index, &mut chunk.cached_tokens);
+                }
+                Some(tokenspeed::generate_response::Response::Complete(complete)) => {
+                    prefill.restamp(complete.index, &mut complete.cached_tokens);
+                }
+                None => {}
+            },
+        }
+    }
+
+    /// Whether this is a `Complete` the engine finished with reason `"error"`.
+    pub fn engine_error(&self) -> bool {
+        match self {
+            Self::Sglang(resp) => matches!(
+                &resp.response,
+                Some(sglang::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+            Self::Vllm(resp) => matches!(
+                &resp.response,
+                Some(vllm::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+            Self::Trtllm(resp) => matches!(
+                &resp.response,
+                Some(trtllm::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+            Self::Mlx(resp) => matches!(
+                &resp.response,
+                Some(mlx::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+            Self::TokenSpeed(resp) => matches!(
+                &resp.response,
+                Some(tokenspeed::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+            ),
+        }
+    }
+
+    /// Whether this is the engine's output: a chunk, or a complete the
+    /// engine neither aborted nor failed (the Rust servicers end an aborted
+    /// choice with a complete, `finish_reason` "abort", in place of a
+    /// status). An empty response is not.
+    pub fn is_output(&self) -> bool {
+        let finished = |reason: &str| !matches!(reason, "abort" | "error");
+        match self {
+            Self::Sglang(resp) => match &resp.response {
+                Some(sglang::generate_response::Response::Chunk(_)) => true,
+                Some(sglang::generate_response::Response::Complete(c)) => {
+                    finished(&c.finish_reason)
+                }
+                None => false,
+            },
+            Self::Vllm(resp) => match &resp.response {
+                Some(vllm::generate_response::Response::Chunk(_)) => true,
+                Some(vllm::generate_response::Response::Complete(c)) => finished(&c.finish_reason),
+                None => false,
+            },
+            Self::Trtllm(resp) => match &resp.response {
+                Some(trtllm::generate_response::Response::Chunk(_)) => true,
+                Some(trtllm::generate_response::Response::Complete(c)) => {
+                    finished(&c.finish_reason)
+                }
+                None => false,
+            },
+            Self::Mlx(resp) => match &resp.response {
+                Some(mlx::generate_response::Response::Chunk(_)) => true,
+                Some(mlx::generate_response::Response::Complete(c)) => finished(&c.finish_reason),
+                None => false,
+            },
+            Self::TokenSpeed(resp) => match &resp.response {
+                Some(tokenspeed::generate_response::Response::Chunk(_)) => true,
+                Some(tokenspeed::generate_response::Response::Complete(c)) => {
+                    finished(&c.finish_reason)
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// The prompt tokens the engine reports served from its prefix cache, on
+    /// a chunk or a complete; zero when it reports none.
+    pub fn cached_tokens(&self) -> u32 {
+        match self {
+            Self::Sglang(resp) => match &resp.response {
+                Some(sglang::generate_response::Response::Chunk(c)) => c.cached_tokens,
+                Some(sglang::generate_response::Response::Complete(c)) => c.cached_tokens,
+                None => 0,
+            },
+            Self::Vllm(resp) => match &resp.response {
+                Some(vllm::generate_response::Response::Chunk(c)) => c.cached_tokens,
+                Some(vllm::generate_response::Response::Complete(c)) => c.cached_tokens,
+                None => 0,
+            },
+            Self::Trtllm(resp) => match &resp.response {
+                Some(trtllm::generate_response::Response::Chunk(c)) => c.cached_tokens,
+                Some(trtllm::generate_response::Response::Complete(c)) => c.cached_tokens,
+                None => 0,
+            },
+            Self::Mlx(resp) => match &resp.response {
+                Some(mlx::generate_response::Response::Chunk(c)) => c.cached_tokens,
+                Some(mlx::generate_response::Response::Complete(c)) => c.cached_tokens,
+                None => 0,
+            },
+            Self::TokenSpeed(resp) => match &resp.response {
+                Some(tokenspeed::generate_response::Response::Chunk(c)) => c.cached_tokens,
+                Some(tokenspeed::generate_response::Response::Complete(c)) => c.cached_tokens,
+                None => 0,
+            },
+        }
+    }
+
     /// Get the response variant (chunk, complete, or error)
     ///
     /// Consumes self to avoid cloning large proto messages in hot streaming path
@@ -1718,7 +322,7 @@ impl ProtoGenerateResponse {
                     ProtoResponseVariant::Chunk(ProtoGenerateStreamChunk::Vllm(chunk))
                 }
                 Some(vllm::generate_response::Response::Complete(complete)) => {
-                    ProtoResponseVariant::Complete(ProtoGenerateComplete::Vllm(complete))
+                    ProtoResponseVariant::Complete(ProtoGenerateComplete::Vllm(Box::new(complete)))
                 }
                 None => ProtoResponseVariant::None,
             },
@@ -1760,6 +364,124 @@ pub enum ProtoResponseVariant {
     None,
 }
 
+/// The wire dispatch of a counter every wire carries under one field name,
+/// written once per form. A wire added to the wrappers is one arm in each
+/// form, two in all, where every reader spelled its own before. The compiler
+/// still refuses a reader that lacks a wire; the macro only moves where the
+/// arms are written. The second form names the wire without the field and
+/// what it reads instead.
+macro_rules! wire_field {
+    ($on:expr, $c:ident => $read:expr) => {
+        match $on {
+            Self::Sglang($c) => $read,
+            Self::Vllm($c) => $read,
+            Self::Trtllm($c) => $read,
+            Self::Mlx($c) => $read,
+            Self::TokenSpeed($c) => $read,
+        }
+    };
+    ($on:expr, $c:ident => $read:expr, Mlx => $none:expr) => {
+        match $on {
+            Self::Sglang($c) => $read,
+            Self::Vllm($c) => $read,
+            Self::Trtllm($c) => $read,
+            Self::TokenSpeed($c) => $read,
+            Self::Mlx(_) => $none,
+        }
+    };
+}
+
+/// The accessors every engine-response wrapper answers with the same five-arm
+/// match, written once and invoked inside each wrapper's `impl` (as the engine
+/// clients invoke `impl_engine_client_basics`): the engine predicates, the chunk
+/// semantics of the response shape, the index, the four token counters and the
+/// reported weight version. What differs per wrapper (the typed accessors, the
+/// token ids, the logprobs, the finish reason) stays in its own `impl`.
+macro_rules! engine_response_basics {
+    () => {
+        /// Check if this is SGLang
+        pub fn is_sglang(&self) -> bool {
+            matches!(self, Self::Sglang(_))
+        }
+
+        /// Check if this is TensorRT-LLM
+        pub fn is_trtllm(&self) -> bool {
+            matches!(self, Self::Trtllm(_))
+        }
+
+        /// Check if this is MLX
+        pub fn is_mlx(&self) -> bool {
+            matches!(self, Self::Mlx(_))
+        }
+
+        /// Check if this is TokenSpeed
+        pub fn is_tokenspeed(&self) -> bool {
+            matches!(self, Self::TokenSpeed(_))
+        }
+
+        /// How this response's payloads relate to the preceding ones of its
+        /// stream — see [`ChunkSemantics`]: a `Delta` stream's counts are
+        /// accumulated chunk by chunk, a `Cumulative` stream's `Complete` reports
+        /// them.
+        pub fn chunk_semantics(&self) -> ChunkSemantics {
+            match self {
+                Self::Vllm(_) => ChunkSemantics::Delta,
+                Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
+                    ChunkSemantics::Cumulative
+                }
+            }
+        }
+
+        /// Get index (for n>1 support)
+        /// Returns the index of this output when n>1 was requested (0-indexed)
+        pub fn index(&self) -> u32 {
+            match self {
+                Self::Sglang(c) => c.index,
+                Self::Vllm(c) => c.index,
+                Self::Trtllm(c) => c.sequence_index,
+                Self::Mlx(c) => c.index,
+                Self::TokenSpeed(c) => c.index,
+            }
+        }
+
+        /// Get prompt tokens
+        pub fn prompt_tokens(&self) -> u32 {
+            wire_field!(self, c => c.prompt_tokens)
+        }
+
+        /// Get completion tokens (the running count on a chunk, the total on a
+        /// `Complete`)
+        pub fn completion_tokens(&self) -> u32 {
+            wire_field!(self, c => c.completion_tokens)
+        }
+
+        /// Get cached tokens
+        pub fn cached_tokens(&self) -> u32 {
+            wire_field!(self, c => c.cached_tokens)
+        }
+
+        /// Get reasoning tokens.
+        pub fn reasoning_tokens(&self) -> u32 {
+            match self {
+                Self::Sglang(c) => c.reasoning_tokens,
+                Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
+            }
+        }
+
+        /// Weight version the engine reported for this response. Only TokenSpeed
+        /// carries it on the wire; see [`is_reported_version`] for what counts.
+        pub fn weight_version(&self) -> Option<&str> {
+            match self {
+                Self::TokenSpeed(c) => c
+                    .weight_version
+                    .as_deref()
+                    .filter(|v| is_reported_version(v)),
+                Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+            }
+        }
+    };
+}
+
 /// Unified GenerateStreamChunk
 #[derive(Clone)]
 pub enum ProtoGenerateStreamChunk {
@@ -1771,6 +493,8 @@ pub enum ProtoGenerateStreamChunk {
 }
 
 impl ProtoGenerateStreamChunk {
+    engine_response_basics!();
+
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,
@@ -1807,37 +531,6 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Check if this is SGLang
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
-    /// Check if this is TensorRT-LLM
-    pub fn is_trtllm(&self) -> bool {
-        matches!(self, Self::Trtllm(_))
-    }
-
-    /// Check if this is MLX
-    pub fn is_mlx(&self) -> bool {
-        matches!(self, Self::Mlx(_))
-    }
-
-    /// Check if this is TokenSpeed
-    pub fn is_tokenspeed(&self) -> bool {
-        matches!(self, Self::TokenSpeed(_))
-    }
-
-    /// How this chunk's payloads relate to the preceding ones — see
-    /// [`ChunkSemantics`].
-    pub fn chunk_semantics(&self) -> ChunkSemantics {
-        match self {
-            Self::Vllm(_) => ChunkSemantics::Delta,
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
-                ChunkSemantics::Cumulative
-            }
-        }
-    }
-
     /// Get token IDs from chunk (common field)
     pub fn token_ids(&self) -> &[u32] {
         match self {
@@ -1849,38 +542,19 @@ impl ProtoGenerateStreamChunk {
         }
     }
 
-    /// Get index (for n>1 support)
-    /// Returns the index of this output when n>1 was requested (0-indexed)
-    pub fn index(&self) -> u32 {
+    /// The output's logprobs, read in place on the message; `None` when the
+    /// engine sent none ([`ProtoOutputLogProbs::trtllm`] reads that wire's
+    /// empty list as none).
+    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
-            Self::Sglang(c) => c.index,
-            Self::Vllm(c) => c.index,
-            Self::Trtllm(c) => c.sequence_index,
-            Self::Mlx(c) => c.index,
-            Self::TokenSpeed(c) => c.index,
-        }
-    }
-
-    /// Get output logprobs.
-    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
-        match self {
-            Self::Sglang(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Vllm(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
-            Self::Mlx(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+            Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
+            Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
+            Self::Trtllm(c) => ProtoOutputLogProbs::trtllm(&c.logprobs),
+            Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(ProtoOutputLogProbs::TokenSpeed),
         }
     }
 
@@ -1899,60 +573,32 @@ impl ProtoGenerateStreamChunk {
             Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
+}
 
-    /// Get prompt tokens (cumulative)
-    pub fn prompt_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens,
-            Self::Trtllm(c) => c.prompt_tokens,
-            Self::Mlx(c) => c.prompt_tokens,
-            Self::TokenSpeed(c) => c.prompt_tokens,
-        }
-    }
-
-    /// Get completion tokens (cumulative)
-    pub fn completion_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.completion_tokens,
-            Self::Vllm(c) => c.completion_tokens,
-            Self::Trtllm(c) => c.completion_tokens,
-            Self::Mlx(c) => c.completion_tokens,
-            Self::TokenSpeed(c) => c.completion_tokens,
-        }
-    }
-
-    /// Get cached tokens (cumulative)
-    pub fn cached_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(c) => c.cached_tokens,
-            Self::Trtllm(c) => c.cached_tokens,
-            Self::Mlx(c) => c.cached_tokens,
-            Self::TokenSpeed(c) => c.cached_tokens,
-        }
-    }
-
-    /// Get reasoning tokens (cumulative).
-    pub fn reasoning_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.reasoning_tokens,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
-        }
-    }
+/// Whether an engine-stamped `weight_version` names a real version. TokenSpeed
+/// always stamps `server_args.weight_version`, whose default is the literal
+/// `"default"`: that is the engine saying it was never given a version, so it
+/// must not shadow a registration label, exactly like an empty string.
+fn is_reported_version(version: &str) -> bool {
+    !version.is_empty() && version != "default"
 }
 
 /// Unified GenerateComplete response
 #[derive(Clone)]
 pub enum ProtoGenerateComplete {
     Sglang(sglang::GenerateComplete),
-    Vllm(vllm::GenerateComplete),
+    // Boxed: the media identity a PD prefill side returns made this variant
+    // several times the size of the others, and completions move through
+    // the same channel as every streamed chunk.
+    Vllm(Box<vllm::GenerateComplete>),
     Trtllm(trtllm::GenerateComplete),
     Mlx(mlx::GenerateComplete),
     TokenSpeed(tokenspeed::GenerateComplete),
 }
 
 impl ProtoGenerateComplete {
+    engine_response_basics!();
+
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,
@@ -2001,38 +647,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Check if this is SGLang
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
-    /// Check if this is TensorRT-LLM
-    pub fn is_trtllm(&self) -> bool {
-        matches!(self, Self::Trtllm(_))
-    }
-
-    /// Check if this is MLX
-    pub fn is_mlx(&self) -> bool {
-        matches!(self, Self::Mlx(_))
-    }
-
-    /// Check if this is TokenSpeed
-    pub fn is_tokenspeed(&self) -> bool {
-        matches!(self, Self::TokenSpeed(_))
-    }
-
-    /// Chunk semantics of the stream this `Complete` terminates — see
-    /// [`ChunkSemantics`]. `Delta` streams already accumulated their counts
-    /// chunk by chunk; `Cumulative` streams report them here.
-    pub fn chunk_semantics(&self) -> ChunkSemantics {
-        match self {
-            Self::Vllm(_) => ChunkSemantics::Delta,
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
-                ChunkSemantics::Cumulative
-            }
-        }
-    }
-
     /// Get token IDs from either backend (output_ids in proto)
     pub fn token_ids(&self) -> &[u32] {
         match self {
@@ -2044,28 +658,6 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get prompt tokens
-    pub fn prompt_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens,
-            Self::Trtllm(c) => c.prompt_tokens,
-            Self::Mlx(c) => c.prompt_tokens,
-            Self::TokenSpeed(c) => c.prompt_tokens,
-        }
-    }
-
-    /// Get completion tokens
-    pub fn completion_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.completion_tokens,
-            Self::Vllm(c) => c.completion_tokens,
-            Self::Trtllm(c) => c.completion_tokens,
-            Self::Mlx(c) => c.completion_tokens,
-            Self::TokenSpeed(c) => c.completion_tokens,
-        }
-    }
-
     /// Get finish reason
     pub fn finish_reason(&self) -> &str {
         match self {
@@ -2074,18 +666,6 @@ impl ProtoGenerateComplete {
             Self::Trtllm(c) => &c.finish_reason,
             Self::Mlx(c) => &c.finish_reason,
             Self::TokenSpeed(c) => &c.finish_reason,
-        }
-    }
-
-    /// Get index (for n>1 support)
-    /// Returns the index of this output when n>1 was requested (0-indexed)
-    pub fn index(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.index,
-            Self::Vllm(c) => c.index,
-            Self::Trtllm(c) => c.sequence_index,
-            Self::Mlx(c) => c.index,
-            Self::TokenSpeed(c) => c.index,
         }
     }
 
@@ -2142,23 +722,14 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get cached tokens
-    pub fn cached_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(c) => c.cached_tokens,
-            Self::Trtllm(c) => c.cached_tokens,
-            Self::Mlx(c) => c.cached_tokens,
-            Self::TokenSpeed(c) => c.cached_tokens,
-        }
+    /// Get accepted speculative draft tokens.
+    pub fn spec_accepted_tokens(&self) -> u32 {
+        wire_field!(self, c => c.spec_accepted_tokens, Mlx => 0)
     }
 
-    /// Get reasoning tokens.
-    pub fn reasoning_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(c) => c.reasoning_tokens,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 0,
-        }
+    /// Get proposed speculative draft tokens.
+    pub fn spec_draft_tokens(&self) -> u32 {
+        wire_field!(self, c => c.spec_draft_tokens, Mlx => 0)
     }
 
     /// Get input/prompt logprobs (SGLang, vLLM, and TensorRT-LLM)
@@ -2201,26 +772,19 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Get output logprobs.
-    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
+    /// The output's logprobs, read in place on the message; `None` when the
+    /// engine sent none ([`ProtoOutputLogProbs::trtllm`] reads that wire's
+    /// empty list as none).
+    pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs<'_>> {
         match self {
-            Self::Sglang(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Vllm(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
-            Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
-            Self::Mlx(c) => c
-                .output_logprobs
-                .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+            Self::Sglang(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Sglang),
+            Self::Vllm(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Vllm),
+            Self::Trtllm(c) => ProtoOutputLogProbs::trtllm(&c.logprobs),
+            Self::Mlx(c) => c.output_logprobs.as_ref().map(ProtoOutputLogProbs::Mlx),
             Self::TokenSpeed(c) => c
                 .output_logprobs
                 .as_ref()
-                .map(|lp| convert_output_logprobs!(lp)),
+                .map(ProtoOutputLogProbs::TokenSpeed),
         }
     }
 
@@ -2232,6 +796,15 @@ impl ProtoGenerateComplete {
                 .kv_transfer_params
                 .as_ref()
                 .map(|params| (params.remote_host.clone(), params.remote_port)),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
+        }
+    }
+
+    /// The media identity a prefill side returned for its processed
+    /// references (vLLM only; absent from older servicers).
+    pub fn media_identity(&self) -> Option<&vllm::MediaIdentity> {
+        match self {
+            Self::Vllm(c) => c.media_identity.as_ref(),
             Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
@@ -2265,12 +838,1054 @@ pub enum ProtoStream {
     /// An n>1 fan-out over rendezvous-room PD pairs: one child per sample,
     /// each response stamped with its sample's index (see [`FanoutStream`]).
     Fanout(FanoutStream),
+    /// Any of the above, with the worker it came from: every response is a
+    /// sign of life for that worker (see [`crate::worker::liveness`]).
+    Tracked(Box<TrackedStream>),
+    /// The decode side of a disaggregated request: every response restamped
+    /// with the prefill side's prefix-cache hit (see [`PrefillCachedTokens`]).
+    DecodeSide(Box<DecodeStream>),
+    /// A stream whose first item was pulled ahead of its reader (see
+    /// [`ProtoStream::first_item_ahead`]): replayed once, then the stream as
+    /// it was.
+    Ahead(Box<AheadStream>),
+    /// Any of the above, read for a client that can leave: the moment the
+    /// client's response body is dropped, the inner stream is dropped (its
+    /// abort-on-drop reaches the engine, its tickets go back to the worker)
+    /// and the reader meets the end (see [`WatchedStream`]).
+    Watched(Box<WatchedStream>),
+}
+
+/// A stream with its first item (`None`: its end) pulled ahead of its reader
+/// and held, with nothing booked for it: whatever tracks the stream later
+/// books the item when its reader meets it.
+pub struct AheadStream {
+    inner: ProtoStream,
+    first: Option<Result<ProtoGenerateResponse, tonic::Status>>,
+}
+
+/// A [`ProtoStream`] read on behalf of one client, whose response body is
+/// the receiving end of `client`. A reader parked on the engine (a
+/// generation that stalled mid-stream, a first token still owed) would
+/// otherwise learn that the client left only when the engine next speaks,
+/// or when the request timeout ends the attempt: its send fails then, and
+/// the stream it drops at its return sends the abort. Here every poll of the
+/// stream races the engine against the client's leaving, so the abort
+/// reaches the engine the moment the body is dropped: the inner stream goes
+/// (its abort-on-drop and its tickets with it) and the reader meets the
+/// end, the path it takes today when the engine ends a stream whose client
+/// had already left.
+pub struct WatchedStream {
+    /// `None` once the client left: the inner stream was dropped there.
+    inner: Option<ProtoStream>,
+    client: SseSender,
+    /// The wait for the client's leaving, one for the stream's whole life:
+    /// built with the watch and polled only while the reader is parked on
+    /// the engine (see [`ProtoStream::next`]), so it registers with the
+    /// channel once, at the first park, instead of once per response.
+    client_gone: Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
+    request_id: String,
+}
+
+impl WatchedStream {
+    /// The client left: drop the inner stream, which sends its abort to the
+    /// engine and gives back its tickets.
+    fn client_left(&mut self) {
+        self.inner = None;
+        tracing::debug!(
+            request_id = %self.request_id,
+            "Client left during the stream; the request was aborted on the engine"
+        );
+    }
+}
+
+/// A disaggregated request's decode side. Its engine loads the prompt's KV
+/// from the prefill side and reports what it loaded as cached, so every chunk
+/// and complete it yields is restamped with the prefill side's prefix-cache
+/// hit before the gateway reads it. Decode sides are not tracked today; if one
+/// ever is, the tracking must sit inside this wrapper, so that a
+/// [`PrefillTicket`] reads the engine's own `cached_tokens`, not the
+/// restamped value.
+pub struct DecodeStream {
+    inner: ProtoStream,
+    prefill: PrefillCachedTokens,
+}
+
+/// The prefix-cache hit of a disaggregated request, by sample index, as its
+/// prefill side reported it on each `Complete`. The prefill side is the one
+/// that computed the prompt against its prefix cache; the decode side receives
+/// that prefix over the KV connector and counts it as cached, so read from the
+/// decode side every request's `cached_tokens` is the transfer (the prompt
+/// less its last token), whatever the cache held. The decode side's responses
+/// are restamped with these values (see [`ProtoStream::decode_side`]) so the
+/// client's usage, and everything the gateway derives from it, carries the
+/// request's real cache hit.
+#[derive(Debug, Clone, Default)]
+pub struct PrefillCachedTokens {
+    by_index: HashMap<u32, u32>,
+}
+
+impl PrefillCachedTokens {
+    /// Record a prefill `Complete`'s cache hit under its sample index.
+    pub fn note(&mut self, complete: &ProtoGenerateComplete) {
+        self.by_index
+            .insert(complete.index(), complete.cached_tokens());
+    }
+
+    /// Whether no prefill completion was recorded (a stream another stage
+    /// drained, or a prefill side that ended without one).
+    pub fn is_empty(&self) -> bool {
+        self.by_index.is_empty()
+    }
+
+    /// The prefill side's cache hit for sample `index`: the sample's own
+    /// entry, or the one entry of a prefill that completed once for the
+    /// whole request.
+    pub fn for_index(&self, index: u32) -> Option<u32> {
+        match self.by_index.get(&index) {
+            Some(cached) => Some(*cached),
+            None if self.by_index.len() == 1 => self.by_index.values().next().copied(),
+            None => None,
+        }
+    }
+
+    fn restamp(&self, index: u32, cached: &mut u32) {
+        if let Some(value) = self.for_index(index) {
+            *cached = value;
+        }
+    }
+}
+
+/// A [`ProtoStream`] paired with the worker serving it, so each response it
+/// yields counts as token progress for that worker, and its prompt counts as
+/// pending prefill on the worker until the first response.
+pub struct TrackedStream {
+    inner: ProtoStream,
+    worker: Arc<dyn Worker>,
+    prefill: Option<PrefillTicket>,
+    /// The request's place in the worker's pile; a non-streaming generation
+    /// holds none.
+    progress: Option<ProgressTicket>,
+    /// Held from the stream's first response to its end: one of the streams
+    /// the worker is producing for (see [`Worker::output_silence`]).
+    output: Option<OutputTicket>,
+    /// Whether the worker's circuit-breaker success for this dispatch is
+    /// still to be sampled, at the stream's first response (a disaggregated
+    /// decode side: see [`ProtoStream::tracked_decode_side`]).
+    samples_success: bool,
+    /// A response (or the stream's end) pulled ahead of the stream's reader
+    /// by [`ProtoStream::first_response_within`], handed to the next `next`
+    /// as it was: its bookkeeping ran when it was pulled.
+    replay: Option<Option<Result<ProtoGenerateResponse, tonic::Status>>>,
+}
+
+/// What [`ProtoStream::first_response_within`] found as the stream's first
+/// item, held for the reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstItem {
+    /// A response: the side answered.
+    Response,
+    /// A failure (the engine's own report, or the transport's): the reader
+    /// meets it next and accounts for it.
+    Failure,
+    /// The end: the stream closed with nothing on it.
+    End,
+}
+
+impl FirstItem {
+    fn of(item: Option<&Result<ProtoGenerateResponse, tonic::Status>>) -> Self {
+        match item {
+            Some(Ok(_)) => Self::Response,
+            Some(Err(_)) => Self::Failure,
+            None => Self::End,
+        }
+    }
+}
+
+/// The request's place in its worker's tracked pile (see
+/// [`Worker::tracked_load`]), held for the stream's life.
+struct ProgressTicket {
+    worker: Arc<dyn Worker>,
+}
+
+impl Drop for ProgressTicket {
+    fn drop(&mut self) {
+        self.worker.note_tracked_ended();
+    }
+}
+
+/// A stream the worker has produced output for and that has not ended (see
+/// [`Worker::output_silence`]): opened at the first response, given back at
+/// the stream's end, or when its reader lets go of it.
+struct OutputTicket {
+    worker: Arc<dyn Worker>,
+}
+
+impl OutputTicket {
+    fn open(worker: &Arc<dyn Worker>) -> Self {
+        worker.note_output_started();
+        Self {
+            worker: Arc::clone(worker),
+        }
+    }
+}
+
+impl Drop for OutputTicket {
+    fn drop(&mut self) {
+        self.worker.note_output_ended();
+    }
+}
+
+/// The prompt tokens a dispatched request adds to its worker's prefill
+/// backlog (see [`Worker::prefill_backlog`]), released by the first response
+/// (with the prefix-cache hit it reports, so the worker's rate learns the
+/// tokens the engine computed) or, failing that, when the stream is dropped.
+pub(crate) struct PrefillTicket {
+    worker: Arc<dyn Worker>,
+    tokens: u64,
+    /// The first response is the request's first token (a streaming
+    /// generation), so the prompt's prefill is timed for the worker's rate;
+    /// a non-streaming generation's one response is its whole answer.
+    timed: bool,
+    released: bool,
+}
+
+impl PrefillTicket {
+    /// Book `prompt_tokens` as pending prefill on `worker` from this moment,
+    /// timed: the dispatch paths book a side before its call is polled, so the
+    /// span the worker's rate learns runs from the dispatch to the first
+    /// response whether the servicer sends its headers at once or, as the
+    /// gRPC servicers do, with the first message (a booking at the call's
+    /// return would then time nothing and teach a rate the worker does not
+    /// have, and the sides waiting in dispatch would be missing from the
+    /// backlog). `None` for an empty prompt. The ticket is handed to the side's
+    /// stream by [`ProtoStream::tracked_prefill_side_booked`]; dropped before
+    /// that (the call failed or was retired), it releases the prompt untimed.
+    pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Self> {
+        Self::book_as(worker, prompt_tokens, true)
+    }
+
+    /// [`Self::book`] with the prompt's prefill `timed` or not: a regular
+    /// dispatch times it when the engine streams the generation (the first
+    /// response is the first token) and books it untimed otherwise (the one
+    /// response of a non-streaming generation is its whole answer).
+    pub(crate) fn book_as(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        timed: bool,
+    ) -> Option<Self> {
+        Self::book_as_at(worker, prompt_tokens, timed, liveness::now_ms())
+    }
+
+    /// [`Self::book_as`] at `now_ms` on the gateway clock (`liveness::now_ms`):
+    /// the dispatch's one stamp, shared with its deadline.
+    pub(crate) fn book_as_at(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        timed: bool,
+        now_ms: u64,
+    ) -> Option<Self> {
+        (prompt_tokens > 0).then(|| {
+            worker.note_prefill_started_at(prompt_tokens, timed, now_ms);
+            Self {
+                worker: Arc::clone(worker),
+                tokens: prompt_tokens,
+                timed,
+                released: false,
+            }
+        })
+    }
+
+    /// The first response came back at `now_ms` on the gateway clock (the
+    /// stamp its reader took for the message), reporting `cached` prompt
+    /// tokens served from the engine's prefix cache.
+    fn first_response_at(&mut self, cached: u64, now_ms: u64) {
+        if !self.released {
+            self.released = true;
+            self.worker
+                .note_prefill_ended_at(self.tokens, self.timed, Some(cached), now_ms);
+        }
+    }
+}
+
+impl Drop for PrefillTicket {
+    fn drop(&mut self) {
+        if !self.released {
+            self.worker
+                .note_prefill_ended(self.tokens, self.timed, None);
+        }
+    }
+}
+
+/// What a regular dispatch books on its worker before its call is polled
+/// (see [`PrefillTicket::book`]): the prompt as pending prefill, timed when
+/// the engine streams the generation, and, for a streaming generation, the
+/// request's place in the worker's pile. [`ProtoStream::tracked_booked`]
+/// hands both to the call's stream; dropped before that (the call failed),
+/// the booking gives both back.
+pub(crate) struct DispatchBooking {
+    prefill: Option<PrefillTicket>,
+    progress: Option<ProgressTicket>,
+}
+
+impl DispatchBooking {
+    pub(crate) fn book(worker: &Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
+        Self::book_at(worker, prompt_tokens, streaming, Instant::now())
+    }
+
+    /// [`Self::book`] for a request dispatched at `dispatched_at`: the one
+    /// instant the dispatch read, which its deadline runs from too, stamps
+    /// the prefill booking and the start of the worker's tracked run.
+    pub(crate) fn book_at(
+        worker: &Arc<dyn Worker>,
+        prompt_tokens: u64,
+        streaming: bool,
+        dispatched_at: Instant,
+    ) -> Self {
+        let now_ms = liveness::ms_at(dispatched_at);
+        let progress = streaming.then(|| {
+            worker.note_tracked_started_at(now_ms);
+            ProgressTicket {
+                worker: Arc::clone(worker),
+            }
+        });
+        Self {
+            prefill: PrefillTicket::book_as_at(worker, prompt_tokens, streaming, now_ms),
+            progress,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tracked_tests {
+    use std::sync::Arc;
+
+    use super::{
+        sglang, tokenspeed, vllm, DispatchBooking, FanoutStream, FirstItem, PrefillTicket,
+        ProtoGenerateResponse, ProtoStream,
+    };
+    use crate::worker::{BasicWorkerBuilder, Worker};
+
+    #[test]
+    fn the_cache_hit_a_first_response_reports_is_read_from_a_chunk_or_a_complete() {
+        // The prefill ticket hands the worker the hit with the first
+        // response, whichever shape it has; a response that carries no
+        // count reads as no hit, and the prompt teaches its full length.
+        let chunk = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk {
+                    cached_tokens: 1_900,
+                    ..Default::default()
+                },
+            )),
+        }));
+        assert_eq!(chunk.cached_tokens(), 1_900);
+        let complete = ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+            response: Some(sglang::generate_response::Response::Complete(
+                sglang::GenerateComplete {
+                    cached_tokens: 64,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }));
+        assert_eq!(complete.cached_tokens(), 64);
+        let empty = ProtoGenerateResponse::Vllm(Box::default());
+        assert_eq!(empty.cached_tokens(), 0);
+    }
+
+    #[test]
+    fn a_tracked_stream_is_one_of_its_workers_pile_for_its_life() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new())).tracked(
+            Arc::clone(&worker),
+            0,
+            true,
+        );
+        assert_eq!(worker.tracked_load(), 1, "counted at dispatch");
+        let stream = stream.defer_abort_until_first_item();
+        assert_eq!(worker.tracked_load(), 1, "and across the stream's rewraps");
+        drop(stream);
+        assert_eq!(worker.tracked_load(), 0, "released with the stream");
+    }
+
+    #[tokio::test]
+    async fn a_tracked_stream_inside_a_tracked_stream_ends_and_releases_both_piles() {
+        // The in-place poll of `next` covers one tracked layer over a
+        // transport stream; a second layer takes the recursive path. Both
+        // layers' bookkeeping holds either way.
+        let outer: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let inner: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w2:8000").build());
+        let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked(Arc::clone(&inner), 0, true)
+            .tracked(Arc::clone(&outer), 0, true);
+        assert_eq!((inner.tracked_load(), outer.tracked_load()), (1, 1));
+        assert!(
+            stream.next().await.is_none(),
+            "an empty fanout ends at once"
+        );
+        drop(stream);
+        assert_eq!((inner.tracked_load(), outer.tracked_load()), (0, 0));
+    }
+
+    #[test]
+    fn a_non_streaming_generation_joins_no_pile_but_keeps_its_prefill_and_its_progress() {
+        // Review finding on the pushed head: left untracked altogether, a
+        // non-streaming generation's one answer no longer counted as progress
+        // and its prompt left the prefill backlog, so a saturated engine
+        // finishing such requests while streaming ones waited was wedged. It
+        // is tracked like any other, minus the pile slot.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new())).tracked(
+            Arc::clone(&worker),
+            64,
+            false,
+        );
+        assert_eq!(
+            worker.tracked_load(),
+            0,
+            "nothing to see progress on until it answers"
+        );
+        match &stream {
+            ProtoStream::Tracked(tracked) => {
+                assert!(tracked.progress.is_none(), "no pile slot");
+                assert!(
+                    tracked.prefill.as_ref().is_some_and(|ticket| !ticket.timed),
+                    "pending prefill like any other, untimed: its first response is its whole answer"
+                );
+                // Its one answer goes through the same `Tracked` arm of
+                // `next` as a token, which is where progress is recorded.
+            }
+            _ => panic!("a tracked stream"),
+        }
+        let stream = stream.defer_abort_until_first_item();
+        assert_eq!(worker.tracked_load(), 0);
+        drop(stream);
+        assert_eq!(worker.tracked_load(), 0);
+    }
+
+    /// A disaggregated decode side earns its worker's breaker success at its
+    /// first response, never at its dispatch: a side whose stream ends with
+    /// nothing on it leaves a failure before it standing, so the next one
+    /// opens a breaker set to two.
+    #[tokio::test]
+    async fn a_decode_side_that_ends_with_nothing_on_it_earns_no_breaker_success() {
+        use crate::worker::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        worker.record_outcome(504);
+        let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_decode_side(Arc::clone(&worker));
+        match &stream {
+            ProtoStream::Tracked(tracked) => {
+                assert!(tracked.samples_success, "the success waits for a response");
+                assert!(tracked.progress.is_none(), "no pile slot");
+                assert!(tracked.prefill.is_none(), "no prompt booked");
+            }
+            _ => panic!("a tracked stream"),
+        }
+        assert!(
+            stream.next().await.is_none(),
+            "an empty fanout ends at once"
+        );
+        drop(stream);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        worker.record_outcome(504);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Open,
+            "two failures with no success earned between them"
+        );
+    }
+
+    #[test]
+    fn a_prefill_side_booked_at_dispatch_is_pending_before_its_stream_exists() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        assert!(
+            PrefillTicket::book(&worker, 0).is_none(),
+            "an empty prompt books nothing"
+        );
+        let ticket = PrefillTicket::book(&worker, 4_096);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::from_millis(409),
+            "pending from the dispatch, before the call has answered"
+        );
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_prefill_side_booked(Arc::clone(&worker), ticket);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::from_millis(409),
+            "handed to the stream: booked once, not again"
+        );
+        assert_eq!(worker.tracked_load(), 0, "a side is never part of a pile");
+        match &stream {
+            ProtoStream::Tracked(tracked) => {
+                assert!(tracked.prefill.as_ref().is_some_and(|ticket| ticket.timed));
+            }
+            _ => panic!("a tracked stream"),
+        }
+        drop(stream);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::ZERO,
+            "released with the stream"
+        );
+    }
+
+    #[test]
+    fn a_side_booked_at_dispatch_whose_call_fails_releases_its_prompt() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        let ticket = PrefillTicket::book(&worker, 1_000);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::from_millis(100)
+        );
+        drop(ticket);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::ZERO,
+            "a call that fails or is retired gives the prompt back untimed"
+        );
+    }
+
+    #[test]
+    fn a_prefill_side_books_its_prompt_timed_and_joins_no_pile() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_prefill_side_booked(Arc::clone(&worker), PrefillTicket::book(&worker, 4_096));
+        assert_eq!(worker.tracked_load(), 0, "a side is never part of a pile");
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::from_millis(409),
+            "its prompt is pending prefill on the prefill worker (cold prior)"
+        );
+        match &stream {
+            ProtoStream::Tracked(tracked) => {
+                assert!(tracked.progress.is_none());
+                assert!(tracked.prefill.as_ref().is_some_and(|ticket| ticket.timed));
+            }
+            _ => panic!("a tracked stream"),
+        }
+        drop(stream);
+        assert_eq!(
+            worker.prefill_backlog(),
+            std::time::Duration::ZERO,
+            "released with the stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_response_pulled_ahead_is_replayed_to_the_reader_once() {
+        // An empty fan-out ends at once: the end is what is pulled ahead, and
+        // the reader sees it once more, then the stream as it is.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
+        let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_prefill_side_booked(Arc::clone(&worker), PrefillTicket::book(&worker, 16));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(
+            stream.first_response_within(deadline).await.ok(),
+            Some(FirstItem::End),
+            "what was pulled ahead is named: the end, not a response"
+        );
+        assert_eq!(
+            stream.first_response_within(deadline).await.ok(),
+            Some(FirstItem::End),
+            "a second wait does not pull past the held item"
+        );
+        assert!(stream.next().await.is_none(), "the held end is replayed");
+        assert!(stream.next().await.is_none(), "and the stream stays ended");
+    }
+
+    /// The parallel decode side's first item, pulled ahead while its prefill
+    /// side is awaited, is held unbooked and replayed once to its reader,
+    /// then the stream as it was; whatever tracks the stream then books it
+    /// at the replay: the decode worker's output, and its success.
+    #[tokio::test]
+    async fn a_first_item_pulled_ahead_is_replayed_once_and_booked_by_its_reader() {
+        use crate::worker::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        type Item = Result<ProtoGenerateResponse, tonic::Status>;
+        // Chunks told apart by the count each carries.
+        let chunk = |cached_tokens| -> Item {
+            let chunk = vllm::GenerateStreamChunk {
+                cached_tokens,
+                ..Default::default()
+            };
+            let response = Some(vllm::generate_response::Response::Chunk(chunk));
+            Ok(ProtoGenerateResponse::Vllm(Box::new(
+                vllm::GenerateResponse { response },
+            )))
+        };
+        let which = |item: Option<&Item>| Some(item?.as_ref().ok()?.cached_tokens());
+        // A child that yields chunks 1 and 2 (each replayed by a tracked
+        // layer of its own, on an engine of its own) and ends, read through
+        // a fan-out: its first item is pulled from it.
+        let engine: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+        let empty = ProtoStream::Fanout(FanoutStream::new(Vec::new()));
+        let child = [2, 1].into_iter().fold(empty, |inner, id| {
+            let mut layer = inner.tracked(Arc::clone(&engine), 0, false);
+            if let ProtoStream::Tracked(tracked) = &mut layer {
+                tracked.replay = Some(Some(chunk(id)));
+            }
+            layer
+        });
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(vec![child]));
+        assert_eq!(which(stream.first_item_ahead().await), Some(1), "pulled");
+        assert_eq!(
+            which(stream.first_item_ahead().await),
+            Some(1),
+            "held, not read again"
+        );
+        assert!(stream.worker().is_none());
+        let stream = stream.defer_abort_until_first_item();
+        assert!(stream.holds_item_ahead(), "rewrapped with what it holds");
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        worker.record_outcome(504);
+        let mut stream = stream.tracked_decode_side(Arc::clone(&worker));
+        assert!(worker.output_silence().is_none(), "nothing booked unread");
+        assert_eq!(which(stream.next().await.as_ref()), Some(1), "replayed");
+        assert!(worker.output_silence().is_some(), "booked at the replay");
+        assert_eq!(which(stream.next().await.as_ref()), Some(2), "then on");
+        assert!(stream.next().await.is_none(), "to the stream's end");
+        worker.record_outcome(504);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Closed,
+            "a success, booked at the replay, between the two failures"
+        );
+    }
+
+    /// A decode side's first item is its prefill worker's handoff only when
+    /// it is output: a chunk, or a complete that ended neither in an abort
+    /// (an aborted choice, as the Rust servicers end one) nor in an error.
+    #[test]
+    fn output_is_a_chunk_or_a_complete_the_engine_neither_aborted_nor_failed() {
+        use sglang::generate_response::Response as Sg;
+        use tokenspeed::generate_response::Response as Ts;
+        let ts = |response: Ts| {
+            let response = Some(response);
+            let response = tokenspeed::GenerateResponse {
+                response,
+                ..Default::default()
+            };
+            ProtoGenerateResponse::TokenSpeed(Box::new(response)).is_output()
+        };
+        let sg = |response: Sg| {
+            let response = Some(response);
+            let response = sglang::GenerateResponse {
+                response,
+                ..Default::default()
+            };
+            ProtoGenerateResponse::Sglang(Box::new(response)).is_output()
+        };
+        assert!(ts(Ts::Chunk(Default::default())) && sg(Sg::Chunk(Default::default())));
+        for (reasons, output) in [(["stop", "length"], true), (["abort", "error"], false)] {
+            for reason in reasons {
+                let finish_reason = reason.to_string();
+                let complete = sglang::GenerateComplete {
+                    finish_reason,
+                    ..Default::default()
+                };
+                assert_eq!(sg(Sg::Complete(complete)), output, "{reason}");
+                let finish_reason = reason.to_string();
+                let complete = tokenspeed::GenerateComplete {
+                    finish_reason,
+                    ..Default::default()
+                };
+                assert_eq!(ts(Ts::Complete(complete)), output, "{reason}");
+            }
+        }
+        let empty = ProtoGenerateResponse::TokenSpeed(Box::default());
+        assert!(!empty.is_output(), "an empty response");
+    }
+
+    #[test]
+    fn a_dispatch_booking_holds_the_prompt_and_the_pile_until_its_stream_takes_over() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let books = |worker: &Arc<dyn Worker>| (worker.prefill_backlog(), worker.tracked_load());
+        // 4,096 prompt tokens at the cold prior read as 409 ms of backlog.
+        let pending = std::time::Duration::from_millis(409);
+        let none = (std::time::Duration::ZERO, 0);
+        // A streaming generation: its prompt timed, its place in the pile.
+        let booking = DispatchBooking::book(&worker, 4_096, true);
+        assert_eq!(
+            books(&worker),
+            (pending, 1),
+            "booked at the dispatch, before the call has answered"
+        );
+        assert!(booking.prefill.as_ref().is_some_and(|ticket| ticket.timed));
+        let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
+            .tracked_booked(Arc::clone(&worker), booking);
+        assert_eq!(
+            books(&worker),
+            (pending, 1),
+            "handed to the stream: booked once, not again"
+        );
+        drop(stream);
+        assert_eq!(books(&worker), none, "released with the stream");
+        // A non-streaming generation: its prompt pending untimed, no pile slot.
+        let booking = DispatchBooking::book(&worker, 4_096, false);
+        assert_eq!(books(&worker), (pending, 0));
+        assert!(booking.prefill.as_ref().is_some_and(|ticket| !ticket.timed));
+        assert!(booking.progress.is_none());
+        // Dropped before a stream took it over (the call failed): given back.
+        drop(booking);
+        assert_eq!(books(&worker), none);
+    }
+}
+
+/// The message of the `Internal` status a stream ends with when the engine
+/// itself finished the request with an error. The ZMQ lane's adapters end
+/// theirs with the same words, and the stream-failure accounting keys its
+/// `engine_error` label on it.
+pub(crate) const ENGINE_ERROR_MESSAGE: &str =
+    "engine finished the request with an error (see engine logs)";
+
+/// Surface an engine-side failure (`finish_reason == "error"`) as a stream error, like the ZMQ lane.
+fn reject_engine_error(
+    item: Result<ProtoGenerateResponse, tonic::Status>,
+) -> Result<ProtoGenerateResponse, tonic::Status> {
+    match item {
+        Ok(response) if response.engine_error() => {
+            Err(tonic::Status::internal(ENGINE_ERROR_MESSAGE))
+        }
+        item => item,
+    }
 }
 
 impl ProtoStream {
+    /// Count this stream's responses as progress for `worker` (a response is
+    /// progress whether it is a token of a streaming generation or the one
+    /// answer of a non-streaming one), its `prompt_tokens` as pending prefill
+    /// there until the first response, and, when the engine streams the
+    /// generation (`streaming`), the request as one of the worker's tracked
+    /// pile while the stream lives, with its prefill timed by its first
+    /// token over the tokens the engine computed for it (its prompt less the
+    /// prefix-cache hit that first response reports). A non-streaming
+    /// generation shows nothing between dispatch and
+    /// completion, so it joins no pile and times no prefill (its one answer
+    /// comes after its decode): the pile rule never judges a worker by
+    /// requests it cannot see progress on, and the prefill rate is learned
+    /// from first tokens only.
+    #[must_use]
+    pub fn tracked(self, worker: Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
+        let booking = DispatchBooking::book(&worker, prompt_tokens, streaming);
+        self.tracked_booked(worker, booking)
+    }
+
+    /// [`Self::tracked`] for a request booked at its dispatch (see
+    /// [`DispatchBooking::book`]): the stream takes the booking over, so the
+    /// prompt's span runs from before the call was polled to the first
+    /// response, and the request has been in the pile since the dispatch.
+    #[must_use]
+    pub(crate) fn tracked_booked(self, worker: Arc<dyn Worker>, booking: DispatchBooking) -> Self {
+        let DispatchBooking { prefill, progress } = booking;
+        Self::Tracked(Box::new(TrackedStream {
+            inner: self,
+            worker,
+            prefill,
+            progress,
+            output: None,
+            samples_success: false,
+            replay: None,
+        }))
+    }
+
+    /// Track this stream as the prefill side of a disaggregated dispatch to
+    /// `worker`, its prompt booked at the dispatch (see [`PrefillTicket::book`]):
+    /// the stream takes over the ticket, so the first response ends the span
+    /// that began before the call was polled and times the prompt's prefill
+    /// for the worker's rate (the side's first response is the end of its
+    /// prefill, on either dispatch shape), and every response is progress for
+    /// the worker. The side joins no pile: the gateway bounds its silence per
+    /// request (see [`crate::worker::liveness::prefill_side_bound`]) instead
+    /// of judging the worker by sides it cannot see progress on.
+    #[must_use]
+    pub(crate) fn tracked_prefill_side_booked(
+        self,
+        worker: Arc<dyn Worker>,
+        prefill: Option<PrefillTicket>,
+    ) -> Self {
+        Self::Tracked(Box::new(TrackedStream {
+            inner: self,
+            worker,
+            prefill,
+            progress: None,
+            output: None,
+            samples_success: false,
+            replay: None,
+        }))
+    }
+
+    /// Track this stream as the decode side of a disaggregated dispatch to
+    /// `worker`: every response is the worker's token progress, the side
+    /// joins no pile and books no prefill (as [`Self::tracked`] with no
+    /// prompt and no pile does), and the worker's circuit-breaker success
+    /// for the dispatch is sampled at the side's first response rather than
+    /// when the call returned its stream. A decode side's first response
+    /// waits for the handoff, so a side accepted into silence, or one whose
+    /// stream fails at once, is one failure of its worker and not a success
+    /// and then a failure, which reset the breaker's streak on every
+    /// request; a stream that ends with nothing on it earns no success
+    /// either, as a prefill side's does not.
+    #[must_use]
+    pub(crate) fn tracked_decode_side(self, worker: Arc<dyn Worker>) -> Self {
+        let mut stream = self.tracked(worker, 0, false);
+        if let Self::Tracked(tracked) = &mut stream {
+            tracked.samples_success = true;
+        }
+        stream
+    }
+
+    /// Wait for the stream's first item, a response or its end, until
+    /// `deadline`, and say which it was. Within the deadline the stream is
+    /// left for its reader as if nothing had been read: the item is replayed
+    /// by the next [`Self::next`], its bookkeeping already done. Past the
+    /// deadline the stream has produced nothing, and the caller decides its
+    /// fate. Only a tracked stream can hold an item back, so any other
+    /// returns at once as if a response had come (the dispatch paths wrap a
+    /// side before they bound it).
+    pub async fn first_response_within(&mut self, deadline: Instant) -> Result<FirstItem, Elapsed> {
+        if let Self::Watched(watched) = self {
+            return match watched.inner.as_mut() {
+                Some(inner) => Box::pin(inner.first_response_within(deadline)).await,
+                None => Ok(FirstItem::End),
+            };
+        }
+        let Self::Tracked(tracked) = self else {
+            return Ok(FirstItem::Response);
+        };
+        if let Some(held) = &tracked.replay {
+            return Ok(FirstItem::of(held.as_ref()));
+        }
+        let item = tokio::time::timeout_at(deadline.into(), self.next()).await?;
+        let first = FirstItem::of(item.as_ref());
+        if let Self::Tracked(tracked) = self {
+            tracked.replay = Some(item);
+        }
+        Ok(first)
+    }
+
+    /// The stream's first item (`None`: its end), pulled ahead of its reader
+    /// and held for the next [`Self::next`] as it was, unbooked: a stream
+    /// tracked later books it when its reader meets it. Only for a stream
+    /// nothing tracks yet (the parallel decode side while its prefill side
+    /// is awaited). Cancel-safe: dropped before the item comes, it leaves
+    /// the stream as it was.
+    pub(crate) async fn first_item_ahead(
+        &mut self,
+    ) -> Option<&Result<ProtoGenerateResponse, tonic::Status>> {
+        if !self.holds_item_ahead() {
+            let first = self.next_untracked().await;
+            let inner = std::mem::replace(self, Self::Fanout(FanoutStream::new(Vec::new())));
+            *self = Self::Ahead(Box::new(AheadStream { inner, first }));
+        }
+        let Self::Ahead(ahead) = self else {
+            return None;
+        };
+        ahead.first.as_ref()
+    }
+
+    /// Whether the stream holds an item pulled ahead of its reader (see
+    /// [`Self::first_item_ahead`]).
+    pub(crate) fn holds_item_ahead(&self) -> bool {
+        matches!(self, Self::Ahead(_))
+    }
+
+    /// The worker this stream was dispatched to, when it is tracked.
+    pub fn worker(&self) -> Option<&Arc<dyn Worker>> {
+        match self {
+            Self::Tracked(tracked) => Some(&tracked.worker),
+            Self::DecodeSide(side) => side.inner.worker(),
+            Self::Ahead(ahead) => ahead.inner.worker(),
+            Self::Watched(watched) => watched.inner.as_ref().and_then(ProtoStream::worker),
+            _ => None,
+        }
+    }
+
+    /// This stream read for the client at the receiving end of `client`'s
+    /// channel (see [`WatchedStream`]): the moment the client's response body
+    /// is dropped, the stream is dropped (its abort reaches the engine) and
+    /// its reader meets the end. `request_id` names the request for the log
+    /// line.
+    #[must_use]
+    pub fn until_client_gone(self, client: &SseSender, request_id: &str) -> Self {
+        let sender = client.clone();
+        self.watched(
+            client,
+            request_id,
+            Box::pin(async move { sender.closed().await }),
+        )
+    }
+
+    /// [`Self::until_client_gone`] with `client_gone` as the wait for the
+    /// client's leaving: the sender's own `closed()`, or a test's view of it.
+    fn watched(
+        self,
+        client: &SseSender,
+        request_id: &str,
+        client_gone: Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
+    ) -> Self {
+        Self::Watched(Box::new(WatchedStream {
+            inner: Some(self),
+            client: client.clone(),
+            client_gone,
+            request_id: request_id.to_string(),
+        }))
+    }
+
+    /// This stream as a disaggregated request's decode side: its responses
+    /// carry `prefill`'s prefix-cache hit instead of their own (see
+    /// [`PrefillCachedTokens`]). A prefill side that reported nothing leaves
+    /// the stream as it is.
+    #[must_use]
+    pub fn decode_side(self, prefill: PrefillCachedTokens) -> Self {
+        if prefill.is_empty() {
+            return self;
+        }
+        Self::DecodeSide(Box::new(DecodeStream {
+            inner: self,
+            prefill,
+        }))
+    }
+
+    /// Whether the end this stream's reader met was the client's leaving
+    /// (see [`Self::until_client_gone`]), not the engine's end: the
+    /// generation did not complete, and nothing accounts it as one. Read
+    /// through a decode-side wrapper as through the watch itself (dual
+    /// dispatch wraps the watched stream once the prefill side has drained);
+    /// `false` for a stream that is not watched.
+    pub fn client_left(&self) -> bool {
+        match self {
+            Self::Watched(watched) => watched.inner.is_none(),
+            Self::DecodeSide(side) => side.inner.client_left(),
+            _ => false,
+        }
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
-        match self {
+        let Self::Watched(watched) = self else {
+            return self.next_unwatched().await;
+        };
+        let WatchedStream {
+            inner,
+            client,
+            client_gone,
+            ..
+        } = &mut **watched;
+        // Nothing after the client left: the inner stream went with it.
+        let stream = inner.as_mut()?;
+        // The client's leaving is looked at first (the channel's flag), so a
+        // stream the engine keeps busy cannot outrun it; the inner stream is
+        // polled in place, without a boxed future per message; and the one
+        // wait for the client's leaving is polled only while the inner
+        // stream has nothing: a ready response costs no registration with
+        // the channel, and a parked reader finds the wait registered since
+        // its first park, so the moment the body is dropped it is woken.
+        // `None` here is the client's leaving, `Some(item)` the stream's own
+        // item or end.
+        let item = {
+            let mut next = std::pin::pin!(stream.next_unwatched());
+            std::future::poll_fn(|cx| {
+                if client.is_closed() {
+                    return Poll::Ready(None);
+                }
+                if let Poll::Ready(item) = next.as_mut().poll(cx) {
+                    return Poll::Ready(Some(item));
+                }
+                client_gone.as_mut().poll(cx).map(|()| None)
+            })
+            .await
+        };
+        match item {
+            Some(item) => item,
+            None => {
+                watched.client_left();
+                None
+            }
+        }
+    }
+
+    /// The next item of a stream that is not [`Self::Watched`]; a watched
+    /// stream goes through [`Self::next`], which races the client's leaving.
+    async fn next_unwatched(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        if let Self::Watched(_) = self {
+            // Reached only with one watched stream inside another.
+            return Box::pin(self.next()).await;
+        }
+        if let Self::DecodeSide(side) = self {
+            // A decode side's messages are polled in place as a tracked
+            // stream's are, without a boxed future per message; a wrapper
+            // inside the wrapper recurses. The inner stream did its own
+            // bookkeeping and engine-error mapping; only the prompt-side usage
+            // changes here.
+            let item = if matches!(side.inner, Self::Tracked(_) | Self::DecodeSide(_)) {
+                Box::pin(side.inner.next()).await
+            } else {
+                side.inner.next_untracked().await
+            };
+            return item.map(|result| {
+                result.map(|mut response| {
+                    response.restamp_cached_tokens(&side.prefill);
+                    response
+                })
+            });
+        }
+        let Self::Tracked(tracked) = self else {
+            return self.next_untracked().await;
+        };
+        if let Some(item) = tracked.replay.take() {
+            return item;
+        }
+        // Every dispatched stream is one tracked layer over a transport
+        // stream: its messages are polled in place, without a boxed future
+        // per message. A tracked stream inside a tracked stream recurses.
+        let item = if matches!(tracked.inner, Self::Tracked(_)) {
+            Box::pin(tracked.inner.next()).await
+        } else {
+            tracked.inner.next_untracked().await
+        };
+        match &item {
+            Some(Ok(response)) => {
+                // One stamp for the message: the worker's progress note and,
+                // on the first response, the end of the prompt's prefill.
+                let now_ms = liveness::now_ms();
+                liveness::on_token_progress_at(&tracked.worker, now_ms);
+                if std::mem::take(&mut tracked.samples_success) {
+                    tracked.worker.record_outcome(200);
+                }
+                if tracked.output.is_none() {
+                    tracked.output = Some(OutputTicket::open(&tracked.worker));
+                }
+                if let Some(ticket) = tracked.prefill.as_mut() {
+                    ticket.first_response_at(u64::from(response.cached_tokens()), now_ms);
+                }
+                tracked.prefill = None;
+            }
+            // The stream ended, or failed: what the worker was producing for
+            // it is over, whenever its reader lets go of it.
+            Some(Err(_)) | None => tracked.output = None,
+        }
+        item
+    }
+
+    /// The next item of a stream that is not [`Self::Tracked`]; a tracked
+    /// stream goes through [`Self::next`], which does its bookkeeping.
+    async fn next_untracked(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
+        let item = match self {
             Self::Sglang(stream) => stream
                 .next()
                 .await
@@ -2304,7 +1919,19 @@ impl ProtoStream {
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Fanout(stream) => stream.next().await,
-        }
+            Self::Tracked(_) | Self::Watched(_) => return Box::pin(self.next()).await,
+            // Reached only with one wrapper inside another: [`Self::next`]
+            // polls a decode side in place.
+            Self::DecodeSide(_) => return Box::pin(self.next()).await,
+            // The held item, mapped when it was read, and the layer goes.
+            Self::Ahead(ahead) => {
+                let first = ahead.first.take();
+                let empty = Self::Fanout(FanoutStream::new(Vec::new()));
+                *self = std::mem::replace(&mut ahead.inner, empty);
+                return first;
+            }
+        };
+        item.map(reject_engine_error)
     }
 
     /// Mark stream as completed (no abort needed)
@@ -2317,12 +1944,55 @@ impl ProtoStream {
             Self::TokenSpeed(stream) => stream.mark_completed(),
             Self::Zmq(stream) => stream.mark_completed(),
             Self::Fanout(stream) => stream.mark_completed(),
+            Self::Tracked(stream) => stream.inner.mark_completed(),
+            Self::DecodeSide(side) => side.inner.mark_completed(),
+            Self::Ahead(ahead) => ahead.inner.mark_completed(),
+            Self::Watched(watched) => {
+                if let Some(inner) = watched.inner.as_mut() {
+                    inner.mark_completed();
+                }
+            }
+        }
+    }
+
+    /// Bound the stream by the request's `deadline`
+    /// (`--grpc-request-timeout-secs`, counted from the dispatch): polled at
+    /// or past it, the transport stream
+    /// ends with the deadline's status and is released as a dropped one is,
+    /// so its abort reaches the engine at once (see
+    /// [`smg_grpc_client::AbortOnDropStream::set_deadline`]). The wrappers (a
+    /// tracked stream, a decode side, a pulled-ahead item, a watched stream, a
+    /// fan-out) reach the transport stream(s) under them through their
+    /// existing boxes, so a deadline costs no allocation on the request; a
+    /// fan-out bounds each child. The ZMQ wire's stream has no deadline hook
+    /// and is left as it is.
+    pub fn apply_deadline(&mut self, deadline: RequestDeadline) {
+        match self {
+            Self::Sglang(stream) => stream.set_deadline(deadline),
+            Self::Vllm(stream) => stream.set_deadline(deadline),
+            Self::Trtllm(stream) => stream.set_deadline(deadline),
+            Self::Mlx(stream) => stream.set_deadline(deadline),
+            Self::TokenSpeed(stream) => stream.set_deadline(deadline),
+            Self::Zmq(_) => {}
+            Self::Fanout(stream) => stream.apply_deadline(deadline),
+            Self::Tracked(stream) => stream.inner.apply_deadline(deadline),
+            Self::DecodeSide(side) => side.inner.apply_deadline(deadline),
+            // The item pulled ahead is already in hand; the stream under it
+            // is bounded.
+            Self::Ahead(ahead) => ahead.inner.apply_deadline(deadline),
+            // The watched stream's inner stream is bounded while the client is
+            // still there; once it left, there is nothing left to bound.
+            Self::Watched(watched) => {
+                if let Some(inner) = watched.inner.as_mut() {
+                    inner.apply_deadline(deadline);
+                }
+            }
         }
     }
 
     /// Defer the abort-on-drop until the stream yields its first response.
     ///
-    /// Used for the disaggregated decode leg: aborting a decode request while
+    /// Used for the disaggregated decode side: aborting a decode request while
     /// it is still receiving the KV handoff from its prefill peer can tear
     /// down the transfer mid-write; the first response proves the handoff
     /// completed, after which the (deferred) abort is safe. No-op for ZMQ
@@ -2330,14 +2000,74 @@ impl ProtoStream {
     /// not serve disaggregated requests.
     #[must_use]
     pub fn defer_abort_until_first_item(self) -> Self {
+        self.defer_abort_within(DEFERRED_ABORT_MAX_WAIT)
+    }
+
+    /// [`Self::defer_abort_until_first_item`] with the wait for the first
+    /// response bounded by `bound` where that is shorter than the house cap
+    /// ([`DEFERRED_ABORT_MAX_WAIT`]): the bound the caller holds for the
+    /// response, a decode side's first-token bound. A side whose first
+    /// response is its whole answer (a non-streaming generation) has no
+    /// earlier signal, and a drop would otherwise hold its worker for the
+    /// answer's length, the cap at most.
+    #[must_use]
+    pub fn defer_abort_within(self, bound: Duration) -> Self {
         match self {
-            Self::Sglang(stream) => Self::Sglang(stream.defer_abort_until_first_item()),
-            Self::Vllm(stream) => Self::Vllm(stream.defer_abort_until_first_item()),
-            Self::Trtllm(stream) => Self::Trtllm(stream.defer_abort_until_first_item()),
-            Self::Mlx(stream) => Self::Mlx(stream.defer_abort_until_first_item()),
-            Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),
+            Self::Sglang(stream) => Self::Sglang(stream.defer_abort_within(bound)),
+            Self::Vllm(stream) => Self::Vllm(stream.defer_abort_within(bound)),
+            Self::Trtllm(stream) => Self::Trtllm(stream.defer_abort_within(bound)),
+            Self::Mlx(stream) => Self::Mlx(stream.defer_abort_within(bound)),
+            Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_within(bound)),
             Self::Zmq(stream) => Self::Zmq(stream),
-            Self::Fanout(stream) => Self::Fanout(stream.defer_abort_until_first_item()),
+            Self::Fanout(stream) => Self::Fanout(stream.defer_abort_within(bound)),
+            Self::Tracked(stream) => {
+                let TrackedStream {
+                    inner,
+                    worker,
+                    prefill,
+                    progress,
+                    output,
+                    samples_success,
+                    replay,
+                } = *stream;
+                Self::Tracked(Box::new(TrackedStream {
+                    inner: inner.defer_abort_within(bound),
+                    worker,
+                    prefill,
+                    progress,
+                    output,
+                    samples_success,
+                    replay,
+                }))
+            }
+            Self::DecodeSide(side) => {
+                let DecodeStream { inner, prefill } = *side;
+                Self::DecodeSide(Box::new(DecodeStream {
+                    inner: inner.defer_abort_within(bound),
+                    prefill,
+                }))
+            }
+            Self::Ahead(ahead) => {
+                let AheadStream { inner, first } = *ahead;
+                Self::Ahead(Box::new(AheadStream {
+                    inner: inner.defer_abort_within(bound),
+                    first,
+                }))
+            }
+            Self::Watched(watched) => {
+                let WatchedStream {
+                    inner,
+                    client,
+                    client_gone,
+                    request_id,
+                } = *watched;
+                Self::Watched(Box::new(WatchedStream {
+                    inner: inner.map(|inner| inner.defer_abort_within(bound)),
+                    client,
+                    client_gone,
+                    request_id,
+                }))
+            }
         }
     }
 }
@@ -2356,6 +2086,18 @@ impl FanoutChild for ProtoStream {
     fn defer_abort_until_first_item(self) -> Self {
         Self::defer_abort_until_first_item(self)
     }
+
+    fn defer_abort_within(self, bound: Duration) -> Self {
+        Self::defer_abort_within(self, bound)
+    }
+
+    fn apply_deadline(&mut self, deadline: RequestDeadline) {
+        Self::apply_deadline(self, deadline);
+    }
+
+    fn worker(&self) -> Option<&Arc<dyn Worker>> {
+        ProtoStream::worker(self)
+    }
 }
 
 /// What a fan-out needs from a child stream. Implemented by [`ProtoStream`];
@@ -2372,6 +2114,22 @@ pub trait FanoutChild: Send {
     /// Defer the child's abort-on-drop until its first response.
     #[must_use]
     fn defer_abort_until_first_item(self) -> Self;
+
+    /// [`Self::defer_abort_until_first_item`] with the wait bounded by
+    /// `bound` where that is shorter than the house cap.
+    #[must_use]
+    fn defer_abort_within(self, bound: Duration) -> Self;
+
+    /// Bound the child by the request's `deadline`, in place (see
+    /// [`ProtoStream::apply_deadline`]); a child with no transport stream
+    /// under it is left as it is.
+    fn apply_deadline(&mut self, _deadline: RequestDeadline) {}
+
+    /// The one worker the child was dispatched to, when it is tracked; a
+    /// fan-out over several workers answers `None`.
+    fn worker(&self) -> Option<&Arc<dyn Worker>> {
+        None
+    }
 }
 
 /// One child per sample of an n>1 fan-out over rendezvous-room PD pairs.
@@ -2382,11 +2140,32 @@ pub trait FanoutChild: Send {
 /// stream. Children are polled together, starting from a rotating cursor so
 /// a chatty child cannot starve its siblings, and are retired as they end;
 /// the fan-out ends with the last child. Dropping it drops every child, so
-/// each leg keeps its abort-on-drop, and `mark_completed` reaches every
+/// each side keeps its abort-on-drop, and `mark_completed` reaches every
 /// child.
 pub struct FanoutStream<C = ProtoStream> {
     children: Vec<Option<C>>,
     cursor: usize,
+}
+
+#[cfg(test)]
+impl<C: FanoutChild> FanoutChild for FanoutStream<C> {
+    fn next_item(
+        &mut self,
+    ) -> impl Future<Output = Option<Result<ProtoGenerateResponse, tonic::Status>>> + Send {
+        self.next()
+    }
+
+    fn mark_completed(&mut self) {
+        Self::mark_completed(self);
+    }
+
+    fn defer_abort_until_first_item(self) -> Self {
+        Self::defer_abort_until_first_item(self)
+    }
+
+    fn defer_abort_within(self, bound: Duration) -> Self {
+        Self::defer_abort_within(self, bound)
+    }
 }
 
 type FanoutItem = Option<Result<ProtoGenerateResponse, tonic::Status>>;
@@ -2402,7 +2181,8 @@ impl<C: FanoutChild> FanoutStream<C> {
     }
 
     /// Children that have not ended yet.
-    pub fn open_children(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn open_children(&self) -> usize {
         self.children.iter().flatten().count()
     }
 
@@ -2466,107 +2246,25 @@ impl<C: FanoutChild> FanoutStream<C> {
             cursor: self.cursor,
         }
     }
-}
 
-/// Unified EmbedRequest that works with all backends
-#[derive(Clone)]
-pub enum ProtoEmbedRequest {
-    Sglang(Box<sglang::EmbedRequest>),
-    Vllm(Box<vllm::EmbedRequest>),
-}
-
-impl ProtoEmbedRequest {
-    /// Serialized wire size, for the release metric.
-    pub fn wire_len(&self) -> usize {
-        use prost::Message;
-        match self {
-            Self::Sglang(req) => req.encoded_len(),
-            Self::Vllm(req) => req.encoded_len(),
+    /// [`Self::defer_abort_until_first_item`] with every child's wait
+    /// bounded by `bound`.
+    #[must_use]
+    pub fn defer_abort_within(self, bound: Duration) -> Self {
+        Self {
+            children: self
+                .children
+                .into_iter()
+                .map(|child| child.map(|child| child.defer_abort_within(bound)))
+                .collect(),
+            cursor: self.cursor,
         }
     }
 
-    /// Get SGLang variant
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang(&self) -> &sglang::EmbedRequest {
-        match self {
-            Self::Sglang(req) => req,
-            Self::Vllm(_) => panic!("Expected SGLang embed request"),
-        }
-    }
-
-    /// Get mutable SGLang variant
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang_mut(&mut self) -> &mut sglang::EmbedRequest {
-        match self {
-            Self::Sglang(req) => req,
-            Self::Vllm(_) => panic!("Expected SGLang embed request"),
-        }
-    }
-
-    /// Check if this is SGLang
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
-    /// Check if this is vLLM
-    pub fn is_vllm(&self) -> bool {
-        matches!(self, Self::Vllm(_))
-    }
-
-    /// Clone the inner request (for passing to embed())
-    pub fn clone_inner(&self) -> Self {
-        self.clone()
-    }
-
-    /// Get request ID
-    pub fn request_id(&self) -> &str {
-        match self {
-            Self::Sglang(req) => &req.request_id,
-            Self::Vllm(req) => &req.request_id,
-        }
-    }
-
-    /// Set request ID.
-    pub fn set_request_id(&mut self, request_id: String) {
-        match self {
-            Self::Sglang(req) => req.request_id = request_id,
-            Self::Vllm(req) => req.request_id = request_id,
-        }
-    }
-}
-
-/// Unified embed completion — both backends now use flat EmbedResponse
-#[derive(Clone)]
-pub enum ProtoEmbedComplete {
-    Sglang(sglang::EmbedResponse),
-    Vllm(vllm::EmbedResponse),
-}
-
-impl ProtoEmbedComplete {
-    pub fn embedding(&self) -> &[f32] {
-        match self {
-            Self::Sglang(r) => &r.embedding,
-            Self::Vllm(r) => &r.embedding,
-        }
-    }
-
-    pub fn prompt_tokens(&self) -> u32 {
-        match self {
-            Self::Sglang(r) => r.prompt_tokens,
-            Self::Vllm(r) => r.prompt_tokens,
-        }
-    }
-
-    pub fn embedding_dim(&self) -> u32 {
-        match self {
-            Self::Sglang(r) => r.embedding_dim,
-            Self::Vllm(r) => r.embedding_dim,
+    /// Bound every open child by the request's `deadline`, in place.
+    pub fn apply_deadline(&mut self, deadline: RequestDeadline) {
+        for child in self.children.iter_mut().flatten() {
+            child.apply_deadline(deadline);
         }
     }
 }
@@ -2582,6 +2280,13 @@ mod fanout_tests {
     };
 
     use super::*;
+    use crate::{
+        routers::grpc::common::response_collection::drain_prefill,
+        worker::{
+            test_support::select_worker, BasicWorkerBuilder, PrefillAdmission, PrefillLoadGuard,
+            Worker, WorkerLoadGuard, WorkerType,
+        },
+    };
 
     /// A child that yields a script, then ends.
     struct Scripted {
@@ -2603,6 +2308,10 @@ mod fanout_tests {
         }
 
         fn defer_abort_until_first_item(self) -> Self {
+            self
+        }
+
+        fn defer_abort_within(self, _bound: Duration) -> Self {
             self
         }
     }
@@ -2685,12 +2394,52 @@ mod fanout_tests {
     async fn fanout_passes_a_child_error_through() {
         let (first, _) = child(vec![chunk("a")]);
         let second = Scripted {
-            items: VecDeque::from([Err(tonic::Status::internal("leg died"))]),
+            items: VecDeque::from([Err(tonic::Status::internal("side died"))]),
             completed: Arc::new(AtomicBool::new(false)),
         };
         let mut fanout = FanoutStream::new(vec![second, first]);
         let first_item = fanout.next().await.unwrap();
-        assert!(matches!(first_item, Err(status) if status.message() == "leg died"));
+        assert!(matches!(first_item, Err(status) if status.message() == "side died"));
+    }
+
+    #[tokio::test]
+    async fn prefill_fanout_retains_unfinished_sample_guards() {
+        for finish_at_complete in [false, true] {
+            for bounded in [false, true] {
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new("http://prefill-fanout")
+                        .worker_type(WorkerType::Prefill)
+                        .build(),
+                );
+                let admission = PrefillAdmission::new(1, 0, Duration::from_secs(1));
+                let guard = if bounded {
+                    let admitted = admission.admit(None, select_worker(&worker)).await.unwrap();
+                    PrefillLoadGuard::Admission {
+                        _reservation: Arc::new(admitted.reservation),
+                    }
+                } else {
+                    PrefillLoadGuard::Unbounded {
+                        _guard: WorkerLoadGuard::new(Arc::clone(&worker), None),
+                    }
+                };
+                let guards = guard.replicate_to(2).into_iter().map(Some).collect();
+                assert_eq!(worker.load(), if bounded { 1 } else { 2 });
+                // Each n=1 Prefill dispatch returns one terminal response.
+                // The second dispatch is unfinished when the first completes.
+                let (first, _) = child(vec![complete()]);
+                let (second, _) = child(vec![complete()]);
+                let mut stream = FanoutStream::new(vec![first, second]);
+                let mut indices = Vec::new();
+                drain_prefill(&mut stream, guards, finish_at_complete, |complete| {
+                    indices.push(complete.index());
+                    assert_eq!(worker.load(), if complete.index() == 0 { 1 } else { 0 });
+                })
+                .await
+                .unwrap();
+                assert_eq!(indices, vec![0, 1]);
+                assert_eq!(worker.load(), 0);
+            }
+        }
     }
 
     #[test]
@@ -2738,10 +2487,233 @@ mod fanout_tests {
 }
 
 #[cfg(test)]
+mod engine_error_tests {
+    use super::*;
+
+    /// One `Complete` per backend finishing with `reason`.
+    fn completes(reason: &str) -> Vec<ProtoGenerateResponse> {
+        let reason = reason.to_string();
+        vec![
+            ProtoGenerateResponse::Sglang(Box::new(sglang::GenerateResponse {
+                response: Some(sglang::generate_response::Response::Complete(
+                    sglang::GenerateComplete {
+                        finish_reason: reason.clone(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })),
+            ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
+                response: Some(vllm::generate_response::Response::Complete(
+                    vllm::GenerateComplete {
+                        finish_reason: reason.clone(),
+                        ..Default::default()
+                    },
+                )),
+            })),
+            ProtoGenerateResponse::Trtllm(Box::new(trtllm::GenerateResponse {
+                response: Some(trtllm::generate_response::Response::Complete(
+                    trtllm::GenerateComplete {
+                        finish_reason: reason.clone(),
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })),
+            ProtoGenerateResponse::Mlx(Box::new(mlx::GenerateResponse {
+                response: Some(mlx::generate_response::Response::Complete(
+                    mlx::GenerateComplete {
+                        finish_reason: reason.clone(),
+                        ..Default::default()
+                    },
+                )),
+            })),
+            ProtoGenerateResponse::TokenSpeed(Box::new(tokenspeed::GenerateResponse {
+                response: Some(tokenspeed::generate_response::Response::Complete(
+                    tokenspeed::GenerateComplete {
+                        finish_reason: reason,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            })),
+        ]
+    }
+
+    #[test]
+    fn engine_error_is_true_only_for_complete_with_error_finish_reason() {
+        assert!(completes("error")
+            .iter()
+            .all(ProtoGenerateResponse::engine_error));
+        for reason in ["stop", "length", "abort", ""] {
+            assert!(!completes(reason)
+                .iter()
+                .any(ProtoGenerateResponse::engine_error));
+        }
+        let chunk = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk::default(),
+            )),
+        }));
+        assert!(!chunk.engine_error());
+        let empty = ProtoGenerateResponse::Vllm(Box::default());
+        assert!(!empty.engine_error());
+    }
+
+    #[test]
+    fn reject_engine_error_turns_error_complete_into_internal_status() {
+        for response in completes("error") {
+            let Err(status) = reject_engine_error(Ok(response)) else {
+                panic!("engine error must not pass through as a completion");
+            };
+            assert_eq!(status.code(), tonic::Code::Internal);
+            assert_eq!(
+                status.message(),
+                "engine finished the request with an error (see engine logs)"
+            );
+        }
+        for response in completes("stop") {
+            assert!(reject_engine_error(Ok(response)).is_ok());
+        }
+        let passed = reject_engine_error(Err(tonic::Status::unavailable("side died")));
+        assert!(matches!(passed, Err(status) if status.code() == tonic::Code::Unavailable));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use prost::Message;
+    use smg_grpc_client::common_proto as common;
 
-    use super::*;
+    #[test]
+    /// Keep PD references intact and reject metadata the SGLang wire cannot express.
+    fn sglang_media_refs_preserve_video_and_refuse_lossy_conversion() {
+        let mut request = ProtoGenerateRequest::Sglang(Box::default());
+        let refs = vllm::MediaRefs {
+            items: vec![vllm::MediaRef {
+                modality: common::Modality::Video as i32,
+                url: "data:video/mp4;base64,AA==".into(),
+            }],
+        };
+        request.set_media_refs(refs.clone()).unwrap();
+        let decode = request.clone_without_mm_pixels();
+        let ProtoGenerateRequest::Sglang(decode) = decode else {
+            panic!("expected SGLang decode request")
+        };
+        assert_eq!(
+            decode.mm_inputs.as_ref().unwrap().video_urls,
+            ["data:video/mp4;base64,AA=="],
+            "PD decode needs references to expand the same prompt as Prefill"
+        );
+        let ProtoGenerateRequest::Sglang(inner) = &request else {
+            panic!("expected SGLang request")
+        };
+        let mm = inner.mm_inputs.as_ref().unwrap();
+        assert_eq!(mm.video_urls, ["data:video/mp4;base64,AA=="]);
+        assert!(mm.image_urls.is_empty());
+        assert!(mm.pixel_values.is_none());
+        let mut mixed = refs;
+        mixed.items.push(vllm::MediaRef {
+            modality: common::Modality::Image as i32,
+            url: "https://example.test/image.png".into(),
+        });
+        request.set_media_refs(mixed).unwrap();
+        let mm = request.as_sglang().mm_inputs.as_ref().unwrap();
+        assert_eq!(mm.image_urls, ["https://example.test/image.png"]);
+        assert_eq!(mm.video_urls, ["data:video/mp4;base64,AA=="]);
+    }
+
+    /// The raw-file request's wire bytes are the files, length-delimited in
+    /// order, whether the generated field holds them as shared or as owned
+    /// bytes: what the TRT-LLM servicer reads does not change with the type.
+    #[test]
+    fn trtllm_raw_images_encode_as_the_files_length_delimited_in_order() {
+        let files: [&[u8]; 2] = [b"abc", b"de"];
+        let data = TrtllmMultimodalData {
+            image_data: files
+                .iter()
+                .map(|file| bytes::Bytes::from_static(file))
+                .collect(),
+        };
+        let mut expected = Vec::new();
+        for file in files {
+            // field 1, wire type 2 (length-delimited): the tag, the length, the bytes
+            expected.push(0x0a);
+            expected.push(u8::try_from(file.len()).unwrap());
+            expected.extend_from_slice(file);
+        }
+        assert_eq!(data.into_proto().encode_to_vec(), expected);
+    }
+
+    #[test]
+    /// Account for all inline pixels and raw media across supported engine payloads.
+    fn inline_bytes_counts_every_inline_tensor_and_raw_image() {
+        let trtllm = MultimodalData::Trtllm(TrtllmMultimodalData {
+            image_data: vec![
+                bytes::Bytes::from(vec![0; 3]),
+                bytes::Bytes::from(vec![0; 5]),
+            ],
+        });
+        assert_eq!(trtllm.inline_bytes(), 8);
+
+        let sglang = MultimodalData::Sglang(SglangMultimodalData {
+            extra_batches: vec![SglangMultimodalData {
+                extra_batches: Vec::new(),
+                modality: "video".to_string(),
+                image_data: Vec::new(),
+                pixel_values: vec![0; 8].into(),
+                pixel_values_shape: vec![2],
+                pixel_values_dtype: "float32".to_string(),
+                model_specific_tensors: HashMap::from([(
+                    "video_grid_thw".to_string(),
+                    TensorBytes {
+                        data: vec![0; 24],
+                        shape: vec![1, 3],
+                        dtype: "int64".to_string(),
+                    },
+                )]),
+                im_token_id: Some(8),
+                mm_placeholders: vec![(4, 2)],
+            }],
+            modality: "image".to_string(),
+            image_data: vec![vec![0; 2]],
+            pixel_values: vec![0; 16].into(),
+            pixel_values_shape: vec![4, 4],
+            pixel_values_dtype: "float32".to_string(),
+            model_specific_tensors: HashMap::from([(
+                "grid".to_string(),
+                TensorBytes {
+                    data: vec![0; 24],
+                    shape: vec![1, 3],
+                    dtype: "int64".to_string(),
+                },
+            )]),
+            im_token_id: None,
+            mm_placeholders: vec![(0, 4)],
+        });
+        assert_eq!(sglang.inline_bytes(), 42 + 8 + 24);
+    }
+
+    #[test]
+    fn inline_bytes_counts_every_batch_of_a_mixed_request() {
+        let alone = MultimodalData::Vllm(vllm_mm_data(common::Modality::Image));
+        assert_eq!(alone.inline_bytes(), 16);
+
+        let mut video = vllm_mm_data(common::Modality::Video);
+        video.model_specific_tensors.insert(
+            "video_grid_thw".to_string(),
+            TensorBytes {
+                data: vec![0; 24],
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+            },
+        );
+        let mut image = vllm_mm_data(common::Modality::Image);
+        image.extra_batches = vec![video];
+        assert_eq!(MultimodalData::Vllm(image).inline_bytes(), 56);
+    }
+
+    use super::{multimodal::tensor_bytes_to_tokenspeed, *};
 
     #[test]
     fn tokenspeed_image_into_proto_uses_itemized_payload() {
@@ -2891,6 +2863,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn tokenspeed_shm_writer_exposes_complete_mapped_payload() {
+        use super::shm::tokenspeed_shm_path;
+
         let expected = [0x12, 0x34, 0x56, 0x78];
         let handle = write_tokenspeed_shm_with(expected.len(), |output| {
             output.copy_from_slice(&expected);
@@ -2943,7 +2917,7 @@ mod tests {
 
     fn inline_tensor_data(tensor: &tokenspeed::TensorData) -> &[u8] {
         match tensor.payload.as_ref() {
-            Some(tokenspeed::tensor_data::Payload::Inline(data)) => data,
+            Some(tokenspeed::tensor_data::Payload::Inline(data)) => data.as_ref(),
             _ => panic!("expected inline TensorData payload"),
         }
     }
@@ -2961,7 +2935,7 @@ mod tests {
         sglang_req.set_data_parallel_rank(3);
         assert!(matches!(
             &sglang_req,
-            ProtoGenerateRequest::Sglang(req) if req.data_parallel_rank == 3
+            ProtoGenerateRequest::Sglang(req) if req.data_parallel_rank == Some(3)
         ));
 
         let mut ts_req = ProtoGenerateRequest::TokenSpeed(Box::default());
@@ -2979,8 +2953,9 @@ mod tests {
     fn vllm_mm_data(modality: common::Modality) -> VllmMultimodalData {
         let is_video = modality == common::Modality::Video;
         VllmMultimodalData {
-            pixel_values: vec![0u8; 16],
+            pixel_values: vec![0u8; 16].into(),
             pixel_values_shape: vec![1, 4],
+            pixel_values_dtype: "float32".to_string(),
             model_specific_tensors: HashMap::new(),
             im_token_id: Some(if is_video { 151656 } else { 151655 }),
             mm_placeholders: vec![(3, 4)],
@@ -2988,10 +2963,12 @@ mod tests {
             batched_keys: vec![],
             flat_keys: HashMap::new(),
             keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
             modality,
             shm_enabled: false,
             shm_min_bytes: 0,
             rdma_enabled: false,
+            extra_batches: Vec::new(),
         }
     }
 
@@ -3043,11 +3020,9 @@ mod tests {
                 .chunk_semantics()
                 .is_delta()
         );
-        assert!(
-            ProtoGenerateComplete::Vllm(vllm::GenerateComplete::default())
-                .chunk_semantics()
-                .is_delta()
-        );
+        assert!(ProtoGenerateComplete::Vllm(Box::default())
+            .chunk_semantics()
+            .is_delta());
 
         // Every other shape reports running totals.
         for chunk in [
@@ -3065,6 +3040,421 @@ mod tests {
             ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete::default()),
         ] {
             assert_eq!(complete.chunk_semantics(), ChunkSemantics::Cumulative);
+        }
+    }
+
+    #[test]
+    fn tokenspeed_generate_messages_expose_the_engine_weight_version() {
+        let complete = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            weight_version: Some("v7".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(complete.weight_version(), Some("v7"));
+        let empty = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            weight_version: Some(String::new()),
+            ..Default::default()
+        });
+        assert_eq!(empty.weight_version(), None, "empty is the same as unset");
+        let placeholder = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+            weight_version: Some("default".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            placeholder.weight_version(),
+            None,
+            "the engine's own placeholder is not a version and must not shadow a label"
+        );
+        let unset = ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete::default());
+        assert_eq!(unset.weight_version(), None);
+
+        let chunk = ProtoGenerateStreamChunk::TokenSpeed(tokenspeed::GenerateStreamChunk {
+            weight_version: Some("v7".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(chunk.weight_version(), Some("v7"));
+        let sglang = ProtoGenerateComplete::Sglang(sglang::GenerateComplete::default());
+        assert_eq!(
+            sglang.weight_version(),
+            None,
+            "no other proto carries the field"
+        );
+    }
+}
+
+#[cfg(test)]
+mod watched_tests {
+    use std::{
+        future::Future,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    use smg_grpc_client::vllm_proto as vllm;
+    use tokio::sync::oneshot;
+
+    use super::{PrefillCachedTokens, ProtoGenerateComplete, ProtoStream};
+    use crate::{
+        routers::{
+            common::sse::{sse_channel, SseReceiver},
+            grpc::regular::streaming::tests::eof::{chunk, complete, gated_stream, staged_stream},
+        },
+        worker::{BasicWorkerBuilder, Worker},
+    };
+
+    /// A stream whose `first` frames come at once and whose `rest` wait for
+    /// the returned gate, read for the client at the receiving end of the
+    /// returned receiver.
+    async fn watched(
+        first: Vec<vllm::GenerateResponse>,
+        rest: Vec<vllm::GenerateResponse>,
+    ) -> (ProtoStream, oneshot::Sender<()>, SseReceiver) {
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let (stream, _server) = gated_stream(first, gate_rx, rest, "0").await;
+        let (client, rx) = sse_channel();
+        (
+            stream.until_client_gone(&client, "req-watched"),
+            gate_tx,
+            rx,
+        )
+    }
+
+    /// A client that leaves while the stream waits on the engine ends the
+    /// wait at once: the reader meets the end, not the engine's next frame,
+    /// and nothing after it.
+    #[tokio::test]
+    async fn a_client_that_leaves_while_the_stream_is_parked_ends_it_at_once() {
+        // A tracked layer under the watch: its worker and its load pile show
+        // the inner stream going with the client.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
+        let (_gate_tx, gate_rx) = oneshot::channel();
+        let (stream, _server) =
+            gated_stream(vec![chunk(0, "a")], gate_rx, vec![complete(0, "stop")], "0").await;
+        let (client, rx) = sse_channel();
+        let mut stream = stream
+            .tracked(Arc::clone(&worker), 0, true)
+            .until_client_gone(&client, "req-watched");
+        assert!(stream.worker().is_some(), "tracked under the watch");
+        assert_eq!(worker.tracked_load(), 1);
+        assert!(
+            matches!(stream.next().await, Some(Ok(_))),
+            "the first response is read"
+        );
+        assert!(!stream.client_left());
+        let (item, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(stream.next(), async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(rx);
+            })
+        })
+        .await
+        .expect("the gate never opens; the client's leaving ends the wait");
+        assert!(item.is_none(), "the client's leaving is the end");
+        assert!(stream.client_left(), "the end was the client's leaving");
+        assert!(
+            stream.next().await.is_none(),
+            "nothing after the client left"
+        );
+        assert!(
+            stream.worker().is_none(),
+            "the inner stream went with the client"
+        );
+        assert_eq!(worker.tracked_load(), 0, "its load released with it");
+    }
+
+    /// The client's leaving is seen through a decode-side wrapper too: dual
+    /// dispatch wraps the watched stream in one once the prefill side has
+    /// drained, and the reader asks the outer layer.
+    #[tokio::test]
+    async fn a_client_that_leaves_is_seen_through_the_decode_side_wrapper() {
+        let (stream, _gate, rx) = watched(vec![chunk(0, "a")], vec![complete(0, "stop")]).await;
+        let mut prefill = PrefillCachedTokens::default();
+        prefill.note(&ProtoGenerateComplete::Vllm(Box::new(
+            vllm::GenerateComplete {
+                prompt_tokens: 4,
+                cached_tokens: 2,
+                ..Default::default()
+            },
+        )));
+        let mut stream = stream.decode_side(prefill);
+        assert!(matches!(stream, ProtoStream::DecodeSide(_)), "wrapped");
+        assert!(
+            matches!(stream.next().await, Some(Ok(_))),
+            "the first response is read through the wrapper"
+        );
+        assert!(!stream.client_left());
+        let (item, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(stream.next(), async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(rx);
+            })
+        })
+        .await
+        .expect("the gate never opens; the client's leaving ends the wait");
+        assert!(item.is_none(), "the client's leaving is the end");
+        assert!(
+            stream.client_left(),
+            "the end was the client's leaving, seen through the wrapper"
+        );
+    }
+
+    /// The wait for the client's leaving is one for the stream's whole life,
+    /// polled only while the reader is parked on the engine: a response that
+    /// is ready costs no poll of it, before a park as after one, and a client
+    /// that leaves during a later park still ends the wait at once.
+    #[tokio::test]
+    async fn the_wait_for_the_client_is_polled_while_parked_only_and_kept_across_parks() {
+        let (first_gate, first_gate_rx) = oneshot::channel();
+        let (_second_gate, second_gate_rx) = oneshot::channel();
+        let (stream, _server) = staged_stream(
+            vec![
+                (None, vec![chunk(0, "a"), chunk(0, "b"), chunk(0, "c")]),
+                (Some(first_gate_rx), vec![chunk(0, "d"), chunk(0, "e")]),
+                (Some(second_gate_rx), vec![complete(0, "stop")]),
+            ],
+            "0",
+        )
+        .await;
+        let (client, rx) = sse_channel();
+        // The sender's `closed()`, as `until_client_gone` keeps it, with its
+        // polls counted.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let client_gone = {
+            let polls = Arc::clone(&polls);
+            let sender = client.clone();
+            let mut closed = Box::pin(async move { sender.closed().await });
+            Box::pin(std::future::poll_fn(move |cx| {
+                polls.fetch_add(1, Ordering::SeqCst);
+                closed.as_mut().poll(cx)
+            }))
+        };
+        let mut stream = stream.watched(&client, "req-watched", client_gone);
+        for _ in 0..3 {
+            assert!(matches!(stream.next().await, Some(Ok(_))));
+        }
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "a ready response costs no poll of the wait"
+        );
+        let (item, ()) = tokio::join!(stream.next(), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = first_gate.send(());
+        });
+        assert!(matches!(item, Some(Ok(_))), "the gap is waited out");
+        let parked = polls.load(Ordering::SeqCst);
+        assert!(parked >= 1, "the parked reader polled the wait");
+        assert!(
+            matches!(stream.next().await, Some(Ok(_))),
+            "the response behind the gate is ready"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            parked,
+            "a ready response costs no poll of the wait after a park either"
+        );
+        let (item, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(stream.next(), async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                drop(rx);
+            })
+        })
+        .await
+        .expect("the second gate never opens; the client's leaving ends the wait");
+        assert!(item.is_none(), "the client's leaving is the end");
+        assert!(stream.client_left(), "the end was the client's leaving");
+        assert!(
+            stream.next().await.is_none(),
+            "nothing after the client left"
+        );
+    }
+
+    /// A client that left before the stream was first polled reads nothing:
+    /// the response the engine has ready is not read for it.
+    #[tokio::test]
+    async fn a_client_that_left_before_the_first_poll_reads_nothing() {
+        let (mut stream, _gate, rx) = watched(vec![chunk(0, "a")], vec![]).await;
+        drop(rx);
+        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none());
+    }
+
+    /// A client that stays reads the stream as it is: every response, a gap
+    /// inside it waited out, and the end where the engine ends it.
+    #[tokio::test]
+    async fn a_client_that_stays_reads_the_stream_as_it_is() {
+        let (mut stream, gate, _rx) = watched(
+            vec![chunk(0, "a")],
+            vec![chunk(0, "b"), complete(0, "stop")],
+        )
+        .await;
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        let (second, ()) = tokio::join!(stream.next(), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = gate.send(());
+        });
+        assert!(
+            matches!(second, Some(Ok(_))),
+            "the gap inside the stream is waited out"
+        );
+        assert!(matches!(stream.next().await, Some(Ok(_))));
+        assert!(stream.next().await.is_none(), "the end is the end");
+    }
+}
+
+#[cfg(test)]
+mod output_logprob_tests {
+    use super::{trtllm, ProtoGenerateComplete, ProtoGenerateStreamChunk};
+
+    fn one_record() -> Vec<trtllm::TokenLogprob> {
+        vec![trtllm::TokenLogprob {
+            token_id: 7,
+            logprob: -0.5,
+            top_logprobs: Vec::new(),
+        }]
+    }
+
+    #[test]
+    fn a_trtllm_chunk_reads_an_empty_logprob_list_as_none() {
+        // The TRT-LLM wire says "no logprobs" with an empty list where the
+        // other wires leave the field absent; one record is one position.
+        let none = ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk::default());
+        assert!(none.output_logprobs().is_none());
+        let one = ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk {
+            logprobs: one_record(),
+            ..Default::default()
+        });
+        assert_eq!(one.output_logprobs().map(|lp| lp.len()), Some(1));
+    }
+
+    #[test]
+    fn a_trtllm_complete_reads_an_empty_logprob_list_as_none() {
+        let none = ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete::default());
+        assert!(none.output_logprobs().is_none());
+        let one = ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete {
+            logprobs: one_record(),
+            ..Default::default()
+        });
+        assert_eq!(one.output_logprobs().map(|lp| lp.len()), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod wire_field_tests {
+    use super::*;
+
+    /// Every wire's counters come from its own fields: the five-wire form on the
+    /// chunk and complete wrappers, and the complete wrapper's speculative pair,
+    /// zero on the wire that has none.
+    #[test]
+    fn counters_read_each_wires_own_fields() {
+        let chunks = [
+            ProtoGenerateStreamChunk::Sglang(sglang::GenerateStreamChunk {
+                prompt_tokens: 11,
+                completion_tokens: 12,
+                cached_tokens: 13,
+                ..Default::default()
+            }),
+            ProtoGenerateStreamChunk::Vllm(vllm::GenerateStreamChunk {
+                prompt_tokens: 21,
+                completion_tokens: 22,
+                cached_tokens: 23,
+                ..Default::default()
+            }),
+            ProtoGenerateStreamChunk::Trtllm(trtllm::GenerateStreamChunk {
+                prompt_tokens: 31,
+                completion_tokens: 32,
+                cached_tokens: 33,
+                ..Default::default()
+            }),
+            ProtoGenerateStreamChunk::Mlx(mlx::GenerateStreamChunk {
+                prompt_tokens: 41,
+                completion_tokens: 42,
+                cached_tokens: 43,
+                ..Default::default()
+            }),
+            ProtoGenerateStreamChunk::TokenSpeed(tokenspeed::GenerateStreamChunk {
+                prompt_tokens: 51,
+                completion_tokens: 52,
+                cached_tokens: 53,
+                ..Default::default()
+            }),
+        ];
+        for (n, chunk) in (1u32..).zip(chunks.iter()) {
+            let base = 10 * n;
+            assert_eq!(
+                (
+                    chunk.prompt_tokens(),
+                    chunk.completion_tokens(),
+                    chunk.cached_tokens()
+                ),
+                (base + 1, base + 2, base + 3)
+            );
+        }
+        let completes = [
+            ProtoGenerateComplete::Sglang(sglang::GenerateComplete {
+                prompt_tokens: 11,
+                completion_tokens: 12,
+                cached_tokens: 13,
+                spec_accepted_tokens: 14,
+                spec_draft_tokens: 15,
+                ..Default::default()
+            }),
+            ProtoGenerateComplete::Vllm(Box::new(vllm::GenerateComplete {
+                prompt_tokens: 21,
+                completion_tokens: 22,
+                cached_tokens: 23,
+                spec_accepted_tokens: 24,
+                spec_draft_tokens: 25,
+                ..Default::default()
+            })),
+            ProtoGenerateComplete::Trtllm(trtllm::GenerateComplete {
+                prompt_tokens: 31,
+                completion_tokens: 32,
+                cached_tokens: 33,
+                spec_accepted_tokens: 34,
+                spec_draft_tokens: 35,
+                ..Default::default()
+            }),
+            ProtoGenerateComplete::Mlx(mlx::GenerateComplete {
+                prompt_tokens: 41,
+                completion_tokens: 42,
+                cached_tokens: 43,
+                ..Default::default()
+            }),
+            ProtoGenerateComplete::TokenSpeed(tokenspeed::GenerateComplete {
+                prompt_tokens: 51,
+                completion_tokens: 52,
+                cached_tokens: 53,
+                spec_accepted_tokens: 54,
+                spec_draft_tokens: 55,
+                ..Default::default()
+            }),
+        ];
+        for (n, complete) in (1u32..).zip(completes.iter()) {
+            let base = 10 * n;
+            assert_eq!(
+                (
+                    complete.prompt_tokens(),
+                    complete.completion_tokens(),
+                    complete.cached_tokens()
+                ),
+                (base + 1, base + 2, base + 3)
+            );
+            let speculative = if matches!(complete, ProtoGenerateComplete::Mlx(_)) {
+                (0, 0)
+            } else {
+                (base + 4, base + 5)
+            };
+            assert_eq!(
+                (
+                    complete.spec_accepted_tokens(),
+                    complete.spec_draft_tokens()
+                ),
+                speculative
+            );
         }
     }
 }

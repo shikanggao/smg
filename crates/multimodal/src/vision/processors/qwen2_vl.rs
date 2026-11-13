@@ -22,10 +22,14 @@ use std::ops::Deref;
 use image::DynamicImage;
 
 use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
-use crate::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processor::{PreprocessedEncoderInputs, VisionPreProcessor},
-    transforms::TransformError,
+use crate::{
+    encoder_inputs::EncoderDtype,
+    types::{Modality, RgbFrameRef},
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
+        transforms::TransformError,
+    },
 };
 
 /// CLIP normalization mean values used by Qwen2-VL models.
@@ -48,6 +52,14 @@ pub const DEFAULT_MERGE_SIZE: usize = 2;
 
 /// Default temporal patch size (for video frames)
 pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+
+/// The video processor's own minimum pixels per frame, for a config that
+/// names none (128 * 28 * 28 = 100,352).
+pub const DEFAULT_VIDEO_MIN_PIXELS: usize = 128 * 28 * 28;
+
+/// The video processor's own maximum pixels per frame, for a config that
+/// names none (768 * 28 * 28 = 602,112).
+pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 28 * 28;
 
 /// Qwen2-VL image processor.
 ///
@@ -120,34 +132,79 @@ impl Qwen2VLProcessor {
         }
     }
 
-    /// Create a processor from preprocessor config.
+    /// Create a processor from preprocessor config, resolving its geometry
+    /// and transforms once.
     pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
         Self {
-            inner: QwenVLProcessorBase::new(QwenVLConfig {
-                patch_size: config.get_patch_size(DEFAULT_PATCH_SIZE),
-                merge_size: config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
-                min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
-                max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
-                video_min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
-                video_max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
-                video_resize_mode: QwenVideoResizeMode::TotalVolume,
-                temporal_patch_size: config
-                    .temporal_patch_size
-                    .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
-                mean: CLIP_MEAN,
-                std: CLIP_STD,
-                model_name: "qwen2-vl",
-            }),
+            inner: QwenVLProcessorBase::from_configs(
+                QwenVLConfig {
+                    patch_size: config.get_patch_size(DEFAULT_PATCH_SIZE),
+                    merge_size: config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
+                    min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
+                    max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
+                    video_min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
+                    video_max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
+                    video_resize_mode: QwenVideoResizeMode::TotalVolume,
+                    temporal_patch_size: config
+                        .temporal_patch_size
+                        .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
+                    mean: CLIP_MEAN,
+                    std: CLIP_STD,
+                    model_name: "qwen2-vl",
+                },
+                config,
+            ),
         }
     }
 
-    /// Build the effective processor for a request, applying any structural
-    /// overrides from `config`; otherwise reuse the existing defaults.
-    fn with_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if config.has_structural_overrides() {
-            Self::from_preprocessor_config(config)
+    /// The processor for `modality` from the config the checkpoint ships for
+    /// it: for a clip the video processor's own pixel bounds, read as that
+    /// processor reads them (the `min_pixels` / `max_pixels` of a config
+    /// shared with the image processor, which is what a checkpoint shipping
+    /// one `preprocessor_config.json` gives both, else its `size` edges, else
+    /// that processor's own defaults); for an image the image processor's.
+    pub fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
+        if modality == Modality::Video {
+            Self::from_video_preprocessor_config(config)
         } else {
-            self.clone()
+            Self::from_preprocessor_config(config)
+        }
+    }
+
+    /// [`Self::from_preprocessor_config`] with the video bounds the video
+    /// processor reads: the config's `min_pixels` / `max_pixels`, else its
+    /// `size` edges, else that processor's own defaults; every frame is sized
+    /// within them on its own, as that processor sizes it.
+    fn from_video_preprocessor_config(config: &PreProcessorConfig) -> Self {
+        let video_min_pixels = config
+            .min_pixels
+            .or_else(|| config.get_shortest_edge())
+            .unwrap_or(DEFAULT_VIDEO_MIN_PIXELS);
+        let video_max_pixels = config
+            .max_pixels
+            .or_else(|| config.get_longest_edge())
+            .unwrap_or(DEFAULT_VIDEO_MAX_PIXELS);
+        Self {
+            inner: QwenVLProcessorBase::from_configs(
+                QwenVLConfig {
+                    patch_size: config.get_patch_size(DEFAULT_PATCH_SIZE),
+                    merge_size: config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
+                    min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
+                    max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
+                    video_min_pixels,
+                    video_max_pixels,
+                    // Each frame is sized within the video bounds on its own, as the
+                    // family's own video processor sizes it; the clip's total is not capped.
+                    video_resize_mode: QwenVideoResizeMode::PerFrame,
+                    temporal_patch_size: config
+                        .temporal_patch_size
+                        .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
+                    mean: CLIP_MEAN,
+                    std: CLIP_STD,
+                    model_name: "qwen2-vl",
+                },
+                config,
+            ),
         }
     }
 
@@ -217,6 +274,25 @@ impl Deref for Qwen2VLProcessor {
 }
 
 impl VisionPreProcessor for Qwen2VLProcessor {
+    fn supports_per_image_preprocessing(&self) -> bool {
+        // The shared Qwen image pipeline plans and writes each image independently.
+        true
+    }
+
+    /// Each image contributes independent BF16 patch rows and grid metadata.
+    fn supports_bf16_batch_cache(&self) -> bool {
+        true
+    }
+
+    /// Use the same geometry as the shared Qwen image encoder for admission.
+    fn image_input_elements(&self, width: u32, height: u32) -> Option<usize> {
+        self.inner.image_input_elements(width, height)
+    }
+
+    fn emits_pixel_bytes(&self) -> bool {
+        true
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         self.inner.default_mean()
     }
@@ -227,37 +303,57 @@ impl VisionPreProcessor for Qwen2VLProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
-        config: &PreProcessorConfig,
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        let processor = self.with_preprocessor_config(config);
-        processor.inner.preprocess(images, config)
+        self.inner.preprocess(images)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        let processor = self.with_preprocessor_config(config);
-        processor.inner.calculate_num_tokens(width, height, config)
+    fn preprocess_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        self.inner.preprocess_wire(images, dtype)
+    }
+
+    fn preprocess_video(
+        &self,
+        frames: &[DynamicImage],
+        clip: &VideoClipOptions,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.inner.preprocess_video(frames, clip)
+    }
+
+    fn preprocess_video_rgb(
+        &self,
+        frames: &[RgbFrameRef<'_>],
+        clip: &VideoClipOptions,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.inner.preprocess_video_rgb(frames, clip)
+    }
+
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
+        self.inner.calculate_num_tokens(width, height)
     }
 
     fn model_name(&self) -> &'static str {
         self.inner.model_name()
     }
 
-    fn get_processed_size(&self, config: &PreProcessorConfig) -> Option<(u32, u32)> {
-        self.inner.get_processed_size(config)
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
+        self.inner.get_processed_size()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use image::{Rgb, RgbImage};
+    use image::Rgb;
 
     use super::*;
-    use crate::vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue};
-
-    fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
-        DynamicImage::from(RgbImage::from_pixel(width, height, color))
-    }
+    use crate::{
+        test_support::{assert_two_image_batch, create_test_image},
+        vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue},
+    };
 
     #[test]
     fn test_qwen2_vl_processor_default() {
@@ -267,6 +363,45 @@ mod tests {
         assert_eq!(processor.min_pixels(), DEFAULT_MIN_PIXELS);
         assert_eq!(processor.max_pixels(), DEFAULT_MAX_PIXELS);
         assert_eq!(processor.get_factor(), 28); // 14 * 2
+    }
+
+    /// A clip goes through the shared video pipeline: four 56 px frames at
+    /// patch 14 and merge 2 are two temporal groups of a 4 x 4 grid, eight
+    /// tokens, with the clip's grid, patch count and timing beside the
+    /// patches. The video bounds come from the config the way the video
+    /// processor reads them: its `min_pixels` / `max_pixels`, else that
+    /// processor's own defaults.
+    #[test]
+    fn video_frames_preprocess_through_the_shared_pipeline() {
+        let processor = Qwen2VLProcessor::with_config(14, 2, 56 * 56, 56 * 56 * 4, 2);
+        let frames: Vec<DynamicImage> = (0..4).map(|_| DynamicImage::new_rgb8(56, 56)).collect();
+        let clip = VideoClipOptions {
+            sample_fps: 2.0,
+            max_long_side_pixel: None,
+        };
+        let inputs = processor.preprocess_video(&frames, &clip).expect("a clip");
+        assert_eq!(inputs.feature_token_counts, vec![8]);
+        for key in [
+            "video_grid_thw",
+            "patches_per_video",
+            "video_second_per_grid",
+        ] {
+            assert!(inputs.model_specific.contains_key(key), "{key}");
+        }
+        let config = PreProcessorConfig {
+            min_pixels: Some(3136),
+            max_pixels: Some(12_845_056),
+            ..PreProcessorConfig::default()
+        };
+        let from_config = Qwen2VLProcessor::from_config_for(&config, Modality::Video);
+        assert_eq!(from_config.video_min_pixels(), 3136);
+        assert_eq!(from_config.video_max_pixels(), 12_845_056);
+        let bare =
+            Qwen2VLProcessor::from_config_for(&PreProcessorConfig::default(), Modality::Video);
+        assert_eq!(bare.video_min_pixels(), DEFAULT_VIDEO_MIN_PIXELS);
+        assert_eq!(bare.video_max_pixels(), DEFAULT_VIDEO_MAX_PIXELS);
+        let image = Qwen2VLProcessor::from_config_for(&config, Modality::Image);
+        assert_eq!(image.min_pixels(), 3136);
     }
 
     #[test]
@@ -368,7 +503,6 @@ mod tests {
 
     #[test]
     fn test_qwen2_vl_preprocess() {
-        let processor = Qwen2VLProcessor::new();
         let config = PreProcessorConfig {
             do_resize: Some(true),
             do_normalize: Some(true),
@@ -383,9 +517,10 @@ mod tests {
             max_pixels: Some(DEFAULT_MAX_PIXELS),
             ..Default::default()
         };
+        let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
 
         let image = create_test_image(600, 400, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let result = processor.preprocess(&[&image]).unwrap();
 
         // encoder_input is patchified: [total_patches, patch_features]
         assert_eq!(result.encoder_input.ndim(), 2);
@@ -405,46 +540,52 @@ mod tests {
         assert!(result.feature_token_counts[0] > 0);
     }
 
+    /// `do_rescale=false, do_normalize=false` is the raw-pixel contract of an
+    /// engine that rescales and normalizes on device: the patches carry the
+    /// image's own 0..255 values, exactly.
+    #[test]
+    fn test_qwen2_vl_preprocess_raw_pixels() {
+        let config = PreProcessorConfig {
+            do_resize: Some(true),
+            do_rescale: Some(false),
+            do_normalize: Some(false),
+            patch_size: Some(PatchSize {
+                height: Some(14),
+                width: Some(14),
+            }),
+            merge_size: Some(2),
+            min_pixels: Some(DEFAULT_MIN_PIXELS),
+            max_pixels: Some(DEFAULT_MAX_PIXELS),
+            ..Default::default()
+        };
+        let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
+        let image = create_test_image(600, 400, Rgb([17, 128, 255]));
+        let result = processor.preprocess(&[&image]).unwrap();
+        let flat = result.encoder_input_flat();
+        assert!(!flat.is_empty());
+        assert!(flat
+            .iter()
+            .all(|&v| v == v.round() && (0.0..=255.0).contains(&v)));
+        // Every channel value of a solid image survives untouched.
+        let mut seen: Vec<i32> = flat.iter().map(|&v| v as i32).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen, vec![17, 128, 255]);
+    }
+
     #[test]
     fn test_qwen2_vl_preprocess_multiple() {
         let processor = Qwen2VLProcessor::new();
-        let config = PreProcessorConfig::default();
-
-        let images = vec![
+        let images = [
             create_test_image(600, 400, Rgb([100, 100, 100])),
             create_test_image(400, 600, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images, &config).unwrap();
+        let result = processor
+            .preprocess(&images.iter().collect::<Vec<_>>())
+            .unwrap();
 
-        // Both images processed
-        assert_eq!(result.item_sizes.len(), 2);
-        assert_eq!(result.feature_token_counts.len(), 2);
-
-        // encoder_input is 2D [total_patches, patch_features]
-        assert_eq!(result.encoder_input.ndim(), 2);
-
-        // Check grid_thw shape
-        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
-            result.model_specific.get("image_grid_thw")
-        {
-            assert_eq!(shape, &[2, 3]); // 2 images, 3 values (T, H, W) each
-            assert_eq!(data.len(), 6);
-        } else {
-            panic!("Expected image_grid_thw to be IntTensor");
-        }
-
-        // Check patches_per_image
-        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
-            result.model_specific.get("patches_per_image")
-        {
-            assert_eq!(shape, &[2]); // 2 images
-            assert_eq!(data.len(), 2);
-            let total: i64 = data.iter().sum();
-            assert_eq!(total as usize, result.encoder_input.shape()[0]);
-        } else {
-            panic!("Expected patches_per_image to be IntTensor");
-        }
+        assert_two_image_batch(&result);
     }
 
     #[test]
@@ -471,20 +612,34 @@ mod tests {
     }
 
     #[test]
+    fn token_count_refuses_the_aspect_ratio_the_resize_refuses() {
+        // An aspect ratio past the reference's limit fails the resize and
+        // therefore the preprocessing; the count fails the same way instead
+        // of counting the image at the minimum size.
+        let processor = Qwen2VLProcessor::new();
+        let error = processor
+            .calculate_num_tokens(4000, 10)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("aspect ratio"), "{error}");
+    }
+
+    #[test]
     fn test_calculate_num_tokens_honors_config_max_pixels() {
         let processor = Qwen2VLProcessor::new();
 
         // A 1400x1400 image clamps to max_pixels before the grid is computed,
         // so a lower config max_pixels must yield fewer tokens.
-        let default_tokens =
-            processor.calculate_num_tokens(1400, 1400, &PreProcessorConfig::default());
+        let default_tokens = processor.calculate_num_tokens(1400, 1400).unwrap();
         assert_eq!(default_tokens, 1225); // resized to 980x980 -> (70*70)/4
 
         let config = PreProcessorConfig {
             max_pixels: Some(512 * 28 * 28), // 401,408, below the 1,003,520 default
             ..Default::default()
         };
-        let config_tokens = processor.calculate_num_tokens(1400, 1400, &config);
+        let config_tokens = Qwen2VLProcessor::from_preprocessor_config(&config)
+            .calculate_num_tokens(1400, 1400)
+            .unwrap();
         assert_eq!(config_tokens, 484); // resized to 616x616 -> (44*44)/4
         assert_ne!(
             config_tokens, default_tokens,
@@ -494,14 +649,14 @@ mod tests {
 
     #[test]
     fn test_preprocess_honors_config_max_pixels() {
-        let processor = Qwen2VLProcessor::new();
         let image = create_test_image(1400, 1400, Rgb([128, 128, 128]));
 
         let config = PreProcessorConfig {
             max_pixels: Some(512 * 28 * 28),
             ..Default::default()
         };
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
+        let result = processor.preprocess(&[&image]).unwrap();
 
         // 616x616 -> grid (1, 44, 44) -> (44*44)/4 = 484 tokens, vs 1225 at the default.
         assert_eq!(result.feature_token_counts[0], 484);

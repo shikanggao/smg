@@ -1,30 +1,41 @@
 //! Per-engine wire protocol modules plus the engine-neutral seam the transport
 //! and connector are generic over.
 //!
-//! vLLM's EngineCore protocol and TokenSpeed's native msgpack protocol
-//! (issues #2003/#2006) live alongside each other. Both are msgpack-over-ZMQ
-//! with a single-byte request-type frame and share the same transport — only
-//! the message struct shapes differ, so the transport and connector are
+//! vLLM's EngineCore protocol, TokenSpeed's native msgpack protocol (issues
+//! #2003/#2006), SGLang's scheduler structs (spoken by the SMG plugin inside
+//! the scheduler) and the TensorRT-LLM shim's request (answered with that
+//! plugin's slim records) live alongside each other. All are msgpack-over-ZMQ with a
+//! single-byte request-type frame and share the same transport — only the
+//! message struct shapes differ, so the transport and connector are
 //! parameterized over the [`EngineProtocol`] trait and each engine family
 //! provides one implementation.
 
 use bytes::Bytes;
 
-use crate::Result;
+use self::{handshake::EngineCoreReadyResponse, kv_transfer::KvTransferStats};
+use crate::{
+    codec::{FrameStr, OpaqueValue},
+    Result,
+};
 
+pub mod control;
 pub mod handshake;
+pub mod kv_transfer;
+pub(crate) mod positional;
+pub mod sglang;
 pub mod tokenspeed;
+pub mod trtllm;
 pub mod vllm;
 
 /// Engine-neutral per-rank load signal. Each protocol maps its native scheduler
-/// stats into this shape (vLLM maps `SchedulerStats`; TokenSpeed carries none
-/// yet), so the connector and gateway consume one load type regardless of
-/// engine. Extend it as more engines report load (task #11).
+/// stats into this shape (vLLM its `SchedulerStats`, TokenSpeed and SGLang the
+/// load tail of their slim batches), so the connector and gateway consume one
+/// load type regardless of engine.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct EngineLoad {
     /// Requests currently in model-execution batches.
     pub num_running: u64,
-    /// Requests waiting in the scheduler queue.
+    /// Total waiting requests, including deferred requests.
     pub num_waiting: u64,
     /// KV-cache usage ratio (`1.0` == 100%).
     pub kv_cache_usage: f64,
@@ -46,6 +57,16 @@ pub enum WaveEvent {
     Start(u64),
 }
 
+/// An engine's answer to a utility RPC (vLLM `call_utility`), matched to the
+/// waiting caller by `call_id`. Protocols without utility RPCs never produce
+/// one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UtilityReply {
+    pub call_id: i64,
+    /// The returned value, or the engine's failure message.
+    pub outcome: std::result::Result<OpaqueValue, String>,
+}
+
 /// A single per-request output decoded from one engine tick. Lets the
 /// engine-neutral connector route outputs to their request streams without
 /// knowing the concrete protocol payload.
@@ -54,6 +75,27 @@ pub trait EngineOutput {
     fn request_id(&self) -> &str;
     /// Whether this output is terminal for the request.
     fn finished(&self) -> bool;
+    /// Replace the id with the request's own copy, shared by every output
+    /// of the request: an output waiting in its stream then keeps no view of
+    /// the step frame it was decoded from.
+    fn own_request_id(&mut self, id: FrameStr);
+    /// The id as this output holds it, shared by a reference count: the
+    /// step's finished set keeps it without a copy.
+    fn request_id_shared(&self) -> FrameStr;
+}
+
+/// The ids of a step's finished outputs, each shared with its output, in a
+/// vector sized once: a step without a finish allocates nothing for it.
+pub(crate) fn finished_request_ids<O: EngineOutput>(outputs: &[O]) -> Vec<FrameStr> {
+    let finished = outputs.iter().filter(|output| output.finished()).count();
+    let mut ids = Vec::with_capacity(finished);
+    ids.extend(
+        outputs
+            .iter()
+            .filter(|output| output.finished())
+            .map(EngineOutput::request_id_shared),
+    );
+    ids
 }
 
 /// One decoded engine tick: the per-request outputs plus the piggybacked load
@@ -67,13 +109,21 @@ pub struct EngineBatch<O> {
     /// Request ids finished in this tick, including ones the connector could
     /// derive from a terminal output: a protocol without an out-of-band finish
     /// channel may list them here too. The connector unions both sources, so
-    /// the overlap is harmless.
-    pub finished_request_ids: Vec<String>,
+    /// the overlap is harmless. An id a terminal output also carries is shared
+    /// with it; an out-of-band id (a wire's own finished set) is the decoded
+    /// string, moved in without a further copy.
+    pub finished_request_ids: Vec<FrameStr>,
     /// Per-rank load signal, when the protocol carries it (`None` otherwise).
     pub load: Option<EngineLoad>,
+    /// The KV-transfer samples the rank's connector reported with this tick,
+    /// when the protocol carries them and the connector recorded any (`None`
+    /// on every other tick, which is most of them: hence boxed).
+    pub kv_transfer: Option<Box<KvTransferStats>>,
     /// Wave-control notification from a lockstep engine group (`None` on every
     /// ordinary tick).
     pub wave: Option<WaveEvent>,
+    /// A utility RPC reply (`None` on every ordinary tick).
+    pub utility: Option<UtilityReply>,
 }
 
 impl<O> Default for EngineBatch<O> {
@@ -83,7 +133,9 @@ impl<O> Default for EngineBatch<O> {
             outputs: Vec::new(),
             finished_request_ids: Vec::new(),
             load: None,
+            kv_transfer: None,
             wave: None,
+            utility: None,
         }
     }
 }
@@ -99,6 +151,14 @@ pub trait EngineProtocol: Send + Sync + 'static {
     type Request: Send + 'static;
     /// The typed per-request output streamed back.
     type Output: EngineOutput + Send + 'static;
+    /// What this protocol reads off an engine's handshake and needs when it
+    /// frames that engine's requests or decodes its outputs: where the engine
+    /// declared the optional output columns this client knows, whether its
+    /// request decoder resolves tensors sent as auxiliary frames (`()` for a
+    /// protocol that needs neither). Read once per connection
+    /// ([`EngineProtocol::read_layout`]) and handed to every
+    /// [`EngineProtocol::encode_add`] and [`EngineProtocol::decode_batch`].
+    type Layout: Clone + Default + PartialEq + std::fmt::Debug + Send + Sync + 'static;
 
     /// The single-byte request-type frame prepended to an add-request.
     fn add_frame() -> Bytes;
@@ -107,12 +167,24 @@ pub trait EngineProtocol: Send + Sync + 'static {
 
     /// The request's id (the registry routing key).
     fn request_id(request: &Self::Request) -> &str;
+    /// The prompt tokens of an add-request: what the engine has to prefill
+    /// before the request's first output.
+    fn prompt_tokens(request: &Self::Request) -> u64;
+    /// Whether the engine reports this request on every scheduler step that
+    /// decodes it, so an engine silent with such a request in flight is a
+    /// scheduler that is not stepping: the connector counts the silence it
+    /// reports over these requests only. A request the engine reports at
+    /// intervals (one that does not stream, whose output comes at its end or
+    /// every forced interval; one streamed every so many tokens) is quiet
+    /// while healthy, and is left out of that count.
+    fn reported_every_step(request: &Self::Request) -> bool;
     /// SMG-pinned DP rank, if any (else the sole engine is used).
     fn data_parallel_rank(request: &Self::Request) -> Option<u32>;
     /// Reject fields this client cannot represent on the wire.
     fn validate(request: &Self::Request) -> Result<()>;
-    /// Encode the add payload plus any aux tensor frames (empty on the text path).
-    fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)>;
+    /// Encode the add payload plus any aux tensor frames (empty on the text
+    /// path) for an engine of `layout`.
+    fn encode_add(request: &Self::Request, layout: &Self::Layout) -> Result<(Vec<u8>, Vec<Bytes>)>;
     /// Encode the abort payload for one request id.
     fn encode_abort(request_id: &str) -> Result<Vec<u8>>;
     /// Encode "start `wave` on every rank" as `(request-type frame, payload)`.
@@ -121,6 +193,38 @@ pub trait EngineProtocol: Send + Sync + 'static {
     /// the protocol has no wave protocol — its ranks run independently, so
     /// there is nothing to wake.
     fn encode_start_wave(wave: u64) -> Result<Option<(Bytes, Vec<u8>)>>;
-    /// Decode one output message (frame 0 plus ordered aux frames) into a batch.
-    fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>>;
+    /// Encode a utility (control) call, `method(*args)` on one rank answered by
+    /// a [`UtilityReply`] under `call_id`, as `(request-type frame, payload)`.
+    /// `Ok(None)` when the protocol has no control messages.
+    fn encode_utility(
+        _call_id: i64,
+        _method: &str,
+        _args: &[OpaqueValue],
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        Ok(None)
+    }
+    /// Check the positional layouts the engine declared at its handshake
+    /// ([`EngineCoreReadyResponse::positional_layouts`], the field order of
+    /// each array-encoded struct it decodes) against the prefixes this
+    /// protocol's encoders fill, once per engine before its first request: a
+    /// struct whose field order moved under this client is named here, with
+    /// the field that differs, instead of failing every request it is sent
+    /// in. `Ok(())` for an engine that declares no layouts, and for a
+    /// protocol with no positional request structs to check.
+    fn check_layouts(_ready: &EngineCoreReadyResponse) -> Result<()> {
+        Ok(())
+    }
+    /// The connection's [`EngineProtocol::Layout`], read off the engine's
+    /// ready response: the positions the engine declares for the optional
+    /// output columns this protocol knows, unset (the default) for a column
+    /// it does not declare, and what it declares its request decoder
+    /// resolves. Never an error: an engine that declares nothing is an older
+    /// engine, whose requests are framed and whose outputs decode as they
+    /// always were.
+    fn read_layout(_ready: &EngineCoreReadyResponse) -> Self::Layout {
+        Self::Layout::default()
+    }
+    /// Decode one output message (frame 0 plus ordered aux frames) into a
+    /// batch, reading the optional output columns where `layout` puts them.
+    fn decode_batch(frames: &[Bytes], layout: &Self::Layout) -> Result<EngineBatch<Self::Output>>;
 }

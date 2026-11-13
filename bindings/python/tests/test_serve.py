@@ -411,6 +411,16 @@ class TestParseServeArgs:
 # ---------------------------------------------------------------------------
 
 
+def _vllm_args_without_vllm(backend: str, parser: argparse.ArgumentParser) -> None:
+    """The second parse pass adds the backend's own arguments; for vllm that
+    imports vLLM, absent here, so the two it needs are added by hand."""
+    if backend == "vllm":
+        parser.add_argument("--tensor-parallel-size", type=int, default=1)
+        parser.add_argument("--model", type=str)
+    else:
+        _import_backend_args(backend, parser)
+
+
 class TestWorkerLauncherGpuEnv:
     """Test GPU assignment via _get_tp_size() and gpu_env().
 
@@ -468,6 +478,76 @@ class TestWorkerLauncherGpuEnv:
         launcher = VllmWorkerLauncher()
         env = launcher.gpu_env(args, dp_rank=0, env={})
         assert env["CUDA_VISIBLE_DEVICES"] == expected_devices
+
+    def test_the_default_servicer_parses_without_the_servicer_package(self, monkeypatch):
+        """`smg serve --backend vllm` with nothing chosen runs the servicer
+        package's default (the Rust servicer): a host without the package
+        parses (the worker's own entrypoint needs the package for either
+        servicer and says so itself); an explicit `--servicer-impl rust` is
+        refused here."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def no_servicer_package(name, *args, **kwargs):
+            if name.startswith("smg_grpc_servicer"):
+                raise ImportError(name)
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", no_servicer_package)
+        with patch("smg.serve._import_backend_args", side_effect=_vllm_args_without_vllm):
+            _, args, _ = parse_serve_args(["--backend", "vllm", "--model", "/tmp/m"])
+            assert args.servicer_impl is None
+            _, args, _ = parse_serve_args(
+                ["--backend", "vllm", "--model", "/tmp/m", "--servicer-impl", "python"]
+            )
+            assert args.servicer_impl == "python"
+            with pytest.raises(SystemExit):
+                parse_serve_args(
+                    ["--backend", "vllm", "--model", "/tmp/m", "--servicer-impl", "rust"]
+                )
+
+    def test_the_hook_is_checked_for_the_default_and_the_explicit_rust_choice(self, monkeypatch):
+        """The vLLM hook check runs whenever the Rust servicer is the effective
+        choice: softly on the default (a missing package is the worker's to
+        report), hard on an explicit rust; never for an explicit python."""
+        checks: list[bool] = []
+        monkeypatch.setattr(
+            "smg.serve._require_rust_servicer_hook", lambda explicit=True: checks.append(explicit)
+        )
+        with patch("smg.serve._import_backend_args", side_effect=_vllm_args_without_vllm):
+            parse_serve_args(["--backend", "vllm", "--model", "/tmp/m"])
+            parse_serve_args(["--backend", "vllm", "--model", "/tmp/m", "--servicer-impl", "rust"])
+            parse_serve_args(
+                ["--backend", "vllm", "--model", "/tmp/m", "--servicer-impl", "python"]
+            )
+        assert checks == [False, True]
+
+    def test_the_hook_check_follows_an_inherited_servicer_variable_like_the_worker(
+        self, monkeypatch
+    ):
+        """With the flag unset the worker honours an exported
+        `SMG_VLLM_SERVICER_IMPL`, so the parse-time check reads the same
+        choice: an inherited python skips the hook check, an inherited rust
+        runs it as an explicit choice, and the flag still wins over the
+        variable."""
+        checks: list[bool] = []
+        monkeypatch.setattr(
+            "smg.serve._require_rust_servicer_hook", lambda explicit=True: checks.append(explicit)
+        )
+        with patch("smg.serve._import_backend_args", side_effect=_vllm_args_without_vllm):
+            monkeypatch.setenv("SMG_VLLM_SERVICER_IMPL", "python")
+            parse_serve_args(["--backend", "vllm", "--model", "/tmp/m"])
+            assert checks == []
+            parse_serve_args(["--backend", "vllm", "--model", "/tmp/m", "--servicer-impl", "rust"])
+            assert checks == [True]
+            monkeypatch.setenv("SMG_VLLM_SERVICER_IMPL", " RUST ")
+            parse_serve_args(["--backend", "vllm", "--model", "/tmp/m"])
+            assert checks == [True, True]
+            parse_serve_args(
+                ["--backend", "vllm", "--model", "/tmp/m", "--servicer-impl", "python"]
+            )
+            assert checks == [True, True]
 
     def test_trtllm_tp_from_cli(self):
         """CLI --tp_size flows through to CUDA_VISIBLE_DEVICES for trtllm."""
@@ -646,10 +726,10 @@ class TestFilterBackendArgs:
 
 
 class TestZmqHandshakePort:
-    """Handshake-port derivation must mirror derive_handshake_port in worker.rs."""
+    """Handshake-port derivation must mirror derive_handshake_port in sockets.rs."""
 
     def test_matches_pinned_rust_vectors(self):
-        # These MUST equal derive_handshake_port() in worker.rs for the same path.
+        # These MUST equal derive_handshake_port() in sockets.rs for the same path.
         assert _zmq_handshake_port("ipc:///tmp/smg-zmq/ts0.ipc") == 25152
         assert _zmq_handshake_port("ipc:///tmp/smg-zmq/ts1.ipc") == 22735
         assert _zmq_handshake_port("ipc:///tmp/smg-zmq/engine-31000") == 22714
@@ -725,6 +805,21 @@ class TestSglangWorkerLauncher:
             assert arg in cmd
         assert "--enable-cache-report" in cmd
 
+    def test_build_zmq_command_launches_headless_and_refuses_dp(self):
+        launcher = SglangWorkerLauncher()
+        args = argparse.Namespace(model_path="/tmp/model", connection_mode="zmq")
+        cmd = launcher.build_command(args, ["--mem-fraction-static", "0.5"], "127.0.0.1", 31000)
+        assert "smg_grpc_servicer.sglang.headless" in cmd
+        expected_port = _zmq_handshake_port(_zmq_ipc_url(31000))
+        assert cmd[cmd.index("--zmq-handshake-address") + 1] == f"tcp://127.0.0.1:{expected_port}"
+        assert cmd[cmd.index("--model-path") + 1] == "/tmp/model"
+        assert "--mem-fraction-static" in cmd and "--grpc-mode" not in cmd
+        # DP over the SGLang ZMQ wire is not wired yet: refuse rather than
+        # start ranks the gateway will not await.
+        for flag in ("--dp-size", "--data-parallel-size"):
+            with pytest.raises(ValueError, match="dp-size"):
+                launcher.build_command(args, [flag, "2"], "127.0.0.1", 31000)
+
     def test_worker_url_grpc_mode(self):
         launcher = SglangWorkerLauncher()
         args = argparse.Namespace(connection_mode="grpc")
@@ -769,6 +864,39 @@ class TestVllmWorkerLauncher:
         assert "32000" in cmd
         for arg in backend_args:
             assert arg in cmd
+
+    def test_rust_servicer_is_a_worker_env_flag_not_a_command(self):
+        """servicer-impl rust keeps upstream's gRPC entrypoint as the command and
+        selects the Rust path through the servicer package's flag in the env."""
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(model="/tmp/model", connection_mode="grpc", servicer_impl="rust")
+        cmd = launcher.build_command(args, ["--max-model-len", "4096"], "0.0.0.0", 32000)
+        assert "vllm.entrypoints.grpc_server" in cmd
+        assert "--impl" not in cmd and "--servicer-impl" not in cmd
+        env = launcher.gpu_env(args, 0, {"CUDA_VISIBLE_DEVICES": "3"})
+        assert env["SMG_VLLM_SERVICER_IMPL"] == "rust"
+        assert env["CUDA_VISIBLE_DEVICES"] == "3"
+
+    def test_an_explicit_servicer_flag_overrides_an_inherited_value(self):
+        """The CLI flag is authoritative: `--servicer-impl python` travels as
+        python even when the operator's shell exported `rust`, an unset flag
+        leaves the operator's export alone (the package default decides when
+        nothing is exported), and an HTTP worker carries no servicer flag."""
+        launcher = VllmWorkerLauncher()
+        inherited = {"CUDA_VISIBLE_DEVICES": "0", "SMG_VLLM_SERVICER_IMPL": "rust"}
+        python = argparse.Namespace(
+            model="/tmp/model", connection_mode="grpc", servicer_impl="python"
+        )
+        env = launcher.gpu_env(python, 0, dict(inherited))
+        assert env["SMG_VLLM_SERVICER_IMPL"] == "python"
+        assert env["CUDA_VISIBLE_DEVICES"] == "0"
+        unset = argparse.Namespace(model="/tmp/model", connection_mode="grpc", servicer_impl=None)
+        assert launcher.gpu_env(unset, 0, dict(inherited))["SMG_VLLM_SERVICER_IMPL"] == "rust"
+        assert "SMG_VLLM_SERVICER_IMPL" not in launcher.gpu_env(
+            unset, 0, {"CUDA_VISIBLE_DEVICES": "0"}
+        )
+        http = argparse.Namespace(model="/tmp/model", connection_mode="http", servicer_impl="rust")
+        assert "SMG_VLLM_SERVICER_IMPL" not in launcher.gpu_env(http, 0, dict(inherited))
 
     def test_build_zmq_command_defaults_to_single_engine(self):
         launcher = VllmWorkerLauncher()
@@ -1634,3 +1762,63 @@ class TestServeOrchestrator:
         assert launched_envs[1]["CUDA_VISIBLE_DEVICES"] == "2,3"
         assert launched_envs[0]["PYTHONUNBUFFERED"] == "1"
         assert launched_envs[1]["PYTHONUNBUFFERED"] == "1"
+
+
+class TestIpv6WorkerHosts:
+    """Worker URLs, health-check targets and the port probe handle an IPv6 worker host."""
+
+    @pytest.mark.parametrize(("mode", "scheme"), [("grpc", "grpc"), ("http", "http")])
+    def test_worker_url_brackets_ipv6_literals(self, mode, scheme):
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(connection_mode=mode)
+        assert launcher.worker_url(args, "::1", 31000) == f"{scheme}://[::1]:31000"
+        assert launcher.worker_url(args, "fd00::1", 31000) == f"{scheme}://[fd00::1]:31000"
+        assert launcher.worker_url(args, "[::1]", 31000) == f"{scheme}://[::1]:31000"
+        assert launcher.worker_url(args, "127.0.0.1", 31000) == f"{scheme}://127.0.0.1:31000"
+        assert launcher.worker_url(args, "localhost", 31000) == f"{scheme}://localhost:31000"
+
+    def test_http_health_check_url_brackets_ipv6_literals(self):
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(connection_mode="http")
+        with patch("smg.serve._http_health_check", return_value=True) as check:
+            assert launcher.health_check(args, "fd00::1", 8000, 1.0)
+            assert launcher.health_check(args, "127.0.0.1", 8000, 1.0)
+        assert [c.args[0] for c in check.call_args_list] == [
+            "http://[fd00::1]:8000/health",
+            "http://127.0.0.1:8000/health",
+        ]
+
+    def test_grpc_health_check_dials_a_bracketed_target(self):
+        pytest.importorskip("grpc")
+        with patch("grpc.insecure_channel", side_effect=RuntimeError("stop")) as channel:
+            assert _grpc_health_check("::1", 31000, 1.0) is False
+            assert _grpc_health_check("worker-0", 31000, 1.0) is False
+        assert [c.args[0] for c in channel.call_args_list] == ["[::1]:31000", "worker-0:31000"]
+
+    def test_port_busy_on_ipv6_loopback_is_not_available(self):
+        import socket
+
+        try:
+            holder = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            holder.bind(("::1", 0))
+        except OSError:
+            pytest.skip("no IPv6 loopback on this host")
+        with holder:
+            port = holder.getsockname()[1]
+            assert _is_port_available(port) is False
+
+    def test_port_busy_on_ipv4_loopback_is_not_available(self):
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+            holder.bind(("127.0.0.1", 0))
+            port = holder.getsockname()[1]
+            assert _is_port_available(port) is False
+
+    def test_free_port_is_available(self):
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        assert _is_port_available(port) is True

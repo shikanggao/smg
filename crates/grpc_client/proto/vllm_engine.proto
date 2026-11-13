@@ -17,6 +17,15 @@ service VllmEngine {
   // Health check
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
 
+  // Invalidate the local KV prefix cache without preempting requests.
+  rpc FlushCache(smg.grpc.common.FlushCacheRequest) returns (smg.grpc.common.FlushCacheResponse);
+
+  // Start the engine's profiler (configured at its launch) on every rank
+  rpc StartProfile(smg.grpc.common.StartProfileRequest) returns (smg.grpc.common.ProfileResponse);
+
+  // Stop the profiler and export its traces
+  rpc StopProfile(smg.grpc.common.StopProfileRequest) returns (smg.grpc.common.ProfileResponse);
+
   // Abort a running request
   rpc Abort(AbortRequest) returns (AbortResponse);
 
@@ -26,7 +35,9 @@ service VllmEngine {
   // Get server information
   rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
 
-  // Get scheduler load metrics
+  // Get scheduler load metrics. The gateway's fallback: a servicer that
+  // pushes its load on the KV-event stream (KvEventBatch.load) is not polled
+  // while those records flow.
   rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
 
   // Get tokenizer artifacts for remote construction
@@ -72,6 +83,13 @@ message SamplingParams {
   bool include_stop_str_in_output = 25;  // Whether to include stop strings in output
   map<int32, float> logit_bias = 26;  // Token ID to bias mapping (-100 to 100)
   optional int32 truncate_prompt_tokens = 27;  // Prompt truncation (-1 for model max)
+  // The constraint starts at the first generated token whatever reasoning
+  // parser the engine runs: the gateway led it with the model's thought and
+  // its close for a worker whose grammar starts there, so an engine that holds
+  // a grammar back until its reasoning parser has seen the close starts this
+  // one at once (vLLM: the request's `reasoning_ended`). Unset for a
+  // constraint the gateway did not shape, which starts where the engine does.
+  bool grammar_from_first_token = 28;
 
   // Structured outputs (one of) - matches vLLM's StructuredOutputsParams
   oneof constraint {
@@ -99,7 +117,7 @@ message TokenizedInput {
 // transport; shape and dtype describe how the receiver interprets them.
 message TensorData {
   repeated uint32 shape = 2;   // Dimension sizes
-  string dtype = 3;            // "float32", "int64", "uint32"
+  string dtype = 3;            // "float32", "bfloat16", "float16", "int64", "uint32"
 
   oneof payload {
     // Current path: raw little-endian bytes carried in the gRPC message
@@ -156,6 +174,28 @@ message MultimodalInputs {
   // modality (`pixel_values_videos` / `video_grid_thw`) and expands the video
   // placeholder token instead of the image one. Unset (0) is treated as image.
   smg.grpc.common.Modality modality = 10;
+
+  // Wire key for the primary encoder tensor carried in `pixel_values`: the
+  // model's forward kwarg when it is not the HF-conventional `pixel_values`
+  // (DeepSeek-V4.1 takes `patches`). Absent = pixel_values. `batched_keys`
+  // and `flat_keys` name the tensor by this key.
+  optional string encoder_input_key = 11;
+}
+
+// One media item the worker fetches and processes itself. `url` is forwarded
+// verbatim from the API request: `http(s)://`, `data:<mime>;base64,...`, or
+// `file://`. The worker's MediaConnector applies --allowed-media-domains /
+// --allowed-local-media-path / VLLM_*_FETCH_TIMEOUT.
+message MediaRef {
+  smg.grpc.common.Modality modality = 1;  // IMAGE | VIDEO
+  string url = 2;
+}
+
+// Media references in prompt (media-part) order. `tokenized.input_ids` carries
+// exactly one UNEXPANDED placeholder anchor per item; the worker's processor
+// expands it.
+message MediaRefs {
+  repeated MediaRef items = 1;
 }
 
 // =====================
@@ -185,6 +225,14 @@ message GenerateRequest {
   // Optional multimodal data (images for vision models)
   MultimodalInputs mm_inputs = 7;
 
+  // Further preprocessed batches when one request carries several modalities
+  // (an image batch in mm_inputs and a video batch here, say). Each batch has
+  // its own modality, tensors, placeholders and hashes.
+  repeated MultimodalInputs extra_mm_inputs = 11;
+
+  // Opaque EC connector request parameters for encoder disaggregation.
+  optional string ec_transfer_params_json = 12;
+
   // Connector KV-transfer params as a JSON object, passed verbatim to the
   // engine (e.g. NIXL's do_remote_prefill/remote_block_ids/remote_host/...).
   // Preferred over the legacy typed kv_transfer_params field.
@@ -192,6 +240,13 @@ message GenerateRequest {
 
   // DP rank to pin this request to; unset lets the engine balance internally
   optional int32 data_parallel_rank = 9;
+
+  // Set only when the router skipped multimodal processing. Mutually
+  // exclusive with mm_inputs; requires `tokenized` input.
+  MediaRefs media_refs = 10;
+
+  // Effective chat-template kwargs consumed by the engine reasoning parser.
+  optional string chat_template_kwargs_json = 13;
 }
 
 // KV cache transfer parameters for Mooncake PD disaggregation
@@ -256,7 +311,7 @@ message GenerateStreamChunk {
 
 message GenerateComplete {
   repeated uint32 output_ids = 1;      // All output tokens
-  string finish_reason = 2;            // "stop", "length", "abort"
+  string finish_reason = 2;            // "stop", "length", "abort", "error"
   uint32 prompt_tokens = 3;
   uint32 completion_tokens = 4;
   uint32 cached_tokens = 5;
@@ -282,6 +337,26 @@ message GenerateComplete {
   // Connector KV-transfer params returned by the engine, as a JSON object
   // (e.g. NIXL's handoff for the decode worker). Forwarded verbatim by the router.
   optional string kv_transfer_params_json = 12;
+
+  uint32 spec_accepted_tokens = 13;
+  uint32 spec_draft_tokens = 14;
+
+  // Identity of worker-processed media, returned by the prefill side so the
+  // decode side can be served without pixels: the expanded prompt ids plus one
+  // pixel-less MultimodalInputs per modality (hashes, placeholders, grid
+  // tensors). Absent on non-PD requests and from older servicers.
+  MediaIdentity media_identity = 15;
+
+  // Encoder completion handles and placeholder metadata, including token-less E replies.
+  optional string ec_transfer_params_json = 16;
+}
+
+// What the prefill worker learned about the media it processed, in the shape
+// the decode side already accepts from a router-preprocessed request.
+message MediaIdentity {
+  repeated uint32 prompt_token_ids = 1;
+  MultimodalInputs mm_inputs = 2;
+  repeated MultimodalInputs extra_mm_inputs = 3;
 }
 
 // =====================
@@ -363,7 +438,7 @@ message GetServerInfoResponse {
 
   // PD pairing protocol: what a prefill and a decode must agree on for a KV
   // handoff to work. These mirror the factors vLLM's NIXL compatibility hash
-  // is built from, so the router can keep incompatible legs apart before the
+  // is built from, so the router can keep incompatible workers apart before the
   // engines reject each other at handshake.
   string kv_cache_dtype = 11;     // cache_config.cache_dtype ("auto", "fp8", ...)
   int32 block_size = 12;          // cache_config.block_size (0 until the engine resolves it)
@@ -373,6 +448,93 @@ message GetServerInfoResponse {
   // environment variable of the engine process; "" when unset. A prefill and
   // a decode that both carry one can pair only when the values are equal.
   string pairing_protocol = 15;
+
+  // Worker-side multimodal processing backend: "" (off, or not a multimodal
+  // model), "inprocess", or "redis". Non-empty iff this worker accepts
+  // `media_refs`. Flattened into the `mm_processor` worker label.
+  string mm_processor = 16;
+
+  // Comma-separated URL schemes the worker will fetch, e.g. "http,https,data"
+  // or "http,https,data,file" (file only with --allowed-local-media-path).
+  // Flattened into the `mm_media_ref_schemes` worker label.
+  string mm_media_ref_schemes = 17;
+
+  // Where the worker's mm_processor setting came from: "flag" (the launcher's
+  // --mm-processor), "env" (SMG_VLLM_MM_PROCESSOR) or "default"; "" when
+  // mm_processor is empty. Flattened into the `mm_processor_source` label.
+  string mm_processor_source = 18;
+
+  // Whether the engine rescales and normalizes pixels on device
+  // (`mm_device_do_normalize`, where the model supports it). It then takes
+  // the pixels' own `uint8` bytes and would normalize anything else twice.
+  // Flattened into the `mm_device_do_normalize` worker label.
+  bool mm_device_do_normalize = 19;
+
+  // The scheduler's running window (`--max-num-seqs`): how many requests the
+  // engine runs at once. Flattened into the `max_num_seqs` worker label, the
+  // bound the router's PD admission gate claims decode rooms against and its
+  // fleet capacity accounting sums; 0 when unknown leaves both as they were.
+  int32 max_num_seqs = 20;
+
+  // The engine's own per-prompt media limits (vLLM's resolved
+  // `--limit-mm-per-prompt`) for the modalities a router request can carry,
+  // as sorted `<modality>=<count>` pairs: "image=8,video=2". Empty when the
+  // engine has none (a text model). Flattened into the `mm_item_limits`
+  // worker label, which the router's own media pipeline holds requests to.
+  string mm_item_limits = 21;
+
+  // Multimodal encoder input dtype, without the torch. prefix (e.g. bfloat16).
+  // Uses the model dtype, matching TokenSpeed; empty when unknown.
+  // Flattened into the worker label used to cast multimodal input tensors.
+  string multimodal_encoder_dtype = 22;
+
+  // The engine's reasoning parser (`--reasoning-parser`, as the structured
+  // outputs config carries it: "glm45", "deepseek_r1", ...); "" when it runs
+  // none. Flattened into the `engine_reasoning_parser` worker label, a name of
+  // its own: `reasoning_parser` is the per-model parser override the router
+  // reads off a worker's labels and validates against its own registry at
+  // registration, and the engine's parser names are the engine's, not the
+  // router's.
+  string engine_reasoning_parser = 23;
+
+  // Where the engine starts applying a request's grammar (structured outputs)
+  // on a prompt that ends inside the model's thinking block:
+  // "after_reasoning" when its structured-output manager waits until the
+  // reasoning parser has seen the thought's end (a reasoning parser is set and
+  // `enable_in_reasoning` is off), "first_token" when the grammar runs from the
+  // first generated token; "" when the engine's config does not say.
+  // Flattened into the `constrained_decoding_start` worker label, which shapes
+  // the router's forced tool-call grammar: the bare calls behind a reasoning
+  // parser's gate (the call is forced right there, as the engine's own server
+  // does), the thought and then the calls from the first token.
+  string constrained_decoding_start = 24;
+
+  // The engine's encoder budget in feature tokens: the most one media item
+  // may carry and still be scheduled (vLLM: the lesser of its encoder compute
+  // budget and its encoder cache size, the "budget of N tokens" of its
+  // encoder-cache start-up line; its own front end refuses an item above it).
+  // 0 when unknown, or not a multimodal model. Flattened into the
+  // `mm_encoder_budget` worker label, which the router's own media pipeline
+  // holds each item to; the worker-side pipeline takes the same number from
+  // its launcher.
+  int32 mm_encoder_budget = 25;
+
+  // The vocabulary of structural-tag nodes the engine's grammar compiler
+  // takes: "older" when the xgrammar installed beside the engine predates the
+  // `optional`, `plus`, `star` and `token` nodes (0.1.33 is the first release
+  // with them) and refuses a tag that carries one at compile time; "" for a
+  // current one, another backend, or nothing known. Flattened into the
+  // `structural_tag_vocabulary` worker label, by which the router spells such
+  // a worker's structural tags without `optional`, `plus` and `star`, the same
+  // language; a `token` node stays as derived, so a table that writes
+  // single-token markers still meets the older compiler's refusal.
+  string structural_tag_vocabulary = 26;
+  bool supports_ec_transfer = 27;
+  // Mooncake consumer entry point for each DP rank; each entry discovers its TP shards.
+  repeated string ec_zmq_addrs = 28;
+  // E/P must agree on the connector and advertise complementary roles.
+  string ec_connector = 29;
+  string ec_role = 30;
 }
 
 // =====================
@@ -416,4 +578,10 @@ message SchedulerLoad {
   double cache_hit_rate = 9;
   double utilization = 10;
   int32 max_running_requests = 11;
+  // Queued token-work: prompt tokens of waiting requests not served from the
+  // prefix cache. The servicer estimates it from the requests it forwarded
+  // that the engine has not started (same semantics as the SGLang field).
+  int32 num_waiting_uncached_tokens = 12;
+  // Computed input tokens per active prefill second; absent if unknown or stale.
+  optional double prefill_throughput = 13;
 }

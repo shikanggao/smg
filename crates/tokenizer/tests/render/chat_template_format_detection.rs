@@ -1,0 +1,620 @@
+use llm_tokenizer::chat_template::{
+    detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
+    ChatTemplateProcessor,
+};
+use openai_protocol::chat::{ChatMessage, MessageContent};
+
+#[test]
+fn test_detect_string_format_deepseek() {
+    // DeepSeek style template - expects string content
+    let template = r"
+        {%- for message in messages %}
+        {%- if message['role'] == 'user' %}
+        User: {{ message['content'] }}
+        {%- elif message['role'] == 'assistant' %}
+        Assistant: {{ message['content'] }}
+        {%- endif %}
+        {%- endfor %}
+        ";
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn test_detect_openai_format_llama4() {
+    // Llama4 style template - expects structured content
+    let template = r"
+        {%- for message in messages %}
+        {%- if message['content'] is iterable %}
+        {%- for content in message['content'] %}
+        {%- if content['type'] == 'text' %}
+        {{ content['text'] }}
+        {%- elif content['type'] == 'image' %}
+        <image>
+        {%- endif %}
+        {%- endfor %}
+        {%- else %}
+        {{ message['content'] }}
+        {%- endif %}
+        {%- endfor %}
+        ";
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn test_detect_openai_format_dot_notation() {
+    // Template using dot notation
+    let template = r"
+        {%- for message in messages %}
+        {%- for part in message.content %}
+        {%- if part.type == 'text' %}
+        {{ part.text }}
+        {%- endif %}
+        {%- endfor %}
+        {%- endfor %}
+        ";
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn test_detect_openai_format_variable_assignment() {
+    // Template that assigns content to variable then iterates
+    let template = r"
+        {%- for message in messages %}
+        {%- set content = message['content'] %}
+        {%- if content is sequence %}
+        {%- for item in content %}
+        {{ item }}
+        {%- endfor %}
+        {%- endif %}
+        {%- endfor %}
+        ";
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn test_detect_openai_format_glm4v_style() {
+    // GLM4V uses 'msg' instead of 'message'
+    let template = r"
+        {%- for msg in messages %}
+        {%- for part in msg.content %}
+        {%- if part.type == 'text' %}{{ part.text }}{%- endif %}
+        {%- if part.type == 'image' %}<image>{%- endif %}
+        {%- endfor %}
+        {%- endfor %}
+        ";
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn test_detect_openai_format_with_length_check() {
+    // Template that checks content length
+    let template = r"
+        {%- for message in messages %}
+        {%- if message.content|length > 0 %}
+        {%- for item in message.content %}
+        {{ item.text }}
+        {%- endfor %}
+        {%- endif %}
+        {%- endfor %}
+        ";
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn test_index_access_without_a_content_loop_is_string_format() {
+    // An index on the content is not a loop over it: the engine's own
+    // detection keeps such a template in the string format, so the gateway
+    // does too and hands it string content as a string.
+    let template = r"
+        {%- for message in messages %}
+        {%- if message.content[0] %}
+        First item: {{ message.content[0].text }}
+        {%- endif %}
+        {%- endfor %}
+        ";
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn test_invalid_template_defaults_to_string() {
+    let template = "Not a valid {% jinja template";
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn test_empty_template_defaults_to_string() {
+    assert_eq!(
+        detect_chat_template_content_format(""),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn test_simple_chat_template_unit_test() {
+    let template = r"
+{%- for message in messages %}
+{{ message.role }}: {{ message.content }}
+{% endfor -%}
+{%- if add_generation_prompt %}
+assistant:
+{%- endif %}
+";
+
+    let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+
+    let messages = [
+        ChatMessage::System {
+            content: MessageContent::Text("You are helpful".to_string()),
+            name: None,
+            ext: Default::default(),
+        },
+        ChatMessage::User {
+            ext: Default::default(),
+            content: MessageContent::Text("Hello".to_string()),
+            name: None,
+        },
+    ];
+
+    // Convert to JSON values like the router does
+    let message_values: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|msg| serde_json::to_value(msg).unwrap())
+        .collect();
+
+    let params = ChatTemplateParams {
+        add_generation_prompt: true,
+        ..Default::default()
+    };
+    let result = processor
+        .apply_chat_template(&message_values, params)
+        .unwrap();
+    assert!(result.contains("system: You are helpful"));
+    assert!(result.contains("user: Hello"));
+    assert!(result.contains("assistant:"));
+}
+
+#[test]
+fn test_chat_template_with_tokens_unit_test() {
+    // Template that uses template kwargs for tokens (more realistic)
+    let template = r"
+{%- if start_token -%}{{ start_token }}{%- endif -%}
+{%- for message in messages -%}
+{{ message.role }}: {{ message.content }}{%- if end_token -%}{{ end_token }}{%- endif -%}
+{% endfor -%}
+";
+
+    let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+
+    let messages = [ChatMessage::User {
+        ext: Default::default(),
+        content: MessageContent::Text("Test".to_string()),
+        name: None,
+    }];
+
+    // Convert to JSON values like the router does
+    let message_values: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|msg| serde_json::to_value(msg).unwrap())
+        .collect();
+
+    // Use template_kwargs to pass tokens
+    let mut template_kwargs = std::collections::HashMap::new();
+    template_kwargs.insert(
+        "start_token".to_string(),
+        serde_json::Value::String("<s>".to_string()),
+    );
+    template_kwargs.insert(
+        "end_token".to_string(),
+        serde_json::Value::String("</s>".to_string()),
+    );
+
+    let params = ChatTemplateParams {
+        template_kwargs: Some(&template_kwargs),
+        ..Default::default()
+    };
+
+    let result = processor
+        .apply_chat_template(&message_values, params)
+        .unwrap();
+    assert!(result.contains("<s>"));
+    assert!(result.contains("</s>"));
+}
+
+#[test]
+fn test_detect_openai_format_qwen3vl_macro_style() {
+    // Qwen3-VL style template using macros to handle multimodal content
+    // This tests the macro-based detection pattern
+    let template = r"{%- set image_count = namespace(value=0) %}
+{%- set video_count = namespace(value=0) %}
+{%- macro render_content(content, do_vision_count) %}
+    {%- if content is string %}
+        {{- content }}
+    {%- else %}
+        {%- for item in content %}
+            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}
+                {%- if do_vision_count %}
+                    {%- set image_count.value = image_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}Picture {{ image_count.value }}: {% endif -%}
+                <|vision_start|><|image_pad|><|vision_end|>
+            {%- elif 'video' in item or item.type == 'video' %}
+                {%- if do_vision_count %}
+                    {%- set video_count.value = video_count.value + 1 %}
+                {%- endif %}
+                {%- if add_vision_id %}Video {{ video_count.value }}: {% endif -%}
+                <|vision_start|><|video_pad|><|vision_end|>
+            {%- elif 'text' in item %}
+                {{- item.text }}
+            {%- endif %}
+        {%- endfor %}
+    {%- endif %}
+{%- endmacro %}
+{%- for message in messages %}
+    {%- set content = render_content(message.content, True) %}
+    {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}";
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn test_detect_openai_format_arbitrary_variable_names() {
+    // Test that detection works with any variable name, not just "message", "msg", "m"
+    // Uses "chat_msg" and "x" as loop variables
+    let template = r"
+        {%- for chat_msg in messages %}
+        {%- for x in chat_msg.content %}
+        {%- if x.type == 'text' %}{{ x.text }}{%- endif %}
+        {%- if x.type == 'image' %}<image>{%- endif %}
+        {%- endfor %}
+        {%- endfor %}
+        ";
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn test_llama31_template_should_be_string_format() {
+    // Llama 3.1 template uses `message.content is iterable` only for tool/ipython roles
+    // to decide JSON serialization format, NOT for iterating over content parts.
+    // This should be detected as String format, not OpenAI format.
+    let template = r#"{{- bos_token }}
+{%- if messages[0]['role'] == 'system' %}
+    {%- set system_message = messages[0]['content']|trim %}
+    {%- set messages = messages[1:] %}
+{%- else %}
+    {%- set system_message = "" %}
+{%- endif %}
+{{- "<|start_header_id|>system<|end_header_id|>\n\n" }}
+{{- system_message }}
+{{- "<|eot_id|>" }}
+
+{%- for message in messages %}
+    {%- if not (message.role == 'ipython' or message.role == 'tool' or 'tool_calls' in message) %}
+        {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' }}
+    {%- elif message.role == "tool" or message.role == "ipython" %}
+        {{- "<|start_header_id|>ipython<|end_header_id|>\n\n" }}
+        {%- if message.content is mapping or message.content is iterable %}
+            {{- message.content | tojson }}
+        {%- else %}
+            {{- message.content }}
+        {%- endif %}
+        {{- "<|eot_id|>" }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}
+{%- endif %}
+"#;
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn test_qwen3_template_should_be_string_format() {
+    // Qwen3 template uses `set content = message.content` to extract content
+    // into a local variable, then checks `content is string`.
+    // The `set` assignment alone does NOT indicate OpenAI format - the template
+    // explicitly rejects non-string content by setting content = ''.
+    let template = r#"{%- for message in messages %}
+    {%- if message.content is string %}
+        {%- set content = message.content %}
+    {%- else %}
+        {%- set content = '' %}
+    {%- endif %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}"#;
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn test_assignment_with_iteration_is_openai() {
+    // Template that assigns content AND iterates over it should still be OpenAI
+    let template = r"
+        {%- for message in messages %}
+        {%- set content = message.content %}
+        {%- for item in content %}
+        {{ item.text }}
+        {%- endfor %}
+        {%- endfor %}
+        ";
+
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+// The rule is the serving engine's own: a template is of the parts format
+// only when it loops over a message's content. The shapes below are those of
+// recorded templates whose renders depend on the verdict.
+
+#[test]
+fn a_length_test_on_the_content_without_a_loop_is_string_format() {
+    // ERNIE 4.5 (`content|length > 0`) and Qwen3-Coder
+    // (`message.content | trim | length > 0`) test the content's length and
+    // render it as a string; handing them a part list drops or breaks the
+    // text, so they are the string format, as on the engine.
+    let ernie = r"
+        {%- for message in messages %}
+        {%- if message.content is string %}{%- set content = message.content %}{%- else %}{%- set content = '' %}{%- endif %}
+        {%- if content|length > 0 %}{{ '<response>' + content + '</response>' }}{%- endif %}
+        {%- endfor %}
+        ";
+    let qwen3_coder = r"
+        {%- set loop_messages = messages %}
+        {%- for message in loop_messages %}
+        {%- if message.content is defined and message.content is string and message.content | trim | length > 0 %}
+        {{- message.content | trim }}
+        {%- endif %}
+        {%- endfor %}
+        ";
+    for template in [ernie, qwen3_coder] {
+        assert_eq!(
+            detect_chat_template_content_format(template),
+            ChatTemplateContentFormat::String,
+            "{template}"
+        );
+    }
+}
+
+#[test]
+fn a_string_test_with_a_default_filter_without_a_loop_is_string_format() {
+    // Nemotron 3: `message.content | default('', true)` then `content is
+    // string`, and the string is printed; a part list would be printed as JSON.
+    let template = r"
+        {%- for message in messages %}
+        {%- set content = message.content | default('', true) %}
+        {%- if content is string and content | trim | length > 0 %}
+        {{- (content | trim) ~ '\n' }}
+        {%- else %}
+        {{- content | default('', true) | string | trim }}
+        {%- endif %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn a_loop_over_a_field_of_the_content_is_string_format() {
+    // Apertus: `message.content is mapping and 'parts' in message.content`,
+    // then a loop over `message.content.parts`, which is not a loop over the
+    // content itself; its string branch is the one the engine takes.
+    let template = r"
+        {%- for message in messages %}
+        {%- if message.content is string %}
+        {{ message.content }}
+        {%- elif message.content is mapping and 'parts' in message.content %}
+        {%- set parts = message.content.parts %}
+        {%- for part in parts %}{{ part.text }}{%- endfor %}
+        {%- else %}
+        {{- raise_exception('Invalid user message') }}
+        {%- endif %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn a_loop_over_the_content_of_a_messages_alias_is_openai_format() {
+    // `loop_messages` is assigned from `messages`, so `message` is a message
+    // and the loop over `message.content` makes the parts format, as on the
+    // engine, whatever the loop variable is called.
+    let template = r"
+        {%- set loop_messages = messages[1:] %}
+        {%- for msg in loop_messages %}
+        {%- for item in msg.content %}{{ item.text }}{%- endfor %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn a_filtered_loop_over_the_content_is_openai_format() {
+    // LLaVA: the loop runs over `message['content'] | selectattr(...)`; the
+    // filter does not hide the content.
+    let template = r"{% for message in messages %}{{ message['role'].upper() + ': ' }}{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}{{ content['text'] + ' ' }}{% endfor %}{% endfor %}";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn a_loop_over_the_content_in_a_nested_branch_is_openai_format() {
+    // K2-Horizon and Qwen3-Omni: the loop over `message.content` sits in the
+    // else branch of a string test, or runs under another name (`mcontent`).
+    let omni = r"
+        {%- for message in messages %}
+        {%- if message.content is string %}
+        {%- set content = message.content %}
+        {%- else %}
+        {%- set content = namespace(text='') %}
+        {%- for mcontent in message.content %}
+        {%- if mcontent.type == 'text' %}{%- set content.text = content.text + mcontent.text %}{%- endif %}
+        {%- endfor %}
+        {%- endif %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(omni),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn a_macro_parameter_fed_a_messages_content_is_openai_format() {
+    // Gemma 4 and Qwen3-VL fill a macro parameter with `message['content']`
+    // (by position or by keyword) and loop over it inside the macro.
+    let by_position = r"
+        {%- macro render(content) %}{%- for item in content %}{{ item.text }}{%- endfor %}{%- endmacro %}
+        {%- for message in messages %}{{ render(message['content']) }}{%- endfor %}
+        ";
+    let by_keyword = r"
+        {%- macro render(prefix, body) %}{%- for item in body %}{{ prefix ~ item.text }}{%- endfor %}{%- endmacro %}
+        {%- for message in messages %}{{ render('> ', body=message.content) }}{%- endfor %}
+        ";
+    for template in [by_position, by_keyword] {
+        assert_eq!(
+            detect_chat_template_content_format(template),
+            ChatTemplateContentFormat::OpenAI,
+            "{template}"
+        );
+    }
+}
+
+#[test]
+fn a_loop_inside_a_macro_not_fed_a_messages_content_is_string_format() {
+    // A macro that tests a type and loops over its parameter is not about the
+    // message content unless a call hands it one: here it renders tool
+    // parameters (Qwen3-Coder's `render_extra_keys`).
+    let template = r"
+        {%- macro render_extra_keys(json_dict, handled_keys) %}
+        {%- if json_dict is mapping %}
+        {%- for json_key in json_dict if json_key not in handled_keys %}{{ json_key }}{%- endfor %}
+        {%- endif %}
+        {%- endmacro %}
+        {%- for tool in tools %}{{ render_extra_keys(tool.parameters, ['type']) }}{%- endfor %}
+        {%- for message in messages %}{{ message.content }}{%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn a_loop_over_a_content_variable_inside_a_macro_is_string_format() {
+    // Outside a macro a loop over a variable named `content` is the parts
+    // format; inside one it is only when a call feeds the parameter a message's
+    // content, which this template never does.
+    let template = r"
+        {%- macro join(content) %}{%- for item in content %}{{ item }}{%- endfor %}{%- endmacro %}
+        {%- for message in messages %}{{ message.content }}{{ join(message.tool_calls) }}{%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}
+
+#[test]
+fn an_assignment_from_messages_to_a_namespace_attribute_still_reaches_the_content_loop() {
+    // A template that keeps its messages in a namespace attribute and then
+    // iterates a message's content parts renders parts: the parts format. A
+    // deliberate divergence from the engine's walk, which stops at an
+    // assignment from `messages` whose target is not a plain name and falls
+    // back to the string format: that heuristic under-detects such a
+    // template, whose content loop is right there after the assignment.
+    let template = r"
+        {%- set ns = namespace(msgs=[]) %}
+        {%- set ns.msgs = messages %}
+        {%- for message in messages %}
+        {%- for item in message.content %}{{ item.text }}{%- endfor %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::OpenAI
+    );
+}
+
+#[test]
+fn a_loop_over_the_content_of_a_wrapped_message_is_string_format() {
+    // The base of `.content` must be the message name itself, as in the
+    // engine's `_is_attr_access`: a filter between them (`(message |
+    // default({})).content`) is not a loop over a message's content there.
+    let template = r"
+        {%- for message in messages %}
+        {%- for item in (message | default({})).content %}{{ item.text }}{%- endfor %}
+        {%- endfor %}
+        ";
+    assert_eq!(
+        detect_chat_template_content_format(template),
+        ChatTemplateContentFormat::String
+    );
+}

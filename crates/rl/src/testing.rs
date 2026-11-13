@@ -15,10 +15,14 @@ use axum::{
     Json, Router,
 };
 use openai_protocol::worker::{ConnectionMode, RuntimeType, WorkerStatus, WorkerType};
+use rustls::crypto::ring;
 use serde_json::json;
 use tokio::net::TcpListener;
 
-use crate::view::{RlWorkerInfo, RlWorkerView};
+use crate::{
+    calls::{CallFailure, RankReply, RlControlCalls},
+    view::{RlWorkerInfo, RlWorkerView},
+};
 
 pub struct FakeView(pub Vec<RlWorkerInfo>);
 
@@ -37,10 +41,11 @@ pub fn worker(id: &str, url: &str, runtime: RuntimeType) -> RlWorkerInfo {
     labels.insert("dp_size".to_string(), "1".to_string());
     labels.insert("pp_size".to_string(), "1".to_string());
     labels.insert("weight_version".to_string(), "default".to_string());
+    let base_url = url.split('@').next().unwrap_or(url).to_string();
     RlWorkerInfo {
         id: id.to_string(),
         url: url.to_string(),
-        base_url: url.split('@').next().unwrap_or(url).to_string(),
+        base_url: base_url.clone(),
         api_key: None,
         model_id: "mock-model".to_string(),
         runtime,
@@ -50,15 +55,25 @@ pub fn worker(id: &str, url: &str, runtime: RuntimeType) -> RlWorkerInfo {
         is_dp_aware: url.contains('@'),
         dp_size: None,
         labels,
-        http_client: Some(test_client()),
+        control_url: Some(base_url),
+        control_client: Ok(test_client()),
+        control_calls: None,
     }
 }
 
 /// One plain client shared by every fake worker, standing in for the
-/// gateway's per-worker negotiated client.
+/// gateway's per-worker negotiated client; the process-level TLS crypto
+/// provider is installed before it is built.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+)]
 pub fn test_client() -> Arc<reqwest::Client> {
     static CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
-    Arc::clone(CLIENT.get_or_init(|| Arc::new(reqwest::Client::new())))
+    Arc::clone(CLIENT.get_or_init(|| {
+        let _ = ring::default_provider().install_default();
+        Arc::new(reqwest::Client::new())
+    }))
 }
 
 /// One recorded request seen by a fake engine.
@@ -143,4 +158,66 @@ async fn handle(State(st): State<EngineState>, req: Request) -> Response {
     }
     st.in_flight.lock().expect("in_flight").0 -= 1;
     (st.status, Json(json!(st.body))).into_response()
+}
+
+/// A worker's engine connection that records the control calls it is given
+/// and answers each with a fixed outcome.
+#[derive(Debug)]
+pub struct FakeCalls {
+    answer: Result<Vec<RankReply>, CallFailure>,
+    seen: Mutex<Vec<(String, Option<serde_json::Value>, std::time::Duration)>>,
+}
+
+impl FakeCalls {
+    pub fn answering(answer: Result<Vec<RankReply>, CallFailure>) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Every rank succeeded, saying nothing.
+    pub fn succeeding(ranks: usize) -> Arc<Self> {
+        Self::answering(Ok(vec![
+            RankReply {
+                success: true,
+                message: String::new(),
+            };
+            ranks
+        ]))
+    }
+
+    pub fn seen(&self) -> Vec<(String, Option<serde_json::Value>, std::time::Duration)> {
+        self.seen.lock().expect("seen").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl RlControlCalls for FakeCalls {
+    async fn call(
+        &self,
+        method: &str,
+        body: Option<serde_json::Value>,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<RankReply>, CallFailure> {
+        self.seen
+            .lock()
+            .expect("seen")
+            .push((method.to_string(), body, timeout));
+        self.answer.clone()
+    }
+}
+
+/// A TokenSpeed ZMQ worker with no control app, whose engine connection
+/// carries the RL routes as `calls`.
+pub fn zmq_worker(id: &str, calls: Arc<FakeCalls>) -> RlWorkerInfo {
+    let mut w = worker(
+        id,
+        &format!("ipc:///tmp/smg-zmq/{id}"),
+        RuntimeType::TokenSpeed,
+    );
+    w.connection_mode = ConnectionMode::Zmq;
+    w.control_url = None;
+    w.control_calls = Some(calls);
+    w
 }

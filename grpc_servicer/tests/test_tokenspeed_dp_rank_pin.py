@@ -25,10 +25,8 @@ if "data_parallel_rank" not in tokenspeed_scheduler_pb2.GenerateRequest.DESCRIPT
         allow_module_level=True,
     )
 
-import smg_grpc_servicer.tokenspeed.servicer as servicer_mod  # noqa: E402
-from smg_grpc_servicer.tokenspeed.servicer import (  # noqa: E402
-    TokenSpeedSchedulerServicer,
-)
+servicer_mod = pytest.importorskip("smg_grpc_servicer.tokenspeed.servicer")
+TokenSpeedSchedulerServicer = servicer_mod.TokenSpeedSchedulerServicer
 
 
 class _CapturingReq:
@@ -42,6 +40,8 @@ class _CapturingReq:
 def _make_servicer():
     servicer = TokenSpeedSchedulerServicer.__new__(TokenSpeedSchedulerServicer)
     servicer.server_args = SimpleNamespace(reasoning_parser=None)
+    # `_config` reads the engine's model config off `async_llm`.
+    servicer.async_llm = None
     return servicer
 
 

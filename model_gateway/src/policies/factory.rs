@@ -19,27 +19,19 @@ impl PolicyFactory {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Passthrough => Arc::new(PassthroughPolicy::new()),
-            PolicyConfig::PowerOfTwo { .. } => {
-                // TODO: Pass load_check_interval_secs to WorkerMonitor for per-policy polling intervals.
-                // Currently, WorkerMonitor uses RouterConfig.load_monitor_interval_secs globally.
-                Arc::new(PowerOfTwoPolicy::new())
+            PolicyConfig::PowerOfTwo { load_metric, .. } => {
+                Arc::new(PowerOfTwoPolicy::with_load_metric(*load_metric))
             }
             PolicyConfig::LeastLoad {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
-                max_waiting_requests,
                 ..
-            } => {
-                // TODO: Pass load_check_interval_secs to WorkerMonitor for per-policy polling intervals.
-                // Currently, WorkerMonitor uses RouterConfig.load_monitor_interval_secs globally.
-                Arc::new(LeastLoadPolicy::with_params(
-                    *kv_pressure_weight,
-                    *mean_prefill_tokens,
-                    *default_throughput,
-                    *max_waiting_requests,
-                ))
-            }
+            } => Arc::new(LeastLoadPolicy::with_params(
+                *kv_pressure_weight,
+                *mean_prefill_tokens,
+                *default_throughput,
+            )),
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
@@ -54,6 +46,10 @@ impl PolicyFactory {
                 cache_index,
                 cache_ttl_secs,
                 cache_boundaries,
+                selection_policy,
+                selection_accounting_ttl_ms,
+                balance_prefix_margin_tokens,
+                balance_uncached_credit,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -69,6 +65,10 @@ impl PolicyFactory {
                     cache_index: *cache_index,
                     cache_ttl_secs: *cache_ttl_secs,
                     cache_boundaries: cache_boundaries.clone(),
+                    selection_policy: selection_policy.clone(),
+                    selection_accounting_ttl_ms: *selection_accounting_ttl_ms,
+                    balance_prefix_margin_tokens: *balance_prefix_margin_tokens,
+                    balance_uncached_credit: *balance_uncached_credit,
                 };
                 Arc::new(CacheAwarePolicy::with_config(config))
             }
@@ -150,25 +150,12 @@ mod tests {
         assert_eq!(policy.name(), "passthrough");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::PowerOfTwo {
-            load_check_interval_secs: 60,
+            load_metric: Default::default(),
         });
         assert_eq!(policy.name(), "power_of_two");
 
-        let policy = PolicyFactory::create_from_config(&PolicyConfig::CacheAware {
-            cache_threshold: 0.7,
-            balance_abs_threshold: 10,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 30,
-            max_tree_size: 1000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-        });
+        let policy =
+            PolicyFactory::create_from_config(&PolicyConfig::cache_aware(0.7, 10, 1.5, 30, 1000));
         assert_eq!(policy.name(), "cache_aware");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Bucket {

@@ -1,0 +1,1063 @@
+//! Router-wide multimodal settings that used to be env-only knobs.
+//!
+//! Each resolves once at startup as flag (`RouterConfig`) > env > built-in
+//! default, remembering which of the three supplied the value. An env-sourced
+//! value logs one deprecation line: env support ends after this release.
+
+use std::{str::FromStr, sync::OnceLock};
+
+use anyhow::{Context, Result};
+use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
+use openai_protocol::worker::MmProcessingMode;
+use tracing::warn;
+
+use crate::config::{parse_listen_ip, RouterConfig};
+
+/// Which of the three layers supplied a setting's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingSource {
+    Flag,
+    Env,
+    Default,
+}
+
+impl SettingSource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Flag => "flag",
+            Self::Env => "env",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// A resolved value and where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Setting<T> {
+    pub value: T,
+    pub source: SettingSource,
+}
+
+impl<T> Setting<T> {
+    fn from_default(value: T) -> Self {
+        Self {
+            value,
+            source: SettingSource::Default,
+        }
+    }
+}
+
+/// The env-only names each flag replaces.
+const ENV_PROCESSING: &str = "SMG_MM_PROCESSING";
+const ENV_PIXEL_CACHE_MB: &str = "SMG_MM_PIXEL_CACHE_MB";
+const ENV_PIXEL_RDMA: &str = "SMG_MM_PIXEL_RDMA";
+const ENV_RDMA_LISTEN_IP: &str = "SMG_RDMA_LISTEN_IP";
+const ENV_RDMA_SLOT_TTL_S: &str = "SMG_RDMA_SLOT_TTL_S";
+const ENV_LOG_MM_TIMING: &str = "SMG_LOG_MM_TIMING";
+/// The opt-in for media origins on private, loopback or link-local addresses;
+/// not a legacy name: it is also how a worker's own media pipeline, which has
+/// no flags, is told (the worker reads it through [`mm_settings`]).
+const ENV_ALLOW_PRIVATE_MEDIA_HOSTS: &str = "SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS";
+/// The switch of the one-pass wire write, on by default; not a legacy name
+/// either: it is the way back to the two-pass write without a rebuild.
+const ENV_ONE_PASS_WIRE: &str = "SMG_MM_ONE_PASS_WIRE";
+/// The TurboJPEG policy for a process without the flag (a worker's own media
+/// pipeline on a launcher that does not carry the setting); not a legacy
+/// name either.
+const ENV_TURBOJPEG: &str = "SMG_MM_TURBOJPEG";
+const ENV_FETCH_TIMEOUT_MS: &str = "SMG_MM_FETCH_TIMEOUT_MS";
+const ENV_VIDEO_FETCH_TIMEOUT_MS: &str = "SMG_MM_VIDEO_FETCH_TIMEOUT_MS";
+/// The env settings an unreadable value of which stops start-up ([`strict`]).
+const STRICT_ENV: [&str; 4] = [
+    ENV_PROCESSING,
+    ENV_TURBOJPEG,
+    ENV_FETCH_TIMEOUT_MS,
+    ENV_VIDEO_FETCH_TIMEOUT_MS,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MultimodalSettings {
+    /// Where media for vLLM gRPC workers is fetched and preprocessed.
+    pub processing: Setting<MmProcessingMode>,
+    /// Host-DRAM budget for router-side preprocessed media, in MiB; 0 is off.
+    pub pixel_cache_mb: Setting<usize>,
+    /// Legacy switch for the RDMA pixel lane; `--multimodal-tensor-transport
+    /// rdma` is the first-class one.
+    pub pixel_rdma: Setting<bool>,
+    /// Listener IP for the RDMA metadata exchange; unset keeps the inline path.
+    pub rdma_listen_ip: Setting<Option<String>>,
+    /// Full-TTL override for leased RDMA slots, in seconds.
+    pub rdma_slot_ttl_s: Setting<Option<u64>>,
+    /// Per-request multimodal timing at INFO.
+    pub log_mm_timing: Setting<bool>,
+    /// Hosts the router's own media pipeline may fetch client-supplied media
+    /// URLs from, by name, every redirect hop included; `None` is any host
+    /// the address policy passes.
+    pub allowed_media_domains: Setting<Option<Vec<String>>>,
+    /// Whether a client-supplied media URL may name or resolve to a loopback,
+    /// link-local, private or otherwise non-public address; off, such URLs
+    /// are refused before anything is connected.
+    pub allow_private_media_hosts: Setting<bool>,
+    /// Whether the images of a request whose workers all read one wire dtype
+    /// are preprocessed straight into it, in one pass; off, every request
+    /// takes the two passes (the patch layout, then the write in the
+    /// worker's dtype at assembly). The bytes are the same either way. With
+    /// a pixel cache, the one pass caches the wire bytes, twice the neutral
+    /// patches at the half widths and four times at float32, against the
+    /// same budget: the same `--mm-pixel-cache-mb` holds fewer images.
+    pub one_pass_wire: Setting<bool>,
+    /// What the router's own media pipeline does when libjpeg-turbo cannot
+    /// be loaded: `Prefer` serves with the pure-Rust decoder behind one
+    /// warning, `Require` stops start-up.
+    pub turbojpeg: Setting<TurboJpegPolicy>,
+    /// Video URL fetch budget in milliseconds.
+    pub video_fetch_timeout_ms: Setting<u64>,
+    /// Image/audio URL fetch budget in milliseconds.
+    pub fetch_timeout_ms: Setting<u64>,
+}
+
+impl Default for MultimodalSettings {
+    fn default() -> Self {
+        Self {
+            processing: Setting::from_default(MmProcessingMode::Auto),
+            pixel_cache_mb: Setting::from_default(0),
+            pixel_rdma: Setting::from_default(false),
+            rdma_listen_ip: Setting::from_default(None),
+            rdma_slot_ttl_s: Setting::from_default(None),
+            log_mm_timing: Setting::from_default(false),
+            allowed_media_domains: Setting::from_default(None),
+            allow_private_media_hosts: Setting::from_default(false),
+            one_pass_wire: Setting::from_default(true),
+            turbojpeg: Setting::from_default(TurboJpegPolicy::Prefer),
+            video_fetch_timeout_ms: Setting::from_default(
+                llm_multimodal::media::DEFAULT_VIDEO_FETCH_TIMEOUT.as_millis() as u64,
+            ),
+            fetch_timeout_ms: Setting::from_default(
+                llm_multimodal::media::DEFAULT_FETCH_TIMEOUT.as_millis() as u64,
+            ),
+        }
+    }
+}
+
+impl MultimodalSettings {
+    /// Resolve from the router config and the process environment, read by
+    /// [`process_env`]: unset is unset, and a strict name set to bytes that
+    /// are not text is refused rather than read as unset.
+    pub(crate) fn resolve(config: &RouterConfig) -> Result<Self> {
+        Self::resolve_with(config, process_env)
+    }
+
+    /// Resolve with an explicit env reader, so tests never touch the process.
+    ///
+    /// Every setting is flag > env > default through [`resolve`]; the env
+    /// switches share one spelling ([`switch`]; the one that is on by
+    /// default reads the off spellings too, [`two_way_switch`]); an
+    /// unreadable processing mode, TurboJPEG policy or download budget stops
+    /// startup ([`strict`]).
+    /// The reader answers `None` for a variable that is unset and an error
+    /// for one it refuses to read, which stops startup the same way.
+    pub(crate) fn resolve_with(
+        config: &RouterConfig,
+        env: impl Fn(&str) -> Result<Option<String>>,
+    ) -> Result<Self> {
+        let defaults = Self::default();
+        let env_nonempty = |name: &str| -> Result<Option<String>> {
+            Ok(env(name)?
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()))
+        };
+
+        let switch_setting =
+            |flag_value: bool, env_name: &str, flag_name: Option<&str>| -> Result<Setting<bool>> {
+                Ok(resolve(
+                    flag_value.then_some(true),
+                    env_nonempty(env_name)?,
+                    env_name,
+                    flag_name,
+                    Setting::from_default(false),
+                    switch,
+                ))
+            };
+
+        Ok(Self {
+            processing: strict(
+                config.mm_processing,
+                env_nonempty(ENV_PROCESSING)?,
+                ENV_PROCESSING,
+                Some("--mm-processing"),
+                defaults.processing,
+            )?,
+            pixel_cache_mb: resolve(
+                config.mm_pixel_cache_mb,
+                env_nonempty(ENV_PIXEL_CACHE_MB)?,
+                ENV_PIXEL_CACHE_MB,
+                Some("--mm-pixel-cache-mb"),
+                defaults.pixel_cache_mb,
+                |raw| number(raw, ENV_PIXEL_CACHE_MB, "pixel cache stays off"),
+            ),
+            pixel_rdma: switch_setting(
+                config.mm_pixel_rdma,
+                ENV_PIXEL_RDMA,
+                Some("--mm-pixel-rdma"),
+            )?,
+            rdma_listen_ip: resolve(
+                config
+                    .rdma_listen_ip
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|ip| !ip.is_empty())
+                    .map(|ip| Some(ip.to_string())),
+                env_nonempty(ENV_RDMA_LISTEN_IP)?,
+                ENV_RDMA_LISTEN_IP,
+                Some("--rdma-listen-ip"),
+                defaults.rdma_listen_ip,
+                |ip| listen_ip(ip, ENV_RDMA_LISTEN_IP, "the lane stays on the inline path"),
+            ),
+            rdma_slot_ttl_s: resolve(
+                config.rdma_slot_ttl_s.map(Some),
+                env_nonempty(ENV_RDMA_SLOT_TTL_S)?,
+                ENV_RDMA_SLOT_TTL_S,
+                Some("--rdma-slot-ttl-s"),
+                defaults.rdma_slot_ttl_s,
+                |raw| number(raw, ENV_RDMA_SLOT_TTL_S, "using the derived TTL").map(Some),
+            ),
+            log_mm_timing: switch_setting(
+                config.log_mm_timing,
+                ENV_LOG_MM_TIMING,
+                Some("--log-mm-timing"),
+            )?,
+            // A flag only: nothing in the environment lists hosts.
+            allowed_media_domains: config
+                .mm_allowed_media_domains
+                .clone()
+                .filter(|domains| !domains.is_empty())
+                .map_or(defaults.allowed_media_domains, |domains| {
+                    flag(Some(domains))
+                }),
+            // Not a legacy name (the worker's own pipeline reads it too), so
+            // no deprecation line.
+            allow_private_media_hosts: switch_setting(
+                config.mm_allow_private_media_hosts,
+                ENV_ALLOW_PRIVATE_MEDIA_HOSTS,
+                None,
+            )?,
+            // No flag and no deprecation line: a switch that is on by
+            // default, read both ways, and a spelling it does not know is
+            // said (here a typo would be an ignored rollback).
+            one_pass_wire: resolve(
+                None,
+                env_nonempty(ENV_ONE_PASS_WIRE)?,
+                ENV_ONE_PASS_WIRE,
+                None,
+                defaults.one_pass_wire,
+                |raw| {
+                    two_way_switch_or_warn(
+                        raw,
+                        ENV_ONE_PASS_WIRE,
+                        "the one-pass wire write stays on",
+                    )
+                },
+            ),
+            fetch_timeout_ms: timeout_setting(
+                config.mm_fetch_timeout_ms,
+                "mm_fetch_timeout_ms",
+                env_nonempty(ENV_FETCH_TIMEOUT_MS)?,
+                ENV_FETCH_TIMEOUT_MS,
+                defaults.fetch_timeout_ms,
+            )?,
+            video_fetch_timeout_ms: timeout_setting(
+                config.mm_video_fetch_timeout_ms,
+                "mm_video_fetch_timeout_ms",
+                env_nonempty(ENV_VIDEO_FETCH_TIMEOUT_MS)?,
+                ENV_VIDEO_FETCH_TIMEOUT_MS,
+                defaults.video_fetch_timeout_ms,
+            )?,
+            // Not a legacy name either (a worker's pipeline without the flag
+            // reads it), so no deprecation line; unreadable, it stops
+            // start-up: `require` misread as the default would serve the
+            // pixels the operator asked to refuse.
+            turbojpeg: strict(
+                config.mm_turbojpeg,
+                env_nonempty(ENV_TURBOJPEG)?,
+                ENV_TURBOJPEG,
+                None,
+                defaults.turbojpeg,
+            )?,
+        })
+    }
+}
+
+/// Resolve a positive millisecond budget without deprecating its env spelling.
+fn timeout_setting(
+    flag: Option<u64>,
+    config_name: &str,
+    env: Option<String>,
+    name: &str,
+    default: Setting<u64>,
+) -> Result<Setting<u64>> {
+    let setting = strict(flag, env, name, None, default)?;
+    let name = if setting.source == SettingSource::Flag {
+        config_name
+    } else {
+        name
+    };
+    anyhow::ensure!(setting.value > 0, "{name} must be positive");
+    Ok(setting)
+}
+
+/// The TurboJPEG policy for a process that was given no setting of its own
+/// (a worker pipeline whose launcher sent none): `SMG_MM_TURBOJPEG` read as
+/// the router reads it, strictly, so a misspelt `require` refuses the
+/// process instead of serving the fallback decoder's pixels under the
+/// default, and so does a value that is not text ([`process_env`]); unset
+/// or blank is the default, `prefer`.
+pub(crate) fn turbojpeg_policy_from_env() -> Result<TurboJpegPolicy> {
+    turbojpeg_policy(process_env(ENV_TURBOJPEG)?)
+}
+
+/// [`turbojpeg_policy_from_env`] over an explicit value of the variable.
+fn turbojpeg_policy(env_value: Option<String>) -> Result<TurboJpegPolicy> {
+    let env_value = env_value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let defaults = MultimodalSettings::default();
+    Ok(strict(None, env_value, ENV_TURBOJPEG, None, defaults.turbojpeg)?.value)
+}
+
+/// A variable of the process environment as the settings read it:
+/// [`env_text`] over what `std::env::var` answers for it.
+fn process_env(name: &str) -> Result<Option<String>> {
+    env_text(name, std::env::var(name))
+}
+
+/// What `std::env::var` answered for `name`, as a setting reads it: unset is
+/// `None` and text is itself. A value set to bytes that are not text is not
+/// "unset" (`require` read as unset would serve the fallback decoder's
+/// pixels under the default): a strict name is refused with the variable
+/// named, and any other leaves its default with a line, as a value it
+/// cannot parse does.
+fn env_text(name: &str, read: Result<String, std::env::VarError>) -> Result<Option<String>> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(raw)) if STRICT_ENV.contains(&name) => Err(
+            anyhow::anyhow!("{name} is set to a value that is not valid UTF-8 ({raw:?})"),
+        ),
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            warn!(value = ?raw, "{name} is not valid UTF-8; leaving its default");
+            Ok(None)
+        }
+    }
+}
+
+/// A setting flag > env > default like the rest, except that an env value
+/// that cannot be read stops startup: carrying on with the default would
+/// leave the process doing the opposite of what the operator asked for
+/// (preprocessing where it should forward, serving the fallback decoder
+/// where it should refuse), and a warning in the startup log is easy to
+/// miss. An env-sourced value logs the deprecation line when `flag_name`
+/// names the flag that replaces `env_name`.
+fn strict<T>(
+    flag_value: Option<T>,
+    env_value: Option<String>,
+    env_name: &str,
+    flag_name: Option<&str>,
+    default: Setting<T>,
+) -> Result<Setting<T>>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    Ok(match (flag_value, env_value) {
+        (Some(value), _) => flag(value),
+        (None, Some(raw)) => {
+            let value = raw
+                .parse::<T>()
+                .map_err(|message| anyhow::anyhow!("{message}"))
+                .context(env_name.to_string())?;
+            if let Some(flag_name) = flag_name {
+                deprecated(env_name, flag_name);
+            }
+            from_env(value)
+        }
+        (None, None) => default,
+    })
+}
+
+/// One setting, flag > env > default: `flag_value` when the flag is set;
+/// else the env value `parse` can read (an unreadable one leaves the
+/// default, and `parse` says so itself where that deserves a line); else
+/// `default`. An env-sourced value logs the deprecation line when
+/// `flag_name` names the flag that replaces `env_name`.
+fn resolve<T>(
+    flag_value: Option<T>,
+    env_value: Option<String>,
+    env_name: &str,
+    flag_name: Option<&str>,
+    default: Setting<T>,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Setting<T> {
+    if let Some(value) = flag_value {
+        return flag(value);
+    }
+    match env_value.as_deref().and_then(parse) {
+        Some(value) => {
+            if let Some(flag_name) = flag_name {
+                deprecated(env_name, flag_name);
+            }
+            from_env(value)
+        }
+        None => default,
+    }
+}
+
+/// An env switch is on with `1`, `true`, `yes` or `on`, in any case; any
+/// other spelling leaves it at its default without a word, as before (an
+/// operator's typo in a legacy switch is not an outage).
+fn switch(raw: &str) -> Option<bool> {
+    two_way_switch(raw).filter(|&on| on)
+}
+
+/// A switch that is on by default reads the off spellings as well: `0`,
+/// `false`, `no` or `off` turn it off, the on spellings of [`switch`] turn
+/// it on, anything else leaves the default without a word, as [`switch`]
+/// does.
+fn two_way_switch(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// [`two_way_switch`] for a switch that is on by default, where a spelling
+/// it does not know is not a typo to pass over in silence but a rollback
+/// that did not happen: it is logged with its consequence, and the default
+/// stands as it does for the other switches.
+fn two_way_switch_or_warn(raw: &str, env_name: &str, consequence: &str) -> Option<bool> {
+    let parsed = two_way_switch(raw);
+    if parsed.is_none() {
+        warn!(value = %raw, "{env_name} is not an on/off spelling; {consequence}");
+    }
+    parsed
+}
+
+/// A numeric env value; one that is not a number is logged with its
+/// consequence and left unused.
+fn number<N: FromStr>(raw: &str, env_name: &str, consequence: &str) -> Option<N> {
+    let parsed = raw.parse::<N>().ok();
+    if parsed.is_none() {
+        warn!(value = %raw, "{env_name} is not a number; {consequence}");
+    }
+    parsed
+}
+
+/// An env listener address, read by the rule the validator applies to the
+/// flag ([`parse_listen_ip`]); one that is not an IP address is logged with
+/// its consequence and left unused, like a numeric value that is not a
+/// number.
+fn listen_ip(raw: &str, env_name: &str, consequence: &str) -> Option<Option<String>> {
+    match parse_listen_ip(raw) {
+        Ok(_) => Some(Some(raw.to_string())),
+        Err(_) => {
+            warn!(value = %raw, "{env_name} is not an IP address; {consequence}");
+            None
+        }
+    }
+}
+
+fn deprecated(env_name: &str, flag_name: &str) {
+    warn!(
+        "{env_name} is deprecated in favour of {flag_name}; env support ends in the next minor \
+         release"
+    );
+}
+
+fn flag<T>(value: T) -> Setting<T> {
+    Setting {
+        value,
+        source: SettingSource::Flag,
+    }
+}
+
+fn from_env<T>(value: T) -> Setting<T> {
+    Setting {
+        value,
+        source: SettingSource::Env,
+    }
+}
+
+static SETTINGS: OnceLock<MultimodalSettings> = OnceLock::new();
+
+/// Seed the process-wide settings from the resolved router config. Call once
+/// at startup before serving; idempotent (first call wins).
+pub(crate) fn init_mm_settings(settings: MultimodalSettings) {
+    let _ = SETTINGS.set(settings);
+}
+
+/// The process-wide settings. Never seeded (tests, embedded use): resolved
+/// lazily from env and the built-in defaults, and an unreadable
+/// setting in [`STRICT_ENV`] falls back to its default while the other
+/// settings keep their env values.
+pub(crate) fn mm_settings() -> &'static MultimodalSettings {
+    SETTINGS.get_or_init(|| resolve_unseeded_with(process_env))
+}
+
+/// Embedded use has no startup error boundary: default only the invalid strict
+/// settings, retaining valid policies and budgets. The normal startup resolver
+/// remains strict. An explicit env reader keeps tests away from global state.
+fn resolve_unseeded_with(env: impl Fn(&str) -> Result<Option<String>>) -> MultimodalSettings {
+    let config = RouterConfig::default();
+    MultimodalSettings::resolve_with(&config, &env).unwrap_or_else(|error| {
+        warn!(error = %error, "unreadable multimodal env setting; using its default");
+        let invalid: Vec<_> = STRICT_ENV
+            .into_iter()
+            .filter(|key| {
+                MultimodalSettings::resolve_with(&config, |name| {
+                    if name == *key {
+                        env(name)
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .is_err()
+            })
+            .collect();
+        MultimodalSettings::resolve_with(&config, |name| {
+            if invalid.contains(&name) {
+                Ok(None)
+            } else {
+                env(name)
+            }
+        })
+        .unwrap_or_default()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Result<Option<String>> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| Ok(map.get(name).cloned())
+    }
+
+    /// Both budgets resolve independently and reject malformed/nonpositive input.
+    #[test]
+    fn media_fetch_timeout_precedence_and_validation() {
+        let config = RouterConfig::default();
+        let defaults = MultimodalSettings::resolve_with(&config, no_env).unwrap();
+        assert_eq!(defaults.fetch_timeout_ms.value, 10_000);
+        assert_eq!(defaults.video_fetch_timeout_ms.value, 30_000);
+        let resolved = MultimodalSettings::resolve_with(
+            &config,
+            env(&[
+                ("SMG_MM_FETCH_TIMEOUT_MS", "60000"),
+                ("SMG_MM_VIDEO_FETCH_TIMEOUT_MS", "120000"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(resolved.fetch_timeout_ms.value, 60_000);
+        assert_eq!(resolved.video_fetch_timeout_ms.value, 120_000);
+        assert_eq!(resolved.fetch_timeout_ms.source, SettingSource::Env);
+        let explicit = RouterConfig {
+            mm_fetch_timeout_ms: Some(1),
+            mm_video_fetch_timeout_ms: Some(2),
+            ..config.clone()
+        };
+        let resolved = MultimodalSettings::resolve_with(
+            &explicit,
+            env(&[
+                ("SMG_MM_FETCH_TIMEOUT_MS", "bad"),
+                ("SMG_MM_VIDEO_FETCH_TIMEOUT_MS", "bad"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(resolved.fetch_timeout_ms.value, 1);
+        assert_eq!(resolved.video_fetch_timeout_ms.value, 2);
+        for name in ["SMG_MM_FETCH_TIMEOUT_MS", "SMG_MM_VIDEO_FETCH_TIMEOUT_MS"] {
+            for raw in ["0", "-1", "bad", "1.5"] {
+                let error =
+                    MultimodalSettings::resolve_with(&config, env(&[(name, raw)])).unwrap_err();
+                assert!(error.to_string().contains(name), "{error}");
+            }
+        }
+        let zero = RouterConfig {
+            mm_fetch_timeout_ms: Some(0),
+            ..config
+        };
+        let error = MultimodalSettings::resolve_with(&zero, no_env).unwrap_err();
+        assert_eq!(error.to_string(), "mm_fetch_timeout_ms must be positive");
+        let zero = RouterConfig {
+            mm_fetch_timeout_ms: None,
+            mm_video_fetch_timeout_ms: Some(0),
+            ..zero
+        };
+        let error = MultimodalSettings::resolve_with(&zero, no_env).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mm_video_fetch_timeout_ms must be positive"
+        );
+    }
+
+    /// A bad timeout in embedded use must not relax other valid strict settings.
+    #[test]
+    fn unseeded_media_fetch_timeout_preserves_valid_settings() {
+        for bad in [ENV_FETCH_TIMEOUT_MS, ENV_VIDEO_FETCH_TIMEOUT_MS] {
+            for invalid in [Some("bad"), Some("0"), Some("-1"), None] {
+                let valid = env(&[
+                    (ENV_PROCESSING, "worker"),
+                    (ENV_TURBOJPEG, "require"),
+                    (ENV_FETCH_TIMEOUT_MS, "60000"),
+                    (ENV_VIDEO_FETCH_TIMEOUT_MS, "120000"),
+                    (ENV_PIXEL_CACHE_MB, "32"),
+                ]);
+                let resolved = resolve_unseeded_with(|name| {
+                    if name == bad {
+                        match invalid {
+                            Some(value) => Ok(Some(value.to_string())),
+                            None => anyhow::bail!("not Unicode"),
+                        }
+                    } else {
+                        valid(name)
+                    }
+                });
+                assert_eq!(resolved.processing.value, MmProcessingMode::Worker);
+                assert_eq!(resolved.processing.source, SettingSource::Env);
+                assert_eq!(resolved.turbojpeg.value, TurboJpegPolicy::Require);
+                assert_eq!(resolved.turbojpeg.source, SettingSource::Env);
+                assert_eq!(resolved.pixel_cache_mb.value, 32);
+                assert_eq!(
+                    resolved.fetch_timeout_ms.value,
+                    if bad == ENV_FETCH_TIMEOUT_MS {
+                        10000
+                    } else {
+                        60000
+                    }
+                );
+                assert_eq!(
+                    resolved.video_fetch_timeout_ms.value,
+                    if bad == ENV_VIDEO_FETCH_TIMEOUT_MS {
+                        30000
+                    } else {
+                        120000
+                    }
+                );
+            }
+        }
+    }
+
+    fn no_env(name: &str) -> Result<Option<String>> {
+        env(&[])(name)
+    }
+
+    #[test]
+    fn defaults_when_neither_flag_nor_env_is_set() {
+        let settings = MultimodalSettings::resolve_with(&RouterConfig::default(), no_env).unwrap();
+        assert_eq!(settings, MultimodalSettings::default());
+        assert_eq!(settings.processing.value, MmProcessingMode::Auto);
+        assert_eq!(settings.processing.source, SettingSource::Default);
+        assert_eq!(settings.one_pass_wire, Setting::from_default(true));
+    }
+
+    #[test]
+    fn env_supplies_every_setting_when_the_flags_are_unset() {
+        let settings = MultimodalSettings::resolve_with(
+            &RouterConfig::default(),
+            env(&[
+                ("SMG_MM_PROCESSING", " Worker "),
+                ("SMG_MM_PIXEL_CACHE_MB", "256"),
+                ("SMG_MM_PIXEL_RDMA", "true"),
+                ("SMG_RDMA_LISTEN_IP", "10.0.0.7"),
+                ("SMG_RDMA_SLOT_TTL_S", "600"),
+                ("SMG_LOG_MM_TIMING", "YES"),
+                ("SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS", "True"),
+                ("SMG_MM_ONE_PASS_WIRE", "off"),
+                ("SMG_MM_TURBOJPEG", " Require "),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(settings.processing, from_env(MmProcessingMode::Worker));
+        assert_eq!(settings.pixel_cache_mb, from_env(256));
+        assert_eq!(settings.pixel_rdma, from_env(true));
+        assert_eq!(
+            settings.rdma_listen_ip,
+            from_env(Some("10.0.0.7".to_string()))
+        );
+        assert_eq!(settings.rdma_slot_ttl_s, from_env(Some(600)));
+        assert_eq!(settings.log_mm_timing, from_env(true));
+        assert_eq!(settings.allow_private_media_hosts, from_env(true));
+        assert_eq!(settings.one_pass_wire, from_env(false));
+        assert_eq!(settings.turbojpeg, from_env(TurboJpegPolicy::Require));
+        // The allow-list is a flag only: nothing in the environment lists hosts.
+        assert_eq!(settings.allowed_media_domains, Setting::from_default(None));
+    }
+
+    #[test]
+    fn flags_win_over_env() {
+        let config = RouterConfig {
+            mm_processing: Some(MmProcessingMode::Router),
+            mm_pixel_cache_mb: Some(64),
+            mm_pixel_rdma: true,
+            rdma_listen_ip: Some("192.168.1.2".to_string()),
+            rdma_slot_ttl_s: Some(900),
+            log_mm_timing: true,
+            mm_allowed_media_domains: Some(vec!["media.example".to_string()]),
+            mm_allow_private_media_hosts: true,
+            mm_turbojpeg: Some(TurboJpegPolicy::Require),
+            ..RouterConfig::default()
+        };
+        let settings = MultimodalSettings::resolve_with(
+            &config,
+            env(&[
+                ("SMG_MM_PROCESSING", "worker"),
+                ("SMG_MM_PIXEL_CACHE_MB", "256"),
+                ("SMG_MM_PIXEL_RDMA", "0"),
+                ("SMG_RDMA_LISTEN_IP", "10.0.0.7"),
+                ("SMG_RDMA_SLOT_TTL_S", "600"),
+                ("SMG_LOG_MM_TIMING", "false"),
+                ("SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS", "0"),
+                ("SMG_MM_TURBOJPEG", "prefer"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(settings.processing, flag(MmProcessingMode::Router));
+        assert_eq!(settings.pixel_cache_mb, flag(64));
+        assert_eq!(settings.pixel_rdma, flag(true));
+        assert_eq!(
+            settings.rdma_listen_ip,
+            flag(Some("192.168.1.2".to_string()))
+        );
+        assert_eq!(settings.rdma_slot_ttl_s, flag(Some(900)));
+        assert_eq!(settings.log_mm_timing, flag(true));
+        assert_eq!(
+            settings.allowed_media_domains,
+            flag(Some(vec!["media.example".to_string()]))
+        );
+        assert_eq!(settings.allow_private_media_hosts, flag(true));
+        assert_eq!(settings.turbojpeg, flag(TurboJpegPolicy::Require));
+    }
+
+    /// The media fetch policy's defaults: any public host, no private ones;
+    /// an empty allow-list is no allow-list, and only a true-ish opt-in
+    /// opens private hosts.
+    #[test]
+    fn media_fetch_policy_defaults_and_opt_in_spellings() {
+        let config = RouterConfig {
+            mm_allowed_media_domains: Some(Vec::new()),
+            ..RouterConfig::default()
+        };
+        let settings = MultimodalSettings::resolve_with(&config, no_env).unwrap();
+        assert_eq!(settings.allowed_media_domains, Setting::from_default(None));
+        assert_eq!(
+            settings.allow_private_media_hosts,
+            Setting::from_default(false)
+        );
+        for (value, expected) in [
+            ("1", from_env(true)),
+            ("yes", from_env(true)),
+            ("ON", from_env(true)),
+            ("0", Setting::from_default(false)),
+            ("false", Setting::from_default(false)),
+            ("sometimes", Setting::from_default(false)),
+        ] {
+            let settings = MultimodalSettings::resolve_with(
+                &RouterConfig::default(),
+                env(&[("SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS", value)]),
+            )
+            .unwrap();
+            assert_eq!(settings.allow_private_media_hosts, expected, "{value}");
+        }
+    }
+
+    /// A mode that is nearly right would otherwise resolve to the default and
+    /// run the opposite of what the operator asked for.
+    #[test]
+    fn an_unreadable_processing_env_stops_startup_but_blank_is_the_default() {
+        let config = RouterConfig::default();
+        let error =
+            MultimodalSettings::resolve_with(&config, env(&[("SMG_MM_PROCESSING", "routers")]))
+                .unwrap_err();
+        assert!(error.to_string().contains("SMG_MM_PROCESSING"), "{error:#}");
+
+        let blank =
+            MultimodalSettings::resolve_with(&config, env(&[("SMG_MM_PROCESSING", "  ")])).unwrap();
+        assert_eq!(
+            blank.processing,
+            Setting::from_default(MmProcessingMode::Auto)
+        );
+    }
+
+    /// `require` misread as the default would serve the very pixels the
+    /// operator asked to refuse, so an unreadable policy stops start-up; a
+    /// blank value is unset, and either value reads in any case. The name
+    /// is not a legacy one: no deprecation line is involved.
+    #[test]
+    fn an_unreadable_turbojpeg_env_stops_startup_but_blank_is_the_default() {
+        let config = RouterConfig::default();
+        let error =
+            MultimodalSettings::resolve_with(&config, env(&[("SMG_MM_TURBOJPEG", "required")]))
+                .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("SMG_MM_TURBOJPEG"), "{message}");
+        assert!(message.contains("expected prefer|require"), "{message}");
+
+        let blank =
+            MultimodalSettings::resolve_with(&config, env(&[("SMG_MM_TURBOJPEG", "  ")])).unwrap();
+        assert_eq!(
+            blank.turbojpeg,
+            Setting::from_default(TurboJpegPolicy::Prefer)
+        );
+        let required =
+            MultimodalSettings::resolve_with(&config, env(&[("SMG_MM_TURBOJPEG", "REQUIRE")]))
+                .unwrap();
+        assert_eq!(required.turbojpeg, from_env(TurboJpegPolicy::Require));
+    }
+
+    /// A process with no setting of its own (a worker pipeline whose
+    /// launcher sent none) reads `SMG_MM_TURBOJPEG` under the same strictness:
+    /// an unreadable value is refused rather than read as the default, a
+    /// readable one applies in any case, unset or blank is `prefer`.
+    #[test]
+    fn a_process_without_the_setting_reads_the_env_strictly() {
+        assert_eq!(
+            turbojpeg_policy(Some(" Require ".to_string())).unwrap(),
+            TurboJpegPolicy::Require
+        );
+        assert_eq!(turbojpeg_policy(None).unwrap(), TurboJpegPolicy::Prefer);
+        assert_eq!(
+            turbojpeg_policy(Some("  ".to_string())).unwrap(),
+            TurboJpegPolicy::Prefer
+        );
+        let error = turbojpeg_policy(Some("required".to_string())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("SMG_MM_TURBOJPEG"),
+            "{error:#}"
+        );
+    }
+
+    /// The real unseeded path defaults invalid policies without discarding valid
+    /// strict timeouts, decoder policies or the lenient settings.
+    #[test]
+    fn the_other_settings_survive_an_unreadable_placement_env() {
+        for policy in ["mandatory", "require"] {
+            let full = env(&[
+                (ENV_PROCESSING, "routers"),
+                (ENV_TURBOJPEG, policy),
+                (ENV_FETCH_TIMEOUT_MS, "60000"),
+                (ENV_PIXEL_CACHE_MB, "256"),
+                (ENV_LOG_MM_TIMING, "1"),
+            ]);
+            assert!(MultimodalSettings::resolve_with(&RouterConfig::default(), &full).is_err());
+            let rest = resolve_unseeded_with(&full);
+            assert_eq!(
+                rest.processing,
+                Setting::from_default(MmProcessingMode::Auto)
+            );
+            assert_eq!(
+                rest.turbojpeg,
+                if policy == "require" {
+                    from_env(TurboJpegPolicy::Require)
+                } else {
+                    Setting::from_default(TurboJpegPolicy::Prefer)
+                }
+            );
+            assert_eq!(rest.fetch_timeout_ms, from_env(60000));
+            assert_eq!(rest.pixel_cache_mb, from_env(256));
+            assert_eq!(rest.log_mm_timing, from_env(true));
+        }
+    }
+
+    /// The numeric and boolean env knobs keep their lenient reading: an
+    /// unreadable value is ignored, and a switch spelling outside `1`, `true`,
+    /// `yes`, `on` leaves the switch off.
+    #[test]
+    fn unreadable_numeric_env_and_unknown_switch_values_fall_back() {
+        let settings = MultimodalSettings::resolve_with(
+            &RouterConfig::default(),
+            env(&[
+                ("SMG_MM_PIXEL_CACHE_MB", "lots"),
+                ("SMG_MM_PIXEL_RDMA", "maybe"),
+                ("SMG_RDMA_SLOT_TTL_S", "soon"),
+                ("SMG_LOG_MM_TIMING", "0"),
+                ("SMG_RDMA_LISTEN_IP", "   "),
+                ("SMG_MM_ONE_PASS_WIRE", "sometimes"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(settings, MultimodalSettings::default());
+    }
+
+    /// The one-pass wire write is on unless its switch says off: the off
+    /// spellings turn it off, the on spellings leave it on (an opt-in from
+    /// before it became the default still reads), anything else is the
+    /// default; and the switch reads its own name only.
+    #[test]
+    fn the_one_pass_wire_switch_is_on_by_default_and_reads_off_as_well() {
+        let config = RouterConfig::default();
+        let unset = MultimodalSettings::resolve_with(&config, no_env).unwrap();
+        assert_eq!(unset.one_pass_wire, Setting::from_default(true));
+        for (value, expected) in [
+            ("0", from_env(false)),
+            ("false", from_env(false)),
+            ("no", from_env(false)),
+            ("OFF", from_env(false)),
+            (" Off ", from_env(false)),
+            ("1", from_env(true)),
+            ("true", from_env(true)),
+            ("yes", from_env(true)),
+            ("ON", from_env(true)),
+            ("", Setting::from_default(true)),
+            ("sometimes", Setting::from_default(true)),
+        ] {
+            let settings =
+                MultimodalSettings::resolve_with(&config, env(&[("SMG_MM_ONE_PASS_WIRE", value)]))
+                    .unwrap();
+            assert_eq!(settings.one_pass_wire, expected, "{value:?}");
+            assert_eq!(
+                settings.pixel_rdma,
+                Setting::from_default(false),
+                "{value:?} reaches no other switch"
+            );
+        }
+    }
+
+    /// The env listener address keeps the lenient reading of the other env
+    /// knobs: one that is not an IP address is left unused (the lane stays
+    /// inline) where the flag's value is refused at validation; a readable
+    /// one is kept trimmed, as a flag value is.
+    #[test]
+    fn an_env_listen_ip_that_is_not_an_address_falls_back() {
+        let settings = MultimodalSettings::resolve_with(
+            &RouterConfig::default(),
+            env(&[("SMG_RDMA_LISTEN_IP", "999.1.1.1")]),
+        )
+        .unwrap();
+        assert_eq!(settings.rdma_listen_ip, Setting::from_default(None));
+
+        let settings = MultimodalSettings::resolve_with(
+            &RouterConfig::default(),
+            env(&[("SMG_RDMA_LISTEN_IP", " fd00::1 ")]),
+        )
+        .unwrap();
+        assert_eq!(
+            settings.rdma_listen_ip,
+            from_env(Some("fd00::1".to_string()))
+        );
+
+        let config = RouterConfig {
+            rdma_listen_ip: Some(" 10.0.0.7 ".to_string()),
+            ..RouterConfig::default()
+        };
+        let settings = MultimodalSettings::resolve_with(&config, no_env).unwrap();
+        assert_eq!(settings.rdma_listen_ip, flag(Some("10.0.0.7".to_string())));
+    }
+
+    /// The three off-by-default env switches read one set of spellings: `1`,
+    /// `true`, `yes` and `on` in any case turn them on, anything else leaves
+    /// the default; the one-pass wire switch keeps its own default under
+    /// every one of their names. (`SMG_MM_PIXEL_RDMA` took `1` and `true`
+    /// only before.)
+    #[test]
+    fn every_env_switch_reads_the_same_spellings() {
+        for name in [
+            "SMG_MM_PIXEL_RDMA",
+            "SMG_LOG_MM_TIMING",
+            "SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS",
+        ] {
+            for (value, on) in [
+                ("1", true),
+                ("true", true),
+                ("yes", true),
+                ("ON", true),
+                (" True ", true),
+                ("0", false),
+                ("false", false),
+                ("off", false),
+                ("sometimes", false),
+                ("", false),
+            ] {
+                let settings = MultimodalSettings::resolve_with(
+                    &RouterConfig::default(),
+                    env(&[(name, value)]),
+                )
+                .unwrap();
+                let [pixel_rdma, log_mm_timing, allow_private] = [
+                    settings.pixel_rdma,
+                    settings.log_mm_timing,
+                    settings.allow_private_media_hosts,
+                ];
+                let expected = if on {
+                    from_env(true)
+                } else {
+                    Setting::from_default(false)
+                };
+                let off = Setting::from_default(false);
+                let (actual, others) = match name {
+                    "SMG_MM_PIXEL_RDMA" => (pixel_rdma, [log_mm_timing, allow_private]),
+                    "SMG_LOG_MM_TIMING" => (log_mm_timing, [pixel_rdma, allow_private]),
+                    _ => (allow_private, [pixel_rdma, log_mm_timing]),
+                };
+                assert_eq!(actual, expected, "{name}={value:?}");
+                // Each switch reads its own name only.
+                assert_eq!(others, [off, off], "{name}={value:?}");
+                assert_eq!(
+                    settings.one_pass_wire,
+                    Setting::from_default(true),
+                    "{name}={value:?}"
+                );
+            }
+        }
+    }
+
+    /// The process reader: unset is `None`, text is itself, and a value set
+    /// to bytes that are not text is refused with the variable named when
+    /// the name is strict (read as unset, `require` would hand the policy
+    /// its default) and leaves its default, like an unparsable value, when
+    /// it is not.
+    #[cfg(unix)]
+    #[test]
+    fn an_env_value_that_is_not_text_is_refused_by_name_where_strict_and_unset_is_none() {
+        use std::{env::VarError, ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let not_text = || VarError::NotUnicode(OsString::from_vec(vec![b'r', 0xff]));
+        assert_eq!(
+            env_text(ENV_TURBOJPEG, Err(VarError::NotPresent)).unwrap(),
+            None
+        );
+        assert_eq!(
+            env_text(ENV_TURBOJPEG, Ok("require".to_string())).unwrap(),
+            Some("require".to_string())
+        );
+        for name in STRICT_ENV {
+            let error = env_text(name, Err(not_text())).unwrap_err();
+            assert!(format!("{error:#}").contains(name), "{error:#}");
+        }
+        assert_eq!(env_text(ENV_PIXEL_CACHE_MB, Err(not_text())).unwrap(), None);
+    }
+
+    /// The settings carry the reader's refusal: a `SMG_MM_TURBOJPEG` the
+    /// reader refuses stops the resolution, named, instead of reading as the
+    /// default.
+    #[test]
+    fn a_turbojpeg_env_the_reader_refuses_stops_the_settings() {
+        let refused = |name: &str| -> Result<Option<String>> {
+            if name == ENV_TURBOJPEG {
+                Err(anyhow::anyhow!(
+                    "{name} is set to a value that is not valid UTF-8"
+                ))
+            } else {
+                Ok(None)
+            }
+        };
+        let error =
+            MultimodalSettings::resolve_with(&RouterConfig::default(), refused).unwrap_err();
+        assert!(format!("{error:#}").contains(ENV_TURBOJPEG), "{error:#}");
+    }
+}

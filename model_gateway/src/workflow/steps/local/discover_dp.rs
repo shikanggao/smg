@@ -10,7 +10,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_metadata::get_server_info;
 use crate::{
-    worker::{ConnectionMode, UNKNOWN_MODEL_ID},
+    worker::{endpoint::Endpoint, ConnectionMode, UNKNOWN_MODEL_ID},
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
 
@@ -29,9 +29,12 @@ pub async fn get_dp_info(
 ) -> Result<DpInfo, String> {
     let info = get_server_info(client, url, api_key).await?;
 
-    let dp_size = info
-        .dp_size
-        .ok_or_else(|| format!("No dp_size in response from {url}"))?;
+    let dp_size = routing_dp_size(info.dp_size, info.attn_dp_size).map_err(|error| {
+        format!(
+            "Invalid DP metadata from {}: {error}",
+            Endpoint::redacted_str(url)
+        )
+    })?;
 
     let model_id = info
         .model_id
@@ -46,19 +49,37 @@ pub async fn get_dp_info(
     Ok(DpInfo { dp_size, model_id })
 }
 
-/// Build DP info from gRPC-discovered metadata labels (`dp_size` is reported
-/// via GetServerInfo and normalized into the label set by metadata discovery).
+/// Build DP info from gRPC-discovered metadata labels, normalized by metadata discovery.
 pub fn dp_info_from_labels(labels: &HashMap<String, String>) -> Result<DpInfo, String> {
-    let dp_size = labels
-        .get("dp_size")
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .ok_or_else(|| "no positive dp_size in discovered metadata".to_string())?;
+    let width = |name: &str| {
+        labels
+            .get(name)
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid {name} in discovered metadata: {value}"))
+            })
+            .transpose()
+    };
+    let dp_size = routing_dp_size(width("dp_size")?, width("attn_dp_size")?)?;
 
     Ok(DpInfo {
         dp_size,
         model_id: model_id_from_labels(labels),
     })
+}
+
+fn routing_dp_size(dp_size: Option<usize>, attn_dp_size: Option<usize>) -> Result<usize, String> {
+    if dp_size.is_none() && attn_dp_size.is_none() {
+        return Err("no DP size in discovered metadata".to_string());
+    }
+    // Newer SGLang separates model replicas from attention-DP groups; older
+    // servers report their routing width in dp_size alone.
+    dp_size
+        .unwrap_or(1)
+        .checked_mul(attn_dp_size.unwrap_or(1))
+        .filter(|&width| width > 0)
+        .ok_or_else(|| "DP sizes must be positive and their product must fit usize".to_string())
 }
 
 /// Best-effort model identity from discovered metadata labels.
@@ -112,12 +133,15 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
         if !app_context.router_config.dp_aware {
             debug!(
                 "Worker {} is not DP-aware, skipping DP discovery",
-                config.url
+                Endpoint::redacted_str(&config.url)
             );
             return Ok(StepResult::Success);
         }
 
-        debug!("Discovering DP info for {} (DP-aware)", config.url);
+        debug!(
+            "Discovering DP info for {} (DP-aware)",
+            Endpoint::redacted_str(&config.url)
+        );
 
         let dp_info = match context.data.connection_mode {
             // gRPC workers report dp_size through GetServerInfo, already
@@ -131,7 +155,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
                         warn!(
                             "No DP info for {} ({e}); registering as a single \
                          non-DP worker",
-                            config.url
+                            Endpoint::redacted_str(&config.url)
                         );
                         return Ok(StepResult::Success);
                     }
@@ -150,7 +174,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
                     warn!(
                         "DP discovery is not supported for {} HTTP workers ({}), skipping",
                         runtime.unwrap_or("unknown"),
-                        config.url
+                        Endpoint::redacted_str(&config.url)
                     );
                     return Ok(StepResult::Success);
                 }
@@ -166,7 +190,9 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
 
         debug!(
             "Discovered DP size {} for {} (model: {})",
-            dp_info.dp_size, config.url, dp_info.model_id
+            dp_info.dp_size,
+            Endpoint::redacted_str(&config.url),
+            dp_info.model_id
         );
 
         context.data.dp_info = Some(dp_info);
@@ -181,35 +207,38 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
+    use crate::workflow::steps::local::test_support::labels_of;
 
     #[test]
     fn dp_info_from_labels_reads_dp_size_and_model() {
-        let info =
-            dp_info_from_labels(&labels(&[("dp_size", "4"), ("served_model_name", "m")])).unwrap();
-        assert_eq!(info.dp_size, 4);
-        assert_eq!(info.model_id, "m");
+        for widths in [
+            vec![("dp_size", "4")],
+            vec![("dp_size", "1"), ("attn_dp_size", "4")],
+            vec![("attn_dp_size", "4")],
+            vec![("dp_size", "2"), ("attn_dp_size", "2")],
+        ] {
+            let mut metadata = labels_of(&widths);
+            metadata.insert("served_model_name".to_string(), "m".to_string());
+            let info = dp_info_from_labels(&metadata).unwrap();
+            assert_eq!(info.dp_size, 4);
+            assert_eq!(info.model_id, "m");
+        }
     }
 
     #[test]
     fn dp_info_from_labels_model_path_fallback() {
-        let info =
-            dp_info_from_labels(&labels(&[("dp_size", "2"), ("model_path", "org/repo")])).unwrap();
+        let info = dp_info_from_labels(&labels_of(&[("dp_size", "2"), ("model_path", "org/repo")]))
+            .unwrap();
         assert_eq!(info.model_id, "repo");
         let info =
-            dp_info_from_labels(&labels(&[("dp_size", "2"), ("model_path", "org/repo/")])).unwrap();
+            dp_info_from_labels(&labels_of(&[("dp_size", "2"), ("model_path", "org/repo/")]))
+                .unwrap();
         assert_eq!(info.model_id, "repo");
     }
 
     #[test]
     fn dp_info_from_labels_unknown_model_when_absent() {
-        let info = dp_info_from_labels(&labels(&[("dp_size", "2")])).unwrap();
+        let info = dp_info_from_labels(&labels_of(&[("dp_size", "2")])).unwrap();
         assert_eq!(info.model_id, UNKNOWN_MODEL_ID);
     }
 
@@ -219,7 +248,7 @@ mod tests {
         // grouped one reports its spec size, so create_worker gets a dp_info
         // to validate under --dp-aware instead of an internal error.
         let mut spec = WorkerSpec::new("ipc:///tmp/smg-zmq/engine.ipc");
-        let info = zmq_dp_info(&spec, &labels(&[("model_id", "m")]));
+        let info = zmq_dp_info(&spec, &labels_of(&[("model_id", "m")]));
         assert_eq!(info.dp_size, 1);
         assert_eq!(info.model_id, "m");
 
@@ -232,8 +261,16 @@ mod tests {
 
     #[test]
     fn dp_info_from_labels_rejects_missing_or_zero_dp_size() {
-        assert!(dp_info_from_labels(&labels(&[])).is_err());
-        assert!(dp_info_from_labels(&labels(&[("dp_size", "0")])).is_err());
-        assert!(dp_info_from_labels(&labels(&[("dp_size", "abc")])).is_err());
+        assert!(dp_info_from_labels(&labels_of(&[])).is_err());
+        assert!(dp_info_from_labels(&labels_of(&[("dp_size", "0")])).is_err());
+        assert!(dp_info_from_labels(&labels_of(&[("dp_size", "abc")])).is_err());
+        assert!(
+            dp_info_from_labels(&labels_of(&[("dp_size", "1"), ("attn_dp_size", "0")])).is_err()
+        );
+        assert!(
+            dp_info_from_labels(&labels_of(&[("dp_size", "1"), ("attn_dp_size", "abc")])).is_err()
+        );
+        let overflow = labels_of(&[("dp_size", &usize::MAX.to_string()), ("attn_dp_size", "2")]);
+        assert!(dp_info_from_labels(&overflow).is_err());
     }
 }

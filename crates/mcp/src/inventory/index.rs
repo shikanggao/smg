@@ -12,8 +12,8 @@ use std::collections::HashSet;
 use dashmap::DashMap;
 use tracing::warn;
 
-use super::types::{QualifiedToolName, ToolCategory, ToolEntry};
-use crate::core::config::{Prompt, RawResource, Tool};
+use super::types::{QualifiedToolName, ToolCategory, ToolEntry, ALIAS_SERVER_KEY};
+use crate::core::config::{Prompt, Resource, Tool};
 
 /// Cached prompt with metadata
 #[derive(Clone)]
@@ -26,7 +26,7 @@ pub(crate) struct CachedPrompt {
 #[derive(Clone)]
 pub(crate) struct CachedResource {
     pub server_name: String,
-    pub resource: RawResource,
+    pub resource: Resource,
 }
 
 pub struct ToolInventory {
@@ -286,7 +286,7 @@ impl ToolInventory {
     }
 
     /// Get a resource by URI, returning the server and resource info.
-    pub fn get_resource(&self, resource_uri: &str) -> Option<(String, RawResource)> {
+    pub fn get_resource(&self, resource_uri: &str) -> Option<(String, Resource)> {
         self.resources
             .get(resource_uri)
             .map(|entry| (entry.server_name.clone(), entry.resource.clone()))
@@ -298,12 +298,7 @@ impl ToolInventory {
     }
 
     /// Insert or update a resource.
-    pub fn insert_resource(
-        &self,
-        resource_uri: String,
-        server_name: String,
-        resource: RawResource,
-    ) {
+    pub fn insert_resource(&self, resource_uri: String, server_name: String, resource: Resource) {
         self.resources.insert(
             resource_uri,
             CachedResource {
@@ -314,7 +309,7 @@ impl ToolInventory {
     }
 
     /// List all resources as (uri, server, resource) tuples.
-    pub fn list_resources(&self) -> Vec<(String, String, RawResource)> {
+    pub fn list_resources(&self) -> Vec<(String, String, Resource)> {
         self.resources
             .iter()
             .map(|entry| {
@@ -328,37 +323,75 @@ impl ToolInventory {
             .collect()
     }
 
-    /// Clear all cached items for a server. Uses server index for O(tools_per_server) removal.
+    /// Clear all cached items for a server: its tools (with the aliases that
+    /// target them), its prompts and its resources. Uses the server index for
+    /// O(tools_per_server) removal.
     pub fn clear_server_tools(&self, server_key: &str) {
+        self.clear_server_tool_entries(server_key);
+        self.clear_server_prompts(server_key);
+        self.clear_server_resources(server_key);
+    }
+
+    /// Clear a server's tools and the aliases that target them, each alias's
+    /// own entry under the alias server key included, so a tool the server
+    /// dropped is not still offered under its alias. Prompts and resources
+    /// stay.
+    pub fn clear_server_tool_entries(&self, server_key: &str) {
         if let Some((_, tool_names)) = self.tools_by_server.remove(server_key) {
             for tool_name in tool_names {
-                let qualified = QualifiedToolName::new(server_key, &tool_name);
-
-                // Get entry before removing to access metadata
-                if let Some((_, entry)) = self.tools_by_qualified.remove(&qualified) {
-                    // Remove from category index
-                    if let Some(mut cat_set) = self.tools_by_category.get_mut(&entry.category) {
-                        cat_set.remove(&qualified);
-                    }
-                }
-
-                // Remove from simple name index
-                if let Some(mut entry) = self.tools_by_simple_name.get_mut(&tool_name) {
-                    entry.retain(|q| q != &qualified);
-                }
-                self.tools_by_simple_name
-                    .remove_if(&tool_name, |_, v| v.is_empty());
+                self.remove_entry(&QualifiedToolName::new(server_key, &tool_name));
             }
         }
 
-        // Remove aliases that point to this server
-        self.aliases
-            .retain(|_, target| target.server_key() != server_key);
+        // Remove aliases that point to this server, index and entry alike
+        let aliases: Vec<String> = self
+            .aliases
+            .iter()
+            .filter(|entry| entry.value().server_key() == server_key)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for alias in aliases {
+            self.aliases.remove(&alias);
+            let qualified = QualifiedToolName::new(ALIAS_SERVER_KEY, &alias);
+            self.remove_entry(&qualified);
+            if let Some(mut names) = self.tools_by_server.get_mut(ALIAS_SERVER_KEY) {
+                names.remove(&alias);
+            }
+            self.tools_by_server
+                .remove_if(ALIAS_SERVER_KEY, |_, names| names.is_empty());
+        }
+    }
 
+    /// Clear a server's prompts; its tools and resources stay.
+    pub fn clear_server_prompts(&self, server_key: &str) {
         self.prompts
             .retain(|_, cached| cached.server_name != server_key);
+    }
+
+    /// Clear a server's resources; its tools and prompts stay.
+    pub fn clear_server_resources(&self, server_key: &str) {
         self.resources
             .retain(|_, cached| cached.server_name != server_key);
+    }
+
+    /// Remove one entry from the primary, category and simple-name indexes
+    /// (the server index is the caller's).
+    fn remove_entry(&self, qualified: &QualifiedToolName) {
+        let tool_name = qualified.tool_name().to_string();
+        // Get entry before removing to access metadata
+        if let Some((_, entry)) = self.tools_by_qualified.remove(qualified) {
+            // Remove from category index
+            if let Some(mut cat_set) = self.tools_by_category.get_mut(&entry.category) {
+                cat_set.remove(qualified);
+            }
+        }
+
+        // Remove from simple name index
+        if let Some(mut entry) = self.tools_by_simple_name.get_mut(&tool_name) {
+            entry.retain(|q| q != qualified);
+        }
+        self.tools_by_simple_name
+            .remove_if(&tool_name, |_, v| v.is_empty());
     }
 
     /// Returns (total_tools, prompts, resources). Total includes collision duplicates.
@@ -412,7 +445,10 @@ pub struct IndexCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::{Prompt, RawResource, Tool};
+    use crate::{
+        core::config::{Prompt, Resource, Tool},
+        inventory::AliasTarget,
+    };
 
     // Helper to create a test tool
     fn create_test_tool(name: &str) -> Tool {
@@ -436,14 +472,25 @@ mod tests {
         )
     }
 
+    /// A fresh inventory holding `tool1` of `server1`.
+    fn inventory_with_tool1() -> ToolInventory {
+        let inventory = ToolInventory::new();
+        inventory.insert_tool(
+            "tool1".to_string(),
+            "server1".to_string(),
+            create_test_tool("tool1"),
+        );
+        inventory
+    }
+
     // Helper to create a test prompt
     fn create_test_prompt(name: &str) -> Prompt {
         Prompt::new(name, Some(format!("Test prompt: {name}")), None)
     }
 
     // Helper to create a test resource
-    fn create_test_resource(uri: &str) -> RawResource {
-        RawResource::new(uri, uri)
+    fn create_test_resource(uri: &str) -> Resource {
+        Resource::new(uri, uri)
             .with_description(format!("Test resource: {uri}"))
             .with_mime_type("text/plain")
     }
@@ -477,13 +524,7 @@ mod tests {
 
     #[test]
     fn test_list_tools() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
         inventory.insert_tool(
             "tool2".to_string(),
             "server1".to_string(),
@@ -501,13 +542,7 @@ mod tests {
 
     #[test]
     fn test_clear_server_tools() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
         inventory.insert_tool(
             "tool2".to_string(),
             "server2".to_string(),
@@ -598,13 +633,7 @@ mod tests {
 
     #[test]
     fn test_clear_all() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
         inventory.insert_prompt(
             "prompt1".to_string(),
             "server1".to_string(),
@@ -764,13 +793,7 @@ mod tests {
 
     #[test]
     fn test_list_tools_qualified() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
         inventory.insert_tool(
             "tool2".to_string(),
             "server2".to_string(),
@@ -796,13 +819,7 @@ mod tests {
 
     #[test]
     fn test_unique_tool_name_count() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
         inventory.insert_tool(
             "tool1".to_string(),
             "server2".to_string(),
@@ -934,13 +951,7 @@ mod tests {
 
     #[test]
     fn test_index_counts() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
         inventory.register_alias(
             "alias1".to_string(),
             QualifiedToolName::new("server1", "tool1"),
@@ -975,13 +986,7 @@ mod tests {
 
     #[test]
     fn test_clear_server_removes_aliases_to_server() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
 
         inventory.register_alias(
             "alias1".to_string(),
@@ -1013,5 +1018,62 @@ mod tests {
         assert_eq!(entry.tool_name(), "my_tool");
 
         assert!(inventory.get_entry("other", "my_tool").is_none());
+    }
+
+    #[test]
+    fn clearing_a_server_drops_the_alias_entries_that_targeted_it() {
+        let inventory = ToolInventory::new();
+        inventory.insert_entry(ToolEntry::new(
+            QualifiedToolName::new("s", "search"),
+            create_test_tool("search"),
+        ));
+        inventory.insert_entry(ToolEntry::new(
+            QualifiedToolName::new("other", "lookup"),
+            create_test_tool("lookup"),
+        ));
+        inventory.insert_entry(
+            ToolEntry::new(
+                QualifiedToolName::new(ALIAS_SERVER_KEY, "web_search"),
+                create_test_tool("search"),
+            )
+            .with_alias(AliasTarget::new(QualifiedToolName::new("s", "search"))),
+        );
+        inventory.register_alias(
+            "web_search".to_string(),
+            QualifiedToolName::new("s", "search"),
+        );
+        inventory.insert_prompt("p".to_string(), "s".to_string(), create_test_prompt("p"));
+        inventory.insert_resource("r".to_string(), "s".to_string(), create_test_resource("r"));
+
+        inventory.clear_server_tool_entries("s");
+
+        assert!(inventory.get_entry("s", "search").is_none());
+        assert!(inventory.resolve_alias("web_search").is_none());
+        assert!(inventory
+            .get_entry(ALIAS_SERVER_KEY, "web_search")
+            .is_none());
+        assert!(inventory.get_tool_or_alias("web_search").is_none());
+        assert!(inventory.get_entry("other", "lookup").is_some());
+        // prompts and resources are not the tool clear's business
+        assert_eq!(inventory.counts().1, 1);
+        assert_eq!(inventory.counts().2, 1);
+    }
+
+    #[test]
+    fn the_per_kind_clears_leave_the_other_kinds() {
+        let inventory = ToolInventory::new();
+        inventory.insert_entry(ToolEntry::new(
+            QualifiedToolName::new("s", "search"),
+            create_test_tool("search"),
+        ));
+        inventory.insert_prompt("p".to_string(), "s".to_string(), create_test_prompt("p"));
+        inventory.insert_resource("r".to_string(), "s".to_string(), create_test_resource("r"));
+
+        inventory.clear_server_prompts("s");
+        assert_eq!(inventory.counts(), (1, 0, 1));
+        inventory.clear_server_resources("s");
+        assert_eq!(inventory.counts(), (1, 0, 0));
+        inventory.clear_server_tools("s");
+        assert_eq!(inventory.counts(), (0, 0, 0));
     }
 }

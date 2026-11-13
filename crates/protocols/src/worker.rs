@@ -84,8 +84,9 @@ pub enum ConnectionMode {
     Http,
     /// gRPC connection.
     Grpc,
-    /// Direct ZMQ connection to a same-host engine core (bypasses the gRPC
-    /// Python servicer). Speaks the engine's native ZMQ IPC.
+    /// Direct ZMQ connection to an engine core (bypasses the gRPC Python
+    /// servicer). Speaks the engine's native ZMQ wire: over `ipc://` sockets
+    /// to a same-host engine, over `tcp://` to engines on other hosts.
     Zmq,
 }
 
@@ -95,7 +96,7 @@ impl ConnectionMode {
     /// scheme) or an unrecognized scheme, leaving the default to the caller
     /// (some probe both protocols; some default to HTTP).
     pub fn from_url(url: &str) -> Option<Self> {
-        if url.starts_with("ipc://") {
+        if url.starts_with("ipc://") || url.starts_with("tcp://") {
             Some(ConnectionMode::Zmq)
         } else if url.starts_with("grpc://") || url.starts_with("grpcs://") {
             Some(ConnectionMode::Grpc)
@@ -309,11 +310,11 @@ impl std::str::FromStr for RuntimeType {
 ///
 /// Different providers have different API formats and requirements.
 /// `None` (when used as `Option<ProviderType>`) means native/passthrough —
-/// no transformation needed (local SGLang backends).
+/// no transformation needed (local engine backends).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
-    /// OpenAI API — strip SGLang-specific fields.
+    /// OpenAI API — strip the engine-specific fields.
     #[serde(alias = "openai")]
     OpenAI,
     /// xAI/Grok — special handling for input items.
@@ -596,6 +597,102 @@ impl JsonSchema for WorkerModels {
     }
 }
 
+/// When the gateway hands a worker's engine a grammar: only when the request
+/// asks for one (a forced tool choice or a JSON response format), which every
+/// worker does unless told otherwise, or on every turn, for a model trained
+/// to be read through one. Set on the worker spec, as the `constrained_decoding`
+/// worker label, or reported by the engine's servicer in server info; the spec
+/// wins over the labels, and a configured label over a discovered one
+/// ([`ConstrainedDecoding::of`]).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ConstrainedDecoding {
+    /// A grammar only when the request asks for one.
+    #[default]
+    Requested,
+    /// A grammar on every turn.
+    Always,
+}
+
+impl ConstrainedDecoding {
+    /// The worker label that carries the policy when it is not on the spec.
+    pub const LABEL: &'static str = "constrained_decoding";
+    /// The label's value for [`Self::Requested`].
+    pub const REQUESTED: &'static str = "requested";
+    /// The label's value for [`Self::Always`].
+    pub const ALWAYS: &'static str = "always";
+
+    /// The policy a label value names, or why it names none.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            Self::REQUESTED => Ok(Self::Requested),
+            Self::ALWAYS => Ok(Self::Always),
+            other => Err(format!(
+                "constrained_decoding must be '{}' or '{}', not '{other}'",
+                Self::REQUESTED,
+                Self::ALWAYS
+            )),
+        }
+    }
+
+    /// The policy a worker's `constrained_decoding` label names; anything
+    /// else, the label's absence included, is [`Self::Requested`].
+    pub fn from_label(value: Option<&str>) -> Self {
+        value
+            .and_then(|value| Self::parse(value).ok())
+            .unwrap_or_default()
+    }
+
+    /// The label value for the policy.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Requested => Self::REQUESTED,
+            Self::Always => Self::ALWAYS,
+        }
+    }
+
+    /// A worker's policy: the spec's when set, else its label's.
+    pub fn of(spec: &WorkerSpec) -> Self {
+        spec.constrained_decoding
+            .unwrap_or_else(|| Self::from_label(spec.labels.get(Self::LABEL).map(String::as_str)))
+    }
+}
+
+/// The vocabulary of structural-tag nodes a worker's grammar compiler
+/// takes, from its `structural_tag_vocabulary` label: the current one unless
+/// the label says `older`, for a compiler that predates the `optional`,
+/// `plus` and `star` nodes and refuses a tag that carries one. The tables'
+/// tags go to such a worker spelled without them, the same language, which
+/// every compiler takes; a worker without the label gets the tag as the
+/// table built it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TagVocabulary {
+    /// Every node the tables use.
+    #[default]
+    Current,
+    /// Without the `optional`, `plus` and `star` nodes; a `token` node stays
+    /// as derived.
+    Older,
+}
+
+impl TagVocabulary {
+    /// The worker label that carries it.
+    pub const LABEL: &'static str = "structural_tag_vocabulary";
+    /// The label's value for [`Self::Older`].
+    pub const OLDER: &'static str = "older";
+
+    /// The vocabulary a worker's `structural_tag_vocabulary` label names;
+    /// anything else, the label's absence included, is [`Self::Current`].
+    pub fn from_label(value: Option<&str>) -> Self {
+        match value {
+            Some(Self::OLDER) => Self::Older,
+            _ => Self::Current,
+        }
+    }
+}
+
 // ── Core identity ────────────────────────────────────────────────────
 
 /// Core worker identity and configuration.
@@ -677,13 +774,13 @@ pub struct WorkerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_role: Option<String>,
 
-    /// KV transfer engine id (vLLM `kv_transfer_config.engine_id`; Mooncake PD).
+    /// KV transfer engine id (the engine's `kv_transfer_config.engine_id`; Mooncake PD).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_engine_id: Option<String>,
 
     /// KV cache block size (tokens per block) for event-driven routing.
     /// When set, overrides the router-level default for this worker's model.
-    /// Typically matches the backend engine's page size (e.g. 16 for SGLang).
+    /// Typically matches the backend engine's page size (e.g. 16 for one of the engines).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_block_size: Option<usize>,
     /// Explicit PD pairing protocol. A prefill and a decode with this set
@@ -696,6 +793,13 @@ pub struct WorkerSpec {
     /// descriptor from the worker's discovered labels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_protocol: Option<String>,
+    /// When the gateway hands this worker's engine a grammar: `always` for a
+    /// model read through one on every turn, `requested` (the default) for a
+    /// grammar only when the request asks. The same value can arrive as a
+    /// `constrained_decoding` worker label or from the engine's servicer in
+    /// server info; this field wins ([`ConstrainedDecoding::of`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained_decoding: Option<ConstrainedDecoding>,
 
     /// Per-worker health check overrides (partial — only `Some` fields override router defaults).
     #[serde(default, skip_serializing_if = "HealthCheckUpdate::is_empty")]
@@ -769,6 +873,7 @@ impl WorkerSpec {
             kv_engine_id: None,
             kv_block_size: None,
             pairing_protocol: None,
+            constrained_decoding: None,
             health: HealthCheckUpdate::default(),
             http_pool: HttpPoolConfig::default(),
             resilience: ResilienceUpdate::default(),
@@ -841,6 +946,62 @@ impl std::str::FromStr for TransportMode {
     }
 }
 
+/// Where media is fetched and preprocessed for one engine's gRPC workers.
+///
+/// - `Auto`: forward media references when every worker serving the model
+///   advertises worker-side processing; otherwise preprocess on the router.
+/// - `Router`: always preprocess on the router (kill switch).
+/// - `Worker`: forward references; a request carrying per-item hints is
+///   preprocessed on the router, which applies them; fail when no capable
+///   worker exists.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MmProcessingMode {
+    #[default]
+    Auto,
+    Router,
+    Worker,
+}
+
+impl MmProcessingMode {
+    /// Parse from a case-insensitive string (`auto` | `router` | `worker`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "router" => Some(Self::Router),
+            "worker" => Some(Self::Worker),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Router => "router",
+            Self::Worker => "worker",
+        }
+    }
+}
+
+impl std::fmt::Display for MmProcessingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MmProcessingMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| {
+            format!("invalid multimodal processing mode '{s}'; expected auto|router|worker")
+        })
+    }
+}
+
 // ── API types ───────────────────────────────────────────────────────
 
 /// Worker information for API responses.
@@ -885,6 +1046,12 @@ pub struct WorkerInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pd_pairing: Option<String>,
 
+    /// Why the gateway's liveness tracker currently keeps the worker out of
+    /// routing (`unreachable` or `wedged`) while its health status stands;
+    /// absent when it is routable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled: Option<String>,
+
     /// The worker's last polled engine load, as published by the load
     /// monitor. `None` when load monitoring has produced nothing for this
     /// worker yet. Unrelated to `load` above, which counts in-flight
@@ -908,6 +1075,7 @@ impl WorkerInfo {
             load: 0,
             http2: false,
             pd_pairing: None,
+            stalled: None,
             engine_load: None,
             job_status,
         }
@@ -925,45 +1093,69 @@ pub struct JobStatus {
 }
 
 impl JobStatus {
-    /// Create a pending job status
-    pub fn pending(job_type: &str, worker_url: &str) -> Self {
+    /// A status with the given word, stamped now, with the message a
+    /// terminal status carries.
+    fn stamped(job_type: &str, worker_url: &str, status: &str, message: Option<String>) -> Self {
         Self {
             job_type: job_type.to_string(),
             worker_url: worker_url.to_string(),
-            status: "pending".to_string(),
-            message: None,
+            status: status.to_string(),
+            message,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
         }
+    }
+
+    /// Create a pending job status
+    pub fn pending(job_type: &str, worker_url: &str) -> Self {
+        Self::stamped(job_type, worker_url, "pending", None)
     }
 
     /// Create a processing job status
     pub fn processing(job_type: &str, worker_url: &str) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "processing".to_string(),
-            message: None,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        }
+        Self::stamped(job_type, worker_url, "processing", None)
     }
 
     /// Create a failed job status
     pub fn failed(job_type: &str, worker_url: &str, error: String) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "failed".to_string(),
-            message: Some(error),
-            timestamp: std::time::SystemTime::now()
+        Self::stamped(job_type, worker_url, "failed", Some(error))
+    }
+}
+
+#[cfg(test)]
+mod job_status_tests {
+    use super::JobStatus;
+
+    #[test]
+    fn a_status_carries_its_word_its_message_and_a_stamp_of_now() {
+        let seconds_since_epoch = || {
+            std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs(),
+                .as_secs()
+        };
+        let before = seconds_since_epoch();
+        let pending = JobStatus::pending("AddWorker", "http://w:8000");
+        let processing = JobStatus::processing("AddWorker", "http://w:8000");
+        let failed = JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string());
+        let after = seconds_since_epoch();
+        let words = |status: &JobStatus| (status.status.clone(), status.message.clone());
+        assert_eq!(words(&pending), ("pending".to_string(), None));
+        assert_eq!(words(&processing), ("processing".to_string(), None));
+        assert_eq!(
+            words(&failed),
+            ("failed".to_string(), Some("boom".to_string()))
+        );
+        for status in [&pending, &processing, &failed] {
+            assert_eq!(status.job_type, "AddWorker");
+            assert_eq!(status.worker_url, "http://w:8000");
+            assert!(
+                (before..=after).contains(&status.timestamp),
+                "stamped between {before} and {after}, not at {}",
+                status.timestamp
+            );
         }
     }
 }
@@ -1047,7 +1239,9 @@ impl HealthCheckUpdate {
 /// Per-worker HTTP connection configuration.
 /// All fields optional — `None` means "use router/global default".
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct HttpPoolConfig {
     /// Max idle connections per host (default: 500).
     pub pool_max_idle_per_host: Option<usize>,
@@ -1189,6 +1383,34 @@ pub struct ListWorkersQuery {
     /// Only return workers serving this model, e.g. `?model=moonshotai/Kimi-K2.5`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The shape of the answer: the worker records when absent, or
+    /// `manifest`, the file discovery provider's manifest, which a second
+    /// gateway reads with `--discovery-provider file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<WorkerListFormat>,
+    /// Only the workers of this origin: `local`, registered at start-up or
+    /// through this API, or `discovery`, registered by a discovery provider
+    /// that re-registers them on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<WorkerListOrigin>,
+}
+
+/// The shape `GET /workers` answers in, when not the worker records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerListFormat {
+    /// The file discovery provider's manifest: `{"version": 1, "workers": [...]}`.
+    Manifest,
+}
+
+/// Who registered a worker, as `GET /workers?origin=` filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerListOrigin {
+    /// The start-up flags or the worker API.
+    Local,
+    /// A discovery provider: Kubernetes, a file, Slurm or Consul.
+    Discovery,
 }
 
 // ── Response types ──────────────────────────────────────────────────
@@ -1211,16 +1433,18 @@ pub struct WorkerErrorResponse {
 }
 
 /// Result from flush cache operations across workers
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FlushCacheResult {
     pub successful: Vec<String>,
     pub failed: Vec<(String, String)>,
     pub total_workers: usize,
     pub http_workers: usize,
+    /// gRPC workers, and direct-ZMQ engines whose wire carries the flush.
     #[serde(default)]
     pub grpc_workers: usize,
     /// Workers skipped because their transport has no cache-flush RPC
-    /// (direct-ZMQ engines). Keeps `total = http + grpc + zmq` exact.
+    /// (direct-ZMQ engines whose wire carries no control calls). Keeps
+    /// `total = http + grpc + zmq` exact.
     #[serde(default)]
     pub zmq_workers: usize,
     pub message: String,
@@ -1231,7 +1455,7 @@ pub struct FlushCacheResult {
 /// Mirrors the engines' native profile parameters: serialized verbatim as
 /// the JSON body for HTTP workers and mapped to the `StartProfile` RPC for
 /// gRPC workers. Unset fields fall back to backend defaults.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ProfileOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1250,7 +1474,7 @@ pub struct ProfileOptions {
 }
 
 /// Result from profile start/stop operations across workers
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ProfileResult {
     pub successful: Vec<String>,
     pub failed: Vec<(String, String)>,
@@ -1261,7 +1485,7 @@ pub struct ProfileResult {
 /// Request body for the gateway `/start_profile` route: profile options
 /// plus an optional worker URL to target a single worker (e.g. one
 /// PD-disaggregation role). All workers are profiled when `url` is unset.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct StartProfileRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1272,7 +1496,7 @@ pub struct StartProfileRequest {
 
 /// Request body for the gateway `/stop_profile` route: optional worker URL
 /// to target a single worker.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct StopProfileRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1281,7 +1505,7 @@ pub struct StopProfileRequest {
 
 /// Per-DP-rank load snapshot from a backend.
 ///
-/// Contains core metrics from the sglang `/v1/loads` endpoint or `GetLoads` gRPC RPC.
+/// Contains core metrics from the engine's `/v1/loads` endpoint or the `GetLoads` gRPC RPC.
 /// Each snapshot represents one data-parallel rank's scheduler state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -1304,7 +1528,18 @@ pub struct SchedulerLoadSnapshot {
     pub max_total_num_tokens: i32,
     /// Token usage ratio (0.0–1.0).
     pub token_usage: f64,
+    /// Non-evictable KV occupancy, excluding retained, reclaimable prefix cache.
+    /// Older backends omit this; pressure then uses their legacy token usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_token_usage: Option<f64>,
+    /// Context tokens (prompt plus committed output) of every request the
+    /// rank holds. Older backends omit this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_resident_tokens: Option<i64>,
     pub gen_throughput: f64,
+    /// Actual non-cached input tokens per active prefill second; unknown/stale is None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_throughput: Option<f64>,
     pub cache_hit_rate: f64,
     pub utilization: f64,
     pub max_running_requests: i32,
@@ -1314,7 +1549,7 @@ pub struct SchedulerLoadSnapshot {
     pub queues: Option<EngineQueueMetricsSnapshot>,
     /// PD disaggregation signals, populated only when the backend reports a
     /// `disagg` section. `None` for HTTP or older engines. Canonical schema
-    /// other engines map into; SGLang derives the queue depths from its
+    /// other engines map into; one engine derives the queue depths from its
     /// per-stage DisaggregationMetrics counters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_transfer_latency_ms: Option<f64>,
@@ -1401,15 +1636,55 @@ pub struct WorkerLoadResponse {
     pub loads: Vec<SchedulerLoadSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<EngineAggregateMetricsSnapshot>,
+    /// When the engine's state behind this report was sampled, on the
+    /// gateway's clock: the poll's receipt, or a pushed record's receipt
+    /// less its age and the one-way latency. A policy that books in-flight
+    /// work locally releases only what it dispatched before this instant.
+    /// Not serialized: it is meaningful only in the process that set it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub sampled_at: Option<std::time::Instant>,
 }
 
 impl WorkerLoadResponse {
+    /// Scope a backend response to one virtual DP worker. A missing rank is
+    /// unavailable; it must never inherit another rank or an aggregate. A
+    /// gateway fleet rollup cannot be projected because its rank IDs repeat
+    /// independently under each annotated worker.
+    pub fn for_dp_rank(mut self, rank: Option<usize>) -> Option<Self> {
+        if rank.is_some() && !self.ranks_are_dp_ranks() {
+            return None;
+        }
+        if let Some(rank) = rank {
+            let rank = i32::try_from(rank).ok()?;
+            self.loads.retain(|load| load.dp_rank == rank);
+            self.aggregate = None;
+            self.dp_rank_count = i32::try_from(self.loads.len()).ok()?;
+        }
+        if self.loads.is_empty() {
+            return None;
+        }
+        Some(self)
+    }
+
     /// Average token usage ratio across DP ranks. Returns 0.0 if empty.
     pub fn effective_token_usage(&self) -> f64 {
         if self.loads.is_empty() {
             return 0.0;
         }
         self.loads.iter().map(|l| l.token_usage).sum::<f64>() / self.loads.len() as f64
+    }
+
+    /// Average non-evictable KV pressure, with the legacy fallback per rank.
+    pub fn effective_kv_pressure(&self) -> f64 {
+        if self.loads.is_empty() {
+            return 0.0;
+        }
+        self.loads
+            .iter()
+            .map(|load| load.active_token_usage.unwrap_or(load.token_usage))
+            .sum::<f64>()
+            / self.loads.len() as f64
     }
 
     /// Total used tokens summed across all DP ranks.
@@ -1438,6 +1713,21 @@ impl WorkerLoadResponse {
             .iter()
             .map(|l| l.num_waiting_uncached_tokens as i64)
             .sum()
+    }
+
+    /// Resident context tokens summed across all DP ranks; `None` unless
+    /// every rank reports them.
+    pub fn total_resident_tokens(&self) -> Option<i64> {
+        self.loads
+            .iter()
+            .map(|l| l.num_resident_tokens)
+            .sum::<Option<i64>>()
+            .filter(|_| !self.loads.is_empty())
+    }
+
+    /// Total running requests summed across all DP ranks.
+    pub fn total_running_reqs(&self) -> i64 {
+        self.loads.iter().map(|l| l.num_running_reqs as i64).sum()
     }
 
     /// Total waiting (queued) requests summed across all DP ranks.
@@ -1546,6 +1836,10 @@ mod connection_mode_tests {
     fn from_url_classifies_known_schemes() {
         assert_eq!(
             ConnectionMode::from_url("ipc:///tmp/e"),
+            Some(ConnectionMode::Zmq)
+        );
+        assert_eq!(
+            ConnectionMode::from_url("tcp://10.0.0.5:31000"),
             Some(ConnectionMode::Zmq)
         );
         assert_eq!(
@@ -1828,5 +2122,78 @@ mod aggregate_rollup_tests {
 
         assert_eq!(aggregate.total_running_reqs, i32::MAX);
         assert_eq!(aggregate.total_reqs, i32::MAX);
+    }
+}
+
+#[cfg(test)]
+mod constrained_decoding_tests {
+    use super::*;
+
+    /// A label names one of the two policies or nothing; the spec's typed
+    /// value wins over the label; absent everywhere, a worker is `requested`.
+    #[test]
+    fn constrained_decoding_resolves_spec_then_label() {
+        assert_eq!(
+            ConstrainedDecoding::parse("always"),
+            Ok(ConstrainedDecoding::Always)
+        );
+        assert_eq!(
+            ConstrainedDecoding::parse(" requested "),
+            Ok(ConstrainedDecoding::Requested)
+        );
+        assert!(ConstrainedDecoding::parse("sometimes")
+            .unwrap_err()
+            .contains("'requested' or 'always'"));
+        assert_eq!(
+            ConstrainedDecoding::from_label(None),
+            ConstrainedDecoding::Requested
+        );
+        assert_eq!(
+            ConstrainedDecoding::from_label(Some("always")),
+            ConstrainedDecoding::Always
+        );
+        assert_eq!(
+            ConstrainedDecoding::from_label(Some("sometimes")),
+            ConstrainedDecoding::Requested
+        );
+        assert_eq!(ConstrainedDecoding::Always.as_label(), "always");
+
+        let mut spec = WorkerSpec::new("http://w:8000");
+        assert_eq!(
+            ConstrainedDecoding::of(&spec),
+            ConstrainedDecoding::Requested
+        );
+        spec.labels
+            .insert(ConstrainedDecoding::LABEL.to_string(), "always".to_string());
+        assert_eq!(ConstrainedDecoding::of(&spec), ConstrainedDecoding::Always);
+        spec.constrained_decoding = Some(ConstrainedDecoding::Requested);
+        assert_eq!(
+            ConstrainedDecoding::of(&spec),
+            ConstrainedDecoding::Requested
+        );
+    }
+
+    /// The spec field round-trips through JSON in the label's spelling and is
+    /// left out when unset.
+    #[test]
+    fn constrained_decoding_serializes_as_its_label_value() {
+        let mut spec = WorkerSpec::new("http://w:8000");
+        assert!(!serde_json::to_string(&spec)
+            .unwrap()
+            .contains("constrained_decoding"));
+        spec.constrained_decoding = Some(ConstrainedDecoding::Always);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["constrained_decoding"], "always");
+        let parsed: WorkerSpec =
+            serde_json::from_str(r#"{"url":"http://w:8000","constrained_decoding":"requested"}"#)
+                .unwrap();
+        assert_eq!(
+            parsed.constrained_decoding,
+            Some(ConstrainedDecoding::Requested)
+        );
+        assert!(serde_json::from_str::<WorkerSpec>(
+            r#"{"url":"http://w:8000","constrained_decoding":"sometimes"}"#
+        )
+        .is_err());
     }
 }

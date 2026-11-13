@@ -1,0 +1,251 @@
+"""The engine facts both vLLM servicers advertise, read once off vLLM's config.
+
+`GetModelInfo` and `GetServerInfo` answer from vLLM's `ModelConfig` and
+`VllmConfig`, through :mod:`.config_view` (the one reader of the config's
+attribute names), for the Python servicer (which answers at request time from
+its AsyncLLM's config) and the Rust servicer (whose launcher computes them
+before the headless engine starts, since no Python runs on its request path).
+What is a fact of the proto, as opposed to an attribute of the config, is
+decided here.
+
+Engine-free at import: this module takes the config objects and imports
+nothing from vLLM.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Callable
+from typing import Any
+
+from smg_grpc_servicer import mm_shm
+from smg_grpc_servicer.constrained_decoding import (
+    CONSTRAINED_DECODING_AFTER_REASONING,
+    CONSTRAINED_DECODING_FIRST_TOKEN,
+)
+from smg_grpc_servicer.mm_item_limits import MODALITIES, format_item_limits
+from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
+from smg_grpc_servicer.vllm.config_view import EngineConfigView, ModelSection, token_ids
+from smg_grpc_servicer.vllm.config_view import hf_eos_token_ids as _hf_eos_token_ids
+from smg_grpc_servicer.vllm.kv_transfer import pairing_fields, resolve_pd_connector
+from smg_grpc_servicer.vllm.mm_salt import engine_accepts_mm_inputs
+
+logger = logging.getLogger(__name__)
+
+# The generation-config sampling defaults `GetModelInfo` advertises.
+SAMPLING_DEFAULT_KEYS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty")
+
+
+def filtered_sampling_defaults(params: dict | None) -> dict:
+    """The advertised subset of a `get_diff_sampling_param()` result."""
+    if not params:
+        return {}
+    return {key: params[key] for key in SAMPLING_DEFAULT_KEYS if params.get(key) is not None}
+
+
+def default_sampling_params_json(model_config: Any) -> str:
+    """`GetModelInfo.default_sampling_params_json`: the model's generation-config
+    sampling defaults as compact JSON, empty when it declares none."""
+    get_diff = getattr(model_config, "get_diff_sampling_param", None)
+    if not callable(get_diff):
+        return ""
+    try:
+        diff = get_diff() or {}
+    except Exception:  # a missing or malformed generation config is not fatal
+        logger.warning("Could not read the model's sampling defaults", exc_info=True)
+        return ""
+    filtered = filtered_sampling_defaults(diff)
+    return json.dumps(filtered, separators=(",", ":")) if filtered else ""
+
+
+def hf_eos_token_ids(model_config: Any) -> list[int]:
+    """The EOS ids the model's HF config declares: what `GetModelInfo` advertises."""
+    return _hf_eos_token_ids(model_config)
+
+
+def eos_token_ids_with_generation_config(model_config: Any) -> list[int]:
+    """The HF config's EOS ids first (the primary id the engine stops on), then
+    the generation config's extras, deduplicated: the full set a request stops
+    on, as vLLM's own frontend assembles it."""
+    ids = hf_eos_token_ids(model_config)
+    try_get = getattr(model_config, "try_get_generation_config", None)
+    if callable(try_get):
+        try:
+            generation = try_get() or {}
+        except Exception:  # a missing or malformed generation config is not fatal
+            generation = {}
+        for extra in token_ids(generation.get("eos_token_id")):
+            if extra not in ids:
+                ids.append(extra)
+    return ids
+
+
+def supports_vision(model_config: Any) -> bool:
+    """vLLM's own answer to whether the engine accepts multimodal input."""
+    try:
+        return bool(engine_accepts_mm_inputs(model_config))
+    except Exception:  # an unexpected config shape must not take the servicer down
+        logger.warning(
+            "Could not determine multimodal support; reporting supports_vision=false",
+            exc_info=True,
+        )
+        return False
+
+
+def model_facts(model_config: Any) -> dict[str, Any]:
+    """`GetModelInfo`'s fields, keyed as the proto names them."""
+    model = ModelSection.read(model_config)
+    return {
+        "model_path": model.model,
+        "is_generation": model.runner_type == "generate",
+        "max_context_length": model.max_model_len,
+        "vocab_size": model.vocab_size,
+        "supports_vision": supports_vision(model_config),
+        "served_model_name": model.served_model_name,
+        "tokenizer_path": model.tokenizer,
+        "model_type": model.model_type,
+        "architectures": model.architectures,
+        "eos_token_ids": model.hf_eos_token_ids,
+        "pad_token_id": model.pad_token_id,
+        "bos_token_id": model.bos_token_id,
+        "default_sampling_params_json": default_sampling_params_json(model_config),
+    }
+
+
+def mm_device_do_normalize(vllm_config: Any) -> bool:
+    """Whether the engine rescales and normalizes pixels on device: vLLM's
+    ``mm_device_do_normalize`` as its model config resolved it (off where the
+    model class does not support it). Such an engine takes the pixels' own
+    ``uint8`` bytes and would normalize anything else twice, so both servicers
+    advertise it and whoever preprocesses sends raw pixels."""
+    return EngineConfigView(vllm_config).multimodal.device_do_normalize
+
+
+def mm_item_limits(vllm_config: Any) -> str:
+    """The engine's per-prompt media limits as the ``mm_item_limits`` label the
+    Router reads: ``<modality>=<count>`` pairs (``audio=1,image=8,video=2``)
+    for every modality the Router's media pipeline counts, from vLLM's resolved
+    ``--limit-mm-per-prompt``, whose own server refuses a prompt above them,
+    written by the one formatter every servicer's label goes through. Empty on
+    a text model or a config that does not carry them, which leaves the Router
+    to its own caps; so is a modality whose limit is no positive count."""
+    get_limit = EngineConfigView(vllm_config).multimodal.limit_per_prompt
+    if get_limit is None:
+        return ""
+    limits: dict[str, int] = {}
+    for modality in MODALITIES:
+        try:
+            limits[modality] = int(get_limit(modality))
+        except (TypeError, ValueError):
+            continue
+    return format_item_limits(limits)
+
+
+def mm_encoder_budget(vllm_config: Any, budget_factory: Callable[[Any], Any] | None = None) -> int:
+    """The engine's encoder budget as the ``mm_encoder_budget`` fact both
+    servicers advertise: the most feature (embedding) tokens one media item may
+    carry and still be scheduled, in the units of the engine's "Encoder cache
+    will be initialized with a budget of N tokens" start-up line. Derived as
+    vLLM derives it, with the ``MultiModalBudget`` helper its own front end and
+    model runner share (the lesser of the encoder compute budget and the
+    encoder cache size: the front end refuses an item above the latter, the
+    scheduler never places one above either). ``0`` on a text model, and when
+    the installed vLLM cannot tell, which leaves an item's size to the engine
+    as before. ``budget_factory`` builds the helper from the config (the
+    default imports vLLM's; tests pass their own)."""
+    model_config = getattr(vllm_config, "model_config", None)
+    if not getattr(model_config, "is_multimodal_model", False):
+        return 0
+    try:
+        factory = budget_factory or _vllm_multimodal_budget
+        budget = int(factory(vllm_config).get_encoder_budget())
+    except Exception:  # an unexpected helper or config shape must not take the servicer down
+        logger.warning(
+            "Could not derive the engine's encoder budget; a media item larger than the engine "
+            "can place is not refused before it reaches the engine",
+            exc_info=True,
+        )
+        return 0
+    return max(budget, 0)
+
+
+def _vllm_multimodal_budget(vllm_config: Any) -> Any:
+    """vLLM's own budget helper over the engine's config, without a processor
+    cache (the number is all a servicer keeps of it)."""
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+    from vllm.multimodal.encoder_budget import MultiModalBudget
+
+    try:
+        return MultiModalBudget(vllm_config, MULTIMODAL_REGISTRY, enable_cache=False)
+    except TypeError:  # a release before the helper took the cache switch
+        return MultiModalBudget(vllm_config, MULTIMODAL_REGISTRY)
+
+
+def running_window(vllm_config: Any) -> int:
+    """The scheduler's running window (``--max-num-seqs``): how many requests
+    the engine runs at once, which ``GetServerInfo`` advertises as
+    ``max_num_seqs`` for the Router's PD admission gate and its fleet capacity
+    accounting; 0 when the config does not carry it, which leaves both as
+    they were."""
+    return EngineConfigView(vllm_config).max_num_seqs
+
+
+def engine_reasoning_parser(vllm_config: Any) -> str:
+    """The engine's reasoning parser (``--reasoning-parser``), as its
+    structured-outputs config carries it, for the ``engine_reasoning_parser``
+    label (a name of its own: ``reasoning_parser`` is the per-model parser
+    override the Router reads off a worker's labels); "" when the engine runs
+    none or the config has no such section."""
+    return EngineConfigView(vllm_config).structured_outputs.reasoning_parser
+
+
+# The `constrained_decoding_start` label's values (where the engine starts a
+# request's grammar on a prompt that ends inside the model's thinking block)
+# are `smg_grpc_servicer.constrained_decoding`', shared with the servicers of
+# the engines that carry them as server args.
+def constrained_decoding_start(vllm_config: Any) -> str:
+    """Where the engine starts a request's grammar on a thinking prompt, as the
+    ``constrained_decoding_start`` label the Router shapes a forced tool call's
+    grammar by. vLLM's structured-output manager holds a grammar back until
+    its reasoning parser has seen the thought's end when a reasoning parser is
+    set and ``enable_in_reasoning`` is off (``after_reasoning``); otherwise the
+    grammar runs from the first generated token (``first_token``). "" when
+    the config has no structured-outputs section, or one without the reasoning
+    parser attribute, which leaves the Router to the shape that fits either
+    kind of engine."""
+    structured = EngineConfigView(vllm_config).structured_outputs
+    if not structured.reasoning_parser_known:
+        # No section, or one that predates the reasoning parser: unknown.
+        return ""
+    if structured.reasoning_parser and not structured.enable_in_reasoning:
+        return CONSTRAINED_DECODING_AFTER_REASONING
+    return CONSTRAINED_DECODING_FIRST_TOKEN
+
+
+def server_facts(vllm_config: Any) -> dict[str, Any]:
+    """`GetServerInfo`'s config-derived fields, keyed as the proto names them:
+    the PD identity and pairing facts, the data-parallel size, the running
+    window, this host's `/dev/shm` identity."""
+    view = EngineConfigView(vllm_config)
+    kv_connector, kv_engine_id = "", ""
+    if view.kv_transfer.config is not None:
+        # The effective PD engine_id; with DP the engine cores serve
+        # `{id}_dp{rank}` and the router derives the suffix from the rank it
+        # pins per request.
+        kv_connector, kv_engine_id = resolve_pd_connector(view.kv_transfer.config)
+    pairing = pairing_fields(vllm_config)
+    encoder_dtype = pairing.get("model_dtype", "").removeprefix("torch.")
+    if encoder_dtype not in {"float32", "float16", "bfloat16"}:
+        encoder_dtype = ""
+    return {
+        "kv_connector": str(kv_connector or ""),
+        "kv_role": view.kv_transfer.role,
+        "kv_engine_id": str(kv_engine_id or ""),
+        "data_parallel_size": view.data_parallel_size,
+        "multimodal_encoder_dtype": encoder_dtype,
+        "max_num_seqs": view.max_num_seqs,
+        "shm_namespace_id": mm_shm.shm_namespace_id(),
+        "pairing_protocol": pairing_protocol_from_env(),
+        **pairing,
+    }

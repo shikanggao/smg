@@ -22,3 +22,20 @@ pub(crate) use accumulator::StreamingResponseAccumulator;
 pub(crate) use common::{extract_output_index, get_event_type};
 pub use non_streaming::handle_non_streaming_response;
 pub use streaming::handle_streaming_response;
+
+use crate::metrics::{metrics_labels, Metrics};
+
+/// Counts a router error of the Responses route: its fixed router, backend,
+/// connection and endpoint labels, the model, the kind of error and the
+/// reason behind it.
+fn record_error(model: &str, kind: &'static str, reason: &'static str) {
+    Metrics::record_router_error(
+        metrics_labels::ROUTER_OPENAI,
+        metrics_labels::BACKEND_EXTERNAL,
+        metrics_labels::CONNECTION_HTTP,
+        model,
+        metrics_labels::ENDPOINT_RESPONSES,
+        kind,
+        reason,
+    );
+}

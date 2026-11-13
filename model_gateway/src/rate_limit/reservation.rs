@@ -1,7 +1,7 @@
 //! Abort-safe reservation lifecycle: [`SharedReservationHandle`] is held
-//! by whoever owns a reservation, and [`ReservationAttachment`] (paired
-//! with `AttachedBody::wrap_response`) can be attached to a response body
-//! so an aborted/disconnected stream still releases it.
+//! by whoever owns a reservation, and [`ReservationAttachment`] rides in a
+//! streaming response's body (see `worker::GuardedStream`) so an
+//! aborted/disconnected stream still releases it.
 
 use std::sync::{
     atomic::{AtomicU8, Ordering},
@@ -10,7 +10,7 @@ use std::sync::{
 
 use uuid::Uuid;
 
-use super::backend::{RateLimitBackend, UsageSettlement};
+use super::{backend::UsageSettlement, manager::Backend};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,20 +23,20 @@ enum ReservationState {
 
 /// Shared handle to an in-flight reservation. Only the first of
 /// [`Self::settle_success`], [`Self::close_reserved_only`], or
-/// [`Self::abandon_if_open`] takes effect; later calls are no-ops, which
+/// `Self::abandon_if_open` takes effect; later calls are no-ops, which
 /// makes `Drop`-triggered `abandon_if_open` safe even after an explicit
 /// settle/close.
 pub struct SharedReservationHandle {
     state: AtomicU8,
-    backend: Arc<dyn RateLimitBackend>,
+    backend: Backend,
     request_charge_id: Uuid,
 }
 
 impl SharedReservationHandle {
-    pub(crate) fn new(backend: Arc<dyn RateLimitBackend>, request_charge_id: Uuid) -> Self {
+    pub(crate) fn new(backend: impl Into<Backend>, request_charge_id: Uuid) -> Self {
         Self {
             state: AtomicU8::new(ReservationState::Open as u8),
-            backend,
+            backend: backend.into(),
             request_charge_id,
         }
     }
@@ -76,7 +76,7 @@ impl SharedReservationHandle {
     /// shouldn't be silently returned).
     fn abandon_if_open(self: &Arc<Self>) {
         if self.try_transition(ReservationState::Abandoned) {
-            let backend = Arc::clone(&self.backend);
+            let backend = self.backend.clone();
             let request_charge_id = self.request_charge_id;
             #[expect(
                 clippy::disallowed_methods,
@@ -89,9 +89,9 @@ impl SharedReservationHandle {
     }
 }
 
-/// RAII guard: pair with `AttachedBody::wrap_response` on a response so an
-/// aborted/disconnected stream still abandons an open reservation instead
-/// of leaking it as permanently reserved.
+/// RAII guard: held by a streaming response's body (`worker::GuardedStream`)
+/// so an aborted/disconnected stream still abandons an open reservation
+/// instead of leaking it as permanently reserved.
 pub struct ReservationAttachment {
     handle: Arc<SharedReservationHandle>,
 }
@@ -115,7 +115,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::rate_limit::backend::{ReserveOutcome, ReserveRequest};
+    use crate::rate_limit::backend::{RateLimitBackend, ReserveOutcome, ReserveRequest};
 
     #[derive(Default)]
     struct CountingBackend {
@@ -126,7 +126,7 @@ mod tests {
 
     #[async_trait]
     impl RateLimitBackend for CountingBackend {
-        async fn reserve(&self, _request: ReserveRequest) -> ReserveOutcome {
+        async fn reserve(&self, _request: ReserveRequest<'_>) -> ReserveOutcome {
             ReserveOutcome::Admitted
         }
 

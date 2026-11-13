@@ -1,38 +1,69 @@
+#[cfg(not(test))]
+use std::time::Instant;
 use std::{
     collections::{HashSet, VecDeque},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use parking_lot::Mutex;
+#[cfg(test)]
+use tokio::time::Instant;
 use tokio::{sync::Notify, time::error::Elapsed};
 use tracing::{debug, trace};
 
-/// Token bucket for rate limiting.
+/// Token bucket for admission control.
+///
+/// With `refill_rate == 0` it is a concurrency semaphore: a request takes a
+/// token at admission and `return_tokens` hands it back on completion, so at
+/// most `capacity` requests are in flight.
+///
+/// With `refill_rate > 0` it is a request-rate limiter with the same
+/// concurrency bound: admission spends a token that only the refill replaces
+/// (`refill_rate` per second, bursting up to `capacity`), while
+/// `return_tokens` frees the concurrency slot alone. A completed request can
+/// therefore not raise the admission rate, and the refill can not push the
+/// outstanding count above `capacity`. `try_take` spends rate budget without
+/// a slot, for callers that bound concurrency elsewhere.
 ///
 /// This implementation provides:
 /// - Smooth rate limiting with configurable refill rate
 /// - Burst capacity handling
-/// - FIFO waiter handoff when `refill_rate=0` (pure concurrency limiting):
-///   returned tokens are granted directly to the oldest waiter, so waiters
-///   are served in arrival order, wakeups cannot be lost, and new arrivals
-///   cannot barge past the queue
+/// - FIFO waiter handoff: returned (and refilled) tokens are granted directly
+///   to the oldest waiter, so waiters are served in arrival order, wakeups
+///   cannot be lost, and new arrivals cannot barge past the queue
 /// - Sync token return for Drop handlers (via `return_tokens_sync`)
+///
+/// Every waiter parks on its own `Notify` and is woken exactly when granted.
+/// With `refill_rate>0` only the front waiter additionally arms a timer for
+/// the instant the refill covers its request; it cascades grants to the rest.
+/// There is deliberately no wake-all or periodic polling: with thousands of
+/// queued waiters those turn every token return into a thundering herd on the
+/// bucket mutex, starving the tokio runtime (observed as multi-second stalls
+/// of unrelated endpoints like `GET /workers` under generation bursts).
 ///
 /// Uses `parking_lot::Mutex` for sync-compatible locking (no async required).
 #[derive(Clone)]
 pub struct TokenBucket {
     inner: Arc<Mutex<TokenBucketInner>>,
-    notify: Arc<Notify>,
     capacity: f64,
     refill_rate: f64, // tokens per second
 }
 
 struct TokenBucketInner {
+    /// Admission budget: free slots without refill, rate budget with it.
     tokens: f64,
+    /// Tokens taken and not yet returned (the outstanding permits).
+    inflight: f64,
+    /// When the budget was last refilled: the system clock in the gateway, and
+    /// under test tokio's clock, the paused clock the tests advance, so the
+    /// refill arithmetic is tested by advancing time, not by sleeping on it.
+    /// tokio's `Instant` stays out of non-test builds: wherever tokio's
+    /// `test-util` is on (the bench binary, the integration tests), its `now()`
+    /// checks a flag on every call, which would skew the admission benches.
     last_refill: Instant,
     next_waiter_id: u64,
-    /// FIFO waiters (refill_rate=0 acquire path only).
+    /// FIFO waiters.
     waiters: VecDeque<Waiter>,
     /// Granted-but-uncollected waiter ids; their tokens are already
     /// deducted from the pool.
@@ -60,10 +91,20 @@ impl Drop for FifoWaiterGuard<'_> {
         }
         let mut inner = self.bucket.inner.lock();
         if inner.granted.remove(&self.id) {
+            // Un-admission, not completion: the slot and the budget both
+            // come back.
+            inner.inflight = (inner.inflight - self.tokens).max(0.0);
             inner.tokens = (inner.tokens + self.tokens).min(self.bucket.capacity);
-            TokenBucket::grant_waiters_locked(&mut inner);
+            self.bucket.grant_waiters_locked(&mut inner);
+            // A partial return shrinks the front's deficit without granting
+            // it; re-arm its refill timer at the new, earlier instant.
+            self.bucket.wake_front_locked(&inner);
         } else if let Some(pos) = inner.waiters.iter().position(|w| w.id == self.id) {
             inner.waiters.remove(pos);
+            // The removal may have made the next waiter affordable, or (with
+            // refill) promoted a new front that must arm its refill timer.
+            self.bucket.grant_waiters_locked(&mut inner);
+            self.bucket.wake_front_locked(&inner);
         }
     }
 }
@@ -83,37 +124,69 @@ impl TokenBucket {
         Self {
             inner: Arc::new(Mutex::new(TokenBucketInner {
                 tokens: capacity,
+                inflight: 0.0,
                 last_refill: Instant::now(),
                 next_waiter_id: 0,
                 waiters: VecDeque::new(),
                 granted: HashSet::new(),
             })),
-            notify: Arc::new(Notify::new()),
             capacity,
             refill_rate,
         }
     }
 
     fn refill_locked(&self, inner: &mut TokenBucketInner) {
+        // Without refill the budget moves with the returns alone: nothing to
+        // add, and no clock to read for it.
+        if self.refill_rate <= 0.0 {
+            return;
+        }
         let now = Instant::now();
         let elapsed = now.duration_since(inner.last_refill).as_secs_f64();
         inner.tokens = (inner.tokens + elapsed * self.refill_rate).min(self.capacity);
         inner.last_refill = now;
     }
 
-    /// Hand tokens to FIFO waiters, oldest first.
-    fn grant_waiters_locked(inner: &mut TokenBucketInner) {
+    /// True when `tokens` more can be admitted: enough budget and room under
+    /// the concurrency bound. Without refill the budget is the free slots, so
+    /// the bound is implied; with refill it is what keeps the refill from
+    /// minting permits above `capacity`.
+    fn admits_locked(&self, inner: &TokenBucketInner, tokens: f64) -> bool {
+        inner.tokens >= tokens && inner.inflight + tokens <= self.capacity
+    }
+
+    /// Hand tokens to FIFO waiters, oldest first. When grants promote a new
+    /// front and the bucket refills over time, the new front is woken so it
+    /// can arm its refill timer.
+    fn grant_waiters_locked(&self, inner: &mut TokenBucketInner) {
+        let mut granted_any = false;
         loop {
             match inner.waiters.front() {
-                Some(front) if inner.tokens >= front.tokens => {}
+                Some(front) if self.admits_locked(inner, front.tokens) => {}
                 _ => break,
             }
             let Some(waiter) = inner.waiters.pop_front() else {
                 break;
             };
             inner.tokens -= waiter.tokens;
+            inner.inflight += waiter.tokens;
             inner.granted.insert(waiter.id);
             waiter.notify.notify_one();
+            granted_any = true;
+        }
+        if granted_any {
+            self.wake_front_locked(inner);
+        }
+    }
+
+    /// With refill enabled, wake the front waiter so it (re)arms the timer
+    /// for the instant the refill covers its request. No-op without refill:
+    /// grants only happen on token return, which notifies grantees directly.
+    fn wake_front_locked(&self, inner: &TokenBucketInner) {
+        if self.refill_rate > 0.0 {
+            if let Some(front) = inner.waiters.front() {
+                front.notify.notify_one();
+            }
         }
     }
 
@@ -138,7 +211,7 @@ impl TokenBucket {
         let mut inner = self.inner.lock();
 
         self.refill_locked(&mut inner);
-        Self::grant_waiters_locked(&mut inner);
+        self.grant_waiters_locked(&mut inner);
 
         trace!(
             "Token bucket: {} tokens available, requesting {}",
@@ -146,8 +219,9 @@ impl TokenBucket {
             tokens
         );
 
-        if inner.waiters.is_empty() && inner.tokens >= tokens {
+        if inner.waiters.is_empty() && self.admits_locked(&inner, tokens) {
             inner.tokens -= tokens;
+            inner.inflight += tokens;
             debug!(
                 "Token bucket: acquired {} tokens, {} remaining",
                 tokens, inner.tokens
@@ -158,56 +232,43 @@ impl TokenBucket {
         }
     }
 
-    /// Acquire tokens, waiting if necessary.
-    ///
-    /// When `refill_rate=0`, waits in FIFO order (indefinitely) for tokens to
-    /// be returned via `return_tokens()`. Use `acquire_timeout()` to set an
-    /// appropriate timeout; a timed-out or cancelled waiter leaves the queue
-    /// and returns any uncollected grant.
-    pub async fn acquire(&self, tokens: f64) -> Result<(), Elapsed> {
-        // When refill_rate=0 (pure concurrency limiting), tokens only come back
-        // via return_tokens(), which hands them to the oldest waiter directly.
-        if self.refill_rate == 0.0 {
-            return self.acquire_fifo(tokens).await;
-        }
-
-        if self.try_acquire(tokens).is_ok() {
-            return Ok(());
-        }
-
-        let wait_time = {
-            let inner = self.inner.lock();
-            let tokens_needed = tokens - inner.tokens;
-            let wait_secs = (tokens_needed / self.refill_rate).max(0.0);
-            Duration::from_secs_f64(wait_secs)
-        };
-
-        debug!(
-            "Token bucket: waiting {:?} for {} tokens",
-            wait_time, tokens
+    /// Spend `tokens` of rate budget without taking a concurrency slot, for
+    /// a caller whose concurrency is bounded elsewhere (the priority
+    /// scheduler's per-second check). Nothing is returned later: only the
+    /// refill replaces what was spent. Fails when the budget is short or
+    /// FIFO waiters are queued ahead.
+    #[expect(
+        clippy::result_unit_err,
+        reason = "Try-acquire pattern: callers only need success/failure, a custom error type adds no information"
+    )]
+    pub fn try_take(&self, tokens: f64) -> Result<(), ()> {
+        debug_assert!(
+            tokens.is_finite() && tokens >= 0.0,
+            "token amount must be non-negative and finite, got {tokens}"
         );
-
-        tokio::time::timeout(wait_time, async {
-            loop {
-                if self.try_acquire(tokens).is_ok() {
-                    return;
-                }
-                tokio::select! {
-                    () = self.notify.notified() => {},
-                    () = tokio::time::sleep(Duration::from_millis(10)) => {},
-                }
-            }
-        })
-        .await?;
-
-        Ok(())
+        let mut inner = self.inner.lock();
+        self.refill_locked(&mut inner);
+        self.grant_waiters_locked(&mut inner);
+        if inner.waiters.is_empty() && inner.tokens >= tokens {
+            inner.tokens -= tokens;
+            Ok(())
+        } else {
+            Err(())
+        }
     }
 
-    async fn acquire_fifo(&self, tokens: f64) -> Result<(), Elapsed> {
+    /// Acquire tokens, waiting in FIFO order (indefinitely) for tokens to be
+    /// returned via `return_tokens()` or, with `refill_rate>0`, refilled over
+    /// time. Use `acquire_timeout()` to set an appropriate timeout; a
+    /// timed-out or cancelled waiter leaves the queue and returns any
+    /// uncollected grant.
+    pub async fn acquire(&self, tokens: f64) -> Result<(), Elapsed> {
         let (id, notify) = {
             let mut inner = self.inner.lock();
-            if inner.waiters.is_empty() && inner.tokens >= tokens {
+            self.refill_locked(&mut inner);
+            if inner.waiters.is_empty() && self.admits_locked(&inner, tokens) {
                 inner.tokens -= tokens;
+                inner.inflight += tokens;
                 return Ok(());
             }
             let id = inner.next_waiter_id;
@@ -221,10 +282,7 @@ impl TokenBucket {
             (id, notify)
         };
 
-        debug!(
-            "Token bucket: waiting in FIFO queue for {} tokens (refill_rate=0)",
-            tokens
-        );
+        debug!("Token bucket: waiting in FIFO queue for {} tokens", tokens);
 
         let mut guard = FifoWaiterGuard {
             bucket: self,
@@ -233,16 +291,42 @@ impl TokenBucket {
             armed: true,
         };
         loop {
-            {
+            let refill_wait = {
                 let mut inner = self.inner.lock();
+                if self.refill_rate > 0.0 {
+                    self.refill_locked(&mut inner);
+                    self.grant_waiters_locked(&mut inner);
+                }
                 if inner.granted.remove(&id) {
                     guard.armed = false;
                     return Ok(());
                 }
+                // Only the front waiter sleeps until the refill covers its
+                // request; everyone else waits for a direct grant, and so
+                // does a front held back by the concurrency bound (the
+                // return that frees a slot wakes it to arm the timer).
+                match inner.waiters.front() {
+                    Some(front)
+                        if self.refill_rate > 0.0
+                            && front.id == id
+                            && inner.inflight + front.tokens <= self.capacity =>
+                    {
+                        let deficit = (front.tokens - inner.tokens).max(0.0);
+                        Some(Duration::from_secs_f64(deficit / self.refill_rate))
+                    }
+                    _ => None,
+                }
+            };
+            match refill_wait {
+                // Wake at the computed deadline; if float rounding leaves a
+                // hair of deficit, the next iteration re-arms for the residue.
+                Some(wait) => {
+                    let _ = tokio::time::timeout(wait, notify.notified()).await;
+                }
+                // notify_one on grant stores a permit, so a grant between the
+                // check above and this await still wakes us.
+                None => notify.notified().await,
             }
-            // notify_one on grant stores a permit, so a grant between the
-            // check above and this await still wakes us.
-            notify.notified().await;
         }
     }
 
@@ -251,7 +335,10 @@ impl TokenBucket {
         tokio::time::timeout(timeout, self.acquire(tokens)).await?
     }
 
-    /// Return tokens to the bucket (sync version).
+    /// Return tokens to the bucket (sync version): the request completed and
+    /// its concurrency slot is free again. Without refill the slot is the
+    /// budget, so it is reusable at once; with refill the budget only comes
+    /// back over time, so a completion cannot raise the admission rate.
     ///
     /// This is safe to call from sync contexts (e.g., Drop handlers).
     /// Uses `parking_lot::Mutex` which never blocks indefinitely.
@@ -260,16 +347,19 @@ impl TokenBucket {
             tokens.is_finite() && tokens >= 0.0,
             "token amount must be non-negative and finite, got {tokens}"
         );
-        {
-            let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        inner.inflight = (inner.inflight - tokens).max(0.0);
+        if self.refill_rate == 0.0 {
             inner.tokens = (inner.tokens + tokens).min(self.capacity);
-            Self::grant_waiters_locked(&mut inner);
-            debug!(
-                "Token bucket: returned {} tokens, {} available",
-                tokens, inner.tokens
-            );
-        } // Release lock before notify
-        self.notify.notify_waiters();
+        }
+        self.grant_waiters_locked(&mut inner);
+        // A partial return shrinks the front's deficit without granting it;
+        // re-arm its refill timer at the new, earlier instant.
+        self.wake_front_locked(&inner);
+        debug!(
+            "Token bucket: returned {} tokens, {} available",
+            tokens, inner.tokens
+        );
     }
 
     /// Return tokens to the bucket.
@@ -294,33 +384,107 @@ impl TokenBucket {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    /// With refill, admission spends rate budget and a completion frees a
+    /// concurrency slot only: after the burst a request needs both a free
+    /// slot and refilled budget.
+    #[tokio::test(start_paused = true)]
     async fn test_token_bucket_basic() {
         let bucket = TokenBucket::new(10, 5);
 
         assert!(bucket.try_acquire(5.0).is_ok());
         assert!(bucket.try_acquire(5.0).is_ok());
 
+        // Burst spent and every slot taken.
         assert!(bucket.try_acquire(1.0).is_err());
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // A completion frees a slot but hands no budget back.
+        bucket.return_tokens(1.0);
+        assert!(bucket.try_acquire(1.0).is_err());
 
+        // 1.5 tokens refilled: the free slot can be taken, once.
+        tokio::time::advance(Duration::from_millis(300)).await;
         assert!(bucket.try_acquire(1.0).is_ok());
+        assert!(bucket.try_acquire(1.0).is_err());
     }
 
-    #[tokio::test]
+    /// Refill replaces spent budget but never mints concurrency: with every
+    /// slot taken, waiting adds budget and still admits nothing until a
+    /// request completes.
+    #[tokio::test(start_paused = true)]
+    async fn refill_cannot_push_inflight_above_capacity() {
+        let bucket = TokenBucket::new(2, 1000);
+        assert!(bucket.try_acquire(1.0).is_ok());
+        assert!(bucket.try_acquire(1.0).is_ok());
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(
+            bucket.available_tokens(),
+            2.0,
+            "the budget refills to capacity while the slots are held"
+        );
+        assert!(bucket.try_acquire(1.0).is_err(), "no slot is free");
+
+        bucket.return_tokens(1.0);
+        assert!(bucket.try_acquire(1.0).is_ok());
+        assert!(bucket.try_acquire(1.0).is_err());
+    }
+
+    /// A burst of `capacity` admissions followed by their completions leaves
+    /// the budget empty: the sustained rate is the refill, not the turnover.
+    #[tokio::test(start_paused = true)]
+    async fn completions_do_not_replenish_the_rate_budget() {
+        let bucket = TokenBucket::new(4, 2);
+        for _ in 0..4 {
+            assert!(bucket.try_acquire(1.0).is_ok());
+        }
+        for _ in 0..4 {
+            bucket.return_tokens(1.0);
+        }
+        assert!(
+            bucket.try_acquire(1.0).is_err(),
+            "budget spent; completions hand none back"
+        );
+
+        // 1.2 tokens at 2/s: exactly one more admission.
+        tokio::time::advance(Duration::from_millis(600)).await;
+        assert!(bucket.try_acquire(1.0).is_ok());
+        assert!(bucket.try_acquire(1.0).is_err());
+    }
+
+    /// `try_take` spends budget without holding a slot: the per-second check
+    /// of a caller that bounds concurrency itself.
+    #[tokio::test(start_paused = true)]
+    async fn try_take_spends_budget_without_a_slot() {
+        let bucket = TokenBucket::new(2, 2);
+        assert!(bucket.try_take(1.0).is_ok());
+        assert!(bucket.try_take(1.0).is_ok());
+        assert!(bucket.try_take(1.0).is_err(), "budget spent");
+
+        // No slot was taken: once 1.2 tokens refill, one admission fits.
+        tokio::time::advance(Duration::from_millis(600)).await;
+        assert!(bucket.try_acquire(1.0).is_ok());
+        assert!(
+            bucket.try_acquire(1.0).is_err(),
+            "1.2 tokens: one admission"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn test_token_bucket_refill() {
         let bucket = TokenBucket::new(10, 10);
 
         assert!(bucket.try_acquire(10.0).is_ok());
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::advance(Duration::from_millis(500)).await;
 
-        let available = bucket.available_tokens();
-        assert!((4.0..=6.0).contains(&available));
+        assert_eq!(
+            bucket.available_tokens(),
+            5.0,
+            "half a second at ten tokens per second"
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_token_bucket_zero_refill_rate() {
         // With refill_rate=0, tokens should only come back via return_tokens()
         let bucket = TokenBucket::new(2, 0);
@@ -333,7 +497,7 @@ mod tests {
         assert!(bucket.try_acquire(1.0).is_err());
 
         // refill_rate=0 should NOT refill automatically even after waiting
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::advance(Duration::from_millis(500)).await;
         assert!(bucket.try_acquire(1.0).is_err());
 
         bucket.return_tokens(1.0);
@@ -343,7 +507,7 @@ mod tests {
         assert!(bucket.try_acquire(1.0).is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_token_bucket_zero_refill_with_notify() {
         // Test that acquire wakes up when tokens are returned
         let bucket = Arc::new(TokenBucket::new(1, 0));
@@ -382,6 +546,9 @@ mod tests {
         assert!(bucket.try_acquire(1.0).is_ok());
     }
 
+    /// A waiter task for one token, joined once it is in the queue. Its
+    /// timeout is a guard: on the paused clock it fires only when every task
+    /// is idle, never because the test thread was descheduled on a loaded host.
     async fn registered_waiter(
         bucket: &Arc<TokenBucket>,
         expected_waiters: usize,
@@ -402,7 +569,7 @@ mod tests {
         handle
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_fifo_waiters_served_in_arrival_order() {
         let bucket = Arc::new(TokenBucket::new(1, 0));
         assert!(bucket.try_acquire(1.0).is_ok());
@@ -425,7 +592,7 @@ mod tests {
         assert_eq!(bucket.available_tokens(), 0.0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_try_acquire_cannot_barge_past_waiters() {
         let bucket = Arc::new(TokenBucket::new(1, 0));
         assert!(bucket.try_acquire(1.0).is_ok());
@@ -438,7 +605,7 @@ mod tests {
         waiter.await.expect("waiter").expect("grant");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_cancelled_waiter_leaves_queue_and_returns_grant() {
         let bucket = Arc::new(TokenBucket::new(1, 0));
         assert!(bucket.try_acquire(1.0).is_ok());
@@ -455,7 +622,7 @@ mod tests {
         survivor.await.expect("survivor").expect("grant");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_timed_out_waiter_does_not_leak_tokens() {
         let bucket = Arc::new(TokenBucket::new(1, 0));
         assert!(bucket.try_acquire(1.0).is_ok());
@@ -468,7 +635,71 @@ mod tests {
         assert_eq!(bucket.available_tokens(), 1.0);
     }
 
-    #[tokio::test]
+    /// With refill enabled and no other bucket traffic, the front waiter's
+    /// refill timer must drive grants for the whole queue, in FIFO order.
+    #[tokio::test(start_paused = true)]
+    async fn test_refill_serves_fifo_waiters_without_other_traffic() {
+        let bucket = Arc::new(TokenBucket::new(2, 50));
+        // Spend the burst without holding slots, so only the budget gates.
+        bucket.try_take(2.0).unwrap();
+
+        let first = registered_waiter(&bucket, 1).await;
+        let second = registered_waiter(&bucket, 2).await;
+
+        first.await.expect("first waiter").expect("first grant");
+        second.await.expect("second waiter").expect("second grant");
+    }
+
+    /// A front waiter held back by the concurrency bound parks without a
+    /// timer; the return that frees the slot must wake it to arm the refill
+    /// timer, instead of leaving it parked until its own timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_return_wakes_slot_blocked_front_to_arm_refill_timer() {
+        let bucket = Arc::new(TokenBucket::new(1, 1));
+        bucket.try_acquire(1.0).unwrap();
+
+        let waiter_bucket = Arc::clone(&bucket);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "Test helper: the waiter task is joined before the test ends"
+        )]
+        let waiter = tokio::spawn(async move {
+            waiter_bucket
+                .acquire_timeout(1.0, Duration::from_millis(2500))
+                .await
+        });
+        while bucket.waiter_count() < 1 {
+            tokio::task::yield_now().await;
+        }
+
+        // The slot frees after 200 ms; the budget (1/s) covers the waiter
+        // a second after its arrival, well inside its timeout.
+        tokio::time::advance(Duration::from_millis(200)).await;
+        bucket.return_tokens(1.0);
+        waiter
+            .await
+            .expect("waiter")
+            .expect("grant via the refill timer armed on return");
+    }
+
+    /// When the front waiter times out, the next waiter takes over the
+    /// refill timer instead of waiting forever for a grant.
+    #[tokio::test(start_paused = true)]
+    async fn test_cancelled_front_waiter_hands_refill_timer_to_next() {
+        let bucket = Arc::new(TokenBucket::new(1, 20));
+        bucket.try_take(1.0).unwrap();
+
+        let front = registered_waiter(&bucket, 1).await;
+        let survivor = registered_waiter(&bucket, 2).await;
+
+        front.abort();
+        let _ = front.await;
+        assert_eq!(bucket.waiter_count(), 1);
+
+        survivor.await.expect("survivor").expect("grant via refill");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn test_no_lost_wakeup_under_tight_release_acquire_loop() {
         let bucket = Arc::new(TokenBucket::new(1, 0));
 

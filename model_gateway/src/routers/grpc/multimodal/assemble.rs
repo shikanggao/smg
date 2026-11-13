@@ -11,10 +11,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use llm_multimodal::{
-    EncoderFieldLayouts, FieldLayout, Modality, ModelSpecificValue, PlaceholderRange,
-    PreprocessedEncoderInputs,
+    EncoderDtype, EncoderFieldLayouts, EncoderInput, EncoderInputView, FieldLayout, Modality,
+    ModelSpecificValue, PlaceholderRange, PreprocessedEncoderInputs,
 };
-use ndarray::ArrayViewD;
 use smg_grpc_client::common_proto as common;
 use tracing::{info, warn};
 
@@ -22,10 +21,13 @@ use super::{
     capability::ensure_backend_supports_modalities,
     log_mm_timing_enabled,
     serialize::{
-        model_specific_to_tensor_bytes, serialize_array_as_tokenspeed_tensor,
-        serialize_encoder_input, serialize_model_specific, slice_array_axis0,
+        model_specific_to_tensor_bytes, serialize_encoder_input_owned, serialize_model_specific,
+        serialize_tokenspeed_encoder_input, serialize_tokenspeed_encoder_input_owned, wire_dtype,
     },
-    transport::{mm_encoder_input_dtype, resolve_mm_shm_enabled, resolve_mm_shm_min_bytes},
+    transport::{
+        mm_encoder_input_dtype, mm_sglang_encoder_input_dtype, mm_vllm_device_normalizes,
+        mm_vllm_encoder_input_dtype, resolve_mm_shm_enabled, resolve_mm_shm_min_bytes,
+    },
     MediaBatch, MultimodalIntermediate, PrecomputedMultimodalIntermediate, PromptBinding,
 };
 use crate::{
@@ -64,6 +66,7 @@ pub(crate) async fn assemble_multimodal_data_after_encode(
     assemble_multimodal_data_impl(intermediate, client, workers, true).await
 }
 
+/// Dispatch assembly using the selected backend and worker metadata.
 async fn assemble_multimodal_data_impl(
     intermediate: MultimodalIntermediate,
     client: &BackendClient,
@@ -76,14 +79,10 @@ async fn assemble_multimodal_data_impl(
     // so assembly can never silently mishandle a modality the backend lacks.
     ensure_client_supports_intermediate(client, &intermediate)?;
     match client {
-        BackendClient::Grpc(GrpcClient::Sglang(_)) => {
-            let batch = into_single_batch(intermediate, "SGLang")?;
-            Ok(MultimodalData::Sglang(assemble_sglang(batch)?))
-        }
-        BackendClient::Grpc(GrpcClient::Vllm(_)) => {
-            let batch = into_single_batch(intermediate, "vLLM")?;
-            Ok(MultimodalData::Vllm(assemble_vllm(batch, workers)?))
-        }
+        BackendClient::Grpc(GrpcClient::Sglang(_)) => assemble_sglang_data(intermediate, workers),
+        BackendClient::Grpc(GrpcClient::Vllm(_)) => Ok(MultimodalData::Vllm(
+            assemble_vllm_batches(intermediate, workers)?,
+        )),
         BackendClient::Grpc(GrpcClient::Trtllm(_)) => {
             let batch = into_single_batch(intermediate, "TRT-LLM")?;
             Ok(MultimodalData::Trtllm(assemble_trtllm(batch)?))
@@ -100,34 +99,106 @@ async fn assemble_multimodal_data_impl(
                     )
                 })
                 .collect::<Vec<_>>();
-            let batches = intermediate.into_batches();
-            let pending = tokio::task::spawn_blocking(move || {
-                assemble_tokenspeed_batches(&batches, options).map(PendingTokenSpeedAssembly::new)
-            })
-            .await
-            .context("TokenSpeed multimodal assembly task failed")??;
-            Ok(MultimodalData::TokenSpeed(pending.into_inner()?))
+            Ok(MultimodalData::TokenSpeed(
+                spawn_tokenspeed_assembly(intermediate, options).await?,
+            ))
         }
         BackendClient::Grpc(GrpcClient::Mlx(_)) => {
             anyhow::bail!("MLX does not support multimodal inputs")
         }
         BackendClient::Zmq(client) => match client.runtime() {
-            // connect() admits only vLLM/TokenSpeed runtimes over ZMQ, so no
-            // Unspecified fallback: anything else is a hard error below.
+            // connect() resolves Unspecified to vLLM before the handshake, so
+            // no Unspecified arm here; a runtime without an arm is a hard
+            // error below.
             RuntimeType::Vllm => {
-                let batch = into_single_batch(intermediate, "vLLM")?;
-                let mut data = assemble_vllm(batch, workers)?;
+                let mut data = assemble_vllm_batches(intermediate, workers)?;
                 // The ZMQ translate reads tensor bytes inline; this wire has no
                 // /dev/shm or RDMA pull on the engine side.
                 data.shm_enabled = false;
                 data.rdma_enabled = false;
+                for batch in &mut data.extra_batches {
+                    batch.shm_enabled = false;
+                    batch.rdma_enabled = false;
+                }
                 Ok(MultimodalData::Vllm(data))
             }
+            RuntimeType::TokenSpeed => {
+                let options = intermediate
+                    .batches()
+                    .iter()
+                    .map(|batch| TokenSpeedAssemblyOptions {
+                        // The ZMQ translate sends tensor bytes inline
+                        // (ext-encoded msgpack): assemble without /dev/shm so no
+                        // handle ever needs re-inlining at conversion. The wire
+                        // does support ShmTensorHandle; wiring that up is a
+                        // follow-up optimization.
+                        shm_enabled: false,
+                        ..tokenspeed_assembly_options(
+                            batch.media.modality(),
+                            workers,
+                            omit_prefill_pixels,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                Ok(MultimodalData::TokenSpeed(
+                    spawn_tokenspeed_assembly(intermediate, options).await?,
+                ))
+            }
+            // The same modality batches the gRPC arm sends the servicer: the
+            // adapter frames it as the scheduler's processor output.
+            RuntimeType::Sglang => assemble_sglang_data(intermediate, workers),
             runtime => anyhow::bail!(
                 "multimodal inputs are not supported over the {runtime} ZMQ backend yet"
             ),
         },
     }
+}
+
+/// Both transports share the same per-modality assembly.
+/// Write every SGLang batch in the selected worker's declared floating dtype.
+fn assemble_sglang_data(
+    intermediate: MultimodalIntermediate,
+    workers: Option<&WorkerSelection>,
+) -> Result<MultimodalData> {
+    Ok(MultimodalData::Sglang(assemble_sglang_batches(
+        intermediate,
+        mm_sglang_encoder_input_dtype(workers).as_str(),
+    )?))
+}
+
+/// Assemble each modality independently, retaining its tensors and prompt bindings.
+pub(super) fn assemble_sglang_batches(
+    intermediate: MultimodalIntermediate,
+    dtype: &str,
+) -> Result<SglangMultimodalData> {
+    let mut batches = intermediate.into_batches().into_iter();
+    let first = batches
+        .next()
+        .context("SGLang multimodal input has no batches")?;
+    let mut data = assemble_sglang_with_dtype(first, dtype)?;
+    data.extra_batches = batches
+        .map(|batch| assemble_sglang_with_dtype(batch, dtype))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(data)
+}
+
+/// Run TokenSpeed batch assembly on a blocking thread, guarding SHM output.
+///
+/// Both the gRPC and ZMQ TokenSpeed arms share this sequence; the
+/// [`PendingTokenSpeedAssembly`] guard is what unlinks `/dev/shm` segments if
+/// the request future is cancelled mid-assembly, so the dance must stay
+/// identical for every caller.
+async fn spawn_tokenspeed_assembly(
+    intermediate: MultimodalIntermediate,
+    options: Vec<TokenSpeedAssemblyOptions>,
+) -> Result<TokenSpeedMultimodalData> {
+    let batches = intermediate.into_batches();
+    let pending = tokio::task::spawn_blocking(move || {
+        assemble_tokenspeed_batches_owned(batches, options).map(PendingTokenSpeedAssembly::new)
+    })
+    .await
+    .context("TokenSpeed multimodal assembly task failed")??;
+    pending.into_inner()
 }
 
 /// Owns SHM-backed assembly output until the awaiting task accepts it.
@@ -159,12 +230,73 @@ impl Drop for PendingTokenSpeedAssembly {
     }
 }
 
-/// Backends other than TokenSpeed take a single preprocessed batch (one
-/// modality). The per-modality capability is enforced by
+/// vLLM takes every modality batch of the request: the first travels as
+/// `mm_inputs`, the rest as `extra_mm_inputs`, each assembled the same way.
+fn assemble_vllm_batches(
+    intermediate: MultimodalIntermediate,
+    workers: Option<&WorkerSelection>,
+) -> Result<VllmMultimodalData> {
+    assemble_vllm_batches_with(intermediate, &VllmAssembly::for_selection(workers))
+}
+
+/// The wire choices of a vLLM assembly: the Router resolves them from the
+/// worker selection and its transport settings; a worker processing its own
+/// media names them directly (inline, in the engine's dtype).
+#[derive(Debug, Clone)]
+pub(super) struct VllmAssembly {
+    /// The float dtype the primary tensor is written in (`float32`,
+    /// `bfloat16`, `float16`).
+    pub encoder_dtype: String,
+    /// The engine rescales and normalizes pixels on device: it takes the
+    /// pixels' own `uint8` bytes and would normalize floats twice.
+    pub device_normalizes: bool,
+    pub shm_enabled: bool,
+    pub shm_min_bytes: usize,
+}
+
+impl VllmAssembly {
+    fn for_selection(workers: Option<&WorkerSelection>) -> Self {
+        Self {
+            encoder_dtype: mm_vllm_encoder_input_dtype(workers),
+            device_normalizes: mm_vllm_device_normalizes(workers),
+            shm_enabled: resolve_mm_shm_enabled(workers, false),
+            shm_min_bytes: resolve_mm_shm_min_bytes(workers),
+        }
+    }
+
+    /// The dtype this assembly writes an image encoder input in, known
+    /// before the images are preprocessed; `None` when the engine takes the
+    /// pixels' own bytes.
+    pub(super) fn image_wire_dtype(&self) -> Option<EncoderDtype> {
+        if self.device_normalizes {
+            return None;
+        }
+        let dtype = wire_dtype(&self.encoder_dtype, true);
+        (dtype != EncoderDtype::Uint8).then_some(dtype)
+    }
+}
+
+/// [`assemble_vllm_batches`] with the wire choices given.
+pub(super) fn assemble_vllm_batches_with(
+    intermediate: MultimodalIntermediate,
+    assembly: &VllmAssembly,
+) -> Result<VllmMultimodalData> {
+    let mut batches = intermediate.into_batches().into_iter();
+    let first = batches
+        .next()
+        .context("multimodal intermediate is missing its first batch")?;
+    let mut data = assemble_vllm(first, assembly)?;
+    data.extra_batches = batches
+        .map(|batch| assemble_vllm(batch, assembly))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(data)
+}
+
+/// TRT-LLM takes a single preprocessed batch (one modality). The
+/// per-modality capability is enforced by
 /// [`ensure_client_supports_intermediate`]; this only enforces the structural
-/// single-batch constraint (multiple modalities in one request are TokenSpeed-
-/// only).
-fn into_single_batch(
+/// single-batch constraint.
+pub(super) fn into_single_batch(
     intermediate: MultimodalIntermediate,
     backend: &str,
 ) -> Result<PrecomputedMultimodalIntermediate> {
@@ -189,32 +321,95 @@ fn ensure_client_supports_intermediate(
     ensure_backend_supports_modalities(client.runtime_type(), intermediate)
 }
 
-fn assemble_sglang(
+/// Serialize worker pixels in the configured vision dtype, preserving integer metadata.
+pub(super) fn assemble_sglang_with_dtype(
     intermediate: PrecomputedMultimodalIntermediate,
+    dtype: &str,
 ) -> Result<SglangMultimodalData> {
-    let (pixel_values, pixel_values_shape) = serialize_encoder_input(&intermediate.preprocessed);
+    anyhow::ensure!(
+        matches!(dtype, "float32" | "bfloat16" | "float16"),
+        "SGLang media dtype must be float32, bfloat16 or float16"
+    );
+    // Normalize in float32 first, then round once, as the engine does before
+    // its vision encoder. Integer grids and other metadata keep their dtype.
+    let (pixel_values, pixel_values_shape, pixel_values_dtype) =
+        serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, dtype)?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
-    let MediaBatch::Images(images) = &intermediate.media else {
-        anyhow::bail!("SGLang assembly requires an image batch");
+    let modality = match &intermediate.media {
+        MediaBatch::Images(_) => "image",
+        MediaBatch::Videos(_) => "video",
+        MediaBatch::Audios(_) => anyhow::bail!("SGLang assembly requires images or videos"),
     };
-    let image_data = images.iter().map(|f| f.raw_bytes.to_vec()).collect();
+    // A tensor request is already preprocessed; raw media are only sent on
+    // the separate reference path, never duplicated alongside its pixels.
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, true)?;
 
     Ok(SglangMultimodalData {
-        image_data,
+        extra_batches: Vec::new(),
+        modality: modality.to_string(),
+        image_data: Vec::new(),
         pixel_values,
         pixel_values_shape,
+        pixel_values_dtype,
         model_specific_tensors,
         im_token_id: intermediate.placeholder_token_id,
         mm_placeholders,
     })
 }
 
+/// The dtype the primary tensor is written in: the engine's own float dtype,
+/// or the pixels' own bytes for an engine that normalizes on device.
+/// Normalized floats have no bytes to give such an engine, which would
+/// normalize them again: the request is refused
+/// ([`FloatsForDeviceNormalization`]) rather than answered wrong.
+fn vllm_pixel_dtype<'a>(
+    preprocessed: &PreprocessedEncoderInputs,
+    assembly: &'a VllmAssembly,
+) -> Result<&'a str> {
+    if !assembly.device_normalizes {
+        return Ok(&assembly.encoder_dtype);
+    }
+    if preprocessed.encoder_input.pixel_norm().is_some() {
+        return Ok("uint8");
+    }
+    Err(anyhow::Error::new(FloatsForDeviceNormalization))
+}
+
+/// Normalized floats met a worker that normalizes pixels on device
+/// (`mm_device_do_normalize`): it takes the pixels' own bytes and would
+/// normalize these a second time, so the request is refused instead of
+/// answered wrong. A processor that produces floats meets it on every
+/// request to such a worker (a pairing the in-process pipeline refuses at
+/// startup); a processor that produces bytes meets it on the one batch it
+/// can only pad after normalizing (a Pixtral-tower batch of images of
+/// different sizes), which both pipelines answer as the request's own error
+/// (`assembly_error_response` on the router side, `WorkerMediaError::Invalid`
+/// on the worker side). The remedy is in the message: a worker that does not
+/// normalize on device, or images the processor gives as bytes.
+#[derive(Debug)]
+pub(crate) struct FloatsForDeviceNormalization;
+
+impl std::fmt::Display for FloatsForDeviceNormalization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the selected worker normalizes pixels on device (mm_device_do_normalize) and takes \
+             raw pixel bytes, but these images were prepared as normalized floats, which it \
+             would normalize again; serve the model on a worker that does not normalize on \
+             device (--mm-device-do-normalize=false), or send images the processor gives as \
+             bytes (one image, or images of one size, per request)",
+        )
+    }
+}
+
+impl std::error::Error for FloatsForDeviceNormalization {}
+
 fn assemble_vllm(
     intermediate: PrecomputedMultimodalIntermediate,
-    workers: Option<&WorkerSelection>,
+    assembly: &VllmAssembly,
 ) -> Result<VllmMultimodalData> {
-    let (pixel_values, pixel_values_shape) = serialize_encoder_input(&intermediate.preprocessed);
+    let dtype = vllm_pixel_dtype(&intermediate.preprocessed, assembly)?;
+    let (pixel_values, pixel_values_shape, pixel_values_dtype) =
+        serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, dtype)?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
     let (modality, mm_hashes) = match &intermediate.media {
         MediaBatch::Images(images) => (
@@ -230,11 +425,19 @@ fn assemble_vllm(
         }
     };
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, false)?;
-    let (batched_keys, flat_keys) = vllm_field_layout_keys(&intermediate.field_layouts);
+    // The primary tensor travels in the proto's `pixel_values` field but is
+    // named by the model's forward kwarg in the layout keys and on the wire.
+    let primary_key = intermediate
+        .encoder_input_key
+        .clone()
+        .unwrap_or_else(|| "pixel_values".to_string());
+    let (batched_keys, flat_keys) =
+        vllm_field_layout_keys(&intermediate.field_layouts, &primary_key);
 
     Ok(VllmMultimodalData {
         pixel_values,
         pixel_values_shape,
+        pixel_values_dtype,
         model_specific_tensors,
         im_token_id: intermediate.placeholder_token_id,
         mm_placeholders,
@@ -242,22 +445,28 @@ fn assemble_vllm(
         batched_keys,
         flat_keys,
         keep_on_cpu_keys: intermediate.keep_on_cpu_keys,
+        encoder_input_key: intermediate.encoder_input_key,
         modality,
-        shm_enabled: resolve_mm_shm_enabled(workers, false),
-        shm_min_bytes: resolve_mm_shm_min_bytes(workers),
+        shm_enabled: assembly.shm_enabled,
+        shm_min_bytes: assembly.shm_min_bytes,
         // vLLM workers cannot pull RDMA payloads yet.
         rdma_enabled: false,
+        extra_batches: Vec::new(),
     })
 }
 
-/// Translate the neutral layout contract to vLLM's legacy HF field names.
-fn vllm_field_layout_keys(layouts: &EncoderFieldLayouts) -> (Vec<String>, HashMap<String, String>) {
+/// Translate the neutral layout contract to vLLM's HF field names, naming the
+/// primary tensor `primary_key` (`pixel_values` unless the spec renames it).
+fn vllm_field_layout_keys(
+    layouts: &EncoderFieldLayouts,
+    primary_key: &str,
+) -> (Vec<String>, HashMap<String, String>) {
     let mut batched_keys = PreprocessedEncoderInputs::batched_keys(&layouts.model_specific);
     let mut flat_keys = PreprocessedEncoderInputs::flat_keys(&layouts.model_specific);
     match &layouts.encoder_input {
-        FieldLayout::Batched => batched_keys.push("pixel_values".to_string()),
+        FieldLayout::Batched => batched_keys.push(primary_key.to_string()),
         FieldLayout::Flat { sizes_key } => {
-            flat_keys.insert("pixel_values".to_string(), sizes_key.clone());
+            flat_keys.insert(primary_key.to_string(), sizes_key.clone());
         }
     }
     (batched_keys, flat_keys)
@@ -269,7 +478,8 @@ fn assemble_trtllm(
     let MediaBatch::Images(images) = &intermediate.media else {
         anyhow::bail!("TRT-LLM assembly requires an image batch");
     };
-    let image_data = images.iter().map(|f| f.raw_bytes.to_vec()).collect();
+    // The request shares each frame's file; nothing is copied per image.
+    let image_data = images.iter().map(|f| f.raw_bytes.clone()).collect();
     Ok(TrtllmMultimodalData { image_data })
 }
 
@@ -282,18 +492,28 @@ fn assemble_tokenspeed(
     validate_precomputed_batch(intermediate)?;
     let options =
         tokenspeed_assembly_options(intermediate.media.modality(), workers, skip_pixel_values);
-    assemble_tokenspeed_with_options(intermediate, options)
+    assemble_tokenspeed_with_options(intermediate, options, None)
 }
 
+/// Assemble the items an EPD request's encode workers run the tower on, with
+/// their pixels; `inline` assembles without /dev/shm, for an encode server on
+/// the ZMQ lane, which carries the tensors inline.
 pub(crate) fn assemble_tokenspeed_for_encode(
     intermediate: &MultimodalIntermediate,
     workers: Option<&WorkerSelection>,
+    inline: bool,
 ) -> Result<TokenSpeedMultimodalData> {
     validate_intermediate(intermediate)?;
     let options = intermediate
         .batches()
         .iter()
-        .map(|batch| tokenspeed_assembly_options(batch.media.modality(), workers, false))
+        .map(|batch| {
+            let options = tokenspeed_assembly_options(batch.media.modality(), workers, false);
+            TokenSpeedAssemblyOptions {
+                shm_enabled: options.shm_enabled && !inline,
+                ..options
+            }
+        })
         .collect();
     assemble_tokenspeed_batches(intermediate.batches(), options)
 }
@@ -318,9 +538,13 @@ fn tokenspeed_assembly_options(
     }
 }
 
+/// `owned_input` is the batch's encoder input when the caller handed it over
+/// whole (see [`take_whole_encoder_input`]); its one item then moves those
+/// bytes into its payload instead of writing a copy of its view.
 fn assemble_tokenspeed_with_options(
     intermediate: &PrecomputedMultimodalIntermediate,
     options: TokenSpeedAssemblyOptions,
+    mut owned_input: Option<EncoderInput>,
 ) -> Result<TokenSpeedMultimodalData> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
@@ -345,6 +569,11 @@ fn assemble_tokenspeed_with_options(
     // cleanup, leaking files until the next sweep.
     let mut ordered_bindings = intermediate.bindings.iter().collect::<Vec<_>>();
     ordered_bindings.sort_by_key(|binding| binding.prompt_ordinal);
+    // Checked before the item loop, while a plain `?` still costs nothing: no
+    // /dev/shm segment has been created yet.
+    for binding in &ordered_bindings {
+        ensure_structural_fallback_covers_features(intermediate, binding)?;
+    }
     let mut items: Vec<TokenSpeedMultimodalItem> = Vec::with_capacity(item_count);
     for binding in ordered_bindings {
         let item_index = binding.item_index;
@@ -368,6 +597,19 @@ fn assemble_tokenspeed_with_options(
         // the per-item slice + serialize entirely when skip_pixel_values is set.
         let encoder_input = if skip_pixel_values {
             TokenSpeedTensor::inline(Vec::new(), Vec::new(), encoder_input_dtype.clone())
+        } else if let Some(input) = owned_input.take() {
+            match serialize_tokenspeed_encoder_input_owned(
+                input,
+                &encoder_input_dtype,
+                shm_enabled,
+                shm_min_bytes,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    cleanup_tokenspeed_items_encoder_shm(&items, None);
+                    return Err(error);
+                }
+            }
         } else {
             let item_encoder_input = match encoder_input_for_item(
                 &intermediate.preprocessed,
@@ -380,12 +622,18 @@ fn assemble_tokenspeed_with_options(
                     return Err(error);
                 }
             };
-            serialize_array_as_tokenspeed_tensor(
+            match serialize_tokenspeed_encoder_input(
                 &item_encoder_input,
                 &encoder_input_dtype,
                 shm_enabled,
                 shm_min_bytes,
-            )
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    cleanup_tokenspeed_items_encoder_shm(&items, None);
+                    return Err(error);
+                }
+            }
         };
         let encoder_input_serialize_ms = encoder_input_started.elapsed().as_secs_f64() * 1000.0;
         let model_specific_started = Instant::now();
@@ -443,12 +691,60 @@ fn assemble_tokenspeed_with_options(
     })
 }
 
+/// Batches the caller keeps: every item's encoder input is written from its
+/// view.
 fn assemble_tokenspeed_batches(
     batches: &[PrecomputedMultimodalIntermediate],
     options: Vec<TokenSpeedAssemblyOptions>,
 ) -> Result<TokenSpeedMultimodalData> {
+    let none = batches.iter().map(|_| None).collect();
+    assemble_tokenspeed_batches_with(batches, options, none)
+}
+
+/// Batches the caller hands over: a batch whose one item is the whole encoder
+/// input moves that input into the item's payload instead of writing a copy.
+fn assemble_tokenspeed_batches_owned(
+    mut batches: Vec<PrecomputedMultimodalIntermediate>,
+    options: Vec<TokenSpeedAssemblyOptions>,
+) -> Result<TokenSpeedMultimodalData> {
+    let owned = batches.iter_mut().map(take_whole_encoder_input).collect();
+    assemble_tokenspeed_batches_with(&batches, options, owned)
+}
+
+/// The encoder input of a batch whose single item spans all of it, taken out
+/// of the batch; an empty tensor stays in its place, which no per-item step
+/// reads. `None` for every other batch, whose items are written from views.
+fn take_whole_encoder_input(batch: &mut PrecomputedMultimodalIntermediate) -> Option<EncoderInput> {
+    let [binding] = batch.bindings.as_slice() else {
+        return None;
+    };
+    let item_index = binding.item_index;
+    if batch.media.len() != 1 {
+        return None;
+    }
+    let whole = batch.preprocessed.encoder_input.view();
+    let item = encoder_input_for_item(
+        &batch.preprocessed,
+        &batch.field_layouts.encoder_input,
+        item_index,
+    )
+    .ok()?;
+    if whole.is_empty() || item.len() != whole.len() {
+        return None;
+    }
+    Some(std::mem::replace(
+        &mut batch.preprocessed.encoder_input,
+        EncoderInput::F32(ndarray::ArrayD::zeros(ndarray::IxDyn(&[0]))),
+    ))
+}
+
+fn assemble_tokenspeed_batches_with(
+    batches: &[PrecomputedMultimodalIntermediate],
+    options: Vec<TokenSpeedAssemblyOptions>,
+    owned_inputs: Vec<Option<EncoderInput>>,
+) -> Result<TokenSpeedMultimodalData> {
     anyhow::ensure!(
-        batches.len() == options.len(),
+        batches.len() == options.len() && batches.len() == owned_inputs.len(),
         "multimodal batch/assembly option count mismatch"
     );
 
@@ -459,8 +755,8 @@ fn assemble_tokenspeed_batches(
     let shm_min_bytes = options.first().map(|opts| opts.shm_min_bytes).unwrap_or(0);
     let mut ordered_items: Vec<(usize, TokenSpeedMultimodalItem)> = Vec::new();
 
-    for (batch, options) in batches.iter().zip(options) {
-        match assemble_tokenspeed_with_options(batch, options) {
+    for ((batch, options), owned_input) in batches.iter().zip(options).zip(owned_inputs) {
+        match assemble_tokenspeed_with_options(batch, options, owned_input) {
             Ok(data) => {
                 let mut ordinals = batch
                     .bindings
@@ -551,6 +847,39 @@ fn validate_precomputed_batch(intermediate: &PrecomputedMultimodalIntermediate) 
         "precomputed multimodal binding count mismatch: modality={modality}, binding_count={binding_count}, media_count={media_count}"
     );
 
+    let encoder_rows = intermediate
+        .preprocessed
+        .encoder_input
+        .shape()
+        .first()
+        .copied()
+        .unwrap_or_default();
+    match &intermediate.field_layouts.encoder_input {
+        FieldLayout::Batched => anyhow::ensure!(
+            encoder_rows == media_count,
+            "precomputed {modality} batch carries {encoder_rows} encoder rows for {media_count} media items"
+        ),
+        FieldLayout::Flat { sizes_key } => {
+            let sizes = tensor_sizes_from_model_specific(
+                &intermediate.preprocessed.model_specific,
+                sizes_key,
+            )?;
+            anyhow::ensure!(
+                sizes.len() == media_count,
+                "precomputed {modality} batch declares {} item sizes for {media_count} media items",
+                sizes.len()
+            );
+            let covered = sizes
+                .iter()
+                .try_fold(0usize, |acc, &size| acc.checked_add(size))
+                .context("flat encoder size total overflow")?;
+            anyhow::ensure!(
+                covered == encoder_rows,
+                "precomputed {modality} item sizes cover {covered} of {encoder_rows} encoder rows"
+            );
+        }
+    }
+
     let mut item_indices = HashSet::with_capacity(binding_count);
     for binding in &intermediate.bindings {
         anyhow::ensure!(
@@ -573,6 +902,7 @@ fn validate_precomputed_batch(intermediate: &PrecomputedMultimodalIntermediate) 
             .offset
             .checked_add(binding.structural.length)
             .context("structural prompt range overflow")?;
+        let mut reserved = 0usize;
         for patch in &binding.patches {
             let patch_end = patch
                 .offset
@@ -587,6 +917,26 @@ fn validate_precomputed_batch(intermediate: &PrecomputedMultimodalIntermediate) 
                 patch.length,
                 binding.structural.offset,
                 binding.structural.length
+            );
+            reserved = reserved
+                .checked_add(patch.length)
+                .context("patch prompt length overflow")?;
+        }
+        if !binding.patches.is_empty() {
+            let features = *intermediate
+                .preprocessed
+                .feature_token_counts
+                .get(binding.item_index)
+                .with_context(|| {
+                    format!(
+                        "missing {modality} feature count for item {}",
+                        binding.item_index
+                    )
+                })?;
+            anyhow::ensure!(
+                features_fit_reservation(reserved, features),
+                "precomputed {modality} item {} reserves {reserved} prompt positions for {features} encoder features",
+                binding.item_index
             );
         }
     }
@@ -611,13 +961,14 @@ fn encoder_input_for_item<'a>(
     preprocessed: &'a PreprocessedEncoderInputs,
     layout: &FieldLayout,
     item_index: usize,
-) -> Result<ArrayViewD<'a, f32>> {
+) -> Result<EncoderInputView<'a>> {
+    let input = preprocessed.encoder_input.view();
     match layout {
-        FieldLayout::Batched => slice_array_axis0(&preprocessed.encoder_input, item_index, 1),
+        FieldLayout::Batched => input.slice_axis0(item_index, 1),
         FieldLayout::Flat { sizes_key } => {
             let sizes = tensor_sizes_from_model_specific(&preprocessed.model_specific, sizes_key)?;
             let (start, len) = item_span(&sizes, item_index)?;
-            slice_array_axis0(&preprocessed.encoder_input, start, len)
+            input.slice_axis0(start, len)
         }
     }
 }
@@ -669,6 +1020,52 @@ fn placeholders_for_bindings(
         })
         .map(placeholder_range_to_u32)
         .collect()
+}
+
+/// Check the ranges an item falls back to when it declares no patches.
+///
+/// An item without patches is sent as its whole structural range, so that
+/// range has to hold exactly as many prompt positions as the item has encoder
+/// features. Items that do declare patches are already covered by
+/// [`validate_precomputed_batch`], and the vLLM path is exempt: it sends the
+/// structural range on purpose and lets the backend pick the feature positions
+/// out of it.
+fn ensure_structural_fallback_covers_features(
+    intermediate: &PrecomputedMultimodalIntermediate,
+    binding: &PromptBinding,
+) -> Result<()> {
+    if !binding.patches.is_empty() {
+        return Ok(());
+    }
+    let modality = intermediate.media.modality();
+    let features = *intermediate
+        .preprocessed
+        .feature_token_counts
+        .get(binding.item_index)
+        .with_context(|| {
+            format!(
+                "missing {modality} feature count for item {}",
+                binding.item_index
+            )
+        })?;
+    anyhow::ensure!(
+        features_fit_reservation(binding.structural.length, features),
+        "precomputed {modality} item {} covers {} prompt positions for {features} encoder features",
+        binding.item_index,
+        binding.structural.length
+    );
+    Ok(())
+}
+
+/// Whether `features` encoder outputs can land in `reserved` prompt positions.
+///
+/// Usually one feature takes one position. Some models pack a fixed number of
+/// encoder outputs into each embedding before placing it, so they reserve fewer
+/// positions than they carry features, by a whole factor. Anything that is not
+/// a whole factor is a genuine mismatch, which the engine answers by ending the
+/// process rather than the request.
+fn features_fit_reservation(reserved: usize, features: usize) -> bool {
+    reserved > 0 && features >= reserved && features.is_multiple_of(reserved)
 }
 
 fn placeholders_for_binding(
@@ -740,571 +1137,4 @@ fn hash_hex_strings<'a>(hashes: impl Iterator<Item = &'a str>) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
-    #[cfg(target_os = "linux")]
-    use std::path::Path;
-    use std::{mem::size_of, sync::Arc};
-
-    use llm_multimodal::{
-        audio::DecodedAudio, AudioClip, AudioSource, ImageDetail, ImageFrame, VideoClip,
-    };
-    use ndarray::{ArrayD, IxDyn};
-
-    use super::*;
-    #[cfg(target_os = "linux")]
-    use crate::routers::grpc::proto_wrapper::write_tokenspeed_shm_with;
-
-    #[cfg(target_os = "linux")]
-    fn pending_tokenspeed_shm_assembly() -> (PendingTokenSpeedAssembly, std::path::PathBuf) {
-        let handle = write_tokenspeed_shm_with(4, |output| {
-            output.copy_from_slice(&[1, 2, 3, 4]);
-            Ok(())
-        })
-        .unwrap();
-        let path = Path::new("/dev/shm").join(&handle.name);
-        let data = TokenSpeedMultimodalData {
-            items: vec![TokenSpeedMultimodalItem {
-                modality: TokenSpeedModality::Image,
-                encoder_input: TokenSpeedTensor::shm(handle, vec![2], "bfloat16".to_string()),
-                model_specific_tensors: HashMap::new(),
-                placeholder_token_id: None,
-                mm_placeholders: vec![],
-                content_hash: vec![],
-            }],
-            shm_enabled: true,
-            shm_min_bytes: 0,
-        };
-        (PendingTokenSpeedAssembly::new(data), path)
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn pending_tokenspeed_assembly_cleans_shm_when_dropped() {
-        let (pending, path) = pending_tokenspeed_shm_assembly();
-        assert!(path.exists());
-
-        drop(pending);
-
-        assert!(!path.exists());
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn pending_tokenspeed_assembly_transfers_shm_ownership() {
-        let (pending, path) = pending_tokenspeed_shm_assembly();
-        let data = pending.into_inner().unwrap();
-        assert!(path.exists());
-
-        cleanup_tokenspeed_items_encoder_shm(&data.items, None);
-
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn assemble_tokenspeed_splits_image_items() {
-        let mut model_specific = HashMap::new();
-        model_specific.insert(
-            "patches_per_image".to_string(),
-            ModelSpecificValue::UintTensor {
-                data: vec![2, 2],
-                shape: vec![2],
-            },
-        );
-        model_specific.insert(
-            "image_grid_thw".to_string(),
-            ModelSpecificValue::UintTensor {
-                data: vec![1, 2, 3, 4, 5, 6],
-                shape: vec![2, 3],
-            },
-        );
-
-        let preprocessed = PreprocessedEncoderInputs {
-            encoder_input: ArrayD::from_shape_vec(
-                IxDyn(&[4, 2]),
-                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            )
-            .unwrap(),
-            feature_token_counts: vec![2, 2],
-            item_sizes: vec![(1, 1), (1, 1)],
-            model_specific,
-        };
-
-        let images = vec![
-            Arc::new(ImageFrame::new(
-                image::DynamicImage::new_rgb8(1, 1),
-                bytes::Bytes::from_static(b"a"),
-                ImageDetail::Auto,
-                llm_multimodal::ImageSource::InlineBytes,
-                "hash-a".to_string(),
-            )),
-            Arc::new(ImageFrame::new(
-                image::DynamicImage::new_rgb8(1, 1),
-                bytes::Bytes::from_static(b"b"),
-                ImageDetail::Auto,
-                llm_multimodal::ImageSource::InlineBytes,
-                "hash-b".to_string(),
-            )),
-        ];
-
-        let intermediate = PrecomputedMultimodalIntermediate {
-            preprocessed,
-            media: MediaBatch::Images(images),
-            bindings: vec![
-                PromptBinding {
-                    item_index: 0,
-                    prompt_ordinal: 0,
-                    structural: PlaceholderRange {
-                        offset: 10,
-                        length: 2,
-                    },
-                    patches: vec![PlaceholderRange {
-                        offset: 10,
-                        length: 2,
-                    }],
-                },
-                PromptBinding {
-                    item_index: 1,
-                    prompt_ordinal: 1,
-                    structural: PlaceholderRange {
-                        offset: 20,
-                        length: 2,
-                    },
-                    patches: vec![PlaceholderRange {
-                        offset: 20,
-                        length: 2,
-                    }],
-                },
-            ],
-            placeholder_token_id: Some(151655),
-            field_layouts: EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_image"),
-                HashMap::from([
-                    ("patches_per_image".to_string(), FieldLayout::Batched),
-                    ("image_grid_thw".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-            keep_on_cpu_keys: vec![],
-        };
-
-        let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
-        assert_eq!(assembled.items.len(), 2);
-
-        let first = &assembled.items[0];
-        assert_eq!(first.modality, TokenSpeedModality::Image);
-        assert_eq!(first.encoder_input.shape, vec![2, 2]);
-        // bf16 is the default TokenSpeed encoder_input wire dtype (2 bytes/elem).
-        assert_eq!(first.encoder_input.nbytes(), 4 * size_of::<u16>());
-        assert_eq!(first.mm_placeholders, vec![(10, 2)]);
-        assert_eq!(
-            first.content_hash,
-            hash_hex_strings(std::iter::once("hash-a"))
-        );
-        assert_eq!(
-            first.model_specific_tensors["image_grid_thw"].shape,
-            vec![1, 3]
-        );
-        assert_eq!(
-            first.model_specific_tensors["patches_per_image"].shape,
-            vec![1]
-        );
-
-        let second = &assembled.items[1];
-        assert_eq!(second.encoder_input.shape, vec![2, 2]);
-        assert_eq!(second.mm_placeholders, vec![(20, 2)]);
-        assert_eq!(
-            second.content_hash,
-            hash_hex_strings(std::iter::once("hash-b"))
-        );
-        assert_eq!(
-            second.model_specific_tensors["image_grid_thw"].shape,
-            vec![1, 3]
-        );
-    }
-
-    #[test]
-    fn assemble_tokenspeed_splits_video_items() {
-        let mut model_specific = HashMap::new();
-        model_specific.insert(
-            "patches_per_video".to_string(),
-            ModelSpecificValue::UintTensor {
-                data: vec![2, 2],
-                shape: vec![2],
-            },
-        );
-        model_specific.insert(
-            "video_grid_thw".to_string(),
-            ModelSpecificValue::UintTensor {
-                data: vec![1, 2, 3, 4, 5, 6],
-                shape: vec![2, 3],
-            },
-        );
-
-        let preprocessed = PreprocessedEncoderInputs {
-            encoder_input: ArrayD::from_shape_vec(
-                IxDyn(&[4, 2]),
-                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            )
-            .unwrap(),
-            feature_token_counts: vec![2, 2],
-            item_sizes: vec![(1, 1), (1, 1)],
-            model_specific,
-        };
-
-        let videos = vec![
-            Arc::new(VideoClip::new(
-                vec![image::DynamicImage::new_rgb8(1, 1)],
-                bytes::Bytes::from_static(b"a"),
-                llm_multimodal::VideoSource::InlineBytes,
-                "video-hash-a".to_string(),
-            )),
-            Arc::new(VideoClip::new(
-                vec![image::DynamicImage::new_rgb8(1, 1)],
-                bytes::Bytes::from_static(b"b"),
-                llm_multimodal::VideoSource::InlineBytes,
-                "video-hash-b".to_string(),
-            )),
-        ];
-
-        let intermediate = PrecomputedMultimodalIntermediate {
-            preprocessed,
-            media: MediaBatch::Videos(videos),
-            bindings: vec![
-                PromptBinding {
-                    item_index: 0,
-                    prompt_ordinal: 0,
-                    structural: PlaceholderRange {
-                        offset: 30,
-                        length: 2,
-                    },
-                    patches: vec![PlaceholderRange {
-                        offset: 30,
-                        length: 2,
-                    }],
-                },
-                PromptBinding {
-                    item_index: 1,
-                    prompt_ordinal: 1,
-                    structural: PlaceholderRange {
-                        offset: 40,
-                        length: 2,
-                    },
-                    patches: vec![PlaceholderRange {
-                        offset: 40,
-                        length: 2,
-                    }],
-                },
-            ],
-            placeholder_token_id: Some(151656),
-            field_layouts: EncoderFieldLayouts::new(
-                FieldLayout::flat("patches_per_video"),
-                HashMap::from([
-                    ("patches_per_video".to_string(), FieldLayout::Batched),
-                    ("video_grid_thw".to_string(), FieldLayout::Batched),
-                ]),
-            ),
-            keep_on_cpu_keys: vec![],
-        };
-
-        let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
-        assert_eq!(assembled.items.len(), 2);
-
-        let first = &assembled.items[0];
-        assert_eq!(first.modality, TokenSpeedModality::Video);
-        assert_eq!(first.encoder_input.shape, vec![2, 2]);
-        // bf16 is the default TokenSpeed encoder_input wire dtype (2 bytes/elem).
-        assert_eq!(first.encoder_input.nbytes(), 4 * size_of::<u16>());
-        assert_eq!(first.mm_placeholders, vec![(30, 2)]);
-        assert_eq!(
-            first.content_hash,
-            hash_hex_strings(std::iter::once("video-hash-a"))
-        );
-        assert_eq!(
-            first.model_specific_tensors["video_grid_thw"].shape,
-            vec![1, 3]
-        );
-        assert_eq!(
-            first.model_specific_tensors["patches_per_video"].shape,
-            vec![1]
-        );
-
-        let second = &assembled.items[1];
-        assert_eq!(second.encoder_input.shape, vec![2, 2]);
-        assert_eq!(second.mm_placeholders, vec![(40, 2)]);
-        assert_eq!(
-            second.content_hash,
-            hash_hex_strings(std::iter::once("video-hash-b"))
-        );
-        assert_eq!(
-            second.model_specific_tensors["video_grid_thw"].shape,
-            vec![1, 3]
-        );
-    }
-
-    #[test]
-    fn assemble_tokenspeed_splits_audio_items_as_bfloat16_by_default() {
-        let mut model_specific = HashMap::new();
-        model_specific.insert(
-            "row_lengths".to_string(),
-            ModelSpecificValue::IntTensor {
-                data: vec![2, 2],
-                shape: vec![2],
-            },
-        );
-
-        let preprocessed = PreprocessedEncoderInputs {
-            encoder_input: ArrayD::from_shape_vec(
-                IxDyn(&[4, 2]),
-                vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
-            )
-            .unwrap(),
-            feature_token_counts: vec![2, 2],
-            item_sizes: vec![(2, 2), (2, 2)],
-            model_specific,
-        };
-
-        let audios = vec![
-            Arc::new(AudioClip::new(
-                bytes::Bytes::from_static(b"a"),
-                DecodedAudio {
-                    samples: Vec::new(),
-                    sample_rate: 16_000,
-                },
-                AudioSource::InlineBytes,
-                "audio-hash-a".to_string(),
-            )),
-            Arc::new(AudioClip::new(
-                bytes::Bytes::from_static(b"b"),
-                DecodedAudio {
-                    samples: Vec::new(),
-                    sample_rate: 16_000,
-                },
-                AudioSource::InlineBytes,
-                "audio-hash-b".to_string(),
-            )),
-        ];
-
-        let intermediate = PrecomputedMultimodalIntermediate {
-            preprocessed,
-            media: MediaBatch::Audios(audios),
-            bindings: vec![
-                PromptBinding {
-                    item_index: 0,
-                    prompt_ordinal: 0,
-                    structural: PlaceholderRange {
-                        offset: 30,
-                        length: 2,
-                    },
-                    patches: vec![PlaceholderRange {
-                        offset: 30,
-                        length: 2,
-                    }],
-                },
-                PromptBinding {
-                    item_index: 1,
-                    prompt_ordinal: 1,
-                    structural: PlaceholderRange {
-                        offset: 40,
-                        length: 2,
-                    },
-                    patches: vec![PlaceholderRange {
-                        offset: 40,
-                        length: 2,
-                    }],
-                },
-            ],
-            placeholder_token_id: Some(42),
-            field_layouts: EncoderFieldLayouts::new(
-                FieldLayout::flat("row_lengths"),
-                HashMap::from([("row_lengths".to_string(), FieldLayout::Batched)]),
-            ),
-            keep_on_cpu_keys: vec![],
-        };
-
-        let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
-        assert_eq!(assembled.items.len(), 2);
-
-        let first = &assembled.items[0];
-        assert_eq!(first.modality, TokenSpeedModality::Audio);
-        assert_eq!(first.encoder_input.dtype, "bfloat16");
-        assert_eq!(first.encoder_input.shape, vec![2, 2]);
-        assert_eq!(first.encoder_input.nbytes(), 4 * size_of::<u16>());
-        assert_eq!(first.mm_placeholders, vec![(30, 2)]);
-        assert_eq!(
-            first.content_hash,
-            hash_hex_strings(std::iter::once("audio-hash-a"))
-        );
-        assert_eq!(first.model_specific_tensors["row_lengths"].shape, vec![1]);
-
-        let second = &assembled.items[1];
-        assert_eq!(second.encoder_input.dtype, "bfloat16");
-        assert_eq!(second.encoder_input.shape, vec![2, 2]);
-        assert_eq!(second.mm_placeholders, vec![(40, 2)]);
-        assert_eq!(
-            second.content_hash,
-            hash_hex_strings(std::iter::once("audio-hash-b"))
-        );
-    }
-
-    #[test]
-    fn tokenspeed_epd_items_and_hashes_follow_prompt_binding_order() {
-        let one_item_inputs = || PreprocessedEncoderInputs {
-            encoder_input: ArrayD::from_shape_vec(IxDyn(&[1, 1]), vec![1.0]).unwrap(),
-            feature_token_counts: vec![1],
-            item_sizes: vec![(1, 1)],
-            model_specific: HashMap::new(),
-        };
-        let image_batch = PrecomputedMultimodalIntermediate {
-            preprocessed: one_item_inputs(),
-            media: MediaBatch::Images(vec![Arc::new(ImageFrame::new(
-                image::DynamicImage::new_rgb8(1, 1),
-                bytes::Bytes::from_static(b"image"),
-                ImageDetail::Auto,
-                llm_multimodal::ImageSource::InlineBytes,
-                "image-hash".to_string(),
-            ))]),
-            // Deliberately earlier by offset but later by explicit ordinal.
-            bindings: vec![PromptBinding {
-                item_index: 0,
-                prompt_ordinal: 2,
-                structural: PlaceholderRange {
-                    offset: 1,
-                    length: 1,
-                },
-                patches: vec![],
-            }],
-            placeholder_token_id: Some(10),
-            field_layouts: EncoderFieldLayouts::default(),
-            keep_on_cpu_keys: vec![],
-        };
-        let video_batch = PrecomputedMultimodalIntermediate {
-            preprocessed: one_item_inputs(),
-            media: MediaBatch::Videos(vec![Arc::new(VideoClip::new(
-                vec![image::DynamicImage::new_rgb8(1, 1)],
-                bytes::Bytes::from_static(b"video"),
-                llm_multimodal::VideoSource::InlineBytes,
-                "video-hash".to_string(),
-            ))]),
-            bindings: vec![PromptBinding {
-                item_index: 0,
-                prompt_ordinal: 1,
-                structural: PlaceholderRange {
-                    offset: 50,
-                    length: 1,
-                },
-                patches: vec![],
-            }],
-            placeholder_token_id: Some(30),
-            field_layouts: EncoderFieldLayouts::default(),
-            keep_on_cpu_keys: vec![],
-        };
-        let audio_batch = PrecomputedMultimodalIntermediate {
-            preprocessed: one_item_inputs(),
-            media: MediaBatch::Audios(vec![Arc::new(AudioClip::new(
-                bytes::Bytes::from_static(b"audio"),
-                DecodedAudio {
-                    samples: Vec::new(),
-                    sample_rate: 16_000,
-                },
-                AudioSource::InlineBytes,
-                "audio-hash".to_string(),
-            ))]),
-            bindings: vec![PromptBinding {
-                item_index: 0,
-                prompt_ordinal: 0,
-                structural: PlaceholderRange {
-                    offset: 100,
-                    length: 1,
-                },
-                patches: vec![],
-            }],
-            placeholder_token_id: Some(20),
-            field_layouts: EncoderFieldLayouts::default(),
-            keep_on_cpu_keys: vec![],
-        };
-        let intermediate =
-            MultimodalIntermediate::try_new(vec![image_batch, video_batch, audio_batch]).unwrap();
-        let routing_hashes = encode_routing_hashes(&intermediate).unwrap();
-        let assembled = assemble_tokenspeed_for_encode(&intermediate, None).unwrap();
-
-        assert_eq!(assembled.items.len(), 3);
-        assert_eq!(assembled.items[0].modality, TokenSpeedModality::Audio);
-        assert_eq!(assembled.items[0].mm_placeholders, vec![(100, 1)]);
-        assert_eq!(assembled.items[1].modality, TokenSpeedModality::Video);
-        assert_eq!(assembled.items[1].mm_placeholders, vec![(50, 1)]);
-        assert_eq!(assembled.items[2].modality, TokenSpeedModality::Image);
-        assert_eq!(assembled.items[2].mm_placeholders, vec![(1, 1)]);
-        assert_eq!(
-            routing_hashes,
-            assembled
-                .items
-                .iter()
-                .map(|item| item.content_hash.clone())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn qwen_audio_batched_layout_slices_items_not_mel_bins() {
-        let mut model_specific = HashMap::new();
-        model_specific.insert(
-            "feature_attention_mask".to_string(),
-            ModelSpecificValue::int_2d(vec![1, 1, 1, 1, 1, 1, 0, 0], 2, 4),
-        );
-        model_specific.insert(
-            "audio_feature_lengths".to_string(),
-            ModelSpecificValue::int_1d(vec![4, 2]),
-        );
-        let preprocessed = PreprocessedEncoderInputs {
-            encoder_input: ArrayD::from_shape_vec(
-                IxDyn(&[2, 3, 4]),
-                (0..24).map(|value| value as f32).collect(),
-            )
-            .unwrap(),
-            feature_token_counts: vec![1, 1],
-            item_sizes: vec![(3, 4), (3, 2)],
-            model_specific,
-        };
-        let layouts = EncoderFieldLayouts::new(
-            FieldLayout::Batched,
-            HashMap::from([
-                ("feature_attention_mask".to_string(), FieldLayout::Batched),
-                ("audio_feature_lengths".to_string(), FieldLayout::Batched),
-            ]),
-        );
-
-        let second = encoder_input_for_item(&preprocessed, &layouts.encoder_input, 1).unwrap();
-        assert_eq!(second.shape(), &[1, 3, 4]);
-        assert_eq!(
-            second.iter().copied().collect::<Vec<_>>(),
-            (12..24).map(|v| v as f32).collect::<Vec<_>>()
-        );
-
-        let extras = serialize_model_specific_for_item(
-            &preprocessed.model_specific,
-            &layouts.model_specific,
-            1,
-        )
-        .unwrap();
-        assert_eq!(extras["feature_attention_mask"].shape, vec![1, 4]);
-        assert_eq!(extras["audio_feature_lengths"].shape, vec![1]);
-    }
-
-    #[test]
-    fn vllm_layout_adapter_restores_legacy_primary_field_name() {
-        let flat = EncoderFieldLayouts::new(
-            FieldLayout::flat("patches_per_image"),
-            HashMap::from([("image_grid_thw".to_string(), FieldLayout::Batched)]),
-        );
-        let (batched_keys, flat_keys) = vllm_field_layout_keys(&flat);
-        assert_eq!(batched_keys, vec!["image_grid_thw"]);
-        assert_eq!(
-            flat_keys.get("pixel_values").map(String::as_str),
-            Some("patches_per_image")
-        );
-
-        let batched = EncoderFieldLayouts::default();
-        let (batched_keys, flat_keys) = vllm_field_layout_keys(&batched);
-        assert_eq!(batched_keys, vec!["pixel_values"]);
-        assert!(flat_keys.is_empty());
-    }
-}
+pub(crate) mod tests;

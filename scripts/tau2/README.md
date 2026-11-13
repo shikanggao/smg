@@ -1,6 +1,6 @@
 # τ²-bench nightly A/B — `scripts/tau2/`
 
-**Track B** of the multi-turn parser-verification suite: run **τ²-bench** (`tau2-bench`) against two serving "arms" and diff pass^1 and pass^k. The companion **Track A** (an offline, deterministic parser-conformance gate) is proposed but not yet built — see the parser-verification proposal in `docs/proposals/`.
+**Track B** of the multi-turn parser-verification suite: run **τ²-bench** (`tau2-bench`) against two serving "arms" and diff pass^1 and pass^k. The companion **Track A** (an offline, deterministic parser-conformance gate) is proposed but not yet built.
 
 ## The experiment
 
@@ -83,11 +83,12 @@ Results land at:
 
 where `<DATA_DIR>` is the path you pass to the **required** `--data-dir` flag (typically `tau2-bench/data`); tau2 reads and writes results under it (override tau2's own location with `TAU2_DATA_DIR` if it differs).
 
-## Per-model parser flags (the nightly matrix)
+## Per-model parser flags (the weekly matrix)
 
-Mirrors `nightly-bfcl.yml`'s 6-leg matrix. The 2 H100 legs run full task sets; the 4
-Blackwell legs are capped at `num_tasks=30`/domain (tau2 is multi-turn + spends
-gpt-5.2 per turn). `glm-5.2` runs **sequential** (whole 8-GPU node per arm — `run_ab.py
+Mirrors `nightly-bfcl.yml`'s 5-leg matrix and runs weekly (Thursdays 07:17 UTC). The 2
+H100 legs run full task sets; the 3 Blackwell legs are capped at `num_tasks=30`/domain
+(tau2 is multi-turn + spends gpt-5.2 per turn) and are skipped on the schedule while
+the `blackwell` runner is offline (no job since 2026-09-18); a dispatch still runs them. `deepseek-v4.1` runs **sequential** (whole 8-GPU node per arm — `run_ab.py
 --score-arm` each arm, then `--diff`); the rest run both arms concurrently on opposite
 GPU halves. On PRs **all** legs run on a tiny retail / 1-trial / few-task subset — a
 quick "does each leg launch + parse + score" smoke (the heavy Blackwell legs are
@@ -97,10 +98,9 @@ dominated by model-load time, serialized by a host lock, so a PR run is not fast
 |---|---|---|---|---|
 | qwen3.8 | Qwen/Qwen3.8-27B | 4-gpu-h100 (2) | `qwen3_xml` / `qwen3` | `qwen_xml` / `qwen3` |
 | gpt-oss | openai/gpt-oss-120b | 4-gpu-h100 (2) | `openai` / — | — / — (harmony auto) |
-| deepseek-v4 | deepseek-ai/DeepSeek-V4-Flash-0731 | blackwell (4) | `deepseek_v4` / `deepseek_v4` | `deepseek_v4` / `deepseek_v4` |
-| minimax-m2.7 | MiniMaxAI/MiniMax-M2.7 | blackwell (4) | `minimax_m2` / `minimax_m2` | `minimax_m2` / `minimax` |
-| kimi-k2.6 | moonshotai/Kimi-K2.6 | blackwell (4) | `kimi_k2` / `kimi_k2` | `kimik2` / `kimi_k25` |
-| glm-5.2 | zai-org/GLM-5.2-FP8 | blackwell (8, seq) | `glm47` / `glm45` | `glm47_moe` / `glm45` |
+| deepseek-v4.1 | deepseek-ai/DeepSeek-V4.1-Flash-1017 | blackwell (8, seq) | `deepseek_v41` / `deepseek_v41` | `deepseek_v41` / `deepseek_v41` |
+| minimax-m3 | MiniMaxAI/MiniMax-M3-MXFP8 | blackwell (4) | `minimax_m3` / `minimax_m3` | `minimax_m3` / `minimax_m3` |
+| glm-5.3-flash | zai-org/GLM-5.3-Flash | blackwell (4) | `glm47` / `glm45` | `glm47_moe` / `glm45` |
 
 > Dispatch `only=<leg>` runs a single leg; `model=` overrides its weights. SKU ids and
 > vLLM parser names may shift; confirm against the installed vLLM build:
@@ -118,7 +118,7 @@ dominated by model-load time, serialized by a host lock, so a PR run is not fast
 
 ## Validation status — ran end-to-end ✅
 
-Brought up end-to-end on an 8×B200 box (`moirai-b200`), **`Qwen/Qwen3.6-27B` at TP=1 per arm** (the 183 GB Blackwell cards fit the 27B model on a single GPU), user-sim **`gpt-5.2`** at temp 0. Stack: vLLM 0.24.0 (CUDA 13.0, Blackwell sm_100), smg 1.7.0, tau2-bench 1.0.0.
+Brought up end-to-end on one node, **`Qwen/Qwen3.6-27B` at TP=1 per arm** (on a high-memory GPU: the 27B model's ~54 GB of BF16 weights fit on one card; the Quick start and the weekly matrix run a 27B at TP=2), user-sim **`gpt-5.2`** at temp 0. Stack: vLLM 0.24.0 (CUDA 13.0), smg 1.7.0, tau2-bench 1.0.0.
 
 **FC confirmed on both arms** — identical `get_weather(city="Paris")` tool call, `finish_reason=tool_calls`. One frontend delta observed: the pure-vLLM arm returned empty `reasoning_content` while the SMG arm populated it (a reasoning-parse/template difference; the tool call itself is identical).
 

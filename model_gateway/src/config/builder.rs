@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 
-use openai_protocol::worker::TransportMode;
+use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
+use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
 
 use super::{
-    CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PdPairingMode, PolicyConfig,
+    AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
+    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig, MetricsConfig,
+    OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig, PolicyEngineMode,
     PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
@@ -30,23 +32,6 @@ impl RouterConfigBuilder {
         Self::default()
     }
 
-    /// Takes ownership
-    pub fn from_config(config: RouterConfig) -> Self {
-        Self {
-            config,
-            client_cert_path: None,
-            client_key_path: None,
-            ca_cert_paths: Vec::new(),
-            server_cert_path: None,
-            server_key_path: None,
-            mcp_config_path: None,
-        }
-    }
-
-    pub fn from_config_ref(config: &RouterConfig) -> Self {
-        Self::from_config(config.clone())
-    }
-
     // ==================== Routing Mode ====================
 
     pub fn regular_mode(mut self, worker_urls: Vec<String>) -> Self {
@@ -68,30 +53,8 @@ impl RouterConfigBuilder {
         self
     }
 
-    /// With separate policies
-    pub fn prefill_decode_mode_with_policies(
-        mut self,
-        prefill_urls: Vec<(String, Option<u16>)>,
-        decode_urls: Vec<String>,
-        prefill_policy: Option<PolicyConfig>,
-        decode_policy: Option<PolicyConfig>,
-    ) -> Self {
-        self.config.mode = RoutingMode::PrefillDecode {
-            prefill_urls,
-            decode_urls,
-            prefill_policy,
-            decode_policy,
-        };
-        self
-    }
-
     pub fn openai_mode(mut self, worker_urls: Vec<String>) -> Self {
         self.config.mode = RoutingMode::OpenAI { worker_urls };
-        self
-    }
-
-    pub fn gemini_mode(mut self, worker_urls: Vec<String>) -> Self {
-        self.config.mode = RoutingMode::Gemini { worker_urls };
         self
     }
 
@@ -130,27 +93,19 @@ impl RouterConfigBuilder {
         eviction_interval_secs: u64,
         max_tree_size: usize,
     ) -> Self {
-        self.config.policy = PolicyConfig::CacheAware {
+        self.config.policy = PolicyConfig::cache_aware(
             cache_threshold,
             balance_abs_threshold,
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: CacheIndexKind::Tree,
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-        };
+        );
         self
     }
 
-    pub fn power_of_two_policy(mut self, load_check_interval_secs: u64) -> Self {
+    pub fn power_of_two_policy(mut self) -> Self {
         self.config.policy = PolicyConfig::PowerOfTwo {
-            load_check_interval_secs,
+            load_metric: Default::default(),
         };
         self
     }
@@ -176,11 +131,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn http_connection(mut self) -> Self {
-        self.config.connection_mode = ConnectionMode::Http;
-        self
-    }
-
     pub fn grpc_connection(mut self) -> Self {
         self.config.connection_mode = ConnectionMode::Grpc;
         self
@@ -198,6 +148,25 @@ impl RouterConfigBuilder {
 
     pub fn health_check_port(mut self, health_check_port: Option<u16>) -> Self {
         self.config.health_check_port = health_check_port;
+        self
+    }
+
+    /// Set optional per-role capacity thresholds for PD/EPD readiness.
+    pub fn pd_readiness(mut self, pd_readiness: Option<PdReadinessConfig>) -> Self {
+        self.config.pd_readiness = pd_readiness;
+        self
+    }
+
+    /// The admin listener's port; `None` keeps the control plane on the
+    /// data listener.
+    pub fn admin_port(mut self, admin_port: Option<u16>) -> Self {
+        self.config.admin_port = admin_port;
+        self
+    }
+
+    /// The admin listener's bind host; `None` binds it on the server host.
+    pub fn admin_host(mut self, admin_host: Option<String>) -> Self {
+        self.config.admin_host = admin_host;
         self
     }
 
@@ -223,6 +192,30 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn header_read_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.header_read_timeout_secs = secs;
+        self
+    }
+
+    pub fn idle_connection_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.idle_connection_timeout_secs = secs;
+        self
+    }
+
+    /// Most client connections the HTTP listener holds open at once; `0` is
+    /// no bound.
+    pub fn max_connections(mut self, max_connections: usize) -> Self {
+        self.config.max_connections = max_connections;
+        self
+    }
+
+    /// Most client connections the admin listener holds open at once; `0`
+    /// is no bound.
+    pub fn admin_max_connections(mut self, admin_max_connections: usize) -> Self {
+        self.config.admin_max_connections = admin_max_connections;
+        self
+    }
+
     pub fn upstream_pool_idle_timeout_secs(mut self, secs: u64) -> Self {
         self.config.upstream_pool_idle_timeout_secs = secs;
         self
@@ -233,8 +226,25 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// The bound on a request to a gRPC worker, from its dispatch to its last
+    /// message; `0` arms no deadline.
+    pub fn grpc_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.grpc_request_timeout_secs = secs;
+        self
+    }
+
+    pub fn sse_keepalive_secs(mut self, secs: u64) -> Self {
+        self.config.sse_keepalive_secs = secs;
+        self
+    }
+
     pub fn worker_startup_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.worker_startup_timeout_secs = timeout;
+        self
+    }
+
+    pub fn zmq_startup_timeout_secs(mut self, timeout: u64) -> Self {
+        self.config.zmq_startup_timeout_secs = timeout;
         self
     }
 
@@ -263,6 +273,37 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_stall_secs(mut self, secs: u64) -> Self {
+        self.config.worker_stall_secs = secs;
+        self
+    }
+
+    pub fn worker_wedge_secs(mut self, secs: u64) -> Self {
+        self.config.worker_wedge_secs = secs;
+        self
+    }
+
+    pub fn worker_stale_secs(mut self, secs: u64) -> Self {
+        self.config.worker_stale_secs = secs;
+        self
+    }
+
+    pub fn worker_warmup(
+        mut self,
+        secs: u64,
+        share: f32,
+        blocks: usize,
+        thin_ratio: f32,
+        divert_every: u64,
+    ) -> Self {
+        self.config.worker_warmup_secs = secs;
+        self.config.worker_warmup_share = share;
+        self.config.worker_warmup_blocks = blocks;
+        self.config.worker_warmup_thin_ratio = thin_ratio;
+        self.config.worker_warmup_divert_every = divert_every;
+        self
+    }
+
     pub fn pd_admission_wait_secs(mut self, secs: u64) -> Self {
         self.config.pd_admission_wait_secs = secs;
         self
@@ -283,18 +324,13 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_overload_shed(mut self, shed: bool) -> Self {
+        self.config.worker_overload_shed = shed;
+        self
+    }
+
     pub fn worker_overload_token_usage(mut self, threshold: Option<f64>) -> Self {
         self.config.worker_overload_token_usage = threshold;
-        self
-    }
-
-    pub fn kv_indexer_ttl_secs(mut self, ttl: Option<u64>) -> Self {
-        self.config.kv_indexer_ttl_secs = ttl;
-        self
-    }
-
-    pub fn kv_indexer_max_entries(mut self, max: Option<usize>) -> Self {
-        self.config.kv_indexer_max_entries = max;
         self
     }
 
@@ -315,9 +351,85 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Most bytes of preprocessed media held in flight for engines at once.
+    pub fn multimodal_max_inflight_bytes(mut self, bytes: Option<usize>) -> Self {
+        self.config.multimodal_max_inflight_bytes = bytes;
+        self
+    }
+
     /// Per-request image-count limit replacing each model spec's built-in limit.
     pub fn mm_per_request_image_limit(mut self, limit: Option<usize>) -> Self {
         self.config.mm_per_request_image_limit = limit;
+        self
+    }
+
+    /// Where media for one engine's gRPC workers is fetched and preprocessed.
+    pub fn mm_processing(mut self, mode: Option<MmProcessingMode>) -> Self {
+        self.config.mm_processing = mode;
+        self
+    }
+
+    /// Host-DRAM budget (MiB) for router-side preprocessed media.
+    pub fn mm_pixel_cache_mb(mut self, mb: Option<usize>) -> Self {
+        self.config.mm_pixel_cache_mb = mb;
+        self
+    }
+
+    /// Image/audio download timeout in milliseconds; unset uses env/default.
+    pub fn mm_fetch_timeout_ms(mut self, timeout: Option<u64>) -> Self {
+        self.config.mm_fetch_timeout_ms = timeout;
+        self
+    }
+
+    /// Video download timeout in milliseconds; unset uses env/default.
+    pub fn mm_video_fetch_timeout_ms(mut self, timeout: Option<u64>) -> Self {
+        self.config.mm_video_fetch_timeout_ms = timeout;
+        self
+    }
+
+    /// Serve cached pixels over RDMA (legacy switch for the RDMA lane).
+    pub fn mm_pixel_rdma(mut self, enabled: bool) -> Self {
+        self.config.mm_pixel_rdma = enabled;
+        self
+    }
+
+    /// What the router's own media pipeline does when libjpeg-turbo cannot be
+    /// loaded: `prefer` (the fallback decoder) or `require` (no start-up).
+    pub fn mm_turbojpeg(mut self, policy: Option<TurboJpegPolicy>) -> Self {
+        self.config.mm_turbojpeg = policy;
+        self
+    }
+
+    /// Hosts the router's own media pipeline may fetch client-supplied media
+    /// URLs from, by name (every redirect hop included); `None` is any host
+    /// the address policy passes.
+    pub fn mm_allowed_media_domains(mut self, domains: Option<Vec<String>>) -> Self {
+        self.config.mm_allowed_media_domains = domains;
+        self
+    }
+
+    /// Allow client-supplied media URLs on loopback, link-local or private
+    /// addresses (a deployment whose media origin is internal).
+    pub fn mm_allow_private_media_hosts(mut self, allowed: bool) -> Self {
+        self.config.mm_allow_private_media_hosts = allowed;
+        self
+    }
+
+    /// Listener IP for the RDMA metadata exchange.
+    pub fn rdma_listen_ip(mut self, ip: Option<impl Into<String>>) -> Self {
+        self.config.rdma_listen_ip = ip.map(Into::into);
+        self
+    }
+
+    /// Full-TTL override (seconds) for leased RDMA pixel slots.
+    pub fn rdma_slot_ttl_s(mut self, secs: Option<u64>) -> Self {
+        self.config.rdma_slot_ttl_s = secs;
+        self
+    }
+
+    /// Emit per-request multimodal timing at INFO.
+    pub fn log_mm_timing(mut self, enabled: bool) -> Self {
+        self.config.log_mm_timing = enabled;
         self
     }
 
@@ -325,11 +437,6 @@ impl RouterConfigBuilder {
 
     pub fn max_concurrent_requests(mut self, max: i32) -> Self {
         self.config.max_concurrent_requests = max;
-        self
-    }
-
-    pub fn disable_rate_limiting(mut self) -> Self {
-        self.config.max_concurrent_requests = -1;
         self
     }
 
@@ -343,8 +450,29 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn prefill_max_inflight_requests_per_worker(mut self, max: i32) -> Self {
+        self.config.prefill_max_inflight_requests_per_worker = max;
+        self
+    }
+
+    pub fn prefill_queue_size(mut self, size: Option<usize>) -> Self {
+        self.config.prefill_queue_size = size;
+        self
+    }
+
+    pub fn prefill_queue_timeout_secs(mut self, timeout: Option<u64>) -> Self {
+        self.config.prefill_queue_timeout_secs = timeout;
+        self
+    }
+
     pub fn rate_limit_tokens_per_second(mut self, tokens: i32) -> Self {
         self.config.rate_limit_tokens_per_second = Some(tokens);
+        self
+    }
+
+    /// Most background Responses in flight at once (0 = background mode off).
+    pub fn max_background_responses(mut self, max: usize) -> Self {
+        self.config.max_background_responses = max;
         self
     }
 
@@ -399,11 +527,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn add_cors_origin<S: Into<String>>(mut self, origin: S) -> Self {
-        self.config.cors_allowed_origins.push(origin.into());
-        self
-    }
-
     // ==================== Retry ====================
 
     pub fn retry_config(mut self, retry: RetryConfig) -> Self {
@@ -413,11 +536,6 @@ impl RouterConfigBuilder {
 
     pub fn disable_retries(mut self) -> Self {
         self.config.disable_retries = true;
-        self
-    }
-
-    pub fn enable_retries(mut self) -> Self {
-        self.config.disable_retries = false;
         self
     }
 
@@ -433,11 +551,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn enable_circuit_breaker(mut self) -> Self {
-        self.config.disable_circuit_breaker = false;
-        self
-    }
-
     // ==================== Health Check ====================
 
     pub fn health_check_config(mut self, health_check: HealthCheckConfig) -> Self {
@@ -447,17 +560,9 @@ impl RouterConfigBuilder {
 
     // ==================== Discovery ====================
 
-    pub fn discovery_config(mut self, discovery: DiscoveryConfig) -> Self {
-        self.config.discovery = Some(discovery);
-        self
-    }
-
-    /// With default settings
+    /// Kubernetes discovery with default settings
     pub fn enable_discovery(mut self) -> Self {
-        self.config.discovery = Some(DiscoveryConfig {
-            enabled: true,
-            ..Default::default()
-        });
+        self.config.discovery = Some(KubernetesDiscoveryConfig::default().into());
         self
     }
 
@@ -486,14 +591,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn disable_trace(mut self) -> Self {
-        self.config.trace_config = Some(TraceConfig {
-            enable_trace: false,
-            otlp_traces_endpoint: String::new(),
-        });
-        self
-    }
-
     // ==================== Logging ====================
 
     pub fn log_dir<S: Into<String>>(mut self, dir: S) -> Self {
@@ -503,6 +600,12 @@ impl RouterConfigBuilder {
 
     pub fn log_level<S: Into<String>>(mut self, level: S) -> Self {
         self.config.log_level = Some(level.into());
+        self
+    }
+
+    /// The optional fields of the access-log record (none by default).
+    pub fn access_log_fields(mut self, fields: Vec<AccessLogField>) -> Self {
+        self.config.access_log_fields = fields;
         self
     }
 
@@ -530,12 +633,6 @@ impl RouterConfigBuilder {
 
     pub fn enable_igw(mut self) -> Self {
         self.config.enable_igw = true;
-        self
-    }
-
-    /// Use proxy mode
-    pub fn disable_igw(mut self) -> Self {
-        self.config.enable_igw = false;
         self
     }
 
@@ -583,6 +680,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Which parser reads a chat completion's output unless a request's header says otherwise.
+    pub fn parser(mut self, parser: ParserChoice) -> Self {
+        self.config.parser = parser;
+        self
+    }
+
     // ==================== History Backend ====================
 
     pub fn history_backend(mut self, backend: HistoryBackend) -> Self {
@@ -590,25 +693,9 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn memory_history(mut self) -> Self {
-        self.config.history_backend = HistoryBackend::Memory;
-        self
-    }
-
-    pub fn no_history(mut self) -> Self {
-        self.config.history_backend = HistoryBackend::None;
-        self
-    }
-
     pub fn oracle_history(mut self, oracle_config: OracleConfig) -> Self {
         self.config.history_backend = HistoryBackend::Oracle;
         self.config.oracle = Some(oracle_config);
-        self
-    }
-
-    pub fn redis_history(mut self, redis_config: RedisConfig) -> Self {
-        self.config.history_backend = HistoryBackend::Redis;
-        self.config.redis = Some(redis_config);
         self
     }
 
@@ -631,30 +718,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn enable_l0_cache(mut self, max_entries: usize) -> Self {
-        self.config.tokenizer_cache.enable_l0 = true;
-        self.config.tokenizer_cache.l0_max_entries = max_entries;
-        self
-    }
-
-    pub fn enable_l1_cache(mut self, max_memory: usize) -> Self {
-        self.config.tokenizer_cache.enable_l1 = true;
-        self.config.tokenizer_cache.l1_max_memory = max_memory;
-        self
-    }
-
-    // ==================== Data Parallelism ====================
-
-    pub fn enable_dp_aware(mut self) -> Self {
-        self.config.dp_aware = true;
-        self
-    }
-
-    pub fn disable_dp_aware(mut self) -> Self {
-        self.config.dp_aware = false;
-        self
-    }
-
     // ==================== Boolean Setters ====================
     // Accept bool parameters to conditionally set flags without if statements
 
@@ -670,6 +733,11 @@ impl RouterConfigBuilder {
 
     pub fn pd_pairing_mode(mut self, mode: PdPairingMode) -> Self {
         self.config.pd_pairing_mode = mode;
+        self
+    }
+
+    pub fn policy_engine(mut self, mode: PolicyEngineMode) -> Self {
+        self.config.policy_engine = mode;
         self
     }
 
@@ -730,6 +798,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn maybe_jemalloc_prof_dir(mut self, dir: Option<impl Into<String>>) -> Self {
+        self.config.jemalloc_prof_dir = dir.map(|d| d.into());
+        self
+    }
+
     pub fn maybe_log_level(mut self, level: Option<impl Into<String>>) -> Self {
         self.config.log_level = level.map(|l| l.into());
         self
@@ -745,13 +818,6 @@ impl RouterConfigBuilder {
         headers: Option<HashMap<String, String>>,
     ) -> Self {
         self.config.storage_context_headers = headers.unwrap_or_default();
-        self
-    }
-
-    pub fn maybe_tenant_header_name(mut self, header_name: Option<impl Into<String>>) -> Self {
-        if let Some(header_name) = header_name {
-            self.config.tenant_resolution.tenant_header_name = header_name.into();
-        }
         self
     }
 
@@ -799,6 +865,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Bounds of the memory history backend.
+    pub fn memory_config(mut self, memory: MemoryConfig) -> Self {
+        self.config.memory = Some(memory);
+        self
+    }
+
     pub fn maybe_reasoning_parser(mut self, parser: Option<impl Into<String>>) -> Self {
         self.config.reasoning_parser = parser.map(|p| p.into());
         self
@@ -811,17 +883,6 @@ impl RouterConfigBuilder {
 
     // ==================== mTLS ====================
 
-    /// Both paths must be provided together. Files read during build()
-    pub fn client_cert_and_key<S1: Into<String>, S2: Into<String>>(
-        mut self,
-        cert_path: S1,
-        key_path: S2,
-    ) -> Self {
-        self.client_cert_path = Some(cert_path.into());
-        self.client_key_path = Some(key_path.into());
-        self
-    }
-
     /// Files read during build()
     pub fn maybe_client_cert_and_key(
         mut self,
@@ -833,12 +894,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    /// File read during build()
-    pub fn add_ca_certificate<S: Into<String>>(mut self, ca_cert_path: S) -> Self {
-        self.ca_cert_paths.push(ca_cert_path.into());
-        self
-    }
-
     /// Files read during build()
     pub fn add_ca_certificates<S: Into<String>>(mut self, ca_cert_paths: Vec<S>) -> Self {
         self.ca_cert_paths
@@ -847,17 +902,6 @@ impl RouterConfigBuilder {
     }
 
     // ==================== Server TLS ====================
-
-    /// Both paths must be provided together. Files read during build()
-    pub fn server_cert_and_key<S1: Into<String>, S2: Into<String>>(
-        mut self,
-        cert_path: S1,
-        key_path: S2,
-    ) -> Self {
-        self.server_cert_path = Some(cert_path.into());
-        self.server_key_path = Some(key_path.into());
-        self
-    }
 
     /// Files read during build()
     pub fn maybe_server_cert_and_key(
@@ -936,6 +980,7 @@ impl RouterConfigBuilder {
                 }
 
                 self.config.client_identity = Some(combined);
+                self.config.client_key_path = Some(key_path.clone());
             }
             (None, None) => {
                 // No client cert configured, that's fine
@@ -972,6 +1017,7 @@ impl RouterConfigBuilder {
                 })?;
                 self.config.server_cert = Some(cert);
                 self.config.server_key = Some(key);
+                self.config.server_key_path = Some(key_path.clone());
             }
             (None, None) => {}
             _ => {
@@ -1014,11 +1060,6 @@ impl RouterConfig {
     pub fn builder() -> RouterConfigBuilder {
         RouterConfigBuilder::new()
     }
-
-    /// Create a builder from this configuration
-    pub fn to_builder(&self) -> RouterConfigBuilder {
-        RouterConfigBuilder::from_config_ref(self)
-    }
 }
 
 #[cfg(test)]
@@ -1026,28 +1067,6 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-
-    /// Test that .to_builder() round-trip conversion works correctly
-    #[test]
-    fn test_builder_from_existing_config() {
-        let original = RouterConfigBuilder::new()
-            .regular_mode(vec!["http://worker1:8000".to_string()])
-            .port(3000)
-            .build()
-            .unwrap();
-
-        let modified = original
-            .to_builder()
-            .port(4000)
-            .enable_metrics("0.0.0.0", 29000)
-            .enable_trace("localhost:4317")
-            .build()
-            .unwrap();
-
-        assert_eq!(modified.port, 4000);
-        assert!(modified.metrics.is_some());
-        assert!(modified.trace_config.is_some());
-    }
 
     /// Test complex routing mode helper method
     #[test]
@@ -1057,7 +1076,7 @@ mod tests {
                 vec![("http://prefill:8000".to_string(), Some(8001))],
                 vec!["http://decode:8000".to_string()],
             )
-            .power_of_two_policy(60)
+            .power_of_two_policy()
             .build()
             .unwrap();
 

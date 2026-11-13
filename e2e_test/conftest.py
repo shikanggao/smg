@@ -8,8 +8,8 @@ Markers
 @pytest.mark.workers(count=1, prefill=None, decode=None, gpus=None, extra_engine_args=None)
     Configure worker topology for the test.
 
-@pytest.mark.gateway(policy="round_robin", timeout=None, extra_args=None)
-    Configure the gateway/router.
+@pytest.mark.gateway(policy="round_robin", timeout=None, extra_args=None, env=None)
+    Configure the gateway/router (``env``: variables added to its process's environment).
 
 @pytest.mark.e2e
     Mark test as an end-to-end test requiring GPU workers.
@@ -37,14 +37,16 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]  # smg/
 _E2E_TEST = Path(__file__).resolve().parent  # e2e_test/
-_SRC = _ROOT / "bindings" / "python"
+_SRC = _ROOT / "bindings" / "python" / "src"  # the package root (maturin's python-source)
 
 # Add e2e_test to path so "from infra import ..." works
 if str(_E2E_TEST) not in sys.path:
     sys.path.insert(0, str(_E2E_TEST))
 
-# Add bindings/python to path if the wheel is not installed (for local development)
-_wheel_installed = find_spec("smg.smg_rs") is not None
+# Without the installed wheel, put the source package root (_SRC) on the path for local development.
+# find_spec imports the parent of a dotted name first, so the smg package is asked for on
+# its own: absent, it reads as no wheel instead of raising ModuleNotFoundError.
+_wheel_installed = find_spec("smg") is not None and find_spec("smg.smg_rs") is not None
 
 if not _wheel_installed and str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -105,8 +107,10 @@ def pytest_runtest_logstart(nodeid: str, location: tuple) -> None:
 import pytest
 from fixtures import (
     backend_router,
+    mock_answers,
     pytest_collection_modifyitems,
     pytest_configure,
+    pytest_runtest_makereport,
     pytest_runtest_setup,
     pytest_sessionfinish,
     setup_backend,
@@ -149,6 +153,7 @@ def api_client(request, setup_backend):
 __all__ = [
     # Hooks
     "pytest_runtest_logstart",
+    "pytest_runtest_makereport",
     "pytest_runtest_setup",
     "pytest_collection_modifyitems",
     "pytest_configure",
@@ -156,6 +161,7 @@ __all__ = [
     # Fixtures
     "setup_backend",
     "backend_router",
+    "mock_answers",
     "model",
     "api_client",
 ]

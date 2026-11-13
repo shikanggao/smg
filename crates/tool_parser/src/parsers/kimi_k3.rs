@@ -152,7 +152,7 @@ impl KimiK3Parser {
     /// tools section nested inside a channel the model can never close — output
     /// the reasoning parser then swallows whole, leaving `tool_calls` empty.
     ///
-    /// So emit one tag per prefix in [`TOOLS_SECTION_PREFIXES`] and register each
+    /// So emit one tag per prefix in `TOOLS_SECTION_PREFIXES` and register each
     /// closing marker as a trigger, mirroring the Harmony builder, which likewise
     /// pairs one tag per channel-entry shape with a trigger per prefix.
     ///
@@ -176,7 +176,7 @@ impl KimiK3Parser {
         let call_formats: Vec<Value> = tools
             .iter()
             .filter(|tool| !tool.function.name.is_empty())
-            .map(|tool| build_call_format(&tool.function.name, &tool.function.parameters))
+            .map(|tool| build_call_format(&tool.function.name, tool.function.parameters_schema()))
             .collect();
 
         let call_choice = if call_formats.is_empty() {

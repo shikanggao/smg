@@ -1,0 +1,61 @@
+//! Olmo 3: the turn's calls between `<function_calls>` and `</function_calls>`, written as
+//! Python, one per line (`get_weather(city="Paris")`); everything else content, and no thought.
+//! A turn opens with `<|im_start|>assistant`, so the prompt's replay starts there. Recorded as
+//! `olmo-3-7b-instruct` (allenai/Olmo-3-7B-Instruct).
+
+use crate::{
+    format::{CallSyntax, Emits, Format},
+    pythonic::Dialect,
+};
+
+/// The Olmo 3 table.
+pub fn olmo3() -> Format {
+    Format::new("olmo3")
+        .terminal("calls_open", "<function_calls>")
+        .terminal("calls_close", "</function_calls>")
+        .state("content", Emits::Content)
+        .state("calls", Emits::Arguments)
+        .transition("content", "calls_open", "calls")
+        .transition("calls", "calls_close", "content")
+        .calls(CallSyntax::Pythonic(Dialect::OLMO3))
+        .opens_turn("<|im_start|>assistant")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{engine::Engine, event::Event, testing::drive, Declared};
+
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
+        drive(
+            &mut Engine::new(olmo3(), Declared::default()),
+            prompt,
+            &[output],
+        )
+    }
+
+    fn text_of(events: &[Event], reasoning: bool) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Reasoning(text) if reasoning => Some(&*text.text),
+                Event::Content(text) if !reasoning => Some(&*text.text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_prompt_is_replayed_from_the_turn_opener_the_table_names() {
+        // A marker quoted in the user's turn moves nothing: the replay starts at the last
+        // `<|im_start|>assistant` (smg #2843, claude[bot]'s probe).
+        let prompt = "<|im_start|>user\nWhy did you print <function_calls> there?<|im_end|>\n\
+                      <|im_start|>assistant\n";
+        let events = run(prompt, "The marker opens a calls block.");
+        assert_eq!(text_of(&events, true), "");
+        assert_eq!(text_of(&events, false), "The marker opens a calls block.");
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallStart { .. })));
+    }
+}

@@ -3,13 +3,17 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::error;
+use openai_protocol::profile::ProviderProfile;
+use smg_grpc_client::FormatSetAside;
 
 use crate::routers::{
     error,
     grpc::{
         common::stages::BuildStage,
-        context::{BuildOutput, ExecutionPlanKind, PreparationOutput, RequestContext},
+        context::{
+            stage_output, BuildOutput, ExecutionPlanKind, PlanSettings, PreparationOutput,
+            RequestContext,
+        },
         regular::stages::chat::build_chat_backed_plan,
         spec::{ResponseSpec, TranscriptionResponseSpec},
     },
@@ -31,13 +35,10 @@ impl TranscriptionRequestBuildingStage {
 #[async_trait]
 impl BuildStage for TranscriptionRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
-        let prep = ctx.state.preparation.take().ok_or_else(|| {
-            error!(
-                function = "TranscriptionRequestBuildingStage::build",
-                "Preparation not completed"
-            );
-            error::internal_error("preparation_not_completed", "Preparation not completed")
-        })?;
+        let prep = stage_output(
+            ctx.state.preparation.take(),
+            "TranscriptionRequestBuildingStage::build",
+        )?;
 
         let PreparationOutput::Transcription {
             token_ids,
@@ -56,16 +57,29 @@ impl BuildStage for TranscriptionRequestBuildingStage {
 
         // The backend request is chat-shaped: reuse the chat build path on the
         // request synthesized in preparation. Regular-only, so a single-plan
-        // request with no PD metadata and no tool constraints.
-        let (plan, stamp) = build_chat_backed_plan(
+        // request with no PD metadata and no tool constraints. The profile is
+        // the one the shared chat preparation derived for that request.
+        let provider = ctx
+            .state
+            .provider
+            .unwrap_or_else(|| ProviderProfile::for_model(&chat_request.model));
+        let (plan, stamp, _) = build_chat_backed_plan(
             ctx,
             &chat_request,
+            provider,
             processed_messages.text,
+            processed_messages.generation_prompt,
+            processed_messages.continued_final_message,
             token_ids,
             None,
+            FormatSetAside::default(),
+            None,
+            false,
             "transcription-",
-            /* inject_pd_metadata */ false,
-            ExecutionPlanKind::Single,
+            PlanSettings {
+                inject_pd_metadata: false,
+                plan_kind: ExecutionPlanKind::Single,
+            },
         )
         .await?;
 

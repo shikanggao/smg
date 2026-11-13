@@ -14,18 +14,18 @@ use std::{
     },
 };
 
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{BoxedTraceInjector, NoopTraceInjector};
+use crate::{channel::Channel, BoxedTraceInjector, NoopTraceInjector};
 
 /// Process-global cache of connected channels, keyed by encode-worker endpoint.
 ///
 /// The EPD encode stage dispatches one `Encode` RPC per image per request, so
 /// without pooling every call paid a fresh TCP + HTTP/2 (+ TLS) handshake on the
-/// request's critical path. A `tonic::Channel` is cheap to clone and multiplexes
+/// request's critical path. A [`Channel`] is cheap to clone and multiplexes
 /// concurrent RPCs over a single HTTP/2 connection, so we reuse one channel per
-/// endpoint — the same connection reuse the prefill/decode legs already get from
+/// endpoint — the same connection reuse the prefill/decode sides already get from
 /// their cached per-worker client.
 /// A single body is large; several concurrent images to the SAME worker would
 /// head-of-line-block on one HTTP/2 connection's write buffer + flow-control
@@ -42,7 +42,10 @@ const ENCODE_CONNS_PER_ENDPOINT: usize = 4;
 /// Round-robin cursor over an endpoint's connection pool.
 static ENCODE_CONN_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod tokenspeed_encoder_proto {
     #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
     tonic::include_proto!("tokenspeed.grpc.encoder");
@@ -56,7 +59,7 @@ pub struct TokenSpeedEncoderClient {
 }
 
 impl TokenSpeedEncoderClient {
-    /// Connect reusing a cached `Channel` for `endpoint` (see [`channel_cache`]).
+    /// Connect reusing a cached `Channel` for `endpoint` (see `channel_cache`).
     /// The lock is never held across the connect `await`, so a
     /// rare concurrent first-connect may build two channels for the same endpoint
     /// — harmless: the first cached wins and the extra is dropped.

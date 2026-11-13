@@ -1,0 +1,946 @@
+//! The public Messages API's own request rules, applied with the field-level
+//! validation of [`CreateMessageRequest`]: the shapes the public API refuses
+//! with `invalid_request_error` are refused here before any rendering, each
+//! message naming the field as the public API names it.
+//!
+//! Deliberately not enforced, as documented extensions of this gateway:
+//! unknown top-level fields and `rid` (forwarded to the engine), a `system`
+//! role inside `messages` (kept in place for the clients that send one), the
+//! vendor's model-specific couplings of thinking with `temperature` or a
+//! forced `tool_choice` (a served model may take both), and the per-model
+//! output-token cap. The rule that `thinking.budget_tokens` stays under
+//! `max_tokens` reads the `anthropic-beta` header (the interleaved-thinking
+//! beta lifts it), so the gateway's handler applies it.
+//!
+//! Tighter than the public API in one place, on purpose: `top_p` is refused
+//! at 0.0 and `top_k` outside 1 to `i32::MAX`, the bounds this gateway's Chat
+//! and Responses APIs apply to the same fields and the engines behind it
+//! enforce, because their wires cannot carry either zero as the request
+//! meant it and carry `top_k` as a signed 32-bit integer, which a larger
+//! value would wrap (`validate_sampling`). The Chat and Responses field is
+//! signed and takes -1 as "disabled"; the Messages field is unsigned, so -1
+//! is a type error there, refused by the deserializer before this validation
+//! runs.
+
+use std::collections::HashSet;
+
+use validator::ValidationError;
+
+use crate::{
+    common::invalid,
+    messages::{
+        CreateMessageRequest, InputContent, InputContentBlock, InputMessage, MessageThread, Role,
+        ThinkingConfig, Tool,
+    },
+};
+
+/// Fields of a custom tool definition the public API accepts that the typed
+/// definition does not model yet; they pass through, anything else is refused
+/// as the public API refuses it.
+const PASSTHROUGH_CUSTOM_TOOL_FIELDS: &[&str] = &[
+    "strict",
+    "input_examples",
+    "eager_input_streaming",
+    "allowed_callers",
+];
+
+pub(crate) fn validate(req: &CreateMessageRequest) -> Result<(), ValidationError> {
+    validate_sampling(req)?;
+    validate_message_contents(&req.messages)?;
+    validate_thread(req)?;
+    validate_stop_sequences(req.stop_sequences.as_deref())?;
+    validate_tools(req.tools.as_deref())?;
+    validate_output_format(req)?;
+    validate_thinking(req)
+}
+
+/// `temperature` takes the public API's range, 0 to 1; `top_p` the same range
+/// without its zero, and `top_k` from 1 to `i32::MAX`: the bounds the Chat
+/// and Responses requests apply to the same fields
+/// ([`crate::sampling_params::validate_top_p_value`],
+/// [`crate::sampling_params::validate_top_k_value`]). Every engine refuses a
+/// nucleus of nothing, and a `top_k` of 0 is "disabled" on some engines and
+/// an error on the others (never a top of nothing); the wire the engines read
+/// cannot tell either zero from a field the client left out, so such a request
+/// is refused here, with the engine's answer, instead of being sampled over
+/// the whole distribution or failing at the engine. The lower bound of
+/// `top_p` and the ceiling of `top_k` are judged on the values the wires
+/// carry, a 32-bit float and a signed 32-bit integer: a positive `top_p`
+/// below the smallest 32-bit float would arrive as the zero, and a `top_k`
+/// above `i32::MAX` would wrap to "disabled" (-1) or to a negative number the
+/// engine refuses. The upper bound of `top_p` stays on the value given, as
+/// the public API states it; the Chat and Responses requests read the field
+/// as a 32-bit float, so a value within one rounding step above 1 passes
+/// there as 1.0 and is refused here.
+fn validate_sampling(req: &CreateMessageRequest) -> Result<(), ValidationError> {
+    if req.temperature.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
+        return Err(invalid(
+            "value_out_of_range",
+            "temperature: range: 0..1".to_owned(),
+        ));
+    }
+    if req.top_p.is_some_and(|v| !(v <= 1.0 && (v as f32) > 0.0)) {
+        return Err(invalid(
+            "value_out_of_range",
+            "top_p: range: (0, 1]".to_owned(),
+        ));
+    }
+    if req
+        .top_k
+        .is_some_and(|k| !(1..=i32::MAX as u32).contains(&k))
+    {
+        return Err(invalid(
+            "value_out_of_range",
+            "top_k: range: 1..2147483647".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// A `continue` request carries the messages since the answer it continues
+/// and nothing the thread keeps from its create request: `system` and
+/// `tools` are refused, as the public API refuses them. Its tool pairing is
+/// judged on the conversation the gateway rebuilds (a `tool_result` that
+/// opens the request answers the stored answer's `tool_use`); every other
+/// request's pairing is judged here.
+fn validate_thread(req: &CreateMessageRequest) -> Result<(), ValidationError> {
+    if !matches!(req.thread, Some(MessageThread::Continue { .. })) {
+        return validate_tool_pairing(&req.messages);
+    }
+    let kept = match (req.system.is_some(), req.tools.is_some()) {
+        (false, false) => return Ok(()),
+        (true, false) => "system",
+        (false, true) => "tools",
+        (true, true) => "system or tools",
+    };
+    Err(invalid(
+        "thread_continue_carries_create_fields",
+        format!(
+            "thread: a continue request sends no {kept}: the thread keeps the create request's"
+        ),
+    ))
+}
+
+fn role_name(role: &Role) -> &'static str {
+    match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+    }
+}
+
+/// Every message carries content, except the optional final assistant
+/// message (a prefill), which may be empty but may not end in whitespace;
+/// every text block carries text, and every `tool_use` block's `input` is
+/// an object. A `system` message in the array is this gateway's extension
+/// and is left to its own rules.
+fn validate_message_contents(messages: &[InputMessage]) -> Result<(), ValidationError> {
+    let last = messages.len().saturating_sub(1);
+    for (index, message) in messages.iter().enumerate() {
+        if message.role == Role::System {
+            continue;
+        }
+        let final_assistant = index == last && message.role == Role::Assistant;
+        let empty = match &message.content {
+            InputContent::String(text) => text.trim().is_empty(),
+            InputContent::Blocks(blocks) => blocks.is_empty(),
+        };
+        if empty && !final_assistant {
+            return Err(invalid(
+                "empty_content",
+                format!(
+                    "messages.{index}: {} messages must have non-empty content",
+                    role_name(&message.role)
+                ),
+            ));
+        }
+        if let InputContent::Blocks(blocks) = &message.content {
+            let empty_text = blocks.iter().any(|block| {
+                matches!(block, InputContentBlock::Text(text) if text.text.trim().is_empty())
+            });
+            if empty_text {
+                return Err(invalid(
+                    "empty_text_block",
+                    format!("messages.{index}: text content blocks must be non-empty"),
+                ));
+            }
+            // A `tool_use` block's `input` is the object the tool was called
+            // with: the public API refuses any other JSON value, and so does
+            // this gateway, before a string would be rendered as the call's
+            // arguments and answered as if the history were well-formed.
+            let not_an_object = blocks.iter().position(|block| {
+                matches!(block, InputContentBlock::ToolUse(tool_use) if !tool_use.input.is_object())
+            });
+            if let Some(position) = not_an_object {
+                return Err(invalid(
+                    "tool_use_input_not_an_object",
+                    format!(
+                        "messages.{index}.content.{position}.tool_use.input: Input should be a \
+                         valid dictionary"
+                    ),
+                ));
+            }
+        }
+        if final_assistant {
+            let tail = match &message.content {
+                InputContent::String(text) => Some(text.as_str()),
+                InputContent::Blocks(blocks) => blocks.last().and_then(|block| match block {
+                    InputContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                }),
+            };
+            if tail.is_some_and(|text| text.ends_with(char::is_whitespace)) {
+                return Err(invalid(
+                    "prefill_trailing_whitespace",
+                    "messages: final assistant content cannot end with trailing whitespace"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A conversation turn: consecutive messages of one role, which the public
+/// API combines into a single turn, with the index of the first.
+struct Turn<'a> {
+    role: Role,
+    at: usize,
+    messages: Vec<(usize, &'a InputMessage)>,
+}
+
+/// The user and assistant turns of `messages`, consecutive same-role
+/// messages combined; a `system` message of this gateway's extension is
+/// transparent.
+fn turns(messages: &[InputMessage]) -> Vec<Turn<'_>> {
+    let mut turns: Vec<Turn<'_>> = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        if message.role == Role::System {
+            continue;
+        }
+        match turns.last_mut() {
+            Some(turn) if turn.role == message.role => turn.messages.push((index, message)),
+            _ => turns.push(Turn {
+                role: message.role.clone(),
+                at: index,
+                messages: vec![(index, message)],
+            }),
+        }
+    }
+    turns
+}
+
+fn tool_use_ids<'a>(turn: &Turn<'a>) -> Vec<&'a str> {
+    turn.messages
+        .iter()
+        .flat_map(|(_, message)| match &message.content {
+            InputContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    InputContentBlock::ToolUse(tool_use) => Some(tool_use.id.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            InputContent::String(_) => Vec::new(),
+        })
+        .collect()
+}
+
+/// A `tool_use` block is answered by a `tool_result` block in the very next
+/// user turn, one per id, and a `tool_result` answers a `tool_use` of the
+/// assistant turn right before it: the public API refuses a result nobody
+/// asked for, a call nobody answered, and a call answered twice, naming the
+/// message. Consecutive messages of one role form one turn, as the public
+/// API combines them (parallel results split over two user messages answer
+/// one assistant turn); a `system` message in between is skipped.
+fn validate_tool_pairing(messages: &[InputMessage]) -> Result<(), ValidationError> {
+    let unanswered = |at: usize, ids: &[&str]| {
+        invalid(
+            "tool_use_without_tool_result",
+            format!(
+                "messages.{at}: `tool_use` ids were found without `tool_result` blocks \
+                 immediately after: {}. Each `tool_use` block must have a corresponding \
+                 `tool_result` block in the next message.",
+                ids.join(", ")
+            ),
+        )
+    };
+    let mut pending: Vec<&str> = Vec::new();
+    let mut pending_at = 0;
+    for turn in turns(messages) {
+        match turn.role {
+            Role::System => continue,
+            Role::Assistant => {
+                if !pending.is_empty() {
+                    return Err(unanswered(pending_at, &pending));
+                }
+                pending = tool_use_ids(&turn);
+                pending_at = turn.at;
+            }
+            Role::User => {
+                let mut answered: HashSet<&str> = HashSet::new();
+                for (index, message) in &turn.messages {
+                    let InputContent::Blocks(blocks) = &message.content else {
+                        continue;
+                    };
+                    for (position, block) in blocks.iter().enumerate() {
+                        let InputContentBlock::ToolResult(result) = block else {
+                            continue;
+                        };
+                        let id = result.tool_use_id.as_str();
+                        if !pending.contains(&id) {
+                            return Err(invalid(
+                                "unexpected_tool_use_id",
+                                format!(
+                                    "messages.{index}.content.{position}: unexpected `tool_use_id` \
+                                     found in `tool_result` blocks: {id}. Each `tool_result` block \
+                                     must have a corresponding `tool_use` block in the previous \
+                                     message."
+                                ),
+                            ));
+                        }
+                        if !answered.insert(id) {
+                            return Err(invalid(
+                                "duplicate_tool_result",
+                                format!(
+                                    "messages.{index}.content.{position}: `tool_result` blocks must \
+                                     each answer a different `tool_use_id`: {id} is answered twice."
+                                ),
+                            ));
+                        }
+                    }
+                }
+                let missing: Vec<&str> = pending
+                    .iter()
+                    .copied()
+                    .filter(|id| !answered.contains(id))
+                    .collect();
+                if !missing.is_empty() {
+                    return Err(unanswered(pending_at, &missing));
+                }
+                pending.clear();
+            }
+        }
+    }
+    if pending.is_empty() {
+        Ok(())
+    } else {
+        Err(unanswered(pending_at, &pending))
+    }
+}
+
+/// A stop sequence is matched against generated text, so it needs text.
+fn validate_stop_sequences(sequences: Option<&[String]>) -> Result<(), ValidationError> {
+    if sequences
+        .unwrap_or_default()
+        .iter()
+        .any(|sequence| sequence.trim().is_empty())
+    {
+        return Err(invalid(
+            "invalid_stop_sequence",
+            "stop_sequences: each stop sequence must contain non-whitespace".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn tool_name(tool: &Tool) -> Option<&str> {
+    match tool {
+        Tool::Custom(tool) => Some(&tool.name),
+        Tool::ToolSearch(tool) => Some(&tool.name),
+        Tool::Bash(tool) => Some(&tool.name),
+        Tool::TextEditor(tool) => Some(&tool.name),
+        Tool::WebSearch(tool) => Some(&tool.name),
+        Tool::McpToolset(_) => None,
+    }
+}
+
+/// Tool names are unique; a custom tool's name matches
+/// `^[a-zA-Z0-9_-]{1,128}$`, its input schema describes an object, and its
+/// definition carries only the public API's fields.
+fn validate_tools(tools: Option<&[Tool]>) -> Result<(), ValidationError> {
+    let mut names: HashSet<&str> = HashSet::new();
+    for (index, tool) in tools.unwrap_or_default().iter().enumerate() {
+        if let Some(name) = tool_name(tool) {
+            if !names.insert(name) {
+                return Err(invalid(
+                    "duplicate_tool_names",
+                    "tools: Tool names must be unique.".to_owned(),
+                ));
+            }
+        }
+        let Tool::Custom(custom) = tool else {
+            continue;
+        };
+        if custom.name.chars().count() > 128 {
+            return Err(invalid(
+                "tool_name_too_long",
+                format!("tools.{index}.custom.name: String should have at most 128 characters"),
+            ));
+        }
+        let well_formed = !custom.name.is_empty()
+            && custom
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !well_formed {
+            return Err(invalid(
+                "invalid_tool_name",
+                format!(
+                    "tools.{index}.custom.name: String should match pattern '^[a-zA-Z0-9_-]{{1,128}}$'"
+                ),
+            ));
+        }
+        if custom.input_schema.schema_type != "object" {
+            return Err(invalid(
+                "invalid_input_schema_type",
+                format!("tools.{index}.custom.input_schema.type: Input should be 'object'"),
+            ));
+        }
+        if let Some(field) = custom
+            .extra
+            .keys()
+            .find(|key| !PASSTHROUGH_CUSTOM_TOOL_FIELDS.contains(&key.as_str()))
+        {
+            return Err(invalid(
+                "unknown_tool_field",
+                format!("tools.{index}.custom.{field}: Extra inputs are not permitted"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// An output format's schema is a JSON object, under either field it comes
+/// in ([`CreateMessageRequest::output_schema`]); the format's `type` is the
+/// deserializer's to refuse.
+fn validate_output_format(req: &CreateMessageRequest) -> Result<(), ValidationError> {
+    let under = [
+        (
+            "output_config.format",
+            req.output_config
+                .as_ref()
+                .and_then(|config| config.format.as_ref()),
+        ),
+        ("output_format", req.output_format.as_deref()),
+    ];
+    for (field, format) in under {
+        if format.is_some_and(|format| !format.schema().is_object()) {
+            return Err(invalid(
+                "output_format_schema_not_an_object",
+                format!("{field}.schema: Input should be a valid dictionary"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `enabled` needs a budget of at least 1024 tokens (that it stays under
+/// `max_tokens` depends on the `anthropic-beta` header, so the gateway's
+/// handler checks it); `between_tools` takes `type` alone (the public API
+/// refuses `display`, `budget_tokens` or `block_binding` sent with it).
+fn validate_thinking(req: &CreateMessageRequest) -> Result<(), ValidationError> {
+    match &req.thinking {
+        Some(ThinkingConfig::Enabled { budget_tokens, .. }) if *budget_tokens < 1024 => {
+            Err(invalid(
+                "thinking_budget_too_small",
+                "thinking.enabled.budget_tokens: Input should be greater than or equal to 1024"
+                    .to_owned(),
+            ))
+        }
+        Some(ThinkingConfig::BetweenTools { other }) if !other.is_empty() => {
+            let mut fields: Vec<&str> = other.keys().map(String::as_str).collect();
+            fields.sort_unstable();
+            let refusals: Vec<String> = fields
+                .iter()
+                .map(|field| {
+                    format!("thinking.between_tools.{field}: Extra inputs are not permitted")
+                })
+                .collect();
+            Err(invalid(
+                "thinking_between_tools_takes_no_other_field",
+                refusals.join("; "),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+    use validator::Validate;
+
+    fn request(body: Value) -> CreateMessageRequest {
+        let mut body = body;
+        let object = body.as_object_mut().expect("an object");
+        object.entry("model").or_insert(json!("m"));
+        object.entry("max_tokens").or_insert(json!(64));
+        object
+            .entry("messages")
+            .or_insert(json!([{"role": "user", "content": "hi"}]));
+        serde_json::from_value(body).expect("a well-formed request")
+    }
+
+    fn rejection(body: Value) -> String {
+        request(body)
+            .validate()
+            .expect_err("the public API refuses this shape")
+            .to_string()
+    }
+
+    fn accepted(body: Value) {
+        request(body)
+            .validate()
+            .expect("the public API accepts this shape");
+    }
+
+    use super::*;
+    use crate::{
+        messages::CountMessageTokensRequest,
+        sampling_params::{validate_top_k_value, validate_top_p_value},
+    };
+
+    #[test]
+    fn sampling_parameters_take_the_public_range() {
+        assert!(rejection(json!({"temperature": 2.0})).contains("temperature: range: 0..1"));
+        assert!(rejection(json!({"temperature": -1.0})).contains("temperature: range: 0..1"));
+        assert!(rejection(json!({"top_p": 1.5})).contains("top_p: range: (0, 1]"));
+        assert!(rejection(json!({"top_p": -0.5})).contains("top_p: range: (0, 1]"));
+        accepted(json!({"temperature": 1.0, "top_p": 1.0, "top_k": 1}));
+        accepted(json!({"temperature": 0.0, "top_p": 0.5, "top_k": 40}));
+    }
+
+    #[test]
+    fn a_nucleus_of_nothing_and_a_top_k_of_zero_are_refused() {
+        // Every engine rejects a top_p of 0.0; a top_k of 0 is "disabled" on
+        // some engines and an error on the others; and the wire cannot tell
+        // either zero from a field the client left out, so the request gets
+        // the engine's answer here instead of a whole-distribution sample.
+        assert!(rejection(json!({"top_p": 0.0})).contains("top_p: range: (0, 1]"));
+        assert!(rejection(json!({"top_k": 0})).contains("top_k: range: 1..2147483647"));
+    }
+
+    #[test]
+    fn a_top_p_the_wires_would_carry_as_zero_is_refused() {
+        // The engines' wires carry top_p as a 32-bit float: a positive value
+        // below its smallest magnitude arrives as the zero the engines read
+        // as a field left out, so it is refused like the zero itself.
+        assert_eq!((1e-46_f64 as f32).to_bits(), 0);
+        assert!((1e-45_f64 as f32) > 0.0);
+        accepted(json!({"top_p": 1e-45}));
+        assert!(rejection(json!({"top_p": 1e-46})).contains("top_p: range: (0, 1]"));
+    }
+
+    #[test]
+    fn a_top_k_above_the_wires_signed_range_is_refused() {
+        // The engines' wires carry top_k as a signed 32-bit integer: u32::MAX
+        // would wrap to -1 ("disabled": the whole distribution) and i32::MAX + 1
+        // to i32::MIN (an engine error), neither what the client asked for.
+        accepted(json!({"top_k": i32::MAX}));
+        assert!(rejection(json!({"top_k": i32::MAX as u32 + 1}))
+            .contains("top_k: range: 1..2147483647"));
+        assert!(rejection(json!({"top_k": u32::MAX})).contains("top_k: range: 1..2147483647"));
+    }
+
+    #[test]
+    fn the_bounds_are_the_chat_and_responses_bounds() {
+        // The same JSON value is accepted or refused alike on the three
+        // request paths (the Chat and Responses requests read these fields
+        // as f32 and i32 and apply the shared validators), with one
+        // difference: a value within one rounding step above 1 is 1.0 as an
+        // f32 and passes there, while the Messages request keeps the public
+        // API's bound on the value given.
+        for (value, chat_accepts, messages_accepts) in [
+            (json!(0.0), false, false),
+            (json!(1e-46), false, false),
+            (json!(1e-45), true, true),
+            (json!(0.5), true, true),
+            (json!(1.0), true, true),
+            (json!(1.000_000_01), true, false),
+            (json!(1.5), false, false),
+            (json!(-0.5), false, false),
+        ] {
+            let as_chat: f32 = serde_json::from_value(value.clone()).expect("a number");
+            assert_eq!(
+                validate_top_p_value(as_chat).is_ok(),
+                chat_accepts,
+                "chat top_p {value}"
+            );
+            assert_eq!(
+                request(json!({"top_p": value})).validate().is_ok(),
+                messages_accepts,
+                "messages top_p {value}"
+            );
+        }
+        for (value, accepted_everywhere) in [(0, false), (1, true), (40, true), (i32::MAX, true)] {
+            assert_eq!(
+                validate_top_k_value(value).is_ok(),
+                accepted_everywhere,
+                "chat top_k {value}"
+            );
+            assert_eq!(
+                request(json!({"top_k": value})).validate().is_ok(),
+                accepted_everywhere,
+                "messages top_k {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn messages_carry_content_except_the_final_prefill() {
+        assert!(
+            rejection(json!({"messages": [{"role": "user", "content": ""}]}))
+                .contains("messages.0: user messages must have non-empty content")
+        );
+        assert!(
+            rejection(json!({"messages": [{"role": "user", "content": []}]}))
+                .contains("messages.0: user messages must have non-empty content")
+        );
+        assert!(rejection(json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "   "}
+        ]}))
+        .contains("messages.2: user messages must have non-empty content"));
+        assert!(rejection(json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": ""}]}
+        ]}))
+        .contains("messages.0: text content blocks must be non-empty"));
+        // The optional final assistant message may be empty, not end in whitespace.
+        accepted(json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": ""}
+        ]}));
+        assert!(rejection(json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "The answer is "}
+        ]}))
+        .contains("final assistant content cannot end with trailing whitespace"));
+        assert!(rejection(json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [{"type": "text", "text": "The answer is\n"}]}
+        ]}))
+        .contains("final assistant content cannot end with trailing whitespace"));
+        // A system message in the array is this gateway's extension: untouched,
+        // empty blocks and empty text alike.
+        accepted(json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": []},
+            {"role": "system", "content": [{"type": "text", "text": ""}]},
+            {"role": "user", "content": "again"}
+        ]}));
+    }
+
+    fn tool_use(id: &str) -> Value {
+        json!({"type": "tool_use", "id": id, "name": "get_weather", "input": {"city": "Paris"}})
+    }
+
+    fn tool_result(id: &str) -> Value {
+        json!({"type": "tool_result", "tool_use_id": id, "content": "sunny"})
+    }
+
+    #[test]
+    fn tool_use_and_tool_result_blocks_pair_up() {
+        accepted(json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [tool_use("toolu_a"), tool_use("toolu_b")]},
+            {"role": "user", "content": [tool_result("toolu_b"), tool_result("toolu_a")]}
+        ]}));
+        let missing = rejection(json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [tool_use("toolu_a"), tool_use("toolu_b")]},
+            {"role": "user", "content": [tool_result("toolu_a")]}
+        ]}));
+        assert!(
+            missing.contains("messages.1: `tool_use` ids were found without `tool_result` blocks immediately after: toolu_b"),
+            "{missing}"
+        );
+        let unknown = rejection(json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [tool_use("toolu_a")]},
+            {"role": "user", "content": [tool_result("toolu_wrong")]}
+        ]}));
+        assert!(
+            unknown.contains("messages.2.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_wrong"),
+            "{unknown}"
+        );
+        let orphan = rejection(json!({"messages": [
+            {"role": "user", "content": [tool_result("toolu_probe")]}
+        ]}));
+        assert!(
+            orphan.contains("messages.0.content.0: unexpected `tool_use_id` found in `tool_result` blocks: toolu_probe"),
+            "{orphan}"
+        );
+        let trailing = rejection(json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [tool_use("toolu_a")]}
+        ]}));
+        assert!(
+            trailing.contains("messages.1: `tool_use` ids were found without"),
+            "{trailing}"
+        );
+        let twice = rejection(json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [tool_use("toolu_a")]},
+            {"role": "user", "content": [tool_result("toolu_a"), tool_result("toolu_a")]}
+        ]}));
+        assert!(
+            twice.contains("messages.2.content.1: `tool_result` blocks must each answer a different `tool_use_id`: toolu_a is answered twice."),
+            "{twice}"
+        );
+    }
+
+    /// A `tool_use` block's `input` is the arguments object: a string, or any
+    /// other value, is refused naming the block; an object of any shape is
+    /// accepted, and a system prompt in its own field stays accepted beside
+    /// it.
+    #[test]
+    fn a_tool_use_input_is_an_object() {
+        let with_input = |input: Value| {
+            json!({"messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Checking."},
+                    {"type": "tool_use", "id": "toolu_a", "name": "get_weather", "input": input}
+                ]},
+                {"role": "user", "content": [tool_result("toolu_a")]}
+            ], "system": "You are terse."})
+        };
+        let string = rejection(with_input(json!("Paris")));
+        assert!(
+            string.contains(
+                "messages.1.content.1.tool_use.input: Input should be a valid dictionary"
+            ),
+            "{string}"
+        );
+        for other in [json!(["Paris"]), json!(1), json!(null)] {
+            let refused = rejection(with_input(other.clone()));
+            assert!(
+                refused.contains("messages.1.content.1.tool_use.input"),
+                "{other}: {refused}"
+            );
+        }
+        accepted(with_input(json!({"city": "Paris"})));
+        accepted(with_input(json!({})));
+    }
+
+    /// Consecutive messages of one role are one turn, as the public API
+    /// combines them: parallel results split over two user messages answer
+    /// one assistant turn, and a tool_use followed by more assistant text is
+    /// answered after the whole assistant turn; a system message in between
+    /// changes nothing.
+    #[test]
+    fn consecutive_same_role_messages_pair_as_one_turn() {
+        accepted(json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [tool_use("toolu_a"), tool_use("toolu_b")]},
+            {"role": "user", "content": [tool_result("toolu_a")]},
+            {"role": "user", "content": [tool_result("toolu_b")]}
+        ]}));
+        accepted(json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [tool_use("toolu_a")]},
+            {"role": "assistant", "content": "Let me check that."},
+            {"role": "system", "content": "stay brief"},
+            {"role": "user", "content": [tool_result("toolu_a")]}
+        ]}));
+        let still_missing = rejection(json!({"messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": [tool_use("toolu_a"), tool_use("toolu_b")]},
+            {"role": "user", "content": [tool_result("toolu_a")]},
+            {"role": "user", "content": "and tomorrow?"}
+        ]}));
+        assert!(still_missing.contains("messages.1: `tool_use` ids were found without `tool_result` blocks immediately after: toolu_b"), "{still_missing}");
+    }
+
+    #[test]
+    fn stop_sequences_carry_text() {
+        assert!(rejection(json!({"stop_sequences": ["   "]}))
+            .contains("stop_sequences: each stop sequence must contain non-whitespace"));
+        accepted(json!({"stop_sequences": ["END", " stop "]}));
+    }
+
+    fn custom_tool(name: &str) -> Value {
+        json!({"name": name, "description": "d", "input_schema": {"type": "object", "properties": {}}})
+    }
+
+    #[test]
+    fn tool_definitions_follow_the_public_contract() {
+        assert!(
+            rejection(json!({"tools": [custom_tool("a"), custom_tool("a")]}))
+                .contains("tools: Tool names must be unique.")
+        );
+        assert!(rejection(json!({"tools": [custom_tool("get weather!")]}))
+            .contains("tools.0.custom.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'"));
+        assert!(rejection(json!({"tools": [custom_tool(&"x".repeat(129))]}))
+            .contains("tools.0.custom.name: String should have at most 128 characters"));
+        assert!(rejection(json!({"tools": [
+            {"name": "a", "input_schema": {"type": "string"}}
+        ]}))
+        .contains("tools.0.custom.input_schema.type: Input should be 'object'"));
+        assert!(rejection(json!({"tools": [
+            {"name": "a", "input_schema": {"type": "object"}, "banana": 1}
+        ]}))
+        .contains("tools.0.custom.banana: Extra inputs are not permitted"));
+        // The public API's own newer tool fields pass through.
+        accepted(json!({"tools": [
+            {"name": "a", "input_schema": {"type": "object"}, "strict": true}
+        ]}));
+        accepted(json!({"tools": [custom_tool("get_weather-v2"), custom_tool("other")]}));
+    }
+
+    #[test]
+    fn thinking_budget_is_bounded() {
+        assert!(rejection(
+            json!({"max_tokens": 4096, "thinking": {"type": "enabled", "budget_tokens": 1023}})
+        )
+        .contains("thinking.enabled.budget_tokens: Input should be greater than or equal to 1024"));
+        accepted(
+            json!({"max_tokens": 4096, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+        );
+        // Whether the budget stays under max_tokens depends on the beta
+        // header: the handler decides, not the body alone.
+        accepted(
+            json!({"max_tokens": 1024, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+        );
+        // The vendor's couplings of thinking with sampling and tool_choice are
+        // model-specific: a served model takes both.
+        accepted(
+            json!({"max_tokens": 4096, "temperature": 0.6, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_in_a_message_does_not_deserialize() {
+        let err = serde_json::from_value::<CreateMessageRequest>(json!({
+            "model": "m", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi", "extra": 1}]
+        }))
+        .expect_err("the public API refuses an unknown field in a message")
+        .to_string();
+        assert!(err.contains("extra"), "{err}");
+    }
+
+    /// `between_tools` passes with `type` alone and is refused, naming each
+    /// field the way the module's other refusals do, with anything else
+    /// beside it.
+    #[test]
+    fn between_tools_takes_no_other_field() {
+        assert!(request(json!({"thinking": {"type": "between_tools"}}))
+            .validate()
+            .is_ok());
+        let refusal = rejection(json!({
+            "thinking": {"type": "between_tools", "display": "omitted", "budget_tokens": 2048}
+        }));
+        assert!(
+            refusal.contains(
+                "thinking.between_tools.budget_tokens: Extra inputs are not permitted; \
+                 thinking.between_tools.display: Extra inputs are not permitted"
+            ),
+            "{refusal}"
+        );
+    }
+
+    /// An output format's schema is a JSON object, under either field it
+    /// comes in; the field is named as the public API names it.
+    #[test]
+    fn an_output_formats_schema_is_an_object() {
+        for field in ["output_config.format", "output_format"] {
+            let body = |schema: Value| {
+                let format = json!({"type": "json_schema", "schema": schema});
+                match field {
+                    "output_format" => json!({"output_format": format}),
+                    _ => json!({"output_config": {"format": format}}),
+                }
+            };
+            accepted(body(json!({"type": "object"})));
+            assert!(
+                rejection(body(json!("an object"))).contains(&format!(
+                    "{field}.schema: Input should be a valid dictionary"
+                )),
+                "{field}"
+            );
+        }
+    }
+
+    /// The `thread` field reads the public shapes: a create, a continue
+    /// naming its previous message (one without it is refused as the
+    /// field's deserializer refuses a missing field).
+    #[test]
+    fn the_thread_field_reads_the_public_shapes() {
+        assert_eq!(
+            request(json!({"thread": {"type": "create"}})).thread,
+            Some(MessageThread::Create)
+        );
+        assert_eq!(
+            request(json!({"thread": {"type": "continue", "previous_message_id": "msg_1"}})).thread,
+            Some(MessageThread::Continue {
+                previous_message_id: "msg_1".to_string()
+            })
+        );
+        let body = json!({
+            "model": "m", "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thread": {"type": "continue"}
+        });
+        let refused = serde_json::from_value::<CreateMessageRequest>(body)
+            .expect_err("a continue names its previous message")
+            .to_string();
+        assert!(refused.contains("previous_message_id"), "{refused}");
+    }
+
+    /// A continue request sends the messages since the answer it continues,
+    /// not the `system` or `tools` the thread keeps; its tool pairing waits
+    /// for the rebuilt conversation, every other request's is judged here.
+    #[test]
+    fn a_continue_request_sends_no_system_or_tools() {
+        let cont = json!({"type": "continue", "previous_message_id": "msg_1"});
+        accepted(json!({"thread": cont}));
+        assert!(rejection(json!({"thread": cont, "system": "be brief"}))
+            .contains("thread: a continue request sends no system:"));
+        let tools = json!([{"name": "f", "input_schema": {"type": "object"}}]);
+        assert!(rejection(json!({"thread": cont, "tools": tools}))
+            .contains("thread: a continue request sends no tools:"));
+        assert!(
+            rejection(json!({"thread": cont, "system": "be brief", "tools": tools}))
+                .contains("thread: a continue request sends no system or tools:")
+        );
+        let result_first = json!([{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "42"}
+        ]}]);
+        accepted(json!({"thread": cont, "messages": result_first}));
+        // The fixed fields a continue request repeats include `tool_choice`,
+        // judged against the thread's tools once the conversation is rebuilt.
+        accepted(json!({"thread": cont, "tool_choice": {"type": "tool", "name": "f"}}));
+        assert!(
+            rejection(json!({"tool_choice": {"type": "tool", "name": "f"}}))
+                .contains("'tool_choice' is only allowed when 'tools' are specified")
+        );
+        assert!(
+            rejection(json!({"thread": {"type": "create"}, "messages": result_first}))
+                .contains("unexpected `tool_use_id`")
+        );
+        assert!(rejection(json!({"messages": result_first})).contains("unexpected `tool_use_id`"));
+    }
+
+    /// A count reads the whole conversation: `thread` is refused there.
+    #[test]
+    fn a_count_takes_no_thread() {
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thread": {"type": "create"}
+        });
+        let request: CountMessageTokensRequest =
+            serde_json::from_value(body).expect("a well-formed count request");
+        let refused = request
+            .validate()
+            .expect_err("a count takes no thread")
+            .to_string();
+        assert!(
+            refused.contains("thread: count_tokens takes no thread"),
+            "{refused}"
+        );
+    }
+}

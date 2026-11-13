@@ -7,9 +7,8 @@ use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
     common::{ChatLogProbs, ToolCall, Usage},
     responses::{
-        InputTokensDetails, OutputTokensDetails, ResponseContentPart, ResponseOutputItem,
-        ResponseReasoningContent, ResponseStatus, ResponseUsage, ResponsesRequest,
-        ResponsesResponse, ResponsesUsage,
+        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseUsage,
+        ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use tracing::error;
@@ -17,15 +16,89 @@ use tracing::error;
 use super::{
     builder::{convert_harmony_logprobs, try_harmony_encoding},
     stop::TextStopScanner,
+    types::HarmonyChannelOutput,
     HarmonyParserAdapter,
 };
-use crate::routers::{
-    error,
-    grpc::{
-        common::{response_collection, response_formatting},
-        context::{DispatchMetadata, ExecutionResult},
+use crate::{
+    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    routers::{
+        error,
+        grpc::{
+            common::{
+                response_collection, response_formatting,
+                responses::{
+                    streaming::OutputItemKind,
+                    utils::{generation_failure_error, response_status},
+                },
+            },
+            context::{DispatchMetadata, ExecutionResult},
+            regular::processor::generation_start,
+        },
     },
 };
+
+/// The usage of a Harmony chat completion: the engine's counters through
+/// the chat usage builder the regular path uses, with the reasoning tokens
+/// the Harmony parser counted on the analysis and commentary channels, every
+/// detail counter present. The streamed answer's usage chunk and the
+/// non-streamed answer both build their usage here, so a request's two
+/// usage objects are the same.
+pub(super) fn chat_usage(
+    counts: response_formatting::TokenCounts,
+    parsed_reasoning_tokens: u32,
+) -> Usage {
+    response_formatting::chat_usage(counts.usage(), Some(parsed_reasoning_tokens), 0)
+}
+
+/// The usage of one Responses API iteration: the engine's counters with the
+/// reasoning tokens the Harmony parser counted, under the chat path's rule
+/// (the details are always reported, zero included; an engine that counts
+/// reasoning itself is not overruled); the same object whether the iteration
+/// streamed or not.
+pub(super) fn iteration_usage(
+    counts: response_formatting::TokenCounts,
+    parsed_reasoning_tokens: u32,
+) -> Usage {
+    response_formatting::with_parsed_reasoning_tokens(counts.usage(), Some(parsed_reasoning_tokens))
+}
+
+/// The router's own enforcement of the string `stop`s its engine cannot
+/// match, on one parsed turn: the channel text is scanned in emission order
+/// (analysis before final) and cut after the first match, which stays as the
+/// suffix, as the token-forwarding gRPC path yields it for these models;
+/// everything the model wrote past the match, calls included, is dropped,
+/// and the turn's finish is `stop`. Answers the stop that matched; none when
+/// no stop did (the turn stands as parsed), and nothing is scanned when the
+/// router has no stops to enforce.
+fn enforce_router_stops(
+    router_stop_strings: &[String],
+    turn: &mut HarmonyChannelOutput,
+) -> Option<String> {
+    if router_stop_strings.is_empty() {
+        return None;
+    }
+    let mut scanner = TextStopScanner::new(router_stop_strings.to_vec());
+    if let Some(text) = turn.analysis.take() {
+        let (out, stopped) = scanner.scan_complete(&text);
+        turn.analysis = (!out.is_empty()).then_some(out);
+        if stopped {
+            turn.final_text.clear();
+            turn.commentary = None;
+        }
+    }
+    if scanner.matched().is_none() && !turn.final_text.is_empty() {
+        let (out, stopped) = scanner.scan_complete(&turn.final_text);
+        turn.final_text = out;
+        if stopped {
+            turn.commentary = None;
+        }
+    }
+    let matched = scanner.matched().map(str::to_string);
+    if matched.is_some() {
+        turn.finish_reason = "stop".to_string();
+    }
+    matched
+}
 
 /// Processor for non-streaming Harmony responses
 ///
@@ -44,13 +117,18 @@ impl HarmonyResponseProcessor {
     /// `router_stop_strings` is non-empty only when the router must enforce
     /// string `stop` sequences itself (direct-ZMQ backends: the engine sees
     /// token ids only).
+    ///
+    /// Returns the response with the engine's counters it was built from:
+    /// the response's usage may carry the parser's reasoning count where
+    /// the engine reports none; the settlement takes the counters.
     pub async fn process_non_streaming_chat_response(
         &self,
         execution_result: ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: DispatchMetadata,
         router_stop_strings: &[String],
-    ) -> Result<ChatCompletionResponse, Response> {
+    ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), Response> {
+        let started = generation_start(&execution_result);
         let request_logprobs = chat_request.logprobs;
 
         // Collect all completed responses (one per choice)
@@ -84,7 +162,7 @@ impl HarmonyResponseProcessor {
             })?;
 
             // Parse Harmony channels with finish_reason
-            let parsed = parser
+            let mut parsed = parser
                 .parse_complete(complete.output_ids(), complete.finish_reason().to_string())
                 .map_err(|e| {
                     error!(
@@ -98,56 +176,33 @@ impl HarmonyResponseProcessor {
                     )
                 })?;
 
-            // Convert output logprobs if present
+            // Convert output logprobs if present: one entry per generated
+            // token, with the candidates the request's `top_logprobs` asked for.
             let logprobs: Option<ChatLogProbs> = if request_logprobs {
                 let encoding = try_harmony_encoding()
                     .map_err(|e| error::internal_error("harmony_encoding_unavailable", e))?;
                 complete
                     .output_logprobs()
-                    .map(|lp| convert_harmony_logprobs(encoding, &lp))
+                    .map(|lp| convert_harmony_logprobs(encoding, lp, chat_request.top_logprobs))
             } else {
                 None
             };
 
-            let mut analysis = parsed.analysis;
-            let mut final_text = parsed.final_text;
-            let mut tool_calls = parsed.commentary;
-            let mut finish_reason = parsed.finish_reason;
-            let mut matched_stop = matched_stop;
-
-            // Router-enforced string stops: scan channel text in emission
-            // order (analysis before final), truncate after the first match
-            // (retaining the stop as suffix, like the token-forwarding gRPC
-            // path), and drop everything generated past it.
-            if !router_stop_strings.is_empty() {
-                let mut scanner = TextStopScanner::new(router_stop_strings.to_vec());
-                if let Some(text) = analysis.take() {
-                    let (out, stopped) = scanner.scan_complete(&text);
-                    analysis = (!out.is_empty()).then_some(out);
-                    if stopped {
-                        final_text.clear();
-                        tool_calls = None;
-                    }
-                }
-                if scanner.matched().is_none() && !final_text.is_empty() {
-                    let (out, stopped) = scanner.scan_complete(&final_text);
-                    final_text = out;
-                    if stopped {
-                        tool_calls = None;
-                    }
-                }
-                if let Some(stop) = scanner.matched() {
-                    finish_reason = "stop".to_string();
-                    matched_stop = Some(serde_json::Value::String(stop.to_string()));
-                }
-            }
+            // The router's own stops, where the engine cannot match them: the
+            // turn is cut at the first match, and that stop is the choice's.
+            let matched_stop = match enforce_router_stops(router_stop_strings, &mut parsed) {
+                Some(stop) => Some(serde_json::Value::String(stop)),
+                None => matched_stop,
+            };
 
             // Build response message (assistant)
             let message = ChatCompletionMessage {
                 role: "assistant".to_string(),
-                content: (!final_text.is_empty()).then_some(final_text),
-                tool_calls,
-                reasoning_content: analysis,
+                content: (!parsed.final_text.is_empty()).then_some(parsed.final_text),
+                refusal: None,
+                annotations: Vec::new(),
+                tool_calls: parsed.commentary,
+                reasoning_content: parsed.analysis,
             };
 
             // Accumulate reasoning tokens across all responses
@@ -157,25 +212,40 @@ impl HarmonyResponseProcessor {
                 index: index as u32,
                 message,
                 logprobs,
-                finish_reason: Some(finish_reason),
+                finish_reason: Some(parsed.finish_reason),
                 matched_stop,
                 hidden_states: None,
             });
         }
 
-        // Build usage from proto fields
-        let usage = response_formatting::build_usage(&all_responses)
-            .with_reasoning_tokens(total_reasoning_tokens);
+        // The usage from the engine's counters, built as the streamed answer
+        // builds its usage chunk: with the reasoning tokens the parser
+        // counted and every detail counter present as the OpenAI API sends it.
+        let counts =
+            response_formatting::TokenCounts::of_collected(&all_responses, chat_request.choices());
+        let usage = chat_usage(counts, total_reasoning_tokens);
 
         // Final ChatCompletionResponse
-        Ok(
-            ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
-                .created(dispatch.created)
-                .choices(choices)
-                .usage(usage)
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build(),
-        )
+        let response = ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
+            .created(dispatch.created)
+            .choices(choices)
+            .usage(usage)
+            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
+            .build();
+        // The records the streamed answer makes at its end; a collected
+        // answer shows no first token.
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_HARMONY,
+            model_id: &chat_request.model,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            ttft: None,
+            generation_duration: started.elapsed(),
+            input_tokens: Some(u64::from(counts.prompt)),
+            cached_tokens: Some(u64::from(counts.cached)),
+            output_tokens: u64::from(counts.completion),
+        });
+        Ok((response, counts))
     }
 }
 
@@ -197,6 +267,11 @@ pub(crate) enum ResponsesIterationResult {
         partial_text: String,     // For streaming emission or message output
         usage: Usage,             // Token usage from this iteration
         request_id: String,       // Request ID from dispatch
+        /// The turn's finish reason as the parser reads it (`tool_calls` when
+        /// the turn ended on closed calls, else the engine's); none when a
+        /// stream ended before its terminal frame. The non-streamed response
+        /// reads its status and its calls' from it.
+        finish_reason: Option<String>,
     },
     /// No tool calls - return final ResponsesResponse
     Completed {
@@ -217,16 +292,23 @@ impl HarmonyResponseProcessor {
     /// * `execution_result` - The execution result from the model
     /// * `responses_request` - The original Responses API request
     /// * `dispatch` - Dispatch metadata for request tracking
+    /// * `router_stop_strings` - The string `stop`s the router must enforce
+    ///   itself, non-empty only where the engine sees token ids and cannot
+    ///   match them: the turn is cut at the first match, as a chat turn is
     ///
     /// # Returns
     ///
-    /// ResponsesIterationResult indicating whether to continue loop or return
+    /// ResponsesIterationResult indicating whether to continue loop or return,
+    /// with the engine's counts of the iteration (the usage the result
+    /// carries is built from them; the settlement of the iteration's
+    /// reservation takes them as they are).
     pub async fn process_responses_iteration(
         &self,
         execution_result: ExecutionResult,
         responses_request: Arc<ResponsesRequest>,
         dispatch: DispatchMetadata,
-    ) -> Result<ResponsesIterationResult, Response> {
+        router_stop_strings: &[String],
+    ) -> Result<(ResponsesIterationResult, response_formatting::TokenCounts), Response> {
         let request_logprobs = responses_request.top_logprobs.is_some();
 
         // Collect all completed responses
@@ -257,7 +339,7 @@ impl HarmonyResponseProcessor {
             )
         })?;
 
-        let parsed = parser
+        let mut parsed = parser
             .parse_complete(complete.output_ids(), complete.finish_reason().to_string())
             .map_err(|e| {
                 error!(
@@ -287,20 +369,30 @@ impl HarmonyResponseProcessor {
             );
         }
 
-        // Build usage (needed for both ToolCallsFound and Completed)
-        let usage = response_formatting::build_usage(std::slice::from_ref(complete))
-            .with_reasoning_tokens(parsed.reasoning_token_count);
+        // The router's own stops, where the engine cannot match them: the
+        // turn is cut at the first match, the calls past it dropped.
+        enforce_router_stops(router_stop_strings, &mut parsed);
+
+        // The engine's counts of the iteration and the usage they make, as
+        // the streamed iteration builds it (needed for both ToolCallsFound
+        // and Completed).
+        let counts = response_formatting::TokenCounts::of(std::slice::from_ref(complete));
+        let usage = iteration_usage(counts, parsed.reasoning_token_count);
 
         // Check for tool calls in commentary channel
         if let Some(tool_calls) = parsed.commentary {
             // Tool calls found - return for MCP loop execution
-            return Ok(ResponsesIterationResult::ToolCallsFound {
-                tool_calls,
-                analysis: parsed.analysis,
-                partial_text: parsed.final_text,
-                usage,
-                request_id: dispatch.request_id.clone(),
-            });
+            return Ok((
+                ResponsesIterationResult::ToolCallsFound {
+                    tool_calls,
+                    analysis: parsed.analysis,
+                    partial_text: parsed.final_text,
+                    usage,
+                    request_id: dispatch.request_id.clone(),
+                    finish_reason: Some(parsed.finish_reason),
+                },
+                counts,
+            ));
         }
 
         // No tool calls - build final ResponsesResponse
@@ -309,7 +401,7 @@ impl HarmonyResponseProcessor {
         // Map analysis channel → ResponseOutputItem::Reasoning
         if let Some(analysis) = parsed.analysis {
             let reasoning_item = ResponseOutputItem::new_reasoning(
-                format!("reasoning_{}", dispatch.request_id),
+                OutputItemKind::Reasoning.new_id(),
                 vec![],
                 vec![ResponseReasoningContent::ReasoningText { text: analysis }],
                 Some("completed".to_string()),
@@ -326,7 +418,7 @@ impl HarmonyResponseProcessor {
         // Map final channel → ResponseOutputItem::Message
         if !parsed.final_text.is_empty() {
             let message_item = ResponseOutputItem::Message {
-                id: format!("msg_{}", dispatch.request_id),
+                id: OutputItemKind::Message.new_id(),
                 role: "assistant".to_string(),
                 content: vec![ResponseContentPart::OutputText {
                     text: parsed.final_text,
@@ -339,32 +431,73 @@ impl HarmonyResponseProcessor {
             output.push(message_item);
         }
 
-        // Build ResponsesResponse with all required fields
-        let response = ResponsesResponse::builder(&dispatch.request_id, &responses_request.model)
-            .copy_from_request(&responses_request)
-            .created_at(dispatch.created as i64)
-            .status(ResponseStatus::Completed)
-            .output(output)
-            .maybe_text(responses_request.text.clone())
-            .usage(ResponsesUsage::Modern(ResponseUsage {
-                input_tokens: usage.prompt_tokens,
-                output_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-                input_tokens_details: usage
-                    .prompt_tokens_details
-                    .as_ref()
-                    .map(InputTokensDetails::from),
-                output_tokens_details: usage.completion_tokens_details.as_ref().and_then(|d| {
-                    d.reasoning_tokens.map(|tokens| OutputTokensDetails {
-                        reasoning_tokens: tokens,
-                    })
-                }),
-            }))
-            .build();
+        // The status is read where every Responses object reads it: a
+        // `length` finish is incomplete with `max_output_tokens`, a failed
+        // generation is failed with its error. No call was found, so none
+        // was cut.
+        let finish_reason = Some(parsed.finish_reason.as_str());
+        let (status, incomplete_details) = response_status(finish_reason, false);
+        let mut builder =
+            ResponsesResponse::builder(&dispatch.request_id, &responses_request.model)
+                .copy_from_request(&responses_request)
+                .created_at(dispatch.created as i64)
+                .status(status)
+                .output(output)
+                .maybe_text(responses_request.text.clone())
+                .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)));
+        if let Some(details) = incomplete_details {
+            builder = builder.incomplete_details(details);
+        }
+        if let Some(error) = generation_failure_error(finish_reason) {
+            builder = builder.error(error);
+        }
+        let response = builder.build();
 
-        Ok(ResponsesIterationResult::Completed {
-            response: Box::new(response),
-            usage,
-        })
+        Ok((
+            ResponsesIterationResult::Completed {
+                response: Box::new(response),
+                usage,
+            },
+            counts,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counts(reasoning: u32) -> response_formatting::TokenCounts {
+        response_formatting::TokenCounts {
+            prompt: 10,
+            completion: 5,
+            cached: 0,
+            reasoning,
+            spec_accepted: 0,
+            spec_drafted: Some(0),
+        }
+    }
+
+    fn reasoning_of(usage: &Usage) -> Option<u32> {
+        usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens)
+    }
+
+    #[test]
+    fn both_helpers_resolve_the_reasoning_count_the_same_way() {
+        // The engine reported none: the parser's count is used, zero included.
+        for parsed in [0, 3] {
+            assert_eq!(reasoning_of(&chat_usage(counts(0), parsed)), Some(parsed));
+            assert_eq!(
+                reasoning_of(&iteration_usage(counts(0), parsed)),
+                Some(parsed)
+            );
+        }
+        // The engine counted reasoning itself: its count stands on both paths.
+        assert_eq!(reasoning_of(&chat_usage(counts(7), 3)), Some(7));
+        assert_eq!(reasoning_of(&iteration_usage(counts(7), 3)), Some(7));
+        assert_eq!(reasoning_of(&iteration_usage(counts(7), 0)), Some(7));
     }
 }

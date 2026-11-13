@@ -7,10 +7,221 @@
       "properties": {
         "policy": {
           "type": "string",
-          "enum": ["cache_aware", "round_robin", "power_of_two", "manual", "random", "prefix_hash"]
+          "enum": [
+            "random",
+            "round_robin",
+            "passthrough",
+            "cache_aware",
+            "power_of_two",
+            "least_load",
+            "manual",
+            "consistent_hashing",
+            "prefix_hash"
+          ]
+        },
+        "parser": { "type": "string", "enum": ["", "legacy", "symphony"] },
+        "mmTurbojpeg": {
+          "type": "string",
+          "enum": ["prefer", "require"],
+          "description": "What the gateway does when libjpeg-turbo cannot be loaded (--mm-turbojpeg). require refuses to start; prefer decodes JPEGs with the pure-Rust fallback, whose pixels differ from the engine's, and sets smg_mm_turbojpeg_available to 0."
         },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "maxConcurrentRequests": {
+          "type": "integer",
+          "description": "In-flight requests the gateway admits before shedding with 429 or 503 (--max-concurrent-requests), each permit held for the whole response. -1 derives the bound from the host (1024 per available core, at least 4096); 0 lifts the bound; a positive value is the bound."
+        },
         "replicas": { "type": "integer", "minimum": 1 },
+        "progressDeadlineSeconds": { "type": "integer", "minimum": 1 },
+        "disaggregation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": { "type": "string", "enum": ["", "pd", "epd"] },
+            "prefillPolicy": {
+              "type": "string",
+              "enum": [
+                "",
+                "random",
+                "round_robin",
+                "passthrough",
+                "cache_aware",
+                "power_of_two",
+                "least_load",
+                "manual",
+                "consistent_hashing",
+                "prefix_hash",
+                "bucket"
+              ]
+            },
+            "decodePolicy": {
+              "type": "string",
+              "enum": [
+                "",
+                "random",
+                "round_robin",
+                "passthrough",
+                "cache_aware",
+                "power_of_two",
+                "least_load",
+                "manual",
+                "consistent_hashing",
+                "prefix_hash"
+              ]
+            },
+            "encodePolicy": {
+              "type": "string",
+              "enum": ["", "random", "round_robin", "consistent_hashing"]
+            },
+            "prefill": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["url"],
+                "properties": {
+                  "url": { "type": "string", "minLength": 1 },
+                  "bootstrapPort": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 }
+                }
+              }
+            },
+            "decode": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["url"],
+                "properties": { "url": { "type": "string", "minLength": 1 } }
+              }
+            },
+            "encode": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["url"],
+                "properties": {
+                  "url": { "type": "string", "minLength": 1 },
+                  "bootstrapPort": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 }
+                }
+              }
+            }
+          }
+        },
+        "discovery": {
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string",
+              "enum": ["", "kubernetes", "file", "slurm", "consul"]
+            },
+            "checkIntervalSecs": { "type": ["integer", "null"], "minimum": 1 },
+            "kubernetes": {
+              "type": "object",
+              "properties": {
+                "clusterWide": { "type": "boolean" },
+                "namespace": { "type": "string" },
+                "selector": { "type": "string" },
+                "prefillSelector": { "type": "string" },
+                "decodeSelector": { "type": "string" },
+                "encodeSelector": { "type": "string" },
+                "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+                "modelIdFrom": { "type": "string" }
+              }
+            },
+            "file": {
+              "type": "object",
+              "properties": {
+                "configMap": {
+                  "type": "object",
+                  "properties": {
+                    "name": { "type": "string" },
+                    "key": { "type": "string" }
+                  }
+                },
+                "path": { "type": "string" }
+              }
+            },
+            "slurm": {
+              "type": "object",
+              "properties": {
+                "jobNames": { "type": "array", "items": { "type": "string" } },
+                "encodeJobNames": { "type": "array", "items": { "type": "string" } },
+                "prefillJobNames": { "type": "array", "items": { "type": "string" } },
+                "decodeJobNames": { "type": "array", "items": { "type": "string" } },
+                "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+                "bootstrapPort": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+                "user": { "type": "string" },
+                "account": { "type": "string" },
+                "partition": { "type": "string" }
+              }
+            },
+            "consul": {
+              "type": "object",
+              "properties": {
+                "service": { "type": "string" },
+                "address": { "type": "string" },
+                "datacenter": { "type": "string" },
+                "token": {
+                  "type": "object",
+                  "properties": {
+                    "existingSecret": { "type": "string" },
+                    "secretKey": { "type": "string" }
+                  }
+                },
+                "tls": {
+                  "type": "object",
+                  "properties": {
+                    "existingSecret": { "type": "string" },
+                    "secretKeys": {
+                      "type": "object",
+                      "properties": {
+                        "caCert": { "type": "string" },
+                        "clientCert": { "type": "string" },
+                        "clientKey": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "adminPort": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "adminHost": { "type": ["string", "null"] },
+        "adminService": {
+          "type": "object",
+          "properties": {
+            "type": { "type": "string" },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "annotations": { "type": "object" }
+          }
+        },
+        "tenantRateLimit": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "configMap": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        "priorityScheduler": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "configMap": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
         "service": {
           "type": "object",
           "properties": {
@@ -36,7 +247,16 @@
     "auth": {
       "type": "object",
       "properties": {
-        "rateLimitTokensPerSecond": { "type": "integer" }
+        "rateLimitTokensPerSecond": { "type": "integer" },
+        "controlPlane": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "existingSecret": { "type": "string" },
+            "apiKeys": { "type": "string" },
+            "secretKey": { "type": "string", "minLength": 1 }
+          }
+        }
       }
     },
     "history": {
@@ -49,18 +269,36 @@
         "postgres": {
           "type": "object",
           "properties": {
+            "url": { "type": "string" },
+            "existingSecret": { "type": "string" },
+            "secretKey": { "type": "string" },
             "poolMax": { "type": "integer", "minimum": 1 }
           }
         },
         "redis": {
           "type": "object",
           "properties": {
+            "url": { "type": "string" },
+            "existingSecret": { "type": "string" },
+            "secretKey": { "type": "string" },
             "poolMax": { "type": "integer", "minimum": 1 }
           }
         },
         "oracle": {
           "type": "object",
           "properties": {
+            "dsn": { "type": "string" },
+            "user": { "type": "string" },
+            "password": { "type": "string" },
+            "existingSecret": { "type": "string" },
+            "secretKeys": {
+              "type": "object",
+              "properties": {
+                "dsn": { "type": "string" },
+                "user": { "type": "string" },
+                "password": { "type": "string" }
+              }
+            },
             "poolMax": { "type": "integer", "minimum": 1 }
           }
         }

@@ -6,25 +6,31 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_true, deserialize_null_as_false, is_false, CachePartition, GenerationRequest,
-        InputIds,
+        default_true, deserialize_null_as_false, invalid, invalid_at, is_false, join_ids,
+        CachePartition, GenerationRequest, InputIds,
     },
     sampling_params::SamplingParams,
 };
 use crate::validated::Normalizable;
 
 // ============================================================================
-// SGLang Generate API (native format)
+// The native Generate API (one engine's own format)
 // ============================================================================
 
+/// A request to the native generate route: the input as text, token ids or
+/// embeddings with its media, the model, the sampling parameters, and the
+/// log-probability, hidden-state, session and adapter options.
 #[derive(Clone, Debug, Serialize, Deserialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_generate_request"))]
 pub struct GenerateRequest {
-    /// Text input - SGLang native format
+    /// Text input - the native format
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 
-    #[serde(default = "super::common::default_unknown_model")]
+    #[serde(
+        default = "super::common::default_unknown_model",
+        skip_serializing_if = "super::common::is_unknown_model"
+    )]
     pub model: String,
 
     /// Input IDs for tokenized input
@@ -58,8 +64,9 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_data: Option<Value>,
 
-    /// Sampling parameters (sglang style)
+    /// Sampling parameters (the native API's style)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
     pub sampling_params: Option<SamplingParams>,
 
     /// Whether to return logprobs
@@ -111,7 +118,7 @@ pub struct GenerateRequest {
     pub lora_id: Option<String>,
 
     /// Custom logit processor for advanced sampling control. Must be a serialized instance
-    /// of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    /// of the engine's `CustomLogitProcessor` (srt/sampling/custom_logit_processor.py).
     /// Use the processor's `to_str()` method to generate the serialized string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_logit_processor: Option<String>,
@@ -181,28 +188,66 @@ impl Normalizable for GenerateRequest {
     // Use default no-op implementation - no normalization needed for GenerateRequest
 }
 
-/// Validation function for GenerateRequest - ensure exactly one input type is provided
+/// Validation function for GenerateRequest: a body with no prompt at all is
+/// refused, an empty `input_ids` is refused as the chat route refuses an
+/// empty `messages`, and a negative id in `input_ids` is refused.
 fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::ValidationError> {
-    // Exactly one of text or input_ids must be provided
-    // Note: input_embeds not yet supported in Rust implementation
-    let has_text = req.text.is_some();
-    let has_input_ids = req.input_ids.is_some();
-
-    let count = [has_text, has_input_ids].iter().filter(|&&x| x).count();
-
-    if count == 0 {
-        return Err(validator::ValidationError::new(
-            "Either text or input_ids should be provided.",
+    // A body with no prompt at all is refused. `input_embeds` is a prompt on
+    // the paths that forward the body as-is, and a body with both `text` and
+    // `input_ids` stays with the routers, which read `text` first today.
+    if req.text.is_none() && req.input_ids.is_none() && req.input_embeds.is_none() {
+        return Err(invalid(
+            "missing_required_parameter",
+            "One of 'text', 'input_ids' or 'input_embeds' is required.",
         ));
     }
 
-    if count > 1 {
-        return Err(validator::ValidationError::new(
-            "Either text or input_ids should be provided.",
+    // An empty list of ids is no prompt, as an empty `messages` is no
+    // conversation on the chat route: the same refusal.
+    let no_ids = match &req.input_ids {
+        Some(InputIds::Single(ids)) => ids.is_empty(),
+        Some(InputIds::Batch(sequences)) => {
+            sequences.is_empty() || sequences.iter().any(Vec::is_empty)
+        }
+        None => false,
+    };
+    if no_ids {
+        return Err(invalid_at(
+            "input_ids",
+            "empty_array",
+            "Invalid 'input_ids': empty array. Expected an array with minimum length 1, but got an empty array instead.",
+        ));
+    }
+
+    // A negative id is no token. Refused here, both wires answer it the same
+    // way at the boundary: the HTTP routers key the routing tokens with a
+    // cast that would wrap it, and an engine refuses it in its own words one
+    // hop later; the gRPC stage's own check becomes a second line.
+    let negative = match &req.input_ids {
+        Some(InputIds::Single(ids)) => ids.iter().copied().find(|&id| id < 0),
+        Some(InputIds::Batch(sequences)) => sequences.iter().flatten().copied().find(|&id| id < 0),
+        None => None,
+    };
+    if let Some(id) = negative {
+        return Err(invalid_at(
+            "input_ids",
+            "integer_below_min_value",
+            format!("Invalid 'input_ids': a token id must be non-negative, but got {id} instead."),
         ));
     }
 
     Ok(())
+}
+
+impl GenerateRequest {
+    /// The choices the request asks for: the sampling `n`, one when absent or zero.
+    pub fn choices(&self) -> u32 {
+        self.sampling_params
+            .as_ref()
+            .and_then(|params| params.n)
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    }
 }
 
 impl GenerationRequest for GenerateRequest {
@@ -216,8 +261,8 @@ impl GenerationRequest for GenerateRequest {
 
     fn cache_partition(&self) -> CachePartition<'_> {
         CachePartition {
-            // vLLM's `cache_salt` is a passthrough extension on this
-            // protocol; `extra_key` is SGLang's typed classification key.
+            // Another engine's `cache_salt` is a passthrough extension on this
+            // protocol; `extra_key` is the native API's typed classification key.
             cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
             extra_key: self.extra_key.as_deref(),
             // Either name identifies the adapter the engine namespaces by.
@@ -237,16 +282,8 @@ impl GenerationRequest for GenerateRequest {
 
         if let Some(ref input_ids) = self.input_ids {
             return match input_ids {
-                InputIds::Single(ids) => ids
-                    .iter()
-                    .map(|&id| id.to_string())
-                    .collect::<Vec<String>>()
-                    .join(" "),
-                InputIds::Batch(batches) => batches
-                    .iter()
-                    .flat_map(|batch| batch.iter().map(|&id| id.to_string()))
-                    .collect::<Vec<String>>()
-                    .join(" "),
+                InputIds::Single(ids) => join_ids(ids),
+                InputIds::Batch(batches) => join_ids(batches.iter().flatten()),
             };
         }
 
@@ -271,10 +308,10 @@ impl GenerationRequest for GenerateRequest {
 }
 
 // ============================================================================
-// SGLang Generate Response Types
+// Native Generate Response Types
 // ============================================================================
 
-/// SGLang generate response (single completion or array for n>1)
+/// Native generate response (single completion or array for n>1)
 ///
 /// Format for n=1:
 /// ```json
@@ -332,6 +369,8 @@ pub enum GenerateFinishReason {
     Other(Value),
 }
 
+/// The kind of a generate finish reason as the wire names it: `length` (the
+/// token cap reached) or `stop` (a stop condition met).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum GenerateFinishType {
@@ -376,6 +415,28 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_input_id_is_refused_single_or_batched() {
+        let mut r = req();
+        r.input_ids = Some(InputIds::Single(vec![1, -2, 3]));
+        let err = validate_generate_request(&r).expect_err("a negative id is no token");
+        assert_eq!(err.code, "integer_below_min_value");
+        assert_eq!(
+            err.params.get("field").map(ToString::to_string).as_deref(),
+            Some("\"input_ids\"")
+        );
+        assert!(
+            err.message.as_deref().unwrap_or("").contains("-2"),
+            "the message names the offending id: {err:?}"
+        );
+
+        r.input_ids = Some(InputIds::Batch(vec![vec![1], vec![2, -3]]));
+        assert!(validate_generate_request(&r).is_err());
+
+        r.input_ids = Some(InputIds::Single(vec![1, 2, 3]));
+        assert!(validate_generate_request(&r).is_ok());
+    }
+
+    #[test]
     fn routing_tokens_prefer_input_ids_over_text() {
         let mut r = req();
         r.text = Some("hello".to_string());
@@ -417,6 +478,23 @@ mod tests {
     }
 
     #[test]
+    fn absent_model_reads_as_the_wildcard_and_is_not_serialized_back() {
+        let request: GenerateRequest =
+            serde_json::from_value(serde_json::json!({ "text": "hi" })).unwrap();
+        assert_eq!(request.model, crate::UNKNOWN_MODEL_ID);
+        let v = serde_json::to_value(&request).unwrap();
+        assert!(
+            v.get("model").is_none(),
+            "wildcard placeholder serialized: {v}"
+        );
+
+        let explicit: GenerateRequest =
+            serde_json::from_value(serde_json::json!({ "text": "hi", "model": "m" })).unwrap();
+        let v = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(v["model"], "m");
+    }
+
+    #[test]
     fn cache_partition_uses_the_typed_extra_key_and_falls_back_to_lora_id() {
         let request: GenerateRequest = serde_json::from_value(serde_json::json!({
             "text": "hi",
@@ -438,5 +516,115 @@ mod tests {
         .unwrap();
         assert_eq!(typed_path.cache_partition().lora_path, Some("adapter-path"));
         assert!(typed_path.cache_partition().cache_salt.is_none());
+    }
+
+    /// The sampling `n` is the number of choices; absent and zero both mean one.
+    #[test]
+    fn a_generate_request_asks_for_at_least_one_choice() {
+        assert_eq!(req().choices(), 1);
+        let with_n = |n: u32| -> GenerateRequest {
+            serde_json::from_value(serde_json::json!({"model": "m", "sampling_params": {"n": n}}))
+                .expect("a generate request")
+        };
+        assert_eq!(with_n(0).choices(), 1);
+        assert_eq!(with_n(4).choices(), 4);
+    }
+
+    /// The rules of `sampling_params` run on the request as the chat route's
+    /// run on its fields, with the chat route's lower bound on `n`, and an
+    /// empty `input_ids` is refused as the chat route refuses an empty
+    /// `messages`; a request within the rules passes.
+    #[test]
+    fn a_generate_request_runs_the_rules_the_chat_route_runs() {
+        use validator::ValidationErrorsKind;
+
+        let request = |value: Value| -> GenerateRequest {
+            serde_json::from_value(value).expect("a generate request")
+        };
+        let within = request(serde_json::json!({
+            "model": "m",
+            "text": "hi",
+            "sampling_params": {"temperature": 0.5, "top_p": 0.9, "n": 1, "max_new_tokens": 4}
+        }));
+        assert!(
+            within.validate().is_ok(),
+            "a request within the rules passes"
+        );
+
+        for (field, value, code) in [
+            ("temperature", serde_json::json!(-1), "range"),
+            ("top_p", serde_json::json!(2), "decimal_above_max_value"),
+            ("n", serde_json::json!(0), "range"),
+        ] {
+            let refused = request(serde_json::json!({
+                "model": "m",
+                "text": "hi",
+                "sampling_params": {field: value, "max_new_tokens": 4}
+            }));
+            let errors = refused.validate().expect_err(field);
+            let Some(ValidationErrorsKind::Struct(nested)) = errors.errors().get("sampling_params")
+            else {
+                panic!("{field}: the refusal is under sampling_params: {errors:?}");
+            };
+            let Some(ValidationErrorsKind::Field(found)) = nested.errors().get(field) else {
+                panic!("{field}: the refusal names the field: {nested:?}");
+            };
+            assert_eq!(found[0].code, code, "{field}");
+        }
+
+        let empty = request(serde_json::json!({"model": "m", "input_ids": []}));
+        let errors = empty.validate().expect_err("an empty input_ids is refused");
+        let Some(ValidationErrorsKind::Field(found)) = errors.errors().get("__all__") else {
+            panic!("the refusal is a rule over the request: {errors:?}");
+        };
+        assert_eq!(found[0].code, "empty_array");
+        assert_eq!(found[0].params["field"], "input_ids");
+    }
+
+    /// The shapes the routers serve today keep passing the request rule: a
+    /// body with both `text` and `input_ids`, and an `input_embeds`-only body.
+    /// Only a body with no prompt at all is refused, and a cross-field
+    /// sampling rule names its field.
+    #[test]
+    fn a_generate_request_is_refused_only_without_a_prompt() {
+        use validator::ValidationErrorsKind;
+
+        let request = |value: Value| -> GenerateRequest {
+            serde_json::from_value(value).expect("a generate request")
+        };
+        for served in [
+            serde_json::json!({"model": "m", "text": "hi", "input_ids": [1, 2]}),
+            serde_json::json!({"model": "m", "input_embeds": [[0.1, 0.2]]}),
+        ] {
+            assert!(request(served.clone()).validate().is_ok(), "{served}");
+        }
+
+        let none =
+            request(serde_json::json!({"model": "m", "sampling_params": {"max_new_tokens": 4}}));
+        let errors = none.validate().expect_err("no prompt at all is refused");
+        let Some(ValidationErrorsKind::Field(found)) = errors.errors().get("__all__") else {
+            panic!("the refusal is a rule over the request: {errors:?}");
+        };
+        assert_eq!(found[0].code, "missing_required_parameter");
+        assert_eq!(
+            found[0].message.as_deref(),
+            Some("One of 'text', 'input_ids' or 'input_embeds' is required.")
+        );
+
+        let crossed = request(serde_json::json!({
+            "model": "m",
+            "text": "hi",
+            "sampling_params": {"min_new_tokens": 8, "max_new_tokens": 4}
+        }));
+        let errors = crossed.validate().expect_err("min above max is refused");
+        let Some(ValidationErrorsKind::Struct(nested)) = errors.errors().get("sampling_params")
+        else {
+            panic!("the refusal is under sampling_params: {errors:?}");
+        };
+        let Some(ValidationErrorsKind::Field(found)) = nested.errors().get("__all__") else {
+            panic!("the refusal is the cross-field rule: {nested:?}");
+        };
+        assert_eq!(found[0].code, "invalid_value");
+        assert_eq!(found[0].params["field"], "min_new_tokens");
     }
 }

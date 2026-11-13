@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -8,7 +10,10 @@ use smg::{config::RouterConfig, routers::RouterFactory};
 use tower::ServiceExt;
 
 use crate::common::{
-    mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
+    mock_worker::{
+        set_request_recorder, HealthStatus, MockWorker, MockWorkerConfig, RequestRecorder,
+        WorkerType,
+    },
     AppTestContext,
 };
 
@@ -294,6 +299,86 @@ mod generation_tests {
         ctx.shutdown().await;
     }
 
+    /// The route reads its body through the gateway's validated extractor, as
+    /// the chat route does: a negative temperature, a `top_p` above one, an
+    /// `n` of zero, an empty `input_ids` and a negative token id in it are
+    /// refused in the error envelope with the chat route's codes before a
+    /// worker sees them, and a body within the rules is served.
+    #[tokio::test]
+    async fn generate_refuses_the_sampling_values_the_chat_route_refuses() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18109,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+
+        let post = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        for (body, code, param) in [
+            (
+                json!({"text": "hi", "sampling_params": {"temperature": -1, "max_new_tokens": 4}}),
+                "decimal_below_min_value",
+                "sampling_params.temperature",
+            ),
+            (
+                json!({"text": "hi", "sampling_params": {"top_p": 2, "max_new_tokens": 4}}),
+                "decimal_above_max_value",
+                "sampling_params.top_p",
+            ),
+            (
+                json!({"text": "hi", "sampling_params": {"n": 0, "max_new_tokens": 4}}),
+                "integer_below_min_value",
+                "sampling_params.n",
+            ),
+            (
+                json!({"input_ids": [], "sampling_params": {"max_new_tokens": 4}}),
+                "empty_array",
+                "input_ids",
+            ),
+            (
+                json!({"input_ids": [1, -2, 3], "sampling_params": {"max_new_tokens": 4}}),
+                "integer_below_min_value",
+                "input_ids",
+            ),
+        ] {
+            let resp = app.clone().oneshot(post(body.clone())).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                envelope["error"]["type"], "invalid_request_error",
+                "{envelope}"
+            );
+            assert_eq!(envelope["error"]["code"], code, "{envelope}");
+            assert_eq!(envelope["error"]["param"], param, "{envelope}");
+        }
+
+        let served = json!({
+            "text": "hi",
+            "sampling_params": {"temperature": 0.5, "top_p": 0.9, "n": 1, "max_new_tokens": 4}
+        });
+        let resp = app.oneshot(post(served)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a body within the rules is served"
+        );
+
+        ctx.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_v1_chat_completions_streaming_preserves_worker_json_error_content_type() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
@@ -329,6 +414,54 @@ mod generation_tests {
             .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body_json["error"]["type"], "internal_error");
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/completions` serves a `max_tokens` of zero: it is the
+    /// prompt-scoring request (`echo` with `logprobs`, nothing generated),
+    /// so the gateway forwards the zero to the worker as written, where the
+    /// chat route refuses its own `max_tokens: 0`.
+    #[tokio::test]
+    async fn test_v1_completions_max_tokens_zero_reaches_the_worker_as_written() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18114, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18114,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "mock-model",
+            "prompt": "hello",
+            "max_tokens": 0,
+            "echo": true,
+            "logprobs": 1
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "max_tokens 0 is a request, not a refused value"
+        );
+        let forwarded = recorder.only_body();
+        assert_eq!(
+            forwarded["max_tokens"], 0,
+            "the zero reaches the worker as written: {forwarded}"
+        );
+        assert_eq!(forwarded["echo"], true, "echo rides with it: {forwarded}");
 
         ctx.shutdown().await;
     }
@@ -659,7 +792,7 @@ mod router_policy_tests {
     }
 
     #[tokio::test]
-    async fn test_worker_selection() {
+    async fn a_started_worker_is_in_the_registry_under_the_url_it_bound() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18207,
             worker_type: WorkerType::Regular,
@@ -669,14 +802,14 @@ mod router_policy_tests {
         }])
         .await;
 
-        let _payload = json!({
-            "text": "Test selection",
-            "stream": false
-        });
-
-        // Check that router has the worker
-        // TODO: Update test after worker management refactoring
-        // For now, skip this check
+        assert!(
+            ctx.app_context
+                .worker_registry
+                .get_by_url(&ctx.worker_urls[0])
+                .is_some(),
+            "the started worker is registered under {}",
+            ctx.worker_urls[0]
+        );
 
         ctx.shutdown().await;
     }
@@ -1179,7 +1312,7 @@ mod responses_endpoint_tests {
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         assert_eq!(
             err_body["error"]["code"].as_str(),
@@ -1266,42 +1399,6 @@ mod error_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
-
-        ctx.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_payload_too_large() {
-        // Create context with small payload limit
-        let mut config = RouterConfig::builder()
-            .regular_mode(vec![])
-            .random_policy()
-            .host("127.0.0.1")
-            .port(3010)
-            .max_payload_size(1024) // 1KB limit
-            .request_timeout_secs(600)
-            .worker_startup_timeout_secs(1)
-            .worker_startup_check_interval_secs(1)
-            .max_concurrent_requests(64)
-            .queue_timeout_secs(60)
-            .build_unchecked();
-        config.health_check.disable_health_check = true;
-
-        let ctx = AppTestContext::new_with_config(
-            config,
-            vec![MockWorkerConfig {
-                port: 18403,
-                worker_type: WorkerType::Regular,
-                health_status: HealthStatus::Healthy,
-                response_delay_ms: 0,
-                fail_rate: 0.0,
-            }],
-        )
-        .await;
-
-        // Note: The server would have payload size middleware configured
-        // but we cannot test it directly through the test app
-        // This test is kept for documentation purposes
 
         ctx.shutdown().await;
     }
@@ -1487,11 +1584,9 @@ mod cache_tests {
                 .map(|entry| entry["worker"].as_str().expect("worker"))
                 .collect();
             reporters.sort_unstable();
-            assert_eq!(
-                reporters,
-                vec!["http://127.0.0.1:18502", "http://127.0.0.1:18503"],
-                "{uri}"
-            );
+            let mut expected: Vec<&str> = ctx.worker_urls.iter().map(String::as_str).collect();
+            expected.sort_unstable();
+            assert_eq!(reporters, expected, "{uri}");
             for entry in loads {
                 assert_eq!(entry["worker_type"], "regular", "{uri}");
                 assert_eq!(entry["num_running_reqs"], 2, "{uri}");
@@ -1637,15 +1732,22 @@ mod pd_mode_tests {
         // Create app context
         let app_context = crate::common::create_test_context(config).await;
 
-        // Create router - this might fail due to health check issues
         let router_result = RouterFactory::create_router(&app_context).await;
 
         // Clean up workers
         prefill_worker.stop().await;
         decode_worker.stop().await;
 
-        // For now, just verify the configuration was attempted
-        assert!(router_result.is_err() || router_result.is_ok());
+        // A prefill-decode configuration over HTTP builds the prefill-decode router; what the
+        // pair then does with a request is pinned by the grpc_pd_tests binary and the
+        // disaggregated e2e classes.
+        let router =
+            router_result.expect("a prefill-decode configuration over HTTP builds its router");
+        assert_eq!(
+            router.router_type(),
+            "pd",
+            "the configuration names two roles, so the factory builds the prefill-decode router"
+        );
     }
 }
 
@@ -2117,6 +2219,62 @@ mod rerank_tests {
         ctx.shutdown().await;
     }
 
+    /// `/v1/rerank` routes by the body's `model`, as `/v1/embeddings` does:
+    /// the worker receives it, and `top_n` holds on the answer.
+    #[tokio::test]
+    async fn test_v1_rerank_carries_the_model_and_top_n() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(18113, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18113,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app();
+
+        let payload = json!({
+            "model": "mock-model",
+            "query": "machine learning algorithms",
+            "documents": [
+                "Introduction to machine learning concepts",
+                "Deep learning neural networks tutorial"
+            ],
+            "top_n": 1
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/rerank")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["model"], "mock-model");
+        assert_eq!(
+            body_json["results"].as_array().unwrap().len(),
+            1,
+            "top_n holds on the answer"
+        );
+        assert_eq!(
+            recorder.only_body()["model"],
+            "mock-model",
+            "the worker receives the body's model"
+        );
+
+        ctx.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_rerank_invalid_request() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
@@ -2194,6 +2352,64 @@ mod rerank_tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        ctx.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod single_model_tests {
+    use super::*;
+
+    /// `GET /v1/models/{id}` takes the whole rest of the path: a served model
+    /// answers 200, and an unknown id with a slash in it (the usual shape of
+    /// a self-hosted id) answers the model_not_found envelope, not the
+    /// unknown-route 404 a one-segment route would fall through to.
+    #[tokio::test]
+    async fn test_single_model_route_takes_a_slashed_id() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18209,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+
+        let served = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/models/mock-model")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+
+        for uri in ["/v1/models/org/model", "/v1/models/org%2Fmodel"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|_| json!({"error": {"code": "unknown_url"}}));
+            assert_eq!(body["error"]["code"], "model_not_found", "{uri}: {body}");
+        }
 
         ctx.shutdown().await;
     }

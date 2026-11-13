@@ -23,6 +23,7 @@ from huggingface_hub import snapshot_download
 from mlx_lm import load
 from smg_grpc_proto import mlx_engine_pb2, mlx_engine_pb2_grpc
 
+from smg_grpc_servicer.hostport import host_port
 from smg_grpc_servicer.mlx.health_servicer import MlxHealthServicer
 from smg_grpc_servicer.mlx.servicer import MlxEngineServicer
 
@@ -111,10 +112,12 @@ def load_model(args):
                 # Chat template sidecars (Gemma 4, Llama 3.1+, newer models).
                 "chat_template.json",
                 "chat_template.jinja",
-                # tiktoken-style tokenizer artifacts — must stay in sync
-                # with MlxEngineServicer._TOKENIZER_FILES / _SUFFIXES.
+                # tiktoken-style tokenizer artifacts; what GetTokenizer bundles
+                # of these is the shared tokenizer_bundle.TOKENIZER_FILES /
+                # TOKENIZER_GLOBS selection.
                 "tiktoken.model",
                 "*.tiktoken",
+                "tekken.json",
             ],
         )
 
@@ -178,7 +181,7 @@ async def serve_grpc(args):
     )
     reflection.enable_server_reflection(SERVICE_NAMES, server)
 
-    listen_addr = f"{args.host}:{args.port}"
+    listen_addr = host_port(args.host, args.port)
     bound_port = server.add_insecure_port(listen_addr)
     if bound_port == 0:
         raise RuntimeError(f"Failed to bind gRPC server to {listen_addr}")

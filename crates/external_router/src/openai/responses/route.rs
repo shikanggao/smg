@@ -8,10 +8,10 @@ use std::{sync::Arc, time::Instant};
 
 use axum::{http::HeaderMap, response::Response};
 use openai_protocol::{
+    common::to_value_exact,
     model_type::Endpoint,
     responses::{ResponseInput, ResponseInputOutputItem, ResponsesRequest},
 };
-use serde_json::to_value;
 
 use super::{
     super::{
@@ -26,8 +26,8 @@ use super::{
 };
 use crate::{
     error, known,
-    metrics::{bool_to_static_str, metrics_labels, Metrics},
-    tenant::TenantRequestMeta,
+    metrics::{bool_to_static_str, error_reason_for_refused_selection, metrics_labels, Metrics},
+    tenant::{storage_tenant, TenantRequestMeta},
     worker::{SelectWorkerRequest, WorkerSource},
 };
 
@@ -71,13 +71,10 @@ pub(in crate::openai) async fn route_responses(
     {
         Ok(w) => w,
         Err(response) => {
-            Metrics::record_router_error(
-                metrics_labels::ROUTER_OPENAI,
-                metrics_labels::BACKEND_EXTERNAL,
-                metrics_labels::CONNECTION_HTTP,
+            super::record_error(
                 model,
-                metrics_labels::ENDPOINT_RESPONSES,
                 metrics_labels::ERROR_NO_WORKERS,
+                error_reason_for_refused_selection(response.status()),
             );
             return response;
         }
@@ -93,13 +90,10 @@ pub(in crate::openai) async fn route_responses(
         .as_ref()
         .is_some_and(|s| !s.is_empty());
     if conversation.is_some() && has_previous_response {
-        Metrics::record_router_error(
-            metrics_labels::ROUTER_OPENAI,
-            metrics_labels::BACKEND_EXTERNAL,
-            metrics_labels::CONNECTION_HTTP,
+        super::record_error(
             model,
-            metrics_labels::ENDPOINT_RESPONSES,
             metrics_labels::ERROR_VALIDATION,
+            metrics_labels::REASON_INVALID_REQUEST,
         );
         return error::bad_request(
             "invalid_request",
@@ -111,11 +105,14 @@ pub(in crate::openai) async fn route_responses(
     request_body.model = model_id.to_string();
     request_body.conversation = None;
 
+    // The stored state as the caller's tenant may see it.
+    let tenant = storage_tenant(tenant_meta);
     let loaded_history = match super::history::load_input_history(
         deps.responses_components,
         conversation.map(|c| c.as_id()),
         &mut request_body,
         model,
+        tenant.as_deref(),
     )
     .await
     {
@@ -128,16 +125,13 @@ pub(in crate::openai) async fn route_responses(
         items.retain(|item| !matches!(item, ResponseInputOutputItem::Reasoning { .. }));
     }
 
-    let mut payload = match to_value(&request_body) {
+    let mut payload = match to_value_exact(&request_body) {
         Ok(v) => v,
         Err(e) => {
-            Metrics::record_router_error(
-                metrics_labels::ROUTER_OPENAI,
-                metrics_labels::BACKEND_EXTERNAL,
-                metrics_labels::CONNECTION_HTTP,
+            super::record_error(
                 model,
-                metrics_labels::ENDPOINT_RESPONSES,
                 metrics_labels::ERROR_VALIDATION,
+                metrics_labels::REASON_INVALID_REQUEST,
             );
             return error::bad_request(
                 "invalid_request",
@@ -148,13 +142,10 @@ pub(in crate::openai) async fn route_responses(
 
     let provider = resolve_provider(deps.provider_registry, worker.as_ref(), model);
     if let Err(e) = provider.transform_request(&mut payload, Endpoint::Responses) {
-        Metrics::record_router_error(
-            metrics_labels::ROUTER_OPENAI,
-            metrics_labels::BACKEND_EXTERNAL,
-            metrics_labels::CONNECTION_HTTP,
+        super::record_error(
             model,
-            metrics_labels::ENDPOINT_RESPONSES,
             metrics_labels::ERROR_VALIDATION,
+            metrics_labels::REASON_INVALID_REQUEST,
         );
         return error::bad_request("invalid_request", format!("Provider transform error: {e}"));
     }
@@ -211,13 +202,13 @@ mod tests {
     //! post-P1 content-part variants produce, so any future change to the
     //! serde layer surfaces here before it reaches an upstream.
     use openai_protocol::{
-        common::Detail,
+        common::{to_value_exact, Detail},
         responses::{
             Annotation, FileDetail, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
             ResponsesRequest,
         },
     };
-    use serde_json::{json, to_value};
+    use serde_json::json;
 
     fn build_request_with_mixed_content() -> ResponsesRequest {
         ResponsesRequest {
@@ -252,10 +243,24 @@ mod tests {
         }
     }
 
-    /// Exercises the exact `to_value(&request_body)` step `route_responses`
+    /// Exercises the exact `to_value_exact(&request_body)` step `route_responses`
     /// uses to build the upstream payload — see `route.rs` handler body.
     fn serialize_like_router(req: &ResponsesRequest) -> serde_json::Value {
-        to_value(req).expect("router serializes ResponsesRequest without error")
+        to_value_exact(req).expect("router serializes ResponsesRequest without error")
+    }
+
+    #[test]
+    fn router_serialization_keeps_f32_fields_as_the_client_wrote_them() {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "temperature": 0.7,
+            "top_p": 0.95
+        }))
+        .expect("responses request");
+        let payload = serialize_like_router(&req);
+        assert_eq!(payload["top_p"], json!(0.95));
+        assert_eq!(payload["temperature"], json!(0.7));
     }
 
     #[test]

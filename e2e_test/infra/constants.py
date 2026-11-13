@@ -1,6 +1,9 @@
 """Constants and enums for E2E test infrastructure."""
 
 import os
+import shutil
+import socket
+from collections.abc import Callable
 from enum import StrEnum
 
 
@@ -29,6 +32,9 @@ class Runtime(StrEnum):
     TRTLLM = "trtllm"
     MLX = "mlx"
     TOKENSPEED = "tokenspeed"
+    # The scripted mock worker (`crates/mock_worker`): no model, the test
+    # states the answer before it sends the request. CPU only.
+    MOCK = "mock"
     OPENAI = "openai"
     XAI = "xai"
     GEMINI = "gemini"
@@ -38,7 +44,7 @@ class Runtime(StrEnum):
 # Convenience sets
 LOCAL_MODES = frozenset({ConnectionMode.HTTP, ConnectionMode.GRPC, ConnectionMode.ZMQ})
 LOCAL_RUNTIMES = frozenset(
-    {Runtime.SGLANG, Runtime.VLLM, Runtime.TRTLLM, Runtime.MLX, Runtime.TOKENSPEED}
+    {Runtime.SGLANG, Runtime.VLLM, Runtime.TRTLLM, Runtime.MLX, Runtime.TOKENSPEED, Runtime.MOCK}
 )
 CLOUD_RUNTIMES = frozenset({Runtime.OPENAI, Runtime.XAI, Runtime.GEMINI, Runtime.ANTHROPIC})
 
@@ -66,7 +72,30 @@ ENV_CONNECTION_MODE = (
 ENV_ZMQ_ENGINE_COUNT = (
     "E2E_ZMQ_ENGINE_COUNT"  # DP engines per ZMQ worker (grouped vLLM launch; empty = 1)
 )
-ENV_STARTUP_TIMEOUT = "E2E_STARTUP_TIMEOUT"
+# The gRPC servicer implementation of a lane's workers, per engine: python or
+# rust; unset follows the servicer package's default — see get_servicer_impl.
+ENV_VLLM_SERVICER_IMPL = "E2E_VLLM_SERVICER_IMPL"
+ENV_SGLANG_SERVICER_IMPL = "E2E_SGLANG_SERVICER_IMPL"
+ENV_TOKENSPEED_SERVICER_IMPL = "E2E_TOKENSPEED_SERVICER_IMPL"
+ENV_TRTLLM_SERVICER_IMPL = "E2E_TRTLLM_SERVICER_IMPL"
+ENV_MM_PROCESSING = (
+    "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
+)
+ENV_MOCK_WIRE = (
+    "E2E_MOCK_WIRE"  # The scheduler wire the mock's gRPC workers speak — see get_mock_wire
+)
+ENV_VLLM_MM_PROCESSOR = "E2E_VLLM_MM_PROCESSOR"  # Worker-lane processor — see get_vllm_mm_processor
+ENV_PARSER = "E2E_PARSER"  # The gateway's --parser for a lane — see get_parser
+ENV_STARTUP_TIMEOUT = (
+    "E2E_STARTUP_TIMEOUT"  # Floor on every startup wait — see effective_startup_timeout
+)
+ENV_GPU_OFFSET = "E2E_GPU_OFFSET"  # First GPU index a lane's workers take — see get_gpu_offset
+ENV_GPU_VENDOR = "E2E_GPU_VENDOR"  # The GPU vendor a lane runs on — see get_gpu_vendor
+# A tracing filter for the Rust servicer in every worker a lane starts (the worker
+# process's RUST_LOG; the gateway's own logging is untouched). Empty or unset leaves
+# the servicer's default. A lane whose tests read the servicer's per-request line
+# raises that line's target: "info,engine_servicer::request=debug".
+ENV_WORKER_RUST_LOG = "E2E_WORKER_RUST_LOG"
 ENV_SKIP_MODEL_POOL = "SKIP_MODEL_POOL"
 ENV_SKIP_BACKEND_SETUP = "SKIP_BACKEND_SETUP"
 
@@ -132,6 +161,16 @@ def is_tokenspeed() -> bool:
     return get_runtime() == "tokenspeed"
 
 
+def zmq_backend(engine: str) -> str:
+    """The backend the gateway is pinned to for a ZMQ engine.
+
+    The gateway cannot probe a ZMQ engine's runtime from its ``ipc://`` URL,
+    so the harness names it: the engine itself, or the vLLM wire for the mock
+    worker, whose ZMQ ranks speak it.
+    """
+    return Runtime.VLLM.value if engine == Runtime.MOCK.value else engine
+
+
 def get_connection_mode_override() -> "ConnectionMode | None":
     """Per-lane wire-protocol override for local backends.
 
@@ -157,6 +196,188 @@ def get_connection_mode_override() -> "ConnectionMode | None":
         ) from None
 
 
+MM_PROCESSING_WORKER = "worker"
+
+
+def get_mm_processing() -> str | None:
+    """Per-lane multimodal processing location for local vLLM gRPC workers.
+
+    Set ``E2E_MM_PROCESSING=worker`` to launch every vLLM gRPC worker with
+    ``SMG_VLLM_MM_PROCESSOR=inprocess``: the worker advertises worker-side media
+    processing and the gateway (left in its default ``auto`` mode) forwards
+    media references instead of preprocessed tensors for models that opt in.
+    Returns ``None`` when the var is unset or blank (the router path); a
+    set-but-unrecognized value is a misconfiguration and raises.
+    """
+    value = os.environ.get(ENV_MM_PROCESSING, "").strip().lower()
+    if not value:
+        return None
+    if value != MM_PROCESSING_WORKER:
+        raise ValueError(
+            f"{ENV_MM_PROCESSING}={value!r} is not a valid processing location; "
+            f"use {MM_PROCESSING_WORKER!r} or leave it unset"
+        )
+    return value
+
+
+# The scheduler protos the mock's gRPC workers can serve (`--grpc-wire`), the
+# mock's own default first.
+MOCK_WIRES = ("tokenspeed", "vllm", "sglang")
+
+
+def get_mock_wire() -> str | None:
+    """The scheduler wire a lane's mock gRPC workers speak (``E2E_MOCK_WIRE``).
+
+    The scripted mock worker serves one of the gateway's three scheduler protos
+    per process (``mock-worker --grpc-wire tokenspeed|vllm|sglang``), the same
+    answers behind each; the gateway detects the runtime from it. Set the
+    variable to run the mock suite over another proto's client arm. Unset or
+    blank leaves the mock on its default (no flag on the command line); a
+    set-but-unrecognized value is a misconfiguration and raises. A class that
+    names a wire of its own passes ``--grpc-wire`` in its ``extra_engine_args``,
+    which the command takes after the lane's flag, so the class's wins.
+    """
+    value = os.environ.get(ENV_MOCK_WIRE, "").strip().lower()
+    if not value:
+        return None
+    if value not in MOCK_WIRES:
+        raise ValueError(
+            f"{ENV_MOCK_WIRE}={value!r} is not a scheduler wire; use one of {MOCK_WIRES}"
+        )
+    return value
+
+
+SERVICER_IMPLS = ("python", "rust")
+# Per engine: the lane's setting and the variable the servicer package's
+# launchers read it under in the worker's environment.
+SERVICER_IMPL_VARIABLES = {
+    "vllm": (ENV_VLLM_SERVICER_IMPL, "SMG_VLLM_SERVICER_IMPL"),
+    "sglang": (ENV_SGLANG_SERVICER_IMPL, "SMG_SGLANG_SERVICER_IMPL"),
+    "tokenspeed": (ENV_TOKENSPEED_SERVICER_IMPL, "SMG_TOKENSPEED_SERVICER_IMPL"),
+    "trtllm": (ENV_TRTLLM_SERVICER_IMPL, "SMG_TRTLLM_SERVICER_IMPL"),
+}
+VLLM_MM_PROCESSORS = ("inprocess", "smg")
+
+
+def get_parser() -> str | None:
+    """The parser a lane starts the gateway with, its ``--parser`` flag.
+
+    Set ``E2E_PARSER=legacy`` to read every chat completion with the per-model
+    parsers; ``symphony`` pins Symphony for the models its registry knows.
+    Unset or blank leaves the gateway on its default, symphony.
+    """
+    value = os.environ.get(ENV_PARSER, "").strip().lower()
+    if not value:
+        return None
+    if value not in ("legacy", "symphony"):
+        raise ValueError(f"{ENV_PARSER}={value!r} is not a parser; use legacy or symphony")
+    return value
+
+
+def effective_parser() -> str:
+    """The parser the gateway reads with in this lane: ``get_parser()`` when ``E2E_PARSER``
+    is set, else the gateway's own default, ``symphony``. A test that branches on the parser
+    reads this, so it need not know the default; the command line still omits ``--parser``
+    when the variable is blank (``Gateway._build_base_cmd``).
+    """
+    return get_parser() or "symphony"
+
+
+def get_vllm_mm_processor() -> str:
+    """The processor the worker lane launches vLLM gRPC workers with
+    (``SMG_VLLM_MM_PROCESSOR``): ``inprocess`` (vLLM's own, the default) or
+    ``smg`` (smg's pipeline inside the Rust servicer, so it needs
+    ``E2E_VLLM_SERVICER_IMPL=rust``). A set-but-unrecognized value raises.
+    """
+    value = os.environ.get(ENV_VLLM_MM_PROCESSOR, "").strip().lower() or "inprocess"
+    if value not in VLLM_MM_PROCESSORS:
+        raise ValueError(
+            f"{ENV_VLLM_MM_PROCESSOR}={value!r} is not a valid processor; "
+            f"use one of {VLLM_MM_PROCESSORS}"
+        )
+    if value == "smg" and get_servicer_impl("vllm") != "rust":
+        raise ValueError(
+            f"{ENV_VLLM_MM_PROCESSOR}=smg needs the Rust servicer ({ENV_VLLM_SERVICER_IMPL}=rust, "
+            "or the servicer package's default): smg's pipeline runs inside it"
+        )
+    return value
+
+
+def get_servicer_impl_setting(engine: str) -> str | None:
+    """The lane's own choice of gRPC servicer implementation for ``engine``'s
+    workers: ``python`` or ``rust`` from ``E2E_<ENGINE>_SERVICER_IMPL``, or
+    None when the variable is unset or blank and the lane leaves the choice to
+    the servicer package's default. A set-but-unrecognized value raises.
+
+    For vLLM, SGLang and TokenSpeed the worker command never changes: the
+    choice travels to the engine's own entrypoint as
+    ``SMG_<ENGINE>_SERVICER_IMPL`` in the worker's environment
+    (``infra.worker``), and the Router and every test case stay the same.
+    For TensorRT-LLM the choice is the command itself
+    (:func:`trtllm_runs_engines_own_servicer`).
+    """
+    setting, _variable = SERVICER_IMPL_VARIABLES[engine]
+    value = os.environ.get(setting, "").strip().lower()
+    if not value:
+        return None
+    if value not in SERVICER_IMPLS:
+        raise ValueError(
+            f"{setting}={value!r} is not a valid servicer impl; use one of {SERVICER_IMPLS}"
+        )
+    return value
+
+
+def _package_servicer_switch() -> Callable[..., tuple[str, str]] | None:
+    """The servicer package's own switch, the one its three launchers share
+    (``smg_grpc_servicer.rust_lifecycle.servicer_switch``), or None when the
+    package is not importable here. Imported late: the harness runs on hosts
+    without it (its own unit tests), where no gRPC worker starts either."""
+    try:
+        from smg_grpc_servicer.rust_lifecycle import servicer_switch
+    except ImportError:
+        return None
+    return servicer_switch
+
+
+def get_servicer_impl_default(engine: str) -> str | None:
+    """The implementation the servicer package selects for ``engine`` when a
+    launch names none (no ``--servicer-impl``, no ``SMG_<ENGINE>_SERVICER_IMPL``):
+    read from the package's own switch against an empty environment, so the
+    harness and the workers it starts agree by construction. None when the
+    package is not importable here."""
+    switch = _package_servicer_switch()
+    if switch is None:
+        return None
+    _setting, variable = SERVICER_IMPL_VARIABLES[engine]
+    impl, _origin = switch(variable, environ={})
+    return impl
+
+
+def get_servicer_impl(engine: str) -> str | None:
+    """Which implementation serves ``engine``'s gRPC contract on this lane: the
+    lane's setting (:func:`get_servicer_impl_setting`), else the servicer
+    package's default (:func:`get_servicer_impl_default`). None only when the
+    lane sets nothing and the package is not importable here. The collection
+    filters (``fixtures.hooks``), the skip conditions of the cases one
+    implementation does not serve and the worker's hook check all read this,
+    never a belief about what unset means."""
+    setting = get_servicer_impl_setting(engine)
+    if setting is not None:
+        return setting
+    return get_servicer_impl_default(engine)
+
+
+def trtllm_runs_engines_own_servicer() -> bool:
+    """Whether this lane's TensorRT-LLM gRPC workers are the engine's own gRPC
+    server (``tensorrt_llm.commands.serve``) rather than this repository's
+    Rust servicer: every choice but ``rust`` (the package's Python default
+    and an absent package included), since the engine release the lane pins
+    has no servicer switch of its own. The worker command, its health probe
+    and the gateway's hand-set label all read this, so the three agree.
+    """
+    return get_servicer_impl("trtllm") != "rust"
+
+
 def get_zmq_engine_count() -> int:
     """DP engines per ZMQ worker (grouped vLLM/TokenSpeed launch).
 
@@ -173,6 +394,69 @@ def get_zmq_engine_count() -> int:
     return count
 
 
+def get_gpu_offset() -> int:
+    """The first GPU index a lane's workers are placed on.
+
+    Workers take GPUs sequentially from 0; on a multi-GPU host, set
+    ``E2E_GPU_OFFSET`` to run several lanes side by side, each on its own
+    GPUs. Every worker of the lane (regular and PD pools) shifts by it.
+    Unset/blank means 0.
+    """
+    value = os.environ.get(ENV_GPU_OFFSET, "").strip()
+    if not value:
+        return 0
+    offset = int(value)
+    if offset < 0:
+        raise ValueError(f"{ENV_GPU_OFFSET}={value!r} must be a non-negative integer")
+    return offset
+
+
+GPU_VENDORS = ("nvidia", "amd")
+
+
+def get_gpu_vendor() -> str:
+    """The GPU vendor a lane's workers run on: "nvidia" or "amd".
+
+    The e2e job hands its ``gpu_vendor`` input down as ``E2E_GPU_VENDOR``.
+    Unset/blank, the vendor is read from the SMI on the path: ``amd-smi``
+    without ``nvidia-smi`` is a ROCm host, anything else counts as nvidia. A
+    sweep reads it where an engine behaves differently per vendor (the PD
+    topology sweep's sole-prefill restart over NIXL).
+    """
+    value = os.environ.get(ENV_GPU_VENDOR, "").strip().lower()
+    if value:
+        if value not in GPU_VENDORS:
+            raise ValueError(
+                f"{ENV_GPU_VENDOR}={value!r} is not a GPU vendor; use one of {GPU_VENDORS}"
+            )
+        return value
+    if shutil.which("nvidia-smi") is None and shutil.which("amd-smi") is not None:
+        return "amd"
+    return "nvidia"
+
+
+def get_startup_timeout() -> int | None:
+    """``E2E_STARTUP_TIMEOUT`` in seconds, or ``None`` when unset/blank."""
+    value = os.environ.get(ENV_STARTUP_TIMEOUT, "").strip()
+    if not value:
+        return None
+    timeout = int(value)
+    if timeout <= 0:
+        raise ValueError(f"{ENV_STARTUP_TIMEOUT}={value!r} must be a positive number of seconds")
+    return timeout
+
+
+def effective_startup_timeout(spec_timeout: int) -> int:
+    """A model's startup wait (its spec's ``startup_timeout`` or the default),
+    raised to ``E2E_STARTUP_TIMEOUT`` when that is larger. The per-model bound
+    assumes warm caches; on a fresh host an engine's first start JIT-compiles
+    and autotunes kernels for minutes, which the env floor covers for every
+    wait that gates on a loaded model (worker health, gateway readiness).
+    An explicitly larger per-model bound is never shrunk.
+    """
+    return max(spec_timeout, get_startup_timeout() or 0)
+
+
 ENV_VLLM_KV_BACKEND = "E2E_VLLM_KV_BACKEND"
 # One KV transfer backend for every PD worker in the lane, whatever the
 # engine; the per-engine variables below are the fallbacks.
@@ -181,7 +465,7 @@ ENV_SGLANG_TRANSFER_BACKEND = "E2E_SGLANG_TRANSFER_BACKEND"
 
 
 def vllm_kv_backend() -> str:
-    """KV transfer backend for vLLM PD workers: "nixl" (default) or "mooncake"."""
+    """KV transfer backend for vLLM PD workers: "nixl" (default), "mooncake" or "moriio"."""
     lane = os.environ.get(ENV_KV_BACKEND, "").strip().lower()
     return lane or os.environ.get(ENV_VLLM_KV_BACKEND, "nixl").lower()
 
@@ -192,6 +476,40 @@ def sglang_transfer_backend() -> str:
     return lane or os.environ.get(ENV_SGLANG_TRANSFER_BACKEND, "mooncake").lower()
 
 
+# MoRI-IO (the "moriio" vLLM KV backend): READ or WRITE transfers, its
+# transfer engine, and the address the workers advertise and SMG hands to
+# their peers.
+ENV_VLLM_MORIIO_MODE = "E2E_VLLM_MORIIO_MODE"
+ENV_VLLM_MORIIO_BACKEND = "E2E_VLLM_MORIIO_BACKEND"
+ENV_MORIIO_HOST = "E2E_MORIIO_HOST"
+
+
+def vllm_moriio_mode() -> str:
+    """MoRI-IO transfer mode for vLLM PD workers: "read" (default) or "write"."""
+    mode = os.environ.get(ENV_VLLM_MORIIO_MODE, "").strip().lower() or "read"
+    if mode not in ("read", "write"):
+        raise ValueError(f"{ENV_VLLM_MORIIO_MODE} must be 'read' or 'write', not {mode!r}")
+    return mode
+
+
+def vllm_moriio_backend() -> str:
+    """MoRI-IO transfer engine: "rdma" (default, through the NICs) or "xgmi" (GPU to GPU, one node)."""
+    backend = os.environ.get(ENV_VLLM_MORIIO_BACKEND, "").strip().lower() or "rdma"
+    if backend not in ("rdma", "xgmi"):
+        raise ValueError(f"{ENV_VLLM_MORIIO_BACKEND} must be 'rdma' or 'xgmi', not {backend!r}")
+    return backend
+
+
+def moriio_host() -> str:
+    """Address of this host for MoRI-IO: ``E2E_MORIIO_HOST``, else the default route's source."""
+    host = os.environ.get(ENV_MORIIO_HOST, "").strip()
+    if host:
+        return host
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("10.255.255.255", 1))  # sends nothing; only picks the route
+        return s.getsockname()[0]
+
+
 # Runtime display labels
 RUNTIME_LABELS = {
     "sglang": "SGLang",
@@ -199,16 +517,37 @@ RUNTIME_LABELS = {
     "trtllm": "TensorRT-LLM",
     "mlx": "MLX",
     "tokenspeed": "TokenSpeed",
+    "mock": "Mock",
 }
 
 ENV_SHOW_ROUTER_LOGS = "SHOW_ROUTER_LOGS"
 ENV_SHOW_WORKER_LOGS = "SHOW_WORKER_LOGS"
 
 # Network
-DEFAULT_HOST = "127.0.0.1"
+ENV_HOST = "E2E_HOST"  # The loopback the lane binds and dials — see default_host
+
+
+def default_host() -> str:
+    """The loopback the harness binds gateways and workers to and dials them at.
+
+    ``127.0.0.1`` unless ``E2E_HOST`` names another address; ``E2E_HOST=::1`` runs
+    a lane over IPv6 (bare literal, no brackets: it is passed to ``--host`` flags
+    as is, and every URL goes through :func:`host_port`).
+    """
+    return os.environ.get(ENV_HOST, "").strip() or "127.0.0.1"
+
+
+def host_port(host: str, port: int | str) -> str:
+    """``host:port`` for a URL or a dial string: an IPv6 literal goes in brackets."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
+DEFAULT_HOST = default_host()
 BRAVE_MCP_PORT = int(os.environ.get("BRAVE_MCP_PORT") or 8080)
 BRAVE_MCP_HOST = os.environ.get("BRAVE_MCP_HOST") or DEFAULT_HOST
-BRAVE_MCP_URL = f"http://{BRAVE_MCP_HOST}:{BRAVE_MCP_PORT}/mcp"
+BRAVE_MCP_URL = f"http://{host_port(BRAVE_MCP_HOST, BRAVE_MCP_PORT)}/mcp"
 
 # In-process mock MCP server (see infra/mock_mcp_server.py). Bound to localhost
 # on an auto-allocated port; host is exposed as a constant so tests and
@@ -216,8 +555,27 @@ BRAVE_MCP_URL = f"http://{BRAVE_MCP_HOST}:{BRAVE_MCP_PORT}/mcp"
 MOCK_MCP_HOST = DEFAULT_HOST
 
 # Timeouts (seconds)
-DEFAULT_STARTUP_TIMEOUT = 300
+# A worker's start-up wait covers two phases before its health reads SERVING:
+# the engine's own start (model load, graph capture, its kernel warm-ups) and
+# the servicer's planned warm-up (smg_grpc_servicer.warmup), which holds the
+# health until it ran and is bounded by its own budget, 300 s unless
+# SMG_<ENGINE>_SERVICER_WARMUP says otherwise. The default bound is the sum, so
+# a model whose engine start alone fit the old 300 s is not failed by the
+# warm-up that now follows it (a 20B MoE on a slower accelerator took 2:36 of
+# engine start and 2:45 of warm-up). A model's spec raises it further, and
+# replaces it: such a spec is sized the same way, its engine's start plus the
+# budget (``model_specs``, pinned by a test).
+ENGINE_START_SECS = 300
+SERVICER_WARMUP_BUDGET_SECS = 300  # smg_grpc_servicer.warmup.DEFAULT_BUDGET_SECS, pinned by a test
+DEFAULT_STARTUP_TIMEOUT = ENGINE_START_SECS + SERVICER_WARMUP_BUDGET_SECS
 DEFAULT_ROUTER_TIMEOUT = 60
+# A cloud gateway's budget for one call to its provider (--request-timeout-secs).
+# A provider call that never answers ends here as a gateway error the SDK
+# clients retry on their own, so a stalled call costs this long instead of the
+# ten minutes the openai and anthropic clients wait before their retry: twice
+# in one job, that reaches the job's cap with every test green. The slowest
+# passing cloud test takes about 70 s for all of its calls together.
+CLOUD_REQUEST_TIMEOUT_SECS = 180
 HEALTH_CHECK_INTERVAL = 2  # Check every 2s (was 5s)
 
 # Model loading configuration

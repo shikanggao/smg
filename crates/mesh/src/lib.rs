@@ -6,6 +6,7 @@
 //! - Partition detection and recovery
 
 mod crdt_kv;
+mod dialer;
 mod gossip_controller;
 mod gossip_service;
 pub mod kv;
@@ -32,6 +33,9 @@ pub use kv::{
 pub use metrics::init_mesh_metrics;
 pub use mtls::{MTLSConfig, MTLSManager};
 pub use partition::PartitionDetector;
-pub use service::{gossip, ClusterState, MeshServerBuilder, MeshServerConfig, MeshServerHandler};
+pub use service::{
+    gossip, member_transition_line, status_of, ClusterState, MeshServer, MeshServerBuilder,
+    MeshServerConfig, MeshServerHandler, PreparedMeshServer,
+};
 pub use transport::limits::MAX_STREAM_CHUNK_BYTES;
 pub use types::WorkerState;

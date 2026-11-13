@@ -1,8 +1,8 @@
 """NIXL KV-transfer verification for vLLM PD disaggregation (gRPC mode).
 
-Unlike the MMLU PD tests, output correctness alone cannot catch a broken KV
-transfer: the decode worker silently recomputes the prefill and still produces
-correct answers. This test asserts the transfer actually happens by checking:
+Output correctness alone cannot catch a broken KV transfer: the decode worker
+silently recomputes the prefill and still produces correct answers. This test
+asserts the transfer actually happens by checking:
 
 1. The router harvested kv_transfer_params from prefill and relayed them to
    decode (router debug log).
@@ -15,7 +15,7 @@ Requirements:
     - 2 GPUs (1 prefill + 1 decode)
 
 Usage:
-    E2E_RUNTIME=vllm pytest e2e_test/router/test_pd_nixl.py -v
+    E2E_RUNTIME=vllm E2E_ENGINE=vllm pytest e2e_test/router/test_pd_nixl.py -v
 """
 
 from __future__ import annotations

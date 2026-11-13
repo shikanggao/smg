@@ -1,34 +1,24 @@
 name: CI TokenSpeed Image
 
-# Bakes the pinned TokenSpeed build (engine + kernel + scheduler) into a
-# runner-matched carrier image (ubuntu:24.04 — the GPU e2e jobs run bare on
-# the runner pods, so this is extracted at job time, not used as a job
-# container; see docker/ci-tokenspeed.Dockerfile) and pushes it under the
-# content-addressed tag printed by scripts/ci_tokenspeed_image_tag.sh
-# (engine ref + a hash of the image tooling). The tokenspeed e2e lanes in
-# pr-test-rust.yml pull this image (resolved in detect-changes) instead of
-# spending ~25 GPU-runner-minutes compiling from source in every job.
-#
-# The kernel compile needs nvcc but no GPU (arch list is pinned in
-# scripts/ci_install_tokenspeed.sh), so this runs on the docker runner pool.
-#
-# Lifecycle: a PR bumping .github/versions/tokenspeed.ref (or touching the
-# image tooling) falls back to the source build — the image for the new tag
-# doesn't exist yet, detect-changes resolves an empty image, and the lanes
-# degrade gracefully. This workflow builds the new tag on merge, and every
-# subsequent run is fast again.
-#
-# Retention: each tag is ~8 GB and nothing can pull a superseded one, so the
-# prune job below keeps the newest few and deletes the rest.
+# Publishes a runner-matched carrier tagged by the pinned TokenSpeed nightly's
+# date. Jobs install that pin (a no-op on the carrier) and validate their
+# FlashInfer artifacts.
 
 on:
+  schedule:
+    - cron: '0 6 * * *'
   push:
     branches: [main]
     paths:
       - '.github/versions/tokenspeed.ref'
+      - '.github/versions/tokenspeed-nightly.txt'
+      - '.github/versions/tokenspeed-engine.txt'
       - 'docker/ci-tokenspeed.Dockerfile'
       - 'scripts/ci_apt_mirror.sh'
+      - 'scripts/ci_ensure_python_headers.sh'
       - 'scripts/ci_install_tokenspeed.sh'
+      - 'scripts/ci_tokenspeed_scheduler_pin.py'
+      - 'scripts/ci_install_flashinfer.py'
       - 'scripts/ci_retry.sh'
       - 'scripts/ci_setup_python_venv.sh'
       - 'scripts/ci_tokenspeed_image_tag.sh'
@@ -68,10 +58,14 @@ jobs:
         run: |
           # Unlike the tolerant resolution in detect-changes, THIS workflow
           # must fail loudly on a broken ref — its whole job is the image.
-          tag="$(bash scripts/ci_tokenspeed_image_tag.sh)"
+          version="$(bash scripts/ci_tokenspeed_image_tag.sh --version)"
+          tag="ci-tokenspeed-${version##*post}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
           # ubuntu:24.04 matches the runner pods (see the Dockerfile's
-          # portability contract); the dispatch input can override it.
-          base="${BASE_OVERRIDE:-ubuntu:24.04}"
+          # portability contract), pinned by the digest docker/Dockerfile
+          # uses (moved by hand with it, see .github/dependabot.yml); the
+          # dispatch input can override it.
+          base="${BASE_OVERRIDE:-ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55}"
           image="ghcr.io/${{ github.repository_owner }}/smg:${tag}"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           echo "base=${base}" >> "$GITHUB_OUTPUT"
@@ -85,9 +79,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tags are content-addressed (engine ref + image-tooling hash, see
-      # scripts/ci_tokenspeed_image_tag.sh), so an existing tag means the
-      # work is already done (unless force is set).
+      # A push to `main` that touches a listed path rebuilds the pinned tag in
+      # place (`no-cache`), so the carrier behind the pin moves with the tooling;
+      # a rebuild only when the tag is missing or forced (or an input-hash tag)
+      # is owed, with the carrier's unbounded dependencies pinned.
       - name: Check for existing image
         id: exists
         env:
@@ -101,13 +96,13 @@ jobs:
           fi
 
       - name: Set up Docker Buildx
-        if: steps.exists.outputs.exists != 'true' || inputs.force
+        if: steps.exists.outputs.exists != 'true' || inputs.force || github.event_name == 'push'
         uses: docker/setup-buildx-action@v4
         with:
           driver: docker
 
       - name: Build and push image
-        if: steps.exists.outputs.exists != 'true' || inputs.force
+        if: steps.exists.outputs.exists != 'true' || inputs.force || github.event_name == 'push'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -116,6 +111,7 @@ jobs:
           no-cache: true
           build-args: |
             BASE_IMAGE=${{ steps.resolve.outputs.base }}
+            TOKENSPEED_VERSION=${{ steps.resolve.outputs.version }}
           tags: ${{ steps.resolve.outputs.image }}
 
       - name: Clean up local images
@@ -127,10 +123,7 @@ jobs:
           docker rmi "$IMAGE" || true
           docker rmi "$BASE" || true
 
-  # Superseded tags are unreachable by construction (the tag is a hash of its
-  # own inputs), so this runs whenever the tag resolves — after a fresh push
-  # and after a no-op run that found the tag already present. Split out onto
-  # the CPU pool because that is where the gh CLI is available.
+  # Keep recent carriers for jobs that already resolved an older digest.
   prune:
     needs: [build-and-push]
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
@@ -140,17 +133,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install gh CLI
-        run: |
-          if ! command -v gh &>/dev/null; then
-            mkdir -p "$HOME/.local/bin"
-            GH_VERSION="2.74.0"
-            GH_SHA256="e55c9d49dc49c0b0fef0a9acd3510482fd9e27ff52ae80f8a6e838cd25b4cd89"
-            curl -fsSL --connect-timeout 10 --max-time 120 -o /tmp/gh.tgz \
-              "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"
-            echo "${GH_SHA256}  /tmp/gh.tgz" | sha256sum --check --quiet
-            tar xzf /tmp/gh.tgz --strip-components=2 -C "$HOME/.local/bin" "gh_${GH_VERSION}_linux_amd64/bin/gh"
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          fi
+        uses: ./.github/actions/setup-gh
 
       - name: Prune superseded images
         env:

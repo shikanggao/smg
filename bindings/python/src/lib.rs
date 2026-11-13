@@ -9,8 +9,30 @@ use pyo3::prelude::*;
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// The gateway's jemalloc options (`SERVER_MALLOC_CONF`). The extension is a
+// final artifact of its own, so it exports them as jemalloc's
+// application-provided `malloc_conf` like the `smg` executable does;
+// without this the router launched from Python ran jemalloc's stock decay
+// and kept a traffic burst's freed pages resident.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[expect(
+    unsafe_code,
+    reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
+)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 100] = observability::metrics::SERVER_MALLOC_CONF;
 use smg::*;
 use smg_auth as auth;
+
+mod servicer;
+use servicer::{
+    init_servicer_tracing, PySglangGrpcServer, PyTokenSpeedGrpcServer, PyTrtllmGrpcServer,
+    PyVllmGrpcServer,
+};
+
+mod tokenizer;
+use tokenizer::PyTokenizer;
 
 // Define the enums with PyO3 bindings
 #[pyclass(eq, from_py_object)]
@@ -40,6 +62,50 @@ pub enum BackendType {
     /// TokenSpeed engine. Routing behaves like the default; over ZMQ this pins
     /// the startup workers' wire protocol to TokenSpeed.
     Tokenspeed,
+    /// TensorRT-LLM engine, as the CLI's `--backend trtllm`: routing behaves
+    /// like the default and no wire is pinned (its servicer speaks gRPC).
+    Trtllm,
+    /// The Gemini provider route (`RoutingMode::Gemini`), as the CLI's
+    /// `--backend gemini`.
+    Gemini,
+}
+
+impl BackendType {
+    /// The routing mode of a provider backend, with the URLs it is given: a
+    /// provider backend is a mode of its own and wins over the disaggregation
+    /// flags, as the CLI's `--backend` does. `None` for an engine backend,
+    /// whose mode those flags select.
+    fn provider_mode(&self, worker_urls: &[String]) -> Option<config::RoutingMode> {
+        use config::RoutingMode;
+
+        let mode = match self {
+            Self::Openai => RoutingMode::OpenAI {
+                worker_urls: worker_urls.to_vec(),
+            },
+            Self::Anthropic => RoutingMode::Anthropic {
+                worker_urls: worker_urls.to_vec(),
+            },
+            Self::Gemini => RoutingMode::Gemini {
+                worker_urls: worker_urls.to_vec(),
+            },
+            Self::Sglang | Self::Vllm | Self::Tokenspeed | Self::Trtllm => return None,
+        };
+        Some(mode)
+    }
+
+    /// The wire a startup worker over ZMQ speaks when this backend names its
+    /// engine. The shared EngineCore handshake carries no engine identity, so
+    /// the wire cannot be probed; a provider or TensorRT-LLM pins none, and
+    /// without a backend the detection step decides, as it does for the CLI
+    /// without `--backend`.
+    fn startup_worker_runtime(&self) -> Option<worker::RuntimeType> {
+        match self {
+            Self::Vllm => Some(worker::RuntimeType::Vllm),
+            Self::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
+            Self::Sglang => Some(worker::RuntimeType::Sglang),
+            Self::Openai | Self::Anthropic | Self::Trtllm | Self::Gemini => None,
+        }
+    }
 }
 
 #[pyclass(eq, from_py_object)]
@@ -65,6 +131,14 @@ impl PyRole {
         match self {
             PyRole::Admin => auth::Role::Admin,
             PyRole::User => auth::Role::User,
+        }
+    }
+
+    /// The role as the gateway's parser read it from a key file's entry.
+    fn from_auth_role(role: auth::Role) -> Self {
+        match role {
+            auth::Role::Admin => PyRole::Admin,
+            auth::Role::User => PyRole::User,
         }
     }
 }
@@ -102,6 +176,15 @@ impl PyApiKeyEntry {
     }
 }
 
+/// The keys of a start once the key files are read (`Router::read_key_files`):
+/// each one the value given, or its file's.
+#[derive(Debug)]
+struct KeysRead {
+    api_key: Option<String>,
+    tenant_api_keys: Vec<(String, String)>,
+    control_plane_auth: Option<PyControlPlaneAuthConfig>,
+}
+
 #[pyclass(from_py_object)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PyJwtConfig {
@@ -113,6 +196,10 @@ pub struct PyJwtConfig {
     pub jwks_uri: Option<String>,
     #[pyo3(get, set)]
     pub role_mapping: HashMap<String, String>,
+    /// The claim that carries the role (the CLI's `--jwt-role-claim`, default
+    /// `roles`); appended last so positional callers keep their binding.
+    #[pyo3(get, set)]
+    pub role_claim: String,
 }
 
 #[pymethods]
@@ -123,41 +210,59 @@ impl PyJwtConfig {
         audience,
         jwks_uri = None,
         role_mapping = HashMap::new(),
+        role_claim = String::from("roles"),
     ))]
     fn new(
         issuer: String,
         audience: String,
         jwks_uri: Option<String>,
         role_mapping: HashMap<String, String>,
+        role_claim: String,
     ) -> Self {
         PyJwtConfig {
             issuer,
             audience,
             jwks_uri,
             role_mapping,
+            role_claim,
         }
     }
 }
 
 impl PyJwtConfig {
-    pub fn to_auth_jwt_config(&self) -> auth::JwtConfig {
+    pub fn to_auth_jwt_config(&self) -> config::ConfigResult<auth::JwtConfig> {
         let mut config = auth::JwtConfig::new(&self.issuer, &self.audience);
+        config.role_claim.clone_from(&self.role_claim);
 
         // Conditionally set JWKS URI
         if let Some(ref uri) = self.jwks_uri {
             config = config.with_jwks_uri(uri);
         }
 
-        // Add role mappings
+        // A gateway role that is neither admin nor user is refused, as the
+        // CLI refuses it: mapped to user in silence, the operator who meant
+        // admin is locked out of the admin routes with nothing to read. An
+        // empty IdP role is refused with it, as the CLI refuses `=admin`: no
+        // claim ever matches it.
         for (idp_role, gateway_role) in &self.role_mapping {
-            let role = match gateway_role.to_lowercase().as_str() {
-                "admin" => auth::Role::Admin,
-                _ => auth::Role::User,
-            };
+            if idp_role.is_empty() {
+                return Err(config::ConfigError::invalid_value(
+                    "role_mapping",
+                    format!("={gateway_role}"),
+                    "the IdP role must not be empty",
+                ));
+            }
+            let role: auth::Role = gateway_role.parse().map_err(|_: String| {
+                config::ConfigError::invalid_value(
+                    "role_mapping",
+                    format!("{idp_role}={gateway_role}"),
+                    "the gateway role must be 'admin' or 'user'",
+                )
+            })?;
             config = config.with_role_mapping(idp_role, role);
         }
 
-        config
+        Ok(config)
     }
 }
 
@@ -190,16 +295,22 @@ impl PyControlPlaneAuthConfig {
 }
 
 impl PyControlPlaneAuthConfig {
-    pub fn to_auth_control_plane_config(&self) -> auth::ControlPlaneAuthConfig {
-        auth::ControlPlaneAuthConfig {
-            jwt: self.jwt.as_ref().map(|j| j.to_auth_jwt_config()),
+    pub fn to_auth_control_plane_config(
+        &self,
+    ) -> config::ConfigResult<auth::ControlPlaneAuthConfig> {
+        Ok(auth::ControlPlaneAuthConfig {
+            jwt: self
+                .jwt
+                .as_ref()
+                .map(|j| j.to_auth_jwt_config())
+                .transpose()?,
             api_keys: self
                 .api_keys
                 .iter()
                 .map(|k| k.to_auth_api_key_entry())
                 .collect(),
             audit_enabled: self.audit_enabled,
-        }
+        })
     }
 }
 
@@ -312,21 +423,30 @@ pub struct PyRedisConfig {
     pub pool_max: usize,
     #[pyo3(get, set)]
     pub retention_days: Option<u64>,
+    /// Bound in seconds on each call to the store (default 5).
+    #[pyo3(get, set)]
+    pub op_timeout_secs: u64,
 }
 
 #[pymethods]
 impl PyRedisConfig {
     #[new]
-    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30)))]
+    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30), op_timeout_secs = 5))]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "PyO3 #[new] method signature requires PyResult"
     )]
-    fn new(url: String, pool_max: usize, retention_days: Option<u64>) -> PyResult<Self> {
+    fn new(
+        url: String,
+        pool_max: usize,
+        retention_days: Option<u64>,
+        op_timeout_secs: u64,
+    ) -> PyResult<Self> {
         Ok(PyRedisConfig {
             url,
             pool_max,
             retention_days,
+            op_timeout_secs,
         })
     }
 }
@@ -336,6 +456,7 @@ impl PyRedisConfig {
         config::RedisConfig {
             url: self.url.clone(),
             pool_max: self.pool_max,
+            op_timeout_secs: self.op_timeout_secs,
             retention_days: self.retention_days,
             schema: None,
         }
@@ -350,18 +471,26 @@ pub struct PyPostgresConfig {
 
     #[pyo3(get, set)]
     pub pool_max: usize,
+
+    /// Bound in seconds on each call to the store (default 5).
+    #[pyo3(get, set)]
+    pub op_timeout_secs: u64,
 }
 
 #[pymethods]
 impl PyPostgresConfig {
     #[new]
-    #[pyo3(signature = (db_url = None,pool_max = 16,))]
+    #[pyo3(signature = (db_url = None, pool_max = 16, op_timeout_secs = 5))]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "PyO3 #[new] method signature requires PyResult"
     )]
-    fn new(db_url: Option<String>, pool_max: usize) -> PyResult<Self> {
-        Ok(PyPostgresConfig { db_url, pool_max })
+    fn new(db_url: Option<String>, pool_max: usize, op_timeout_secs: u64) -> PyResult<Self> {
+        Ok(PyPostgresConfig {
+            db_url,
+            pool_max,
+            op_timeout_secs,
+        })
     }
 }
 
@@ -370,6 +499,7 @@ impl PyPostgresConfig {
         config::PostgresConfig {
             db_url: self.db_url.clone().unwrap_or_default(),
             pool_max: self.pool_max,
+            op_timeout_secs: self.op_timeout_secs,
             schema: None,
         }
     }
@@ -378,162 +508,262 @@ impl PyPostgresConfig {
 #[pyclass(from_py_object)]
 #[derive(Debug, Clone, PartialEq)]
 struct Router {
-    host: String,
-    port: u16,
-    health_check_port: Option<u16>,
-    routing_key_override: bool,
+    // The constructor's positional parameters, in their order.
     worker_urls: Vec<String>,
     policy: PolicyType,
-    worker_startup_timeout_secs: u64,
-    worker_startup_check_interval: u64,
-    load_monitor_interval: u64,
-    cache_threshold: f32,
-    balance_abs_threshold: usize,
-    balance_rel_threshold: f32,
-    eviction_interval_secs: u64,
-    max_tree_size: usize,
-    block_size: usize,
-    balance_token_usage_threshold: f32,
-    overload_token_usage_threshold: f32,
-    prefix_token_count: usize,
-    prefix_hash_load_factor: f64,
-    prefix_hash_balance_abs_threshold: usize,
-    least_load_kv_pressure_weight: f64,
-    least_load_default_throughput: f64,
-    least_load_mean_prefill_tokens: u32,
-    max_idle_secs: u64,
-    assignment_mode: Option<String>,
-    max_payload_size: usize,
-    dp_aware: bool,
-    dp_minimum_tokens_scheduler: bool,
-    upstream_http2: bool,
+    host: String,
+    port: u16,
+    // The keyword-only parameters, in alphabetical order, as the `#[pyo3(signature)]`
+    // below lists them: a new one goes at its place in each of the four lists (this
+    // struct, the signature, the parameters of `new`, the literal in `new`), never at
+    // the tail, so two additions do not touch the same lines.
+    /// The optional fields of the access-log record.
+    access_log_fields: Vec<String>,
+    admin_host: Option<String>,
+    admin_max_connections: usize,
+    admin_port: Option<u16>,
     api_key: Option<String>,
-    log_dir: Option<String>,
-    log_level: Option<String>,
-    log_json: bool,
-    service_discovery: bool,
-    selector: HashMap<String, String>,
-    service_discovery_port: u16,
-    service_discovery_namespace: Option<String>,
-    prefill_selector: HashMap<String, String>,
-    decode_selector: HashMap<String, String>,
-    router_selector: HashMap<String, String>,
+    api_key_file: Option<String>,
+    assignment_mode: Option<String>,
+    backend: Option<BackendType>,
+    balance_abs_threshold: usize,
+    balance_prefix_margin_tokens: u32,
+    balance_rel_threshold: f32,
+    balance_token_usage_threshold: f32,
+    balance_uncached_credit: bool,
+    block_size: usize,
     bootstrap_port_annotation: String,
-    model_id_from: Option<String>,
-    prometheus_port: Option<u16>,
-    prometheus_host: Option<String>,
-    prometheus_duration_buckets: Option<Vec<f64>>,
-    request_timeout_secs: u64,
-    shutdown_grace_period_secs: u64,
-    request_id_headers: Option<Vec<String>>,
-    trust_tenant_header: bool,
-    tenant_header_name: String,
-    storage_context_headers: HashMap<String, String>,
-    pd_disaggregation: bool,
     bucket_adjust_interval_secs: usize,
-    prefill_urls: Option<Vec<(String, Option<u16>)>>,
-    decode_urls: Option<Vec<String>>,
-    prefill_policy: Option<PolicyType>,
-    decode_policy: Option<PolicyType>,
-    max_concurrent_requests: i32,
-    cors_allowed_origins: Vec<String>,
-    retry_max_retries: u32,
-    retry_initial_backoff_ms: u64,
-    retry_max_backoff_ms: u64,
-    retry_backoff_multiplier: f32,
-    retry_jitter_factor: f32,
-    disable_retries: bool,
+    ca_cert_paths: Vec<String>,
+    cache_boundaries: Vec<usize>,
+    cache_index: String,
+    cache_threshold: f32,
+    cache_ttl_secs: u64,
     cb_failure_threshold: u32,
     cb_success_threshold: u32,
     cb_timeout_duration_secs: u64,
     cb_window_duration_secs: u64,
+    chat_template: Option<String>,
+    client_cert_path: Option<String>,
+    client_key_path: Option<String>,
+    control_plane_api_keys_file: Option<String>,
+    control_plane_auth: Option<PyControlPlaneAuthConfig>,
+    cors_allowed_origins: Vec<String>,
+    decode_expected_workers: Option<usize>,
+    decode_min_ready_percent: Option<u8>,
+    decode_min_ready_workers: Option<usize>,
+    decode_policy: Option<PolicyType>,
+    decode_selector: HashMap<String, String>,
+    decode_urls: Option<Vec<String>>,
     disable_circuit_breaker: bool,
+    disable_health_check: bool,
+    disable_load_monitoring: bool,
+    disable_retries: bool,
+    disable_tokenizer_autoload: bool,
+    /// The `discovery` mapping, read by the same rules as
+    /// `RouterConfig.discovery`.
+    discovery: Option<config::DiscoveryConfig>,
+    /// The interval of `service_discovery=True` Kubernetes discovery
+    /// (`None`: the default every provider has, 30s).
+    discovery_check_interval_secs: Option<u64>,
+    dp_aware: bool,
+    dp_minimum_tokens_scheduler: bool,
+    drain_settle_secs: u64,
+    enable_igw: bool,
+    enable_mesh: bool,
+    enable_rl: bool,
+    enable_trace: bool,
+    enable_wasm: bool,
+    encode_policy: Option<PolicyType>,
+    encode_selector: HashMap<String, String>,
+    encode_urls: Option<Vec<(String, Option<u16>)>>,
+    engine_metrics: bool,
+    epd_disaggregation: bool,
+    eviction_interval_secs: u64,
+    grpc_request_timeout_secs: u64,
+    header_read_timeout_secs: u64,
+    health_check_endpoint: String,
+    health_check_interval_secs: u64,
+    health_check_port: Option<u16>,
+    health_check_timeout_secs: u64,
     health_failure_threshold: u32,
     health_success_threshold: u32,
-    health_check_timeout_secs: u64,
-    health_check_interval_secs: u64,
-    health_check_endpoint: String,
-    disable_health_check: bool,
-    remove_unhealthy_workers: Option<bool>,
-    enable_igw: bool,
+    history_backend: HistoryBackendType,
+    history_memory_max_items: usize,
+    history_memory_max_responses: usize,
+    history_memory_retention_secs: u64,
+    idle_connection_timeout_secs: u64,
+    jemalloc_prof_dir: Option<String>,
+    job_queue_capacity: usize,
+    job_queue_concurrency: usize,
+    kv_connector_annotation: String,
+    kv_engine_id_annotation: String,
+    least_load_default_throughput: f64,
+    least_load_kv_pressure_weight: f64,
+    least_load_mean_prefill_tokens: u32,
+    load_monitor_interval: u64,
+    log_dir: Option<String>,
+    log_json: bool,
+    log_level: Option<String>,
+    log_mm_timing: bool,
+    max_background_responses: usize,
+    max_buffered_request_bytes: u64,
+    max_concurrent_requests: i32,
+    max_connections: usize,
+    max_idle_secs: u64,
+    max_payload_size: usize,
+    max_tree_size: usize,
+    mcp_config_path: Option<String>,
+    mesh_advertise_host: Option<String>,
+    mesh_host: String,
+    mesh_peer_urls: Vec<String>,
+    mesh_port: u16,
+    mesh_server_name: Option<String>,
+    /// The mesh CA, this node's certificate and key (PEM
+    /// paths); all three or none.
+    mesh_tls_ca_cert: Option<String>,
+    mesh_tls_cert: Option<String>,
+    mesh_tls_key: Option<String>,
+    mm_allow_private_media_hosts: bool,
+    mm_allowed_media_domains: Option<Vec<String>>,
+    mm_fetch_timeout_ms: Option<u64>,
+    mm_per_request_image_limit: Option<usize>,
+    mm_pixel_cache_mb: Option<usize>,
+    mm_pixel_rdma: bool,
+    mm_processing: Option<String>,
+    mm_turbojpeg: Option<String>,
+    mm_video_fetch_timeout_ms: Option<u64>,
+    model_aliases: HashMap<String, String>,
+    model_id_from: Option<String>,
+    model_path: Option<String>,
+    multimodal_max_inflight_bytes: Option<usize>,
+    multimodal_shm_min_bytes: Option<usize>,
+    multimodal_tensor_transport: Option<String>,
+    oracle_config: Option<PyOracleConfig>,
+    otlp_traces_endpoint: String,
+    overlap_decay: f32,
+    overload_token_usage_threshold: f32,
+    /// `symphony` (the default) or `legacy`: which parser reads a chat completion's output.
+    parser: String,
+    pd_admission_wait_secs: u64,
+    pd_disaggregation: bool,
+    pd_pairing_mode: String,
+    policy_engine: String,
+    postgres_config: Option<PyPostgresConfig>,
+    power_of_two_load_metric: String,
+    prefill_expected_workers: Option<usize>,
+    prefill_max_inflight_requests_per_worker: i32,
+    prefill_min_ready_percent: Option<u8>,
+    prefill_min_ready_workers: Option<usize>,
+    prefill_policy: Option<PolicyType>,
+    prefill_queue_size: Option<usize>,
+    prefill_queue_timeout_secs: Option<u64>,
+    prefill_selector: HashMap<String, String>,
+    prefill_urls: Option<Vec<(String, Option<u16>)>>,
+    prefix_hash_balance_abs_threshold: usize,
+    prefix_hash_load_factor: f64,
+    prefix_token_count: usize,
+    priority_scheduler_config: Option<String>,
+    priority_scheduler_default_max_class: String,
+    priority_scheduler_enabled: bool,
+    priority_scheduler_tenant_metric_top_n: u32,
+    prometheus_duration_buckets: Option<Vec<f64>>,
+    prometheus_host: Option<String>,
+    prometheus_port: Option<u16>,
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
-    connection_mode: worker::ConnectionMode,
-    model_path: Option<String>,
-    tokenizer_path: Option<String>,
-    chat_template: Option<String>,
-    disable_tokenizer_autoload: bool,
-    tokenizer_cache_enable_l0: bool,
-    tokenizer_cache_l0_max_entries: usize,
-    tokenizer_cache_enable_l1: bool,
-    tokenizer_cache_l1_max_memory: usize,
+    rdma_listen_ip: Option<String>,
+    rdma_slot_ttl_s: Option<u64>,
     reasoning_parser: Option<String>,
-    tool_call_parser: Option<String>,
-    mcp_config_path: Option<String>,
-    storage_hook_wasm_path: Option<String>,
-    backend: BackendType,
-    history_backend: HistoryBackendType,
-    oracle_config: Option<PyOracleConfig>,
-    postgres_config: Option<PyPostgresConfig>,
     redis_config: Option<PyRedisConfig>,
-    client_cert_path: Option<String>,
-    client_key_path: Option<String>,
-    ca_cert_paths: Vec<String>,
-    server_cert_path: Option<String>,
-    server_key_path: Option<String>,
-    enable_trace: bool,
-    otlp_traces_endpoint: String,
-    control_plane_auth: Option<PyControlPlaneAuthConfig>,
-    schema_config: Option<String>,
-    // Mesh server
-    enable_mesh: bool,
-    mesh_server_name: Option<String>,
-    mesh_host: String,
-    mesh_advertise_host: Option<String>,
-    mesh_port: u16,
-    mesh_peer_urls: Vec<String>,
-    /// New parameters MUST be appended here (not inserted mid-list) to avoid
-    /// breaking external Python callers that pass `_Router(...)` positionally.
-    drain_settle_secs: u64,
-    enable_wasm: bool,
-    encode_selector: HashMap<String, String>,
-    epd_disaggregation: bool,
-    encode_urls: Option<Vec<(String, Option<u16>)>>,
-    encode_policy: Option<PolicyType>,
-    multimodal_tensor_transport: Option<String>,
-    multimodal_shm_min_bytes: Option<usize>,
-    model_aliases: HashMap<String, String>,
-    worker_startup_delay: u64,
-    worker_ports_annotation: String,
-    /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
-    /// Positional slot preserved; new constructor arguments belong at the signature tail.
-    zmq_engine_count: Option<usize>,
-    overlap_decay: f32,
-    selection_temperature: f32,
-    upstream_pool_idle_timeout_secs: u64,
-    least_load_max_waiting_requests: u32,
-    stream_body_stall_timeout_secs: u64,
-    routing_key_headers: Vec<String>,
-    cache_boundaries: Vec<usize>,
-    cache_index: String,
-    cache_ttl_secs: u64,
-    job_queue_capacity: usize,
-    job_queue_concurrency: usize,
-    worker_overload_waiting_requests: Option<usize>,
-    worker_overload_token_usage: Option<f64>,
-    worker_overload_protection: bool,
-    disable_load_monitoring: bool,
-    max_buffered_request_bytes: u64,
-    kv_connector_annotation: String,
-    kv_engine_id_annotation: String,
-    mm_per_request_image_limit: Option<usize>,
-    pd_admission_wait_secs: u64,
-    /// New parameters MUST be appended here (not inserted mid-list) to avoid
-    /// breaking external Python callers that pass `_Router(...)` positionally.
-    enable_rl: bool,
+    remove_unhealthy_workers: Option<bool>,
+    request_id_headers: Option<Vec<String>>,
+    request_timeout_secs: u64,
+    retry_backoff_multiplier: f32,
+    retry_initial_backoff_ms: u64,
+    retry_jitter_factor: f32,
+    retry_max_backoff_ms: u64,
+    retry_max_retries: u32,
     rl_control_timeout_secs: u64,
     rl_fanout_concurrency: usize,
+    router_selector: HashMap<String, String>,
+    routing_key_headers: Vec<String>,
+    routing_key_override: bool,
+    runtime_worker_threads: Option<usize>,
+    schema_config: Option<String>,
+    secrets_auto_reload: bool,
+    selection_accounting_ttl_ms: u64,
+    selection_policy: String,
+    selection_temperature: f32,
+    selector: HashMap<String, String>,
+    server_cert_path: Option<String>,
+    server_key_path: Option<String>,
+    service_discovery: bool,
+    service_discovery_namespace: Option<String>,
+    service_discovery_port: u16,
+    shutdown_grace_period_secs: u64,
+    shutdown_settle_secs: Option<u64>,
+    sse_keepalive_secs: u64,
+    storage_context_headers: HashMap<String, String>,
+    storage_hook_wasm_path: Option<String>,
+    stream_body_stall_timeout_secs: u64,
+    /// Per-tenant data-plane keys as `(tenant_id, key)` pairs; each resolves
+    /// to its own tenant identity (`auth:<tenant_id>`) on top of `api_key`.
+    tenant_api_keys: Vec<(String, String)>,
+    tenant_api_keys_file: Option<String>,
+    tenant_header_name: String,
+    tenant_rate_limit_config: Option<String>,
+    tenant_rate_limit_enabled: bool,
+    tokenizer_cache_enable_l0: bool,
+    tokenizer_cache_enable_l1: bool,
+    tokenizer_cache_l0_max_entries: usize,
+    tokenizer_cache_l0_max_memory: usize,
+    tokenizer_cache_l1_max_memory: usize,
+    tokenizer_path: Option<String>,
+    tool_call_parser: Option<String>,
+    trust_tenant_header: bool,
+    upstream_http2: bool,
+    upstream_pool_idle_timeout_secs: u64,
+    webrtc_bind_addr: Option<String>,
+    webrtc_stun_server: Option<String>,
+    worker_overload_protection: bool,
+    worker_overload_shed: bool,
+    worker_overload_token_usage: Option<f64>,
+    worker_overload_waiting_requests: Option<usize>,
+    worker_ports_annotation: String,
+    worker_stale_secs: u64,
+    worker_stall_secs: u64,
+    worker_startup_check_interval: u64,
+    worker_startup_delay: u64,
+    worker_startup_timeout_secs: u64,
+    worker_warmup_blocks: usize,
+    worker_warmup_divert_every: u64,
+    worker_warmup_secs: u64,
+    worker_warmup_share: f32,
+    worker_warmup_thin_ratio: f32,
+    worker_wedge_secs: u64,
+    /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
+    zmq_engine_count: Option<usize>,
+    /// Seconds any one stage of a ZMQ engine's startup handshake may stay
+    /// silent; it alone covers the engine's init between HELLO and READY.
+    zmq_startup_timeout_secs: u64,
+    // Derived from the URL lists; not a parameter.
+    connection_mode: worker::ConnectionMode,
+}
+
+/// Read the keyword-only `discovery` mapping by the same rules as
+/// `RouterConfig.discovery`. It goes through JSON, so nested mappings and
+/// lists convert without a hand-written walker.
+fn parse_discovery(mapping: &Bound<'_, PyAny>) -> PyResult<Option<config::DiscoveryConfig>> {
+    let invalid = |e: serde_json::Error| {
+        pyo3::exceptions::PyValueError::new_err(format!("Invalid discovery mapping: {e}"))
+    };
+    let json: String = PyModule::import(mapping.py(), "json")?
+        .call_method1("dumps", (mapping,))?
+        .extract()?;
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(invalid)?;
+    config::deserialize_discovery(value).map_err(invalid)
 }
 
 impl Router {
@@ -550,15 +780,226 @@ impl Router {
             .unwrap_or(ConnectionMode::Http)
     }
 
+    /// The metrics bind host: `prometheus_host`, or the unspecified address
+    /// of `host`'s family when it is not given.
+    fn metrics_host(&self) -> String {
+        self.prometheus_host
+            .clone()
+            .unwrap_or_else(|| config::MetricsConfig::default_host_for(&self.host))
+    }
+
+    /// The mesh mTLS configuration from `mesh_tls_ca_cert`, `mesh_tls_cert`
+    /// and `mesh_tls_key`: all three or none, each a readable file.
+    fn mesh_mtls_config(&self) -> PyResult<Option<smg_mesh::MTLSConfig>> {
+        let (ca, cert, key) = match (
+            &self.mesh_tls_ca_cert,
+            &self.mesh_tls_cert,
+            &self.mesh_tls_key,
+        ) {
+            (None, None, None) => return Ok(None),
+            (Some(ca), Some(cert), Some(key)) => (ca, cert, key),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "mesh_tls_ca_cert, mesh_tls_cert and mesh_tls_key come together: give all \
+                     three or none",
+                ))
+            }
+        };
+        for (field, path) in [
+            ("mesh_tls_ca_cert", ca),
+            ("mesh_tls_cert", cert),
+            ("mesh_tls_key", key),
+        ] {
+            std::fs::metadata(path).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid value for {field}='{path}': cannot read the file: {e}"
+                ))
+            })?;
+        }
+        Ok(Some(smg_mesh::MTLSConfig {
+            ca_cert_path: ca.into(),
+            server_cert_path: cert.into(),
+            server_key_path: key.into(),
+            ..smg_mesh::MTLSConfig::default()
+        }))
+    }
+
+    /// The files the keys were read from, where a file was the source: the
+    /// targets of the key reload. A key given as a value came from the
+    /// launcher's flag or environment, which the binding does not see, so
+    /// it has no file.
+    fn secret_files(
+        api_key_file: Option<&str>,
+        tenant_api_keys_file: Option<&str>,
+        control_plane_api_keys_file: Option<&str>,
+    ) -> secrets::SecretFiles {
+        let path = |file: Option<&str>| file.map(std::path::PathBuf::from);
+        secrets::SecretFiles {
+            api_key: path(api_key_file),
+            tenant_api_keys: path(tenant_api_keys_file),
+            control_plane_api_keys: path(control_plane_api_keys_file),
+        }
+    }
+
+    /// The sources record: each file with the entries the binding read
+    /// from it; a key given as a value, or the selected history backend's
+    /// store URL, is the launcher's, from its flag or its environment, which
+    /// the binding does not tell apart; a secret neither given nor filed is
+    /// unnamed.
+    fn secret_sources(
+        files: &secrets::SecretFiles,
+        api_key_given: bool,
+        tenant_entries: usize,
+        control_plane_entries: usize,
+        postgres_db_url_given: bool,
+        redis_url_given: bool,
+    ) -> server::posture::SecretSources {
+        use smg::server::posture::SecretSource;
+        let source = |file: Option<&std::path::PathBuf>, given: bool| match (file, given) {
+            (Some(_), _) => Some(SecretSource::File),
+            (None, true) => Some(SecretSource::Launcher),
+            (None, false) => None,
+        };
+        server::posture::SecretSources {
+            api_key: source(files.api_key.as_ref(), api_key_given),
+            tenant_api_keys: source(files.tenant_api_keys.as_ref(), tenant_entries > 0)
+                .map(|source| (source, tenant_entries)),
+            control_plane_api_keys: source(
+                files.control_plane_api_keys.as_ref(),
+                control_plane_entries > 0,
+            )
+            .map(|source| (source, control_plane_entries)),
+            postgres_db_url: postgres_db_url_given.then_some(SecretSource::Launcher),
+            redis_url: redis_url_given.then_some(SecretSource::Launcher),
+        }
+    }
+
+    /// The keys a key file gives, read here as the CLI reads them: the
+    /// shared key as the one line of its file, the tenant and control-plane
+    /// keys as one entry per line (blank and `#` lines skipped), through the
+    /// gateway's readers and entry parsers. A value and a file for one key
+    /// are refused as given twice: ranking them would honour a stale secret
+    /// in silence. A refusal names the keywords, or the file's setting and
+    /// its path, never a value. The control-plane entries join the auth
+    /// config the launcher built, or one with its defaults when it built
+    /// none.
+    fn read_key_files(
+        api_key: Option<String>,
+        api_key_file: Option<&str>,
+        tenant_api_keys: Vec<(String, String)>,
+        tenant_api_keys_file: Option<&str>,
+        control_plane_auth: Option<PyControlPlaneAuthConfig>,
+        control_plane_api_keys_file: Option<&str>,
+    ) -> Result<KeysRead, String> {
+        use config::secrets::{
+            control_plane_api_key_parts, parse_tenant_api_key, API_KEY_FILE,
+            CONTROL_PLANE_API_KEYS_FILE, TENANT_API_KEYS_FILE,
+        };
+        let given_twice =
+            |value: &str, file: &str| format!("{value} and {file} are both given; give one source");
+        let api_key = match (api_key, api_key_file) {
+            (Some(_), Some(_)) => return Err(given_twice("api_key", "api_key_file")),
+            (None, Some(path)) => Some(
+                API_KEY_FILE
+                    .value(std::path::Path::new(path))
+                    .map_err(|error| error.to_string())?,
+            ),
+            (value, None) => value,
+        };
+        let tenant_api_keys = match (tenant_api_keys.is_empty(), tenant_api_keys_file) {
+            (false, Some(_)) => {
+                return Err(given_twice("tenant_api_keys", "tenant_api_keys_file"));
+            }
+            (true, Some(path)) => Self::key_file_entries(&TENANT_API_KEYS_FILE, path, |entry| {
+                parse_tenant_api_key(entry).map(|entry| (entry.tenant_id, entry.key))
+            })?,
+            (_, None) => tenant_api_keys,
+        };
+        let control_plane_auth = match (control_plane_auth, control_plane_api_keys_file) {
+            (Some(auth), Some(_)) if !auth.api_keys.is_empty() => {
+                return Err(given_twice(
+                    "control_plane_auth.api_keys",
+                    "control_plane_api_keys_file",
+                ));
+            }
+            (auth, Some(path)) => {
+                let api_keys =
+                    Self::key_file_entries(&CONTROL_PLANE_API_KEYS_FILE, path, |entry| {
+                        control_plane_api_key_parts(entry).map(|parts| PyApiKeyEntry {
+                            id: parts.id.to_string(),
+                            name: parts.name.to_string(),
+                            key: parts.key.to_string(),
+                            role: PyRole::from_auth_role(parts.role),
+                        })
+                    })?;
+                Some(PyControlPlaneAuthConfig {
+                    api_keys,
+                    ..auth.unwrap_or_default()
+                })
+            }
+            (auth, None) => auth,
+        };
+        Ok(KeysRead {
+            api_key,
+            tenant_api_keys,
+            control_plane_auth,
+        })
+    }
+
+    /// The entries of a key file, each read by `parse`; a bad entry is
+    /// refused under the file's setting and path, as a reload refuses it.
+    fn key_file_entries<T>(
+        file: &config::secrets::SecretFile,
+        path: &str,
+        parse: impl Fn(&str) -> config::ConfigResult<T>,
+    ) -> Result<Vec<T>, String> {
+        let path = std::path::Path::new(path);
+        file.entries(path)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|entry| {
+                parse(entry).map_err(|error| {
+                    file.bad_file(path, &secrets::entry_refusal(error))
+                        .to_string()
+                })
+            })
+            .collect()
+    }
+
+    /// The join peers of `mesh_peer_urls`, each an `ip:port`. The binary's
+    /// flag takes the entries space- or comma-separated (clap splits the
+    /// list); the Python launcher hands each argument through as typed, so
+    /// the comma list is split here for both. An empty entry (an empty
+    /// string, a trailing comma) is refused like any other bad one: dropped
+    /// in silence, it would leave the gateway outside the mesh it was
+    /// configured to join. The error is the message the binding raises as a
+    /// `ValueError`: a plain string, so the unit test needs no interpreter
+    /// (the extension module's test binary links none).
+    fn parse_mesh_peer_urls(entries: &[String]) -> Result<Vec<std::net::SocketAddr>, String> {
+        entries
+            .iter()
+            .flat_map(|entry| entry.split(','))
+            .map(|url| {
+                if url.trim().is_empty() {
+                    return Err(String::from(
+                        "Invalid mesh peer URL '': an entry of mesh_peer_urls is empty; \
+                         every entry is an ip:port",
+                    ));
+                }
+                url.parse::<std::net::SocketAddr>()
+                    .map_err(|e| format!("Invalid mesh peer URL '{url}': {e}"))
+            })
+            .collect()
+    }
+
     fn parse_mesh_socket_addr(
         host: &str,
         port: u16,
         field: &str,
     ) -> PyResult<std::net::SocketAddr> {
-        let addr = format!("{host}:{port}");
-        addr.parse::<std::net::SocketAddr>().map_err(|e| {
+        config::bind_socket_addr(host, port).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
-                "Invalid value for {field}='{host}': invalid mesh socket address '{addr}': {e}"
+                "Invalid value for {field}='{host}': invalid mesh socket address: {e}"
             ))
         })
     }
@@ -573,6 +1014,32 @@ impl Router {
                 reason: "expected 'tree' or 'hash'".to_string(),
             }),
         }
+    }
+
+    /// The pairing rule by its CLI spelling (`off`, `lenient`, `strict`; any
+    /// case, trimmed); anything else is refused by name, as the CLI's choices
+    /// refuse it.
+    fn parse_pd_pairing_mode(&self) -> Result<config::PdPairingMode, config::ConfigError> {
+        config::PdPairingMode::parse(&self.pd_pairing_mode).ok_or_else(|| {
+            config::ConfigError::InvalidValue {
+                field: "pd_pairing_mode".to_string(),
+                value: self.pd_pairing_mode.clone(),
+                reason: "expected 'off', 'lenient', or 'strict'".to_string(),
+            }
+        })
+    }
+
+    /// The deciding implementation by its CLI spelling (`legacy`, `engine`;
+    /// any case, trimmed); anything else is refused by name, as the CLI's
+    /// choices refuse it.
+    fn parse_policy_engine(&self) -> Result<config::PolicyEngineMode, config::ConfigError> {
+        config::PolicyEngineMode::parse(&self.policy_engine).ok_or_else(|| {
+            config::ConfigError::InvalidValue {
+                field: "policy_engine".to_string(),
+                value: self.policy_engine.clone(),
+                reason: "expected 'legacy' or 'engine'".to_string(),
+            }
+        })
     }
 
     fn parse_assignment_mode(
@@ -595,9 +1062,33 @@ impl Router {
         }
     }
 
+    /// Build optional per-role readiness thresholds from Python arguments.
+    fn pd_readiness_config(&self) -> Option<config::PdReadinessConfig> {
+        let configured = self.prefill_expected_workers.is_some()
+            || self.prefill_min_ready_workers.is_some()
+            || self.prefill_min_ready_percent.is_some()
+            || self.decode_min_ready_workers.is_some()
+            || self.decode_expected_workers.is_some()
+            || self.decode_min_ready_percent.is_some();
+        configured.then(|| config::PdReadinessConfig {
+            prefill: config::ReadinessRoleConfig {
+                expected_workers: self.prefill_expected_workers,
+                min_healthy_workers: self.prefill_min_ready_workers.unwrap_or(1),
+                min_healthy_percent: self.prefill_min_ready_percent,
+            },
+            decode: config::ReadinessRoleConfig {
+                expected_workers: self.decode_expected_workers,
+                min_healthy_workers: self.decode_min_ready_workers.unwrap_or(1),
+                min_healthy_percent: self.decode_min_ready_percent,
+            },
+        })
+    }
+
+    /// Convert Python settings through the shared validating configuration builder.
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
-            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
+            DiscoveryConfig, KubernetesDiscoveryConfig, MetricsConfig,
+            PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
 
         // Validate the transport mode up front. The CLI (value_parser) and the
@@ -616,6 +1107,58 @@ impl Router {
                 })
             })
             .transpose()?;
+        let mm_processing = self
+            .mm_processing
+            .as_deref()
+            .map(|value| {
+                config::MmProcessingMode::parse(value).ok_or_else(|| {
+                    config::ConfigError::InvalidValue {
+                        field: "mm_processing".to_string(),
+                        value: value.to_string(),
+                        reason: "expected 'auto', 'router', or 'worker'".to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+        let mm_turbojpeg = self
+            .mm_turbojpeg
+            .as_deref()
+            .map(|value| {
+                config::TurboJpegPolicy::parse(value).ok_or_else(|| {
+                    config::ConfigError::InvalidValue {
+                        field: "mm_turbojpeg".to_string(),
+                        value: value.to_string(),
+                        reason: "expected 'prefer' or 'require'".to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+
+        // The access-log fields by name, each spelled as the record keys it.
+        let access_log_fields = self
+            .access_log_fields
+            .iter()
+            .map(|name| {
+                name.parse::<config::AccessLogField>().map_err(|reason| {
+                    config::ConfigError::InvalidValue {
+                        field: "access_log_fields".to_string(),
+                        value: name.clone(),
+                        reason,
+                    }
+                })
+            })
+            .collect::<config::ConfigResult<Vec<_>>>()?;
+
+        let power_of_two_load_metric = config::PowerOfTwoLoadMetric::parse(
+            &self.power_of_two_load_metric,
+        )
+        .ok_or_else(|| config::ConfigError::InvalidValue {
+            field: "power_of_two_load_metric".to_string(),
+            value: self.power_of_two_load_metric.clone(),
+            reason: "expected expected_wait, requests, least_requests or \
+                     resident_tokens:<request_tokens>"
+                .to_string(),
+        })?;
 
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
             Ok(match policy {
@@ -636,16 +1179,19 @@ impl Router {
                     cache_index: self.parse_cache_index()?,
                     cache_ttl_secs: self.cache_ttl_secs,
                     cache_boundaries: self.cache_boundaries.clone(),
+                    selection_policy: (self.selection_policy != policies::cost::DEFAULT_POLICY)
+                        .then(|| self.selection_policy.clone()),
+                    selection_accounting_ttl_ms: self.selection_accounting_ttl_ms,
+                    balance_prefix_margin_tokens: self.balance_prefix_margin_tokens,
+                    balance_uncached_credit: self.balance_uncached_credit,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: self.load_monitor_interval,
+                    load_metric: power_of_two_load_metric,
                 },
                 PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
-                    load_check_interval_secs: self.load_monitor_interval,
                     kv_pressure_weight: self.least_load_kv_pressure_weight,
                     mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                     default_throughput: self.least_load_default_throughput,
-                    max_waiting_requests: self.least_load_max_waiting_requests,
                 },
                 PolicyType::Bucket => ConfigPolicyConfig::Bucket {
                     balance_abs_threshold: self.balance_abs_threshold,
@@ -668,26 +1214,34 @@ impl Router {
             })
         };
 
-        // IGW does not override backend or disaggregated modes; IGW-only keeps
-        // the Python binding's existing empty startup-worker behavior.
-        let mode = if matches!(self.backend, BackendType::Openai) {
-            RoutingMode::OpenAI {
-                worker_urls: self.worker_urls.clone(),
-            }
-        } else if matches!(self.backend, BackendType::Anthropic) {
-            RoutingMode::Anthropic {
-                worker_urls: self.worker_urls.clone(),
-            }
+        // The encode side takes the three policies the CLI's `--encode-policy`
+        // takes; the shared validator holds the one list and reads the encode
+        // policy in EPD mode. It is asked here before anything binds, for an
+        // encode policy given outside EPD as well. Converted once: the EPD branch
+        // below takes this value.
+        let encode_policy = self
+            .encode_policy
+            .as_ref()
+            .map(convert_policy)
+            .transpose()?;
+        if let Some(policy) = &encode_policy {
+            config::validate_encode_policy(policy)?;
+        }
+
+        // IGW selects routers per request; it does not change which configured
+        // workers are registered at startup, or override backend/disaggregated modes.
+        let provider = self
+            .backend
+            .as_ref()
+            .and_then(|backend| backend.provider_mode(&self.worker_urls));
+        let mode = if let Some(provider) = provider {
+            provider
         } else if self.epd_disaggregation {
             RoutingMode::EncodePrefillDecode {
                 encode_urls: self.encode_urls.clone().unwrap_or_default(),
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
                 decode_urls: self.decode_urls.clone().unwrap_or_default(),
-                encode_policy: self
-                    .encode_policy
-                    .as_ref()
-                    .map(convert_policy)
-                    .transpose()?,
+                encode_policy,
                 prefill_policy: self
                     .prefill_policy
                     .as_ref()
@@ -716,22 +1270,19 @@ impl Router {
             }
         } else {
             RoutingMode::Regular {
-                worker_urls: if self.enable_igw {
-                    vec![]
-                } else {
-                    self.worker_urls.clone()
-                },
+                worker_urls: self.worker_urls.clone(),
             }
         };
 
         let policy = convert_policy(&self.policy)?;
 
         let discovery = if self.service_discovery {
-            Some(DiscoveryConfig {
-                enabled: true,
+            Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
                 namespace: self.service_discovery_namespace.clone(),
                 port: self.service_discovery_port,
-                check_interval_secs: 60,
+                check_interval_secs: self
+                    .discovery_check_interval_secs
+                    .unwrap_or(config::DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS),
                 selector: self.selector.clone(),
                 encode_selector: self.encode_selector.clone(),
                 prefill_selector: self.prefill_selector.clone(),
@@ -743,24 +1294,31 @@ impl Router {
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: self.model_id_from.clone(),
-            })
+            }))
         } else {
-            None
+            self.discovery.clone()
         };
 
-        let metrics = match (self.prometheus_port, self.prometheus_host.as_ref()) {
-            (Some(port), Some(host)) => Some(MetricsConfig {
-                port,
-                host: host.clone(),
-            }),
-            _ => None,
-        };
+        // The metrics listener `start` creates: its port when unset is the
+        // exporter's default, so the validator's port checks (the admin,
+        // probe and data ports against it) see the listener that will bind.
+        let metrics = Some(MetricsConfig {
+            port: self.prometheus_port.unwrap_or(29000),
+            host: self.metrics_host(),
+        });
 
         let trace_config = Some(config::TraceConfig {
             enable_trace: self.enable_trace,
             otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
         });
 
+        let parser = config::ParserChoice::parse(&self.parser).ok_or_else(|| {
+            config::ConfigError::InvalidValue {
+                field: "parser".to_string(),
+                value: self.parser.clone(),
+                reason: "expected legacy or symphony".to_string(),
+            }
+        })?;
         let history_backend = match self.history_backend {
             HistoryBackendType::Memory => config::HistoryBackend::Memory,
             HistoryBackendType::None => config::HistoryBackend::None,
@@ -816,21 +1374,21 @@ impl Router {
             None
         };
 
-        // `backend` normally only steers the routing mode. Over ZMQ it
-        // additionally pins the startup workers' runtime: the shared EngineCore
-        // handshake carries no engine identity, so the wire protocol cannot be
-        // probed. HTTP/gRPC keep auto-detection (None). Mirrors
-        // `to_router_config` in model_gateway/src/main.rs.
+        // `backend` normally only steers the routing mode. Over ZMQ an engine
+        // backend additionally pins the startup workers' runtime. HTTP/gRPC,
+        // and ZMQ without a backend, keep auto-detection (None). Mirrors
+        // `to_router_config` in model_gateway/src/cli/configure.rs.
         let startup_worker_runtime_type =
             if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
-                match self.backend {
-                    BackendType::Vllm => Some(worker::RuntimeType::Vllm),
-                    BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
-                    _ => None,
-                }
+                self.backend
+                    .as_ref()
+                    .and_then(BackendType::startup_worker_runtime)
             } else {
                 None
             };
+
+        let pd_pairing_mode = self.parse_pd_pairing_mode()?;
+        let policy_engine = self.parse_policy_engine()?;
 
         config::RouterConfig::builder()
             .mode(mode)
@@ -839,11 +1397,16 @@ impl Router {
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
+            .pd_readiness(self.pd_readiness_config())
+            .admin_port(self.admin_port)
+            .admin_host(self.admin_host.clone())
             .connection_mode(self.connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.zmq_engine_count)
+            .zmq_startup_timeout_secs(self.zmq_startup_timeout_secs)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
+            .grpc_request_timeout_secs(self.grpc_request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
@@ -852,12 +1415,32 @@ impl Router {
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
             .worker_overload_token_usage(self.worker_overload_token_usage)
             .worker_overload_protection(self.worker_overload_protection)
+            .worker_overload_shed(self.worker_overload_shed)
+            .worker_stall_secs(self.worker_stall_secs)
+            .worker_wedge_secs(self.worker_wedge_secs)
+            .worker_stale_secs(self.worker_stale_secs)
+            .worker_warmup(
+                self.worker_warmup_secs,
+                self.worker_warmup_share,
+                self.worker_warmup_blocks,
+                self.worker_warmup_thin_ratio,
+                self.worker_warmup_divert_every,
+            )
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .priority_scheduler_enabled(self.priority_scheduler_enabled)
+            .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
+            .priority_scheduler_config(self.priority_scheduler_config.clone())
+            .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
+            .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
+            .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
+            .prefill_max_inflight_requests_per_worker(self.prefill_max_inflight_requests_per_worker)
+            .prefill_queue_size(self.prefill_queue_size)
+            .prefill_queue_timeout_secs(self.prefill_queue_timeout_secs)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -879,27 +1462,42 @@ impl Router {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
                 disable_health_check: self.disable_health_check,
-                // Explicit setting wins; otherwise recovery-by-removal follows
-                // service discovery, which is what re-adds a removed worker.
-                remove_unhealthy_workers: config::resolve_worker_auto_recovery(
-                    self.remove_unhealthy_workers,
-                    self.service_discovery,
-                ),
+                // Kept unresolved: the server resolves it against the
+                // discovery the configuration selects.
+                remove_unhealthy_workers: self.remove_unhealthy_workers,
                 drain_settle_secs: self.drain_settle_secs,
             })
             .tokenizer_cache(config::TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
                 l0_max_entries: self.tokenizer_cache_l0_max_entries,
+                l0_max_memory: self.tokenizer_cache_l0_max_memory,
                 enable_l1: self.tokenizer_cache_enable_l1,
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
+            .parser(parser)
             .history_backend(history_backend)
+            .memory_config(config::MemoryConfig {
+                max_responses: self.history_memory_max_responses,
+                max_items: self.history_memory_max_items,
+                retention_secs: (self.history_memory_retention_secs > 0)
+                    .then_some(self.history_memory_retention_secs),
+            })
             .maybe_api_key(self.api_key.as_ref())
+            .tenant_api_keys(
+                self.tenant_api_keys
+                    .iter()
+                    .map(|(tenant_id, key)| config::TenantApiKeyEntry {
+                        tenant_id: tenant_id.clone(),
+                        key: key.clone(),
+                    })
+                    .collect(),
+            )
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
             .maybe_log_dir(self.log_dir.as_ref())
+            .maybe_jemalloc_prof_dir(self.jemalloc_prof_dir.as_ref())
             .maybe_log_level(self.log_level.as_ref())
             .maybe_request_id_headers(self.request_id_headers.clone())
             .trust_tenant_header(self.trust_tenant_header)
@@ -909,6 +1507,8 @@ impl Router {
                     .then(|| self.storage_context_headers.clone()),
             )
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .max_background_responses(self.max_background_responses)
+            .sse_keepalive_secs(self.sse_keepalive_secs)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -922,13 +1522,34 @@ impl Router {
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
+            .engine_metrics(self.engine_metrics)
+            .pd_pairing_mode(pd_pairing_mode)
+            .policy_engine(policy_engine)
+            .runtime_worker_threads(self.runtime_worker_threads)
             .upstream_http2(self.upstream_http2)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .max_buffered_request_bytes(self.max_buffered_request_bytes)
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
+            .header_read_timeout_secs(self.header_read_timeout_secs)
+            .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
+            .max_connections(self.max_connections)
+            .admin_max_connections(self.admin_max_connections)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
             .mm_per_request_image_limit(self.mm_per_request_image_limit)
+            .mm_processing(mm_processing)
+            .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
+            .mm_pixel_rdma(self.mm_pixel_rdma)
+            .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
+            .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
+            .mm_turbojpeg(mm_turbojpeg)
+            .mm_video_fetch_timeout_ms(self.mm_video_fetch_timeout_ms)
+            .mm_fetch_timeout_ms(self.mm_fetch_timeout_ms)
+            .rdma_listen_ip(self.rdma_listen_ip.clone())
+            .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
+            .log_mm_timing(self.log_mm_timing)
+            .access_log_fields(access_log_fields)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -964,319 +1585,492 @@ impl Router {
     #[new]
     #[pyo3(signature = (
         worker_urls,
-        policy = PolicyType::RoundRobin,
+        policy = PolicyType::CacheAware,
         host = String::from("0.0.0.0"),
-        port = 3001,
-        worker_startup_timeout_secs = 600,
-        worker_startup_check_interval = 30,
-        load_monitor_interval = 10,
-        cache_threshold = 0.3,
-        balance_abs_threshold = 64,
-        balance_rel_threshold = 1.5,
-        eviction_interval_secs = 120,
-        max_tree_size = 2usize.pow(26),
-        block_size = 16,
-        balance_token_usage_threshold = 1.0,
-        overload_token_usage_threshold = 1.0,
-        least_load_kv_pressure_weight = 0.15,
-        least_load_default_throughput = 2000.0,
-        least_load_mean_prefill_tokens = 1024,
-        max_idle_secs = 14400,
-        assignment_mode = None,
-        max_payload_size = 512 * 1024 * 1024,
-        dp_aware = false,
-        dp_minimum_tokens_scheduler = false,
+        port = 30000,
+        // Every other parameter is keyword-only, in alphabetical order (the struct's
+        // note says where a new one goes).
+        *,
+        access_log_fields = vec![],
+        admin_host = None,
+        admin_max_connections = 0,
+        admin_port = None,
         api_key = None,
-        log_dir = None,
-        log_level = None,
-        log_json = false,
-        service_discovery = false,
-        selector = HashMap::new(),
-        service_discovery_port = 80,
-        service_discovery_namespace = None,
-        prefill_selector = HashMap::new(),
-        decode_selector = HashMap::new(),
-        router_selector = HashMap::new(),
+        api_key_file = None,
+        assignment_mode = None,
+        backend = None,
+        balance_abs_threshold = 64,
+        balance_prefix_margin_tokens = 0,
+        balance_rel_threshold = 1.5,
+        balance_token_usage_threshold = 1.0,
+        balance_uncached_credit = false,
+        block_size = 16,
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
-        model_id_from = None,
-        prometheus_port = None,
-        prometheus_host = None,
-        prometheus_duration_buckets = None,
-        request_timeout_secs = 1800,
-        shutdown_grace_period_secs = 180,
-        request_id_headers = None,
-        trust_tenant_header = false,
-        tenant_header_name = String::from("x-smg-tenant-id"),
-        storage_context_headers = HashMap::new(),
-        pd_disaggregation = false,
         bucket_adjust_interval_secs = 5,
-        prefill_urls = None,
-        decode_urls = None,
-        prefill_policy = None,
-        decode_policy = None,
-        max_concurrent_requests = -1,
-        cors_allowed_origins = vec![],
-        retry_max_retries = 5,
-        retry_initial_backoff_ms = 50,
-        retry_max_backoff_ms = 30_000,
-        retry_backoff_multiplier = 1.5,
-        retry_jitter_factor = 0.2,
-        disable_retries = false,
+        ca_cert_paths = vec![],
+        cache_boundaries = vec![],
+        cache_index = String::from("tree"),
+        cache_threshold = 0.3,
+        cache_ttl_secs = 180,
         cb_failure_threshold = 10,
         cb_success_threshold = 3,
         cb_timeout_duration_secs = 60,
         cb_window_duration_secs = 120,
+        chat_template = None,
+        client_cert_path = None,
+        client_key_path = None,
+        control_plane_api_keys_file = None,
+        control_plane_auth = None,
+        cors_allowed_origins = vec![],
+        decode_expected_workers = None,
+        decode_min_ready_percent = None,
+        decode_min_ready_workers = None,
+        decode_policy = None,
+        decode_selector = HashMap::new(),
+        decode_urls = None,
         disable_circuit_breaker = false,
+        disable_health_check = false,
+        disable_load_monitoring = false,
+        disable_retries = false,
+        disable_tokenizer_autoload = false,
+        discovery = None,
+        discovery_check_interval_secs = None,
+        dp_aware = false,
+        dp_minimum_tokens_scheduler = false,
+        drain_settle_secs = 5,
+        enable_igw = false,
+        enable_mesh = false,
+        enable_rl = false,
+        enable_trace = false,
+        enable_wasm = false,
+        encode_policy = None,
+        encode_selector = HashMap::new(),
+        encode_urls = None,
+        engine_metrics = false,
+        epd_disaggregation = false,
+        eviction_interval_secs = 120,
+        grpc_request_timeout_secs = 0,
+        header_read_timeout_secs = 30,
+        health_check_endpoint = String::from("/health"),
+        health_check_interval_secs = 60,
+        health_check_port = None,
+        health_check_timeout_secs = 5,
         health_failure_threshold = 3,
         health_success_threshold = 2,
-        health_check_timeout_secs = 5,
-        health_check_interval_secs = 60,
-        health_check_endpoint = String::from("/health"),
-        disable_health_check = false,
-        remove_unhealthy_workers = None,
-        enable_igw = false,
+        history_backend = HistoryBackendType::Memory,
+        history_memory_max_items = 100000,
+        history_memory_max_responses = 10000,
+        history_memory_retention_secs = 86400,
+        idle_connection_timeout_secs = 90,
+        jemalloc_prof_dir = None,
+        job_queue_capacity = 1000,
+        job_queue_concurrency = 200,
+        kv_connector_annotation = String::from("smg.ai/kv-connector"),
+        kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
+        least_load_default_throughput = 2000.0,
+        least_load_kv_pressure_weight = 0.15,
+        least_load_mean_prefill_tokens = 1024,
+        load_monitor_interval = 10,
+        log_dir = None,
+        log_json = false,
+        log_level = None,
+        log_mm_timing = false,
+        max_background_responses = 1024,
+        max_buffered_request_bytes = 1_048_576,
+        max_concurrent_requests = -1,
+        max_connections = 0,
+        max_idle_secs = 14400,
+        max_payload_size = 512 * 1024 * 1024,
+        max_tree_size = 2usize.pow(26),
+        mcp_config_path = None,
+        mesh_advertise_host = None,
+        mesh_host = String::from("0.0.0.0"),
+        mesh_peer_urls = vec![],
+        mesh_port = 39527u16,
+        mesh_server_name = None,
+        mesh_tls_ca_cert = None,
+        mesh_tls_cert = None,
+        mesh_tls_key = None,
+        mm_allow_private_media_hosts = false,
+        mm_allowed_media_domains = None,
+        mm_fetch_timeout_ms = None,
+        mm_per_request_image_limit = None,
+        mm_pixel_cache_mb = None,
+        mm_pixel_rdma = false,
+        mm_processing = None,
+        mm_turbojpeg = None,
+        mm_video_fetch_timeout_ms = None,
+        model_aliases = HashMap::new(),
+        model_id_from = None,
+        model_path = None,
+        multimodal_max_inflight_bytes = None,
+        multimodal_shm_min_bytes = None,
+        multimodal_tensor_transport = None,
+        oracle_config = None,
+        otlp_traces_endpoint = String::from("localhost:4317"),
+        overlap_decay = 0.0,
+        overload_token_usage_threshold = 1.0,
+        parser = String::from("symphony"),
+        pd_admission_wait_secs = 30,
+        pd_disaggregation = false,
+        pd_pairing_mode = String::from("lenient"),
+        policy_engine = String::from("legacy"),
+        postgres_config = None,
+        power_of_two_load_metric = String::from("expected_wait"),
+        prefill_expected_workers = None,
+        prefill_max_inflight_requests_per_worker = -1,
+        prefill_min_ready_percent = None,
+        prefill_min_ready_workers = None,
+        prefill_policy = None,
+        prefill_queue_size = None,
+        prefill_queue_timeout_secs = None,
+        prefill_selector = HashMap::new(),
+        prefill_urls = None,
+        prefix_hash_balance_abs_threshold = 10,
+        prefix_hash_load_factor = 1.25,
+        prefix_token_count = 256,
+        priority_scheduler_config = None,
+        priority_scheduler_default_max_class = String::from("default"),
+        priority_scheduler_enabled = false,
+        priority_scheduler_tenant_metric_top_n = 32,
+        prometheus_duration_buckets = None,
+        prometheus_host = None,
+        prometheus_port = None,
         queue_size = 100,
         queue_timeout_secs = 60,
         rate_limit_tokens_per_second = None,
-        model_path = None,
-        tokenizer_path = None,
-        chat_template = None,
-        tokenizer_cache_enable_l0 = false,
-        tokenizer_cache_l0_max_entries = 10000,
-        tokenizer_cache_enable_l1 = false,
-        tokenizer_cache_l1_max_memory = 52428800,
+        rdma_listen_ip = None,
+        rdma_slot_ttl_s = None,
         reasoning_parser = None,
-        tool_call_parser = None,
-        mcp_config_path = None,
-        storage_hook_wasm_path = None,
-        backend = BackendType::Sglang,
-        history_backend = HistoryBackendType::Memory,
-        oracle_config = None,
-        postgres_config = None,
         redis_config = None,
-        client_cert_path = None,
-        client_key_path = None,
-        ca_cert_paths = vec![],
-        server_cert_path = None,
-        server_key_path = None,
-        enable_trace = false,
-        otlp_traces_endpoint = String::from("localhost:4317"),
-        control_plane_auth = None,
-        schema_config = None,
-        disable_tokenizer_autoload = false,
-        enable_mesh = false,
-        mesh_server_name = None,
-        mesh_host = String::from("0.0.0.0"),
-        mesh_port = 39527u16,
-        mesh_peer_urls = vec![],
-        mesh_advertise_host = None,
-        drain_settle_secs = 5,
-        enable_wasm = false,
-        // Appended last (not inserted mid-list) so every pre-existing
-        // positional argument keeps its index for callers that construct
-        // `_Router(...)` positionally. See the struct-field note above.
-        health_check_port = None,
-        routing_key_override = false,
-        encode_selector = HashMap::new(),
-        epd_disaggregation = false,
-        encode_urls = None,
-        encode_policy = None,
-        multimodal_tensor_transport = None,
-        multimodal_shm_min_bytes = None,
-        model_aliases = HashMap::new(),
-        worker_startup_delay = 0,
-        worker_ports_annotation = String::from("smg.ai/worker-ports"),
-        zmq_engine_count = None,
-        prefix_token_count = 256,
-        prefix_hash_load_factor = 1.25,
-        prefix_hash_balance_abs_threshold = 10,
-        upstream_http2 = false,
-        overlap_decay = 0.0,
-        selection_temperature = 0.0,
-        upstream_pool_idle_timeout_secs = 3,
-        least_load_max_waiting_requests = 0,
-        stream_body_stall_timeout_secs = 300,
-        routing_key_headers = vec![String::from("x-smg-routing-key")],
-        cache_boundaries = vec![],
-        cache_index = String::from("tree"),
-        cache_ttl_secs = 180,
-        job_queue_capacity = 1000,
-        job_queue_concurrency = 200,
-        worker_overload_waiting_requests = None,
-        worker_overload_token_usage = None,
-        worker_overload_protection = false,
-        disable_load_monitoring = false,
-        max_buffered_request_bytes = 1_048_576,
-        kv_connector_annotation = String::from("smg.ai/kv-connector"),
-        kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
-        mm_per_request_image_limit = None,
-        pd_admission_wait_secs = 30,
-        // Appended last (not inserted mid-list) so every pre-existing
-        // positional argument keeps its index for callers that construct
-        // `_Router(...)` positionally. See the struct-field note above.
-        enable_rl = false,
+        remove_unhealthy_workers = None,
+        request_id_headers = None,
+        request_timeout_secs = 1800,
+        retry_backoff_multiplier = 1.5,
+        retry_initial_backoff_ms = 50,
+        retry_jitter_factor = 0.2,
+        retry_max_backoff_ms = 30_000,
+        retry_max_retries = 5,
         rl_control_timeout_secs = 600,
         rl_fanout_concurrency = 32,
+        router_selector = HashMap::new(),
+        routing_key_headers = vec![String::from("x-smg-routing-key")],
+        routing_key_override = false,
+        runtime_worker_threads = None,
+        schema_config = None,
+        secrets_auto_reload = false,
+        selection_accounting_ttl_ms = 0,
+        selection_policy = String::from("cache-aware-default"),
+        selection_temperature = 0.0,
+        selector = HashMap::new(),
+        server_cert_path = None,
+        server_key_path = None,
+        service_discovery = false,
+        service_discovery_namespace = None,
+        service_discovery_port = 80,
+        shutdown_grace_period_secs = 180,
+        shutdown_settle_secs = None,
+        sse_keepalive_secs = 15,
+        storage_context_headers = HashMap::new(),
+        storage_hook_wasm_path = None,
+        stream_body_stall_timeout_secs = 300,
+        tenant_api_keys = vec![],
+        tenant_api_keys_file = None,
+        tenant_header_name = String::from("x-smg-tenant-id"),
+        tenant_rate_limit_config = None,
+        tenant_rate_limit_enabled = false,
+        tokenizer_cache_enable_l0 = false,
+        tokenizer_cache_enable_l1 = false,
+        tokenizer_cache_l0_max_entries = 10000,
+        tokenizer_cache_l0_max_memory = 268435456,
+        tokenizer_cache_l1_max_memory = 52428800,
+        tokenizer_path = None,
+        tool_call_parser = None,
+        trust_tenant_header = false,
+        upstream_http2 = false,
+        upstream_pool_idle_timeout_secs = 3,
+        webrtc_bind_addr = None,
+        webrtc_stun_server = None,
+        worker_overload_protection = true,
+        worker_overload_shed = false,
+        worker_overload_token_usage = Some(0.8),
+        worker_overload_waiting_requests = Some(8),
+        worker_ports_annotation = String::from("smg.ai/worker-ports"),
+        worker_stale_secs = 15,
+        worker_stall_secs = 2,
+        worker_startup_check_interval = 30,
+        worker_startup_delay = 0,
+        worker_startup_timeout_secs = 1800,
+        worker_warmup_blocks = 1024,
+        worker_warmup_divert_every = 8,
+        worker_warmup_secs = 60,
+        worker_warmup_share = 0.25,
+        worker_warmup_thin_ratio = 0.5,
+        worker_wedge_secs = 3,
+        zmq_engine_count = None,
+        zmq_startup_timeout_secs = 3600,
     ))]
     #[expect(clippy::too_many_arguments)]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "PyO3 #[new] method signature requires PyResult"
-    )]
+    /// Store launcher settings; configuration validation runs before the server starts.
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
         host: String,
         port: u16,
-        worker_startup_timeout_secs: u64,
-        worker_startup_check_interval: u64,
-        load_monitor_interval: u64,
-        cache_threshold: f32,
-        balance_abs_threshold: usize,
-        balance_rel_threshold: f32,
-        eviction_interval_secs: u64,
-        max_tree_size: usize,
-        block_size: usize,
-        balance_token_usage_threshold: f32,
-        overload_token_usage_threshold: f32,
-        least_load_kv_pressure_weight: f64,
-        least_load_default_throughput: f64,
-        least_load_mean_prefill_tokens: u32,
-        max_idle_secs: u64,
-        assignment_mode: Option<String>,
-        max_payload_size: usize,
-        dp_aware: bool,
-        dp_minimum_tokens_scheduler: bool,
+        // Keyword-only, in the signature's order (pyo3 wants the two orders to agree).
+        access_log_fields: Vec<String>,
+        admin_host: Option<String>,
+        admin_max_connections: usize,
+        admin_port: Option<u16>,
         api_key: Option<String>,
-        log_dir: Option<String>,
-        log_level: Option<String>,
-        log_json: bool,
-        service_discovery: bool,
-        selector: HashMap<String, String>,
-        service_discovery_port: u16,
-        service_discovery_namespace: Option<String>,
-        prefill_selector: HashMap<String, String>,
-        decode_selector: HashMap<String, String>,
-        router_selector: HashMap<String, String>,
+        api_key_file: Option<String>,
+        assignment_mode: Option<String>,
+        backend: Option<BackendType>,
+        balance_abs_threshold: usize,
+        balance_prefix_margin_tokens: u32,
+        balance_rel_threshold: f32,
+        balance_token_usage_threshold: f32,
+        balance_uncached_credit: bool,
+        block_size: usize,
         bootstrap_port_annotation: String,
-        model_id_from: Option<String>,
-        prometheus_port: Option<u16>,
-        prometheus_host: Option<String>,
-        prometheus_duration_buckets: Option<Vec<f64>>,
-        request_timeout_secs: u64,
-        shutdown_grace_period_secs: u64,
-        request_id_headers: Option<Vec<String>>,
-        trust_tenant_header: bool,
-        tenant_header_name: String,
-        storage_context_headers: HashMap<String, String>,
-        pd_disaggregation: bool,
         bucket_adjust_interval_secs: usize,
-        prefill_urls: Option<Vec<(String, Option<u16>)>>,
-        decode_urls: Option<Vec<String>>,
-        prefill_policy: Option<PolicyType>,
-        decode_policy: Option<PolicyType>,
-        max_concurrent_requests: i32,
-        cors_allowed_origins: Vec<String>,
-        retry_max_retries: u32,
-        retry_initial_backoff_ms: u64,
-        retry_max_backoff_ms: u64,
-        retry_backoff_multiplier: f32,
-        retry_jitter_factor: f32,
-        disable_retries: bool,
+        ca_cert_paths: Vec<String>,
+        cache_boundaries: Vec<usize>,
+        cache_index: String,
+        cache_threshold: f32,
+        cache_ttl_secs: u64,
         cb_failure_threshold: u32,
         cb_success_threshold: u32,
         cb_timeout_duration_secs: u64,
         cb_window_duration_secs: u64,
+        chat_template: Option<String>,
+        client_cert_path: Option<String>,
+        client_key_path: Option<String>,
+        control_plane_api_keys_file: Option<String>,
+        control_plane_auth: Option<PyControlPlaneAuthConfig>,
+        cors_allowed_origins: Vec<String>,
+        decode_expected_workers: Option<usize>,
+        decode_min_ready_percent: Option<u8>,
+        decode_min_ready_workers: Option<usize>,
+        decode_policy: Option<PolicyType>,
+        decode_selector: HashMap<String, String>,
+        decode_urls: Option<Vec<String>>,
         disable_circuit_breaker: bool,
+        disable_health_check: bool,
+        disable_load_monitoring: bool,
+        disable_retries: bool,
+        disable_tokenizer_autoload: bool,
+        discovery: Option<Bound<'_, PyAny>>,
+        discovery_check_interval_secs: Option<u64>,
+        dp_aware: bool,
+        dp_minimum_tokens_scheduler: bool,
+        drain_settle_secs: u64,
+        enable_igw: bool,
+        enable_mesh: bool,
+        enable_rl: bool,
+        enable_trace: bool,
+        enable_wasm: bool,
+        encode_policy: Option<PolicyType>,
+        encode_selector: HashMap<String, String>,
+        encode_urls: Option<Vec<(String, Option<u16>)>>,
+        engine_metrics: bool,
+        epd_disaggregation: bool,
+        eviction_interval_secs: u64,
+        grpc_request_timeout_secs: u64,
+        header_read_timeout_secs: u64,
+        health_check_endpoint: String,
+        health_check_interval_secs: u64,
+        health_check_port: Option<u16>,
+        health_check_timeout_secs: u64,
         health_failure_threshold: u32,
         health_success_threshold: u32,
-        health_check_timeout_secs: u64,
-        health_check_interval_secs: u64,
-        health_check_endpoint: String,
-        disable_health_check: bool,
-        remove_unhealthy_workers: Option<bool>,
-        enable_igw: bool,
+        history_backend: HistoryBackendType,
+        history_memory_max_items: usize,
+        history_memory_max_responses: usize,
+        history_memory_retention_secs: u64,
+        idle_connection_timeout_secs: u64,
+        jemalloc_prof_dir: Option<String>,
+        job_queue_capacity: usize,
+        job_queue_concurrency: usize,
+        kv_connector_annotation: String,
+        kv_engine_id_annotation: String,
+        least_load_default_throughput: f64,
+        least_load_kv_pressure_weight: f64,
+        least_load_mean_prefill_tokens: u32,
+        load_monitor_interval: u64,
+        log_dir: Option<String>,
+        log_json: bool,
+        log_level: Option<String>,
+        log_mm_timing: bool,
+        max_background_responses: usize,
+        max_buffered_request_bytes: u64,
+        max_concurrent_requests: i32,
+        max_connections: usize,
+        max_idle_secs: u64,
+        max_payload_size: usize,
+        max_tree_size: usize,
+        mcp_config_path: Option<String>,
+        mesh_advertise_host: Option<String>,
+        mesh_host: String,
+        mesh_peer_urls: Vec<String>,
+        mesh_port: u16,
+        mesh_server_name: Option<String>,
+        mesh_tls_ca_cert: Option<String>,
+        mesh_tls_cert: Option<String>,
+        mesh_tls_key: Option<String>,
+        mm_allow_private_media_hosts: bool,
+        mm_allowed_media_domains: Option<Vec<String>>,
+        mm_fetch_timeout_ms: Option<u64>,
+        mm_per_request_image_limit: Option<usize>,
+        mm_pixel_cache_mb: Option<usize>,
+        mm_pixel_rdma: bool,
+        mm_processing: Option<String>,
+        mm_turbojpeg: Option<String>,
+        mm_video_fetch_timeout_ms: Option<u64>,
+        model_aliases: HashMap<String, String>,
+        model_id_from: Option<String>,
+        model_path: Option<String>,
+        multimodal_max_inflight_bytes: Option<usize>,
+        multimodal_shm_min_bytes: Option<usize>,
+        multimodal_tensor_transport: Option<String>,
+        oracle_config: Option<PyOracleConfig>,
+        otlp_traces_endpoint: String,
+        overlap_decay: f32,
+        overload_token_usage_threshold: f32,
+        parser: String,
+        pd_admission_wait_secs: u64,
+        pd_disaggregation: bool,
+        pd_pairing_mode: String,
+        policy_engine: String,
+        postgres_config: Option<PyPostgresConfig>,
+        power_of_two_load_metric: String,
+        prefill_expected_workers: Option<usize>,
+        prefill_max_inflight_requests_per_worker: i32,
+        prefill_min_ready_percent: Option<u8>,
+        prefill_min_ready_workers: Option<usize>,
+        prefill_policy: Option<PolicyType>,
+        prefill_queue_size: Option<usize>,
+        prefill_queue_timeout_secs: Option<u64>,
+        prefill_selector: HashMap<String, String>,
+        prefill_urls: Option<Vec<(String, Option<u16>)>>,
+        prefix_hash_balance_abs_threshold: usize,
+        prefix_hash_load_factor: f64,
+        prefix_token_count: usize,
+        priority_scheduler_config: Option<String>,
+        priority_scheduler_default_max_class: String,
+        priority_scheduler_enabled: bool,
+        priority_scheduler_tenant_metric_top_n: u32,
+        prometheus_duration_buckets: Option<Vec<f64>>,
+        prometheus_host: Option<String>,
+        prometheus_port: Option<u16>,
         queue_size: usize,
         queue_timeout_secs: u64,
         rate_limit_tokens_per_second: Option<i32>,
-        model_path: Option<String>,
-        tokenizer_path: Option<String>,
-        chat_template: Option<String>,
-        tokenizer_cache_enable_l0: bool,
-        tokenizer_cache_l0_max_entries: usize,
-        tokenizer_cache_enable_l1: bool,
-        tokenizer_cache_l1_max_memory: usize,
+        rdma_listen_ip: Option<String>,
+        rdma_slot_ttl_s: Option<u64>,
         reasoning_parser: Option<String>,
-        tool_call_parser: Option<String>,
-        mcp_config_path: Option<String>,
-        storage_hook_wasm_path: Option<String>,
-        backend: BackendType,
-        history_backend: HistoryBackendType,
-        oracle_config: Option<PyOracleConfig>,
-        postgres_config: Option<PyPostgresConfig>,
         redis_config: Option<PyRedisConfig>,
-        client_cert_path: Option<String>,
-        client_key_path: Option<String>,
-        ca_cert_paths: Vec<String>,
-        server_cert_path: Option<String>,
-        server_key_path: Option<String>,
-        enable_trace: bool,
-        otlp_traces_endpoint: String,
-        control_plane_auth: Option<PyControlPlaneAuthConfig>,
-        schema_config: Option<String>,
-        disable_tokenizer_autoload: bool,
-        enable_mesh: bool,
-        mesh_server_name: Option<String>,
-        mesh_host: String,
-        mesh_port: u16,
-        mesh_peer_urls: Vec<String>,
-        mesh_advertise_host: Option<String>,
-        drain_settle_secs: u64,
-        enable_wasm: bool,
-        // Appended last to match the `#[pyo3(signature)]` order above and
-        // preserve positional-argument compatibility.
-        health_check_port: Option<u16>,
-        routing_key_override: bool,
-        encode_selector: HashMap<String, String>,
-        epd_disaggregation: bool,
-        encode_urls: Option<Vec<(String, Option<u16>)>>,
-        encode_policy: Option<PolicyType>,
-        multimodal_tensor_transport: Option<String>,
-        multimodal_shm_min_bytes: Option<usize>,
-        model_aliases: HashMap<String, String>,
-        worker_startup_delay: u64,
-        worker_ports_annotation: String,
-        zmq_engine_count: Option<usize>,
-        prefix_token_count: usize,
-        prefix_hash_load_factor: f64,
-        prefix_hash_balance_abs_threshold: usize,
-        upstream_http2: bool,
-        overlap_decay: f32,
-        selection_temperature: f32,
-        upstream_pool_idle_timeout_secs: u64,
-        least_load_max_waiting_requests: u32,
-        stream_body_stall_timeout_secs: u64,
-        routing_key_headers: Vec<String>,
-        cache_boundaries: Vec<usize>,
-        cache_index: String,
-        cache_ttl_secs: u64,
-        job_queue_capacity: usize,
-        job_queue_concurrency: usize,
-        worker_overload_waiting_requests: Option<usize>,
-        worker_overload_token_usage: Option<f64>,
-        worker_overload_protection: bool,
-        disable_load_monitoring: bool,
-        max_buffered_request_bytes: u64,
-        kv_connector_annotation: String,
-        kv_engine_id_annotation: String,
-        mm_per_request_image_limit: Option<usize>,
-        pd_admission_wait_secs: u64,
-        // Appended last to match the `#[pyo3(signature)]` order above and
-        // preserve positional-argument compatibility.
-        enable_rl: bool,
+        remove_unhealthy_workers: Option<bool>,
+        request_id_headers: Option<Vec<String>>,
+        request_timeout_secs: u64,
+        retry_backoff_multiplier: f32,
+        retry_initial_backoff_ms: u64,
+        retry_jitter_factor: f32,
+        retry_max_backoff_ms: u64,
+        retry_max_retries: u32,
         rl_control_timeout_secs: u64,
         rl_fanout_concurrency: usize,
+        router_selector: HashMap<String, String>,
+        routing_key_headers: Vec<String>,
+        routing_key_override: bool,
+        runtime_worker_threads: Option<usize>,
+        schema_config: Option<String>,
+        secrets_auto_reload: bool,
+        selection_accounting_ttl_ms: u64,
+        selection_policy: String,
+        selection_temperature: f32,
+        selector: HashMap<String, String>,
+        server_cert_path: Option<String>,
+        server_key_path: Option<String>,
+        service_discovery: bool,
+        service_discovery_namespace: Option<String>,
+        service_discovery_port: u16,
+        shutdown_grace_period_secs: u64,
+        shutdown_settle_secs: Option<u64>,
+        sse_keepalive_secs: u64,
+        storage_context_headers: HashMap<String, String>,
+        storage_hook_wasm_path: Option<String>,
+        stream_body_stall_timeout_secs: u64,
+        tenant_api_keys: Vec<(String, String)>,
+        tenant_api_keys_file: Option<String>,
+        tenant_header_name: String,
+        tenant_rate_limit_config: Option<String>,
+        tenant_rate_limit_enabled: bool,
+        tokenizer_cache_enable_l0: bool,
+        tokenizer_cache_enable_l1: bool,
+        tokenizer_cache_l0_max_entries: usize,
+        tokenizer_cache_l0_max_memory: usize,
+        tokenizer_cache_l1_max_memory: usize,
+        tokenizer_path: Option<String>,
+        tool_call_parser: Option<String>,
+        trust_tenant_header: bool,
+        upstream_http2: bool,
+        upstream_pool_idle_timeout_secs: u64,
+        webrtc_bind_addr: Option<String>,
+        webrtc_stun_server: Option<String>,
+        worker_overload_protection: bool,
+        worker_overload_shed: bool,
+        worker_overload_token_usage: Option<f64>,
+        worker_overload_waiting_requests: Option<usize>,
+        worker_ports_annotation: String,
+        worker_stale_secs: u64,
+        worker_stall_secs: u64,
+        worker_startup_check_interval: u64,
+        worker_startup_delay: u64,
+        worker_startup_timeout_secs: u64,
+        worker_warmup_blocks: usize,
+        worker_warmup_divert_every: u64,
+        worker_warmup_secs: u64,
+        worker_warmup_share: f32,
+        worker_warmup_thin_ratio: f32,
+        worker_wedge_secs: u64,
+        zmq_engine_count: Option<usize>,
+        zmq_startup_timeout_secs: u64,
     ) -> PyResult<Self> {
+        // Two spellings of one choice: refuse both rather than pick one.
+        if service_discovery && discovery.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Pass service_discovery=True or a discovery mapping, not both",
+            ));
+        }
+        // A `discovery` mapping carries its own `check_interval_secs`.
+        if discovery_check_interval_secs.is_some() && !service_discovery {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "discovery_check_interval_secs applies to service_discovery=True; \
+                 a discovery mapping takes check_interval_secs",
+            ));
+        }
+        // A key file keyword names a file this binding reads, as the CLI
+        // reads its own: the key, or the refusal, is the file's.
+        let KeysRead {
+            api_key,
+            tenant_api_keys,
+            control_plane_auth,
+        } = Self::read_key_files(
+            api_key,
+            api_key_file.as_deref(),
+            tenant_api_keys,
+            tenant_api_keys_file.as_deref(),
+            control_plane_auth,
+            control_plane_api_keys_file.as_deref(),
+        )
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let discovery = discovery
+            .as_ref()
+            .map(parse_discovery)
+            .transpose()?
+            .flatten();
+
         let mut all_urls = worker_urls.clone();
 
         if let Some(ref encode_urls) = encode_urls {
@@ -1298,238 +2092,330 @@ impl Router {
         let connection_mode = Self::determine_connection_mode(&all_urls);
 
         Ok(Router {
-            host,
-            port,
-            health_check_port,
-            routing_key_override,
             worker_urls,
             policy,
-            worker_startup_timeout_secs,
-            worker_startup_check_interval,
-            load_monitor_interval,
-            cache_threshold,
-            balance_abs_threshold,
-            balance_rel_threshold,
-            eviction_interval_secs,
-            max_tree_size,
-            block_size,
-            balance_token_usage_threshold,
-            overload_token_usage_threshold,
-            prefix_token_count,
-            prefix_hash_load_factor,
-            prefix_hash_balance_abs_threshold,
-            least_load_kv_pressure_weight,
-            least_load_default_throughput,
-            least_load_mean_prefill_tokens,
-            max_idle_secs,
-            assignment_mode,
-            max_payload_size,
-            dp_aware,
-            dp_minimum_tokens_scheduler,
-            upstream_http2,
+            host,
+            port,
+            access_log_fields,
+            admin_host,
+            admin_max_connections,
+            admin_port,
             api_key,
-            log_dir,
-            log_level,
-            log_json,
-            service_discovery,
-            selector,
-            service_discovery_port,
-            service_discovery_namespace,
-            prefill_selector,
-            decode_selector,
-            router_selector,
+            api_key_file,
+            assignment_mode,
+            backend,
+            balance_abs_threshold,
+            balance_prefix_margin_tokens,
+            balance_rel_threshold,
+            balance_token_usage_threshold,
+            balance_uncached_credit,
+            block_size,
             bootstrap_port_annotation,
-            model_id_from,
-            prometheus_port,
-            prometheus_host,
-            prometheus_duration_buckets,
-            request_timeout_secs,
-            shutdown_grace_period_secs,
-            request_id_headers,
-            trust_tenant_header,
-            tenant_header_name,
-            storage_context_headers,
-            pd_disaggregation,
             bucket_adjust_interval_secs,
-            prefill_urls,
-            decode_urls,
-            prefill_policy,
-            decode_policy,
-            max_concurrent_requests,
-            cors_allowed_origins,
-            retry_max_retries,
-            retry_initial_backoff_ms,
-            retry_max_backoff_ms,
-            retry_backoff_multiplier,
-            retry_jitter_factor,
-            disable_retries,
+            ca_cert_paths,
+            cache_boundaries,
+            cache_index,
+            cache_threshold,
+            cache_ttl_secs,
             cb_failure_threshold,
             cb_success_threshold,
             cb_timeout_duration_secs,
             cb_window_duration_secs,
+            chat_template,
+            client_cert_path,
+            client_key_path,
+            control_plane_api_keys_file,
+            control_plane_auth,
+            cors_allowed_origins,
+            decode_expected_workers,
+            decode_min_ready_percent,
+            decode_min_ready_workers,
+            decode_policy,
+            decode_selector,
+            decode_urls,
             disable_circuit_breaker,
+            disable_health_check,
+            disable_load_monitoring,
+            disable_retries,
+            disable_tokenizer_autoload,
+            discovery,
+            discovery_check_interval_secs,
+            dp_aware,
+            dp_minimum_tokens_scheduler,
+            drain_settle_secs,
+            enable_igw,
+            enable_mesh,
+            enable_rl,
+            enable_trace,
+            enable_wasm,
+            encode_policy,
+            encode_selector,
+            encode_urls,
+            engine_metrics,
+            epd_disaggregation,
+            eviction_interval_secs,
+            grpc_request_timeout_secs,
+            header_read_timeout_secs,
+            health_check_endpoint,
+            health_check_interval_secs,
+            health_check_port,
+            health_check_timeout_secs,
             health_failure_threshold,
             health_success_threshold,
-            health_check_timeout_secs,
-            health_check_interval_secs,
-            health_check_endpoint,
-            disable_health_check,
-            remove_unhealthy_workers,
-            enable_igw,
+            history_backend,
+            history_memory_max_items,
+            history_memory_max_responses,
+            history_memory_retention_secs,
+            idle_connection_timeout_secs,
+            jemalloc_prof_dir,
+            job_queue_capacity,
+            job_queue_concurrency,
+            kv_connector_annotation,
+            kv_engine_id_annotation,
+            least_load_default_throughput,
+            least_load_kv_pressure_weight,
+            least_load_mean_prefill_tokens,
+            load_monitor_interval,
+            log_dir,
+            log_json,
+            log_level,
+            log_mm_timing,
+            max_background_responses,
+            max_buffered_request_bytes,
+            max_concurrent_requests,
+            max_connections,
+            max_idle_secs,
+            max_payload_size,
+            max_tree_size,
+            mcp_config_path,
+            mesh_advertise_host,
+            mesh_host,
+            mesh_peer_urls,
+            mesh_port,
+            mesh_server_name,
+            mesh_tls_ca_cert,
+            mesh_tls_cert,
+            mesh_tls_key,
+            mm_allow_private_media_hosts,
+            mm_allowed_media_domains,
+            mm_fetch_timeout_ms,
+            mm_per_request_image_limit,
+            mm_pixel_cache_mb,
+            mm_pixel_rdma,
+            mm_processing,
+            mm_turbojpeg,
+            mm_video_fetch_timeout_ms,
+            model_aliases,
+            model_id_from,
+            model_path,
+            multimodal_max_inflight_bytes,
+            multimodal_shm_min_bytes,
+            multimodal_tensor_transport,
+            oracle_config,
+            otlp_traces_endpoint,
+            overlap_decay,
+            overload_token_usage_threshold,
+            parser,
+            pd_admission_wait_secs,
+            pd_disaggregation,
+            pd_pairing_mode,
+            policy_engine,
+            postgres_config,
+            power_of_two_load_metric,
+            prefill_expected_workers,
+            prefill_max_inflight_requests_per_worker,
+            prefill_min_ready_percent,
+            prefill_min_ready_workers,
+            prefill_policy,
+            prefill_queue_size,
+            prefill_queue_timeout_secs,
+            prefill_selector,
+            prefill_urls,
+            prefix_hash_balance_abs_threshold,
+            prefix_hash_load_factor,
+            prefix_token_count,
+            priority_scheduler_config,
+            priority_scheduler_default_max_class,
+            priority_scheduler_enabled,
+            priority_scheduler_tenant_metric_top_n,
+            prometheus_duration_buckets,
+            prometheus_host,
+            prometheus_port,
             queue_size,
             queue_timeout_secs,
             rate_limit_tokens_per_second,
-            connection_mode,
-            model_path,
-            tokenizer_path,
-            chat_template,
-            disable_tokenizer_autoload,
-            tokenizer_cache_enable_l0,
-            tokenizer_cache_l0_max_entries,
-            tokenizer_cache_enable_l1,
-            tokenizer_cache_l1_max_memory,
+            rdma_listen_ip,
+            rdma_slot_ttl_s,
             reasoning_parser,
-            tool_call_parser,
-            mcp_config_path,
-            storage_hook_wasm_path,
-            backend,
-            history_backend,
-            oracle_config,
-            postgres_config,
             redis_config,
-            client_cert_path,
-            client_key_path,
-            ca_cert_paths,
-            server_cert_path,
-            server_key_path,
-            enable_trace,
-            otlp_traces_endpoint,
-            control_plane_auth,
-            schema_config,
-            enable_mesh,
-            mesh_server_name,
-            mesh_host,
-            mesh_advertise_host,
-            mesh_port,
-            mesh_peer_urls,
-            drain_settle_secs,
-            enable_wasm,
-            encode_selector,
-            epd_disaggregation,
-            encode_urls,
-            encode_policy,
-            multimodal_tensor_transport,
-            multimodal_shm_min_bytes,
-            model_aliases,
-            worker_startup_delay,
-            worker_ports_annotation,
-            zmq_engine_count,
-            overlap_decay,
-            selection_temperature,
-            upstream_pool_idle_timeout_secs,
-            least_load_max_waiting_requests,
-            stream_body_stall_timeout_secs,
-            routing_key_headers,
-            cache_boundaries,
-            cache_index,
-            cache_ttl_secs,
-            job_queue_capacity,
-            job_queue_concurrency,
-            worker_overload_waiting_requests,
-            worker_overload_token_usage,
-            worker_overload_protection,
-            disable_load_monitoring,
-            max_buffered_request_bytes,
-            kv_connector_annotation,
-            kv_engine_id_annotation,
-            mm_per_request_image_limit,
-            pd_admission_wait_secs,
-            enable_rl,
+            remove_unhealthy_workers,
+            request_id_headers,
+            request_timeout_secs,
+            retry_backoff_multiplier,
+            retry_initial_backoff_ms,
+            retry_jitter_factor,
+            retry_max_backoff_ms,
+            retry_max_retries,
             rl_control_timeout_secs,
             rl_fanout_concurrency,
+            router_selector,
+            routing_key_headers,
+            routing_key_override,
+            runtime_worker_threads,
+            schema_config,
+            secrets_auto_reload,
+            selection_accounting_ttl_ms,
+            selection_policy,
+            selection_temperature,
+            selector,
+            server_cert_path,
+            server_key_path,
+            service_discovery,
+            service_discovery_namespace,
+            service_discovery_port,
+            shutdown_grace_period_secs,
+            shutdown_settle_secs,
+            sse_keepalive_secs,
+            storage_context_headers,
+            storage_hook_wasm_path,
+            stream_body_stall_timeout_secs,
+            tenant_api_keys,
+            tenant_api_keys_file,
+            tenant_header_name,
+            tenant_rate_limit_config,
+            tenant_rate_limit_enabled,
+            tokenizer_cache_enable_l0,
+            tokenizer_cache_enable_l1,
+            tokenizer_cache_l0_max_entries,
+            tokenizer_cache_l0_max_memory,
+            tokenizer_cache_l1_max_memory,
+            tokenizer_path,
+            tool_call_parser,
+            trust_tenant_header,
+            upstream_http2,
+            upstream_pool_idle_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            worker_overload_protection,
+            worker_overload_shed,
+            worker_overload_token_usage,
+            worker_overload_waiting_requests,
+            worker_ports_annotation,
+            worker_stale_secs,
+            worker_stall_secs,
+            worker_startup_check_interval,
+            worker_startup_delay,
+            worker_startup_timeout_secs,
+            worker_warmup_blocks,
+            worker_warmup_divert_every,
+            worker_warmup_secs,
+            worker_warmup_share,
+            worker_warmup_thin_ratio,
+            worker_wedge_secs,
+            zmq_engine_count,
+            zmq_startup_timeout_secs,
+            connection_mode,
         })
     }
 
+    /// Run the gateway with the configured propagation window and shared shutdown deadline.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
         use observability::metrics::PrometheusConfig;
 
+        // Refused before the runtime exists, as the CLI refuses it at parse time.
+        if let Some(buckets) = &self.prometheus_duration_buckets {
+            PrometheusConfig::validate_duration_buckets(buckets).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
+            })?;
+        }
+
+        // Validated once, by the builder's `build()` inside `to_router_config`;
+        // `startup` validates once more for a library caller that never went
+        // through the builder.
         let router_config = self.to_router_config().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
         })?;
 
-        router_config.validate().map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Configuration validation failed: {e}"))
-        })?;
+        let service_discovery_config = router_config
+            .discovery
+            .as_ref()
+            .map(|discovery| {
+                service_discovery::RuntimeDiscoveryConfig::from_config(
+                    discovery,
+                    &router_config.mode,
+                )
+            })
+            .transpose()
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
+            })?;
+        let mesh_discovery_config = router_config
+            .discovery
+            .as_ref()
+            .and_then(mesh::discovery::MeshDiscoveryConfig::from_discovery);
 
-        let model_id_source = self
-            .model_id_from
+        let prometheus_config = Some(PrometheusConfig {
+            port: self.prometheus_port.unwrap_or(29000),
+            host: self.metrics_host(),
+            duration_buckets: self.prometheus_duration_buckets.clone(),
+        });
+
+        // Refused before the runtime exists, as the CLI refuses it at parse time.
+        let webrtc_bind_addr = self
+            .webrtc_bind_addr
             .as_deref()
-            .map(|s| {
-                service_discovery::ModelIdSource::parse(s).map_err(|e| {
+            .map(|addr| {
+                addr.parse::<std::net::IpAddr>().map_err(|e| {
                     pyo3::exceptions::PyValueError::new_err(format!(
-                        "Invalid --model-id-from value '{s}': {e}"
+                        "Invalid value for webrtc_bind_addr='{addr}': {e}"
                     ))
                 })
             })
             .transpose()?;
 
-        let service_discovery_config = if self.service_discovery {
-            Some(service_discovery::ServiceDiscoveryConfig {
-                enabled: true,
-                selector: self.selector.clone(),
-                check_interval: std::time::Duration::from_secs(60),
-                port: self.service_discovery_port,
-                namespace: self.service_discovery_namespace.clone(),
-                disaggregated_mode: self.pd_disaggregation || self.epd_disaggregation,
-                encode_selector: self.encode_selector.clone(),
-                prefill_selector: self.prefill_selector.clone(),
-                decode_selector: self.decode_selector.clone(),
-                bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
-                worker_ports_annotation: self.worker_ports_annotation.clone(),
-                kv_connector_annotation: self.kv_connector_annotation.clone(),
-                kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
-                router_selector: self.router_selector.clone(),
-                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                model_id_source,
-            })
-        } else {
-            None
-        };
-
-        let prometheus_config = Some(PrometheusConfig {
-            port: self.prometheus_port.unwrap_or(29000),
-            host: self
-                .prometheus_host
-                .clone()
-                .unwrap_or_else(|| "127.0.0.1".to_string()),
-            duration_buckets: self.prometheus_duration_buckets.clone(),
-        });
-
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        // The runtime's default size unless a thread count is given (the
+        // validation above refused 0), read from the validated config as the
+        // CLI's `serve` reads it.
+        let runtime = match router_config.runtime_worker_threads {
+            Some(threads) => tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(threads)
+                .enable_all()
+                .build(),
+            None => tokio::runtime::Runtime::new(),
+        }
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         // Release the GIL while the server runs so Python threads can make progress.
         py.detach(|| {
             runtime.block_on(async move {
+            // The launcher hands over the key files' paths alone; the binding
+            // read them at construction: the record names those files, and
+            // the reload reads them again.
+            let secret_files = Self::secret_files(
+                self.api_key_file.as_deref(),
+                self.tenant_api_keys_file.as_deref(),
+                self.control_plane_api_keys_file.as_deref(),
+            );
             Box::pin(server::startup(server::ServerConfig {
-                host: self.host.clone(),
-                port: self.port,
-                health_check_port: self.health_check_port,
-                runtime_worker_threads: None,
                 router_config,
-                max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
                 log_level: self.log_level.clone(),
                 log_json: self.log_json,
                 service_discovery_config,
+                mesh_discovery_config,
                 prometheus_config,
-                request_timeout_secs: self.request_timeout_secs,
-                request_id_headers: self.request_id_headers.clone(),
                 shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+                shutdown_settle_secs: self.shutdown_settle_secs,
                 control_plane_auth: self
                     .control_plane_auth
                     .as_ref()
-                    .map(|c| c.to_auth_control_plane_config()),
+                    .map(|c| c.to_auth_control_plane_config())
+                    .transpose()
+                    .map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "Configuration error: {e}"
+                        ))
+                    })?,
                 mesh_server_config: if self.enable_mesh {
                     let self_name = self.mesh_server_name.clone().unwrap_or_else(|| {
                         use rand::{distr::Alphanumeric, RngExt};
@@ -1538,17 +2424,18 @@ impl Router {
                             .collect();
                         format!("Mesh_{random_string}")
                     });
-                    let peer = self
-                        .mesh_peer_urls
-                        .first()
-                        .map(|url| {
-                            url.parse::<std::net::SocketAddr>().map_err(|e| {
-                                pyo3::exceptions::PyValueError::new_err(format!(
-                                    "Invalid mesh peer URL '{url}': {e}"
-                                ))
-                            })
-                        })
-                        .transpose()?;
+                    let init_peers = Self::parse_mesh_peer_urls(&self.mesh_peer_urls)
+                        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+                    // Mirrors the CLI check in `cli/configure.rs`: port 0 parses as a
+                    // socket address but is undialable once gossiped to peers,
+                    // and reaches router discovery as the fallback mesh port
+                    // for Pods with no usable annotation.
+                    if self.mesh_port == 0 {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "Invalid value for mesh_port='0': mesh port cannot be 0; peers dial \
+                             the advertised port, so it must be a fixed, routable one",
+                        ));
+                    }
                     let bind_addr =
                         Self::parse_mesh_socket_addr(&self.mesh_host, self.mesh_port, "mesh_host")?;
                     let (advertise_host, advertise_field) =
@@ -1571,14 +2458,31 @@ impl Router {
                         self_name,
                         bind_addr,
                         advertise_addr,
-                        init_peer: peer,
-                        mtls_config: None,
+                        init_peers,
+                        mtls_config: self.mesh_mtls_config()?,
                     })
                 } else {
                     None
                 },
-                webrtc_bind_addr: None,
-                webrtc_stun_server: None,
+                webrtc_bind_addr,
+                webrtc_stun_server: self.webrtc_stun_server.clone(),
+                secret_sources: Self::secret_sources(
+                    &secret_files,
+                    self.api_key.is_some(),
+                    self.tenant_api_keys.len(),
+                    self.control_plane_auth
+                        .as_ref()
+                        .map_or(0, |auth| auth.api_keys.len()),
+                    matches!(self.history_backend, HistoryBackendType::Postgres)
+                        && self
+                            .postgres_config
+                            .as_ref()
+                            .is_some_and(|config| config.db_url.is_some()),
+                    matches!(self.history_backend, HistoryBackendType::Redis)
+                        && self.redis_config.is_some(),
+                ),
+                secret_files,
+                secrets_auto_reload: self.secrets_auto_reload,
             }))
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
@@ -1610,11 +2514,39 @@ fn print_banner(host: &str, port: u16, mode: &str) {
 fn get_available_tool_call_parsers() -> Vec<String> {
     static PARSERS: OnceCell<Vec<String>> = OnceCell::new();
     PARSERS
-        .get_or_init(|| {
-            let factory = tool_parser::ParserFactory::new();
-            factory.list_parsers()
-        })
+        .get_or_init(|| parser_choices(|tools, _| tools.list_parsers()))
         .clone()
+}
+
+/// The choices of one parser flag: the names `legacy` picks from the two legacy registries (the
+/// flag's own kind), Symphony's tables' (`symphony::formats::Table::name`), which `--parser
+/// symphony` reads with when both flags name one, the names a table answers to that no legacy
+/// parser of either kind has (the gateway's `utils::ALIASES`: an engine's exact parser name for a
+/// family, or a launcher's name for one whose table has no older parser, which the gateway takes
+/// in either flag), and `hf`,
+/// the table a model's response template compiles into, sorted, each once.
+fn parser_choices(
+    legacy: impl FnOnce(&tool_parser::ParserFactory, &reasoning_parser::ParserFactory) -> Vec<String>,
+) -> Vec<String> {
+    let tools = tool_parser::ParserFactory::new();
+    let reasoning = reasoning_parser::ParserFactory::new();
+    let mut names = legacy(&tools, &reasoning);
+    names.extend(
+        symphony::formats::Table::ALL
+            .iter()
+            .map(|table| table.name().to_string()),
+    );
+    names.extend(
+        routers::grpc::utils::ALIASES
+            .iter()
+            .map(|(alias, _)| *alias)
+            .filter(|alias| !tools.has_parser(alias) && !reasoning.registry().has_parser(alias))
+            .map(str::to_string),
+    );
+    names.push(config::TEMPLATE_PARSER.to_string());
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Get the list of available reasoning parsers from the Rust factory.
@@ -1622,16 +2554,17 @@ fn get_available_tool_call_parsers() -> Vec<String> {
 fn get_available_reasoning_parsers() -> Vec<String> {
     static PARSERS: OnceCell<Vec<String>> = OnceCell::new();
     PARSERS
-        .get_or_init(|| {
-            let factory = reasoning_parser::ParserFactory::new();
-            factory.list_parsers()
-        })
+        .get_or_init(|| parser_choices(|_, reasoning| reasoning.list_parsers()))
         .clone()
 }
 
 #[pymodule]
 fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     observability::metrics::register_jemalloc_as_global_allocator();
+    // The process-level TLS crypto provider, installed once when the module
+    // is imported: every HTTP client a binding builds takes it, whether or
+    // not a router is started in this process.
+    server::install_crypto_provider();
 
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;
@@ -1644,10 +2577,355 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPostgresConfig>()?;
     m.add_class::<PyRedisConfig>()?;
     m.add_class::<Router>()?;
+    m.add_class::<PyVllmGrpcServer>()?;
+    m.add_class::<PyTokenSpeedGrpcServer>()?;
+    m.add_class::<PySglangGrpcServer>()?;
+    m.add_class::<PyTrtllmGrpcServer>()?;
+    m.add_class::<PyTokenizer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_tool_call_parsers, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_reasoning_parsers, m)?)?;
+    m.add_function(wrap_pyfunction!(init_servicer_tracing, m)?)?;
     Ok(())
+}
+
+// `cargo test -p smg-python --lib` runs these without an interpreter: the
+// tests reach pure-Rust code only, so the linker drops the module's Python
+// references with the code nothing here calls (the crate's features change
+// nothing about that: pyo3's `extension-module` is on either way).
+#[cfg(test)]
+mod tests {
+    use config::RoutingMode;
+
+    use super::*;
+
+    #[test]
+    fn a_provider_backend_is_its_routing_mode_and_an_engine_backend_is_none() {
+        let urls = vec!["https://provider.example".to_string()];
+        let provider = |backend: BackendType| backend.provider_mode(&urls);
+
+        assert!(matches!(
+            provider(BackendType::Openai),
+            Some(RoutingMode::OpenAI { worker_urls }) if worker_urls == urls
+        ));
+        assert!(matches!(
+            provider(BackendType::Anthropic),
+            Some(RoutingMode::Anthropic { worker_urls }) if worker_urls == urls
+        ));
+        assert!(matches!(
+            provider(BackendType::Gemini),
+            Some(RoutingMode::Gemini { worker_urls }) if worker_urls == urls
+        ));
+        for engine in [
+            BackendType::Sglang,
+            BackendType::Vllm,
+            BackendType::Tokenspeed,
+            BackendType::Trtllm,
+        ] {
+            assert!(
+                engine.provider_mode(&urls).is_none(),
+                "{engine:?} is an engine backend: the disaggregation flags select its mode"
+            );
+        }
+    }
+
+    /// An engine backend pins the wire its startup workers speak over ZMQ; no
+    /// backend, a provider and TensorRT-LLM leave the choice to the detection
+    /// step, as the CLI does without `--backend`.
+    #[test]
+    fn an_engine_backend_pins_its_wire_and_no_backend_pins_none() {
+        use worker::RuntimeType;
+        let pin = |backend: Option<BackendType>| {
+            backend
+                .as_ref()
+                .and_then(BackendType::startup_worker_runtime)
+        };
+        assert_eq!(pin(None), None);
+        assert_eq!(pin(Some(BackendType::Vllm)), Some(RuntimeType::Vllm));
+        assert_eq!(
+            pin(Some(BackendType::Tokenspeed)),
+            Some(RuntimeType::TokenSpeed)
+        );
+        assert_eq!(pin(Some(BackendType::Sglang)), Some(RuntimeType::Sglang));
+        for unpinned in [
+            BackendType::Openai,
+            BackendType::Anthropic,
+            BackendType::Trtllm,
+            BackendType::Gemini,
+        ] {
+            assert_eq!(unpinned.startup_worker_runtime(), None, "{unpinned:?}");
+        }
+    }
+
+    /// Each key file the binding read reaches the gateway under its own
+    /// name, and a key given as a value has no file.
+    #[test]
+    fn secret_files_keep_each_file_under_its_own_name() {
+        let files = Router::secret_files(Some("/run/keys/api"), None, Some("/run/keys/control"));
+        assert_eq!(
+            files.api_key.as_deref(),
+            Some(std::path::Path::new("/run/keys/api"))
+        );
+        assert!(files.tenant_api_keys.is_none(), "given as a value: no file");
+        assert_eq!(
+            files.control_plane_api_keys.as_deref(),
+            Some(std::path::Path::new("/run/keys/control"))
+        );
+        let none = Router::secret_files(None, None, None);
+        assert_eq!(none, secrets::SecretFiles::default());
+    }
+
+    /// The sources record names a file for each key a file gave, with the
+    /// entries read from it; a count without a file or a value names nothing.
+    #[test]
+    fn secret_sources_name_the_files_with_their_own_entry_counts() {
+        use smg::server::posture::SecretSource;
+        let files =
+            Router::secret_files(None, Some("/run/keys/tenants"), Some("/run/keys/control"));
+        let sources = Router::secret_sources(&files, false, 3, 2, false, false);
+        assert!(
+            sources.api_key.is_none(),
+            "neither given nor filed: unnamed"
+        );
+        assert_eq!(sources.tenant_api_keys, Some((SecretSource::File, 3)));
+        assert_eq!(
+            sources.control_plane_api_keys,
+            Some((SecretSource::File, 2))
+        );
+        assert!(sources.postgres_db_url.is_none() && sources.redis_url.is_none());
+
+        let serving_only = Router::secret_files(Some("/run/keys/api"), None, None);
+        let sources = Router::secret_sources(&serving_only, true, 0, 0, false, false);
+        assert_eq!(sources.api_key, Some(SecretSource::File));
+        assert!(
+            sources.tenant_api_keys.is_none(),
+            "neither given nor filed names nothing"
+        );
+        assert!(sources.control_plane_api_keys.is_none());
+    }
+
+    /// A key given as a value and no file is the launcher's in the record,
+    /// with its entry count, and so is the selected backend's store URL; the
+    /// binding does not tell flag from environment.
+    #[test]
+    fn secret_sources_name_a_value_given_key_as_the_launchers() {
+        use smg::server::posture::SecretSource;
+        let none = Router::secret_files(None, None, None);
+        let sources = Router::secret_sources(&none, true, 3, 2, true, false);
+        assert_eq!(sources.api_key, Some(SecretSource::Launcher));
+        assert_eq!(sources.postgres_db_url, Some(SecretSource::Launcher));
+        assert!(
+            sources.redis_url.is_none(),
+            "the other backend's URL is not given"
+        );
+        assert_eq!(sources.tenant_api_keys, Some((SecretSource::Launcher, 3)));
+        assert_eq!(
+            sources.control_plane_api_keys,
+            Some((SecretSource::Launcher, 2))
+        );
+        assert!(Router::secret_sources(&none, false, 0, 0, false, false)
+            .api_key
+            .is_none());
+    }
+
+    /// A path written under a temporary directory, for the key-file tests.
+    fn key_file(dir: &tempfile::TempDir, name: &str, content: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).expect("the file written");
+        path.display().to_string()
+    }
+
+    /// A key file keyword alone is read: the shared key as its file's one
+    /// line, the tenant and control-plane keys as entries with blank and
+    /// comment lines skipped; the control-plane entries join the launcher's
+    /// auth config, or one with its defaults. Without a file the values
+    /// pass as given.
+    #[test]
+    fn key_files_are_read_by_the_binding() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let api_key = key_file(&dir, "api-key", "file-shared-key\n");
+        let tenants = key_file(
+            &dir,
+            "tenants",
+            "# the tenants\n\nred:file-red\n  blue : file-blue  \n",
+        );
+        let operators = key_file(
+            &dir,
+            "control-plane-keys",
+            "ops:Ops:admin:file-ops-key\nro:Read:user:file-ro-key\n",
+        );
+        let read = Router::read_key_files(
+            None,
+            Some(api_key.as_str()),
+            vec![],
+            Some(tenants.as_str()),
+            None,
+            Some(operators.as_str()),
+        )
+        .expect("the files read");
+        assert_eq!(read.api_key.as_deref(), Some("file-shared-key"));
+        assert_eq!(
+            read.tenant_api_keys,
+            vec![
+                ("red".to_string(), "file-red".to_string()),
+                ("blue".to_string(), "file-blue".to_string()),
+            ]
+        );
+        let auth = read
+            .control_plane_auth
+            .expect("an auth config from the file alone");
+        assert_eq!(auth.api_keys.len(), 2);
+        assert_eq!(
+            (
+                auth.api_keys[0].id.as_str(),
+                auth.api_keys[0].name.as_str(),
+                auth.api_keys[0].key.as_str(),
+                auth.api_keys[0].role.clone(),
+            ),
+            ("ops", "Ops", "file-ops-key", PyRole::Admin)
+        );
+        assert_eq!(auth.api_keys[1].role, PyRole::User);
+        assert!(
+            !auth.audit_enabled,
+            "the defaults when the launcher built none"
+        );
+
+        let launcher = PyControlPlaneAuthConfig {
+            jwt: None,
+            api_keys: vec![],
+            audit_enabled: true,
+        };
+        let read = Router::read_key_files(
+            None,
+            None,
+            vec![],
+            None,
+            Some(launcher),
+            Some(operators.as_str()),
+        )
+        .expect("the file read into the launcher's config");
+        let auth = read.control_plane_auth.expect("kept");
+        assert!(auth.audit_enabled, "the launcher's setting stands");
+        assert_eq!(auth.api_keys.len(), 2);
+
+        let read = Router::read_key_files(
+            Some("k".to_string()),
+            None,
+            vec![("t".to_string(), "k2".to_string())],
+            None,
+            None,
+            None,
+        )
+        .expect("no file");
+        assert_eq!(read.api_key.as_deref(), Some("k"));
+        assert_eq!(read.tenant_api_keys.len(), 1);
+        assert!(read.control_plane_auth.is_none());
+    }
+
+    /// A value and a file for one key are refused as given twice; a file
+    /// the reader refuses, or a bad entry, is refused under the file's
+    /// setting and path; no refusal carries a key.
+    #[test]
+    fn a_key_given_twice_or_a_bad_key_file_is_refused() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let api_key = key_file(&dir, "api-key", "file-shared-key\n");
+        let err = Router::read_key_files(
+            Some("k".to_string()),
+            Some(api_key.as_str()),
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .expect_err("given twice");
+        assert_eq!(
+            err,
+            "api_key and api_key_file are both given; give one source"
+        );
+        let err = Router::read_key_files(
+            None,
+            None,
+            vec![("t".to_string(), "k".to_string())],
+            Some(api_key.as_str()),
+            None,
+            None,
+        )
+        .expect_err("given twice");
+        assert!(
+            err.starts_with("tenant_api_keys and tenant_api_keys_file"),
+            "{err}"
+        );
+        let launcher = PyControlPlaneAuthConfig {
+            jwt: None,
+            api_keys: vec![PyApiKeyEntry {
+                id: "a".to_string(),
+                name: "A".to_string(),
+                key: "k".to_string(),
+                role: PyRole::Admin,
+            }],
+            audit_enabled: false,
+        };
+        let err = Router::read_key_files(
+            None,
+            None,
+            vec![],
+            None,
+            Some(launcher),
+            Some(api_key.as_str()),
+        )
+        .expect_err("given twice");
+        assert!(
+            err.starts_with("control_plane_auth.api_keys and control_plane_api_keys_file"),
+            "{err}"
+        );
+
+        let empty = key_file(&dir, "empty", "");
+        let err = Router::read_key_files(None, Some(empty.as_str()), vec![], None, None, None)
+            .expect_err("an empty file");
+        assert!(
+            err.contains("api-key-file")
+                && err.contains(&empty)
+                && err.contains("the file is empty"),
+            "{err}"
+        );
+        let bad = key_file(&dir, "operators", "ops:Ops:owner:file-ops-key\n");
+        let err = Router::read_key_files(None, None, vec![], None, None, Some(bad.as_str()))
+            .expect_err("a bad role");
+        assert!(
+            err.contains("control-plane-api-keys-file")
+                && err.contains(&bad)
+                && err.contains("the role must be 'admin' or 'user'"),
+            "{err}"
+        );
+        assert!(!err.contains("file-ops-key"), "{err}");
+    }
+
+    /// The join peers parse the same from a comma list and from separate
+    /// values, and an empty entry is refused rather than dropped.
+    #[test]
+    fn mesh_peer_urls_split_on_commas_and_refuse_an_empty_entry() {
+        let separate =
+            Router::parse_mesh_peer_urls(&["10.0.0.1:1".to_string(), "10.0.0.2:2".to_string()])
+                .expect("two entries");
+        let comma = Router::parse_mesh_peer_urls(&["10.0.0.1:1,10.0.0.2:2".to_string()])
+            .expect("a comma list");
+        assert_eq!(separate, comma);
+        assert_eq!(separate.len(), 2);
+        for bad in [
+            vec![String::new()],
+            vec!["10.0.0.1:1,".to_string()],
+            vec!["10.0.0.1:1".to_string(), " ".to_string()],
+        ] {
+            let err = Router::parse_mesh_peer_urls(&bad).expect_err("an empty entry is refused");
+            assert!(err.contains("is empty"), "{bad:?}: {err}");
+        }
+        let err = Router::parse_mesh_peer_urls(&["not-an-address".to_string()])
+            .expect_err("a bad entry is refused");
+        assert!(
+            err.contains("Invalid mesh peer URL 'not-an-address'"),
+            "{err}"
+        );
+    }
 }

@@ -145,7 +145,7 @@ mod pd_routing_unit_tests {
                     decode_policy: None,
                 },
                 PolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 5,
+                    load_metric: Default::default(),
                 },
             ),
             (
@@ -159,21 +159,7 @@ mod pd_routing_unit_tests {
                     prefill_policy: None,
                     decode_policy: None,
                 },
-                PolicyConfig::CacheAware {
-                    cache_threshold: 0.7,
-                    balance_abs_threshold: 20,
-                    balance_rel_threshold: 1.2,
-                    eviction_interval_secs: 60,
-                    max_tree_size: 1000000,
-                    block_size: 16,
-                    balance_token_usage_threshold: 1.0,
-                    overload_token_usage_threshold: 1.0,
-                    overlap_decay: 0.0,
-                    selection_temperature: 0.0,
-                    cache_index: Default::default(),
-                    cache_ttl_secs: 180,
-                    cache_boundaries: Vec::new(),
-                },
+                PolicyConfig::cache_aware(0.7, 20, 1.2, 60, 1000000),
             ),
             (
                 RoutingMode::PrefillDecode {
@@ -227,7 +213,7 @@ mod pd_routing_unit_tests {
                     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
                 };
 
-                let client = reqwest::Client::new();
+                let client = smg::server::http_client();
 
                 // Initialize rate limiter
                 let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));

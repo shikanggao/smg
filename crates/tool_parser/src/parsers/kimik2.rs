@@ -20,7 +20,7 @@ use crate::{
 /// - Function calls with explicit indexing
 /// - JSON arguments
 ///
-/// Reference: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md
+/// Reference: <https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md>
 pub struct KimiK2Parser {
     /// Regex for extracting complete tool calls
     tool_call_extractor: Regex,
@@ -53,7 +53,7 @@ pub struct KimiK2Parser {
 impl KimiK2Parser {
     /// Build structural tag for Kimi K2 tool call format.
     ///
-    /// Uses dual triggers following sglang's approach:
+    /// Uses dual triggers following the serving engine's approach:
     /// - `<|tool_calls_section_begin|>` for the first tool call
     /// - `<|tool_call_begin|>` for subsequent parallel tool calls
     pub fn build_structural_tag(tools: &[Tool], at_least_one: bool) -> Value {
@@ -63,7 +63,7 @@ impl KimiK2Parser {
             if name.is_empty() {
                 continue;
             }
-            let schema = &tool.function.parameters;
+            let schema = tool.function.parameters_schema();
 
             // Tag for FIRST tool call (includes outer section wrapper)
             tags.push(serde_json::json!({

@@ -1,19 +1,13 @@
 #!/bin/bash
 set -euxo pipefail
 
-# Fix any half-configured packages (e.g. cuda-keyring left from previous runs)
-export DEBIAN_FRONTEND=noninteractive
-if command -v sudo >/dev/null 2>&1; then
-    sudo dpkg --configure -a --force-confnew 2>/dev/null || true
-    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
-    sudo apt-get update
-    sudo apt-get install -y build-essential libssl-dev pkg-config protobuf-compiler
-else
-    dpkg --configure -a --force-confnew 2>/dev/null || true
-    bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
-    apt-get update
-    apt-get install -y build-essential libssl-dev pkg-config protobuf-compiler
-fi
+# The native dependencies (the compiler, pkg-config, the OpenSSL headers,
+# protoc): only what the host lacks comes from the archive, and protoc comes
+# from its release when the archive does not answer (ci_install_build_deps.sh).
+bash "$(dirname "${BASH_SOURCE[0]}")/ci_install_build_deps.sh"
+# The release fallback installs under this prefix; the steps that follow read
+# it from GITHUB_PATH, this script from PATH.
+export PATH="${CI_PROTOC_PREFIX:-${HOME}/.local}/bin:${PATH}"
 
 # Install rustup (Rust installer and version manager)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.0

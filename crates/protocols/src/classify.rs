@@ -1,7 +1,7 @@
 //! Classify API protocol definitions.
 //!
 //! This module defines the request and response types for the `/v1/classify` API,
-//! which is compatible with vLLM's classification endpoint.
+//! which is compatible with the serving engine's classification endpoint.
 //!
 //! Classification reuses the embedding backend - the scheduler returns logits as
 //! "embeddings", and the classify layer applies softmax + label mapping.
@@ -9,13 +9,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::common::{GenerationRequest, UsageInfo};
+use super::common::{routing_text_of_input, GenerationRequest, UsageInfo};
 
 // ============================================================================
 // Classify API
 // ============================================================================
 
-/// Classification request - compatible with vLLM's /v1/classify API
+/// Classification request - compatible with the serving engine's /v1/classify API
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ClassifyRequest {
@@ -31,11 +31,15 @@ pub struct ClassifyRequest {
     /// Optional user identifier
     pub user: Option<String>,
 
-    /// SGLang extension: request id for tracking
+    /// Engine extension: request id for tracking
     pub rid: Option<String>,
 
-    /// SGLang extension: request priority
+    /// Engine extension: request priority
     pub priority: Option<i32>,
+
+    /// Additional fields not explicitly defined above (e.g. engine-specific parameters)
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, Value>,
 }
 
 impl GenerationRequest for ClassifyRequest {
@@ -52,15 +56,7 @@ impl GenerationRequest for ClassifyRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        match &self.input {
-            Value::String(s) => s.clone(),
-            Value::Array(arr) => arr
-                .iter()
-                .filter_map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => String::new(),
-        }
+        routing_text_of_input(&self.input)
     }
 }
 

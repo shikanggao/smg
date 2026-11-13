@@ -2,22 +2,32 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+mod byte_fallback;
+mod byte_level;
 pub mod cache;
+pub mod decode_activity;
+pub mod encode_path;
 pub mod encoders;
 pub mod eos;
 pub mod factory;
 pub mod hub;
 pub(crate) mod json_dumps;
 pub mod mock;
+mod native;
 pub mod registry;
 pub mod sequence;
 pub mod stop;
 pub mod stream;
+mod token_text;
 pub mod traits;
+#[cfg(feature = "tokenizers-v1")]
+mod v1;
+mod word_cache;
 
 pub mod chat_template;
 pub mod huggingface;
 mod kimi_k2_tokenizer;
+mod tekken;
 pub mod tiktoken;
 
 #[cfg(test)]
@@ -26,6 +36,10 @@ mod tests;
 // Re-export types used outside this module
 pub use cache::{CacheConfig, CacheStats, CachedTokenizer, L0Cache, L1Cache, TokenizerFingerprint};
 pub use chat_template::ChatTemplateState;
+pub use decode_activity::{decode_activity_stats, DecodeActivityStats};
+pub use encode_path::{
+    encode_fallbacks, encode_path_loads, EncodeFallbacks, EncodePath, EncodePathLoads,
+};
 pub use factory::{
     create_tokenizer, create_tokenizer_from_file, create_tokenizer_with_chat_template,
     TokenizerType,
@@ -34,12 +48,14 @@ pub use huggingface::HuggingFaceTokenizer;
 pub use mock::MockTokenizer;
 pub use registry::{LoadError, LoadOutcome, TokenizerRegistry};
 pub use sequence::Sequence;
-pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
+pub use stop::{
+    SequenceDecoderOutput, SequenceDecoderStep, StopRules, StopSequenceConfig, StopSequenceDecoder,
+};
 pub use stream::DecodeStream;
 pub use tiktoken::{TiktokenModel, TiktokenTokenizer};
 pub use traits::{
-    ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding, SpecialTokens,
-    TokenIdType, Tokenizer as TokenizerTrait,
+    ChatTemplateOutput, DecodeStep, Decoder, EncodeJob, Encoder, Encoding, IncrementalDecoder,
+    PromptEncoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
 };
 
 /// Main tokenizer wrapper that provides a unified interface for different tokenizer implementations
@@ -63,7 +79,7 @@ impl Tokenizer {
         )?))
     }
 
-    /// Create a tokenizer from an Arc<dyn Tokenizer>
+    /// Create a tokenizer from an `Arc<dyn Tokenizer>`
     pub fn from_arc(tokenizer: Arc<dyn traits::Tokenizer>) -> Self {
         Tokenizer(tokenizer)
     }

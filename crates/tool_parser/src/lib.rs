@@ -4,6 +4,7 @@
 // Core modules
 pub mod errors;
 pub mod factory;
+mod json_format;
 pub mod partial_json;
 pub mod traits;
 pub mod types;
@@ -15,11 +16,11 @@ pub mod parsers;
 mod tests;
 
 // Re-export types used outside this module
-pub use factory::{ParserFactory, PooledParser, ToolConstraint};
+pub use factory::{GrammarStart, ParserFactory, PooledParser, ToolConstraint};
 pub use parsers::{
-    CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser,
-    InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser, MinimaxM2Parser,
-    MinimaxM3Parser, MistralParser, PythonicParser, QwenParser, Step3Parser,
+    CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Gemma4Parser,
+    Glm4MoeParser, HyV4Parser, InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser,
+    MinimaxM2Parser, MinimaxM3Parser, MistralParser, PythonicParser, QwenParser, Step3Parser,
 };
 pub use traits::ToolParser;
 pub use types::{FunctionCall, StreamingParseResult, ToolCall};

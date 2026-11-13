@@ -1,30 +1,46 @@
 //! Common helper functions shared across stages
 
-use std::sync::Arc;
+use std::{
+    fmt,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::response::Response;
+use engine_zmq_adapter::stops::encode_single_token_stops;
 use llm_tokenizer::traits::Tokenizer;
+use openai_protocol::common::ResponseFormat;
 use rand::RngExt;
 use smg_grpc_client::{
     mlx_proto,
     sglang_proto::{self, DisaggregatedParams},
     tokenspeed_proto, vllm_proto,
 };
+use tool_parser::{GrammarStart, ParserFactory as ToolParserFactory};
 use tracing::{debug, error, warn};
 
 use super::pd_protocol::{DpPlacement, PdProtocol, PdRendezvous};
 use crate::{
     middleware::{RequestId, TenantRequestMeta},
-    rate_limit::{ReservationAttachment, SharedReservationHandle},
     routers::{
         error,
         grpc::{
-            context::{AttemptStamp, ExecutionPlan, LoadGuards, RequestType, WorkerSelection},
-            proto_wrapper::ProtoGenerateRequest,
+            backend_client::BackendClient,
+            context::{
+                stage_output, AttemptStamp, ClientSelection, EncodeOutputs, ExecutionPlan,
+                RequestContext, RequestType, WorkerSelection,
+            },
+            multimodal::{
+                assemble_media_refs, assemble_multimodal_data,
+                assemble_multimodal_data_after_encode, assembly_error_response,
+                reserve_multimodal_inflight,
+            },
+            proto_wrapper::{AnswerConstraint, MultimodalData, ProtoGenerateRequest},
+            utils,
         },
     },
     worker::{
-        sampling_defaults::SamplingDefaults, AttachedBody, Worker, DEFAULT_BOOTSTRAP_PORT,
+        sampling_defaults::SamplingDefaults, Worker, DEFAULT_BOOTSTRAP_PORT,
         DEFAULT_SAMPLING_PARAMS_LABEL,
     },
 };
@@ -90,34 +106,13 @@ impl SamplingDefaultsMask {
             RequestType::Responses(_)
             | RequestType::Embedding(_)
             | RequestType::Classify(_)
+            | RequestType::Decisions(_)
             | RequestType::Transcription { .. } => None,
         }
     }
 
     fn any(self) -> bool {
         self.temperature || self.top_p || self.top_k || self.min_p || self.repetition_penalty
-    }
-}
-
-/// Attach load guards and/or a rate-limit reservation to a streaming
-/// response body so each survives (and, for the reservation, resolves via
-/// `ReservationAttachment`'s `Drop`) exactly as long as the body does,
-/// regardless of how the client disconnects. A no-op returning `response`
-/// unchanged when both are `None`.
-pub(crate) fn attach_response_guards(
-    response: Response,
-    guards: Option<LoadGuards>,
-    reservation: Option<Arc<SharedReservationHandle>>,
-) -> Response {
-    match (guards, reservation) {
-        (Some(guards), Some(handle)) => {
-            AttachedBody::wrap_response(response, (guards, ReservationAttachment::new(handle)))
-        }
-        (Some(guards), None) => AttachedBody::wrap_response(response, guards),
-        (None, Some(handle)) => {
-            AttachedBody::wrap_response(response, ReservationAttachment::new(handle))
-        }
-        (None, None) => response,
     }
 }
 
@@ -128,6 +123,34 @@ pub(crate) fn middleware_request_id(tenant_meta: Option<&TenantRequestMeta>) -> 
     tenant_meta
         .and_then(|meta| meta.extension::<RequestId>())
         .map(|request_id| request_id.0.as_str())
+}
+
+/// The request's wall-clock time as `(seconds, subsecond nanos)` since the
+/// Unix epoch: the timestamp of its charge id, a version-7 uuid the edge
+/// minted when it took the request in, which is the request's one wall-clock
+/// read (the response's `created`, the engine request id's stamp and the
+/// charge id all tell the same second); read from the clock for a request
+/// that carries no meta.
+pub(crate) fn request_wall_clock(tenant_meta: Option<&TenantRequestMeta>) -> (u64, u32) {
+    tenant_meta
+        .and_then(|meta| meta.request_charge_id().get_timestamp())
+        .map_or_else(
+            || {
+                let since_epoch = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                (since_epoch.as_secs(), since_epoch.subsec_nanos())
+            },
+            |stamp| stamp.to_unix(),
+        )
+}
+
+/// A fresh version-7 uuid at the request's wall-clock time (see
+/// [`request_wall_clock`]): unique by its random bits, ordered by the
+/// request's time like one minted now, without a clock read of its own.
+fn request_stamp_uuid(tenant_meta: Option<&TenantRequestMeta>) -> uuid::Uuid {
+    let (seconds, nanos) = request_wall_clock(tenant_meta);
+    uuid::Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, seconds, nanos))
 }
 
 /// How each retry attempt re-mints the engine request id, captured at build
@@ -164,7 +187,8 @@ pub(crate) struct BatchIdStamp {
 /// attempts re-mint it with.
 ///
 /// Priority: the protocol `rid`, else the middleware request id, else a fresh
-/// `{prefix}{uuid}` (see [`IdStamp`] for the uniqueness rules).
+/// `{prefix}{uuid}` (see [`IdStamp`] for the uniqueness rules). The uuid is
+/// stamped at the request's wall-clock time ([`request_stamp_uuid`]).
 pub(crate) fn resolve_request_id_stamp(
     request_type: &RequestType,
     tenant_meta: Option<&TenantRequestMeta>,
@@ -176,23 +200,49 @@ pub(crate) fn resolve_request_id_stamp(
             let stamp = IdStamp::Suffixed {
                 base: rid.to_string(),
             };
-            (format!("{rid}-{}", uuid::Uuid::now_v7()), stamp)
+            (suffixed_id(rid, request_stamp_uuid(tenant_meta)), stamp)
         } else {
             (rid.to_string(), IdStamp::Exact)
         };
     }
     match middleware_request_id(tenant_meta) {
         Some(request_id) => (
-            format!("{request_id}-{}", uuid::Uuid::now_v7()),
+            suffixed_id(request_id, request_stamp_uuid(tenant_meta)),
             IdStamp::Suffixed {
                 base: request_id.to_string(),
             },
         ),
         None => (
-            format!("{prefix}{}", uuid::Uuid::now_v7()),
+            minted_id(prefix, request_stamp_uuid(tenant_meta)),
             IdStamp::Minted { prefix },
         ),
     }
+}
+
+/// `{base}-{uuid}`, written into one `String` of its exact size: a `format!`
+/// of these pieces starts its buffer empty and grows it twice on the way
+/// (three allocations per id on every gRPC request, measured on the mock
+/// bed), where the length is known before the first byte is written.
+fn suffixed_id(base: &str, uuid: uuid::Uuid) -> String {
+    let mut id = String::with_capacity(base.len() + 1 + uuid::fmt::Hyphenated::LENGTH);
+    id.push_str(base);
+    id.push('-');
+    push_hyphenated(&mut id, uuid);
+    id
+}
+
+/// `{prefix}{uuid}`, written into one `String` of its exact size (see
+/// `suffixed_id`).
+fn minted_id(prefix: &str, uuid: uuid::Uuid) -> String {
+    let mut id = String::with_capacity(prefix.len() + uuid::fmt::Hyphenated::LENGTH);
+    id.push_str(prefix);
+    push_hyphenated(&mut id, uuid);
+    id
+}
+
+fn push_hyphenated(id: &mut String, uuid: uuid::Uuid) {
+    let mut text = [0u8; uuid::fmt::Hyphenated::LENGTH];
+    id.push_str(uuid.hyphenated().encode_lower(&mut text));
 }
 
 /// Shared id + stamp for the batched completion fan-out. The shared id
@@ -209,11 +259,7 @@ pub(crate) fn resolve_batch_id_stamp(
         Some(rid) => (rid.to_string(), Some(rid.to_string()), disaggregated),
         None => match middleware_request_id(tenant_meta) {
             Some(request_id) => (request_id.to_string(), Some(request_id.to_string()), true),
-            None => (
-                format!("{prefix}{}", uuid::Uuid::now_v7()),
-                None,
-                disaggregated,
-            ),
+            None => (minted_id(prefix, uuid::Uuid::now_v7()), None, disaggregated),
         },
     };
     (
@@ -235,6 +281,22 @@ pub(crate) fn batch_sub_id(shared: &str, index: usize, unique: bool) -> String {
     }
 }
 
+/// What a tokenized `Generate` carries as `original_text` next to its ids.
+///
+/// Workers generate from the ids. The text is read only by the worker-side
+/// media processors, which hand it on as the prompt's text next to the ids,
+/// so a request that carries media keeps it; a text-only request sends the
+/// ids alone. The rendered text of a 1M-token prompt is about 4 MB: next to
+/// its ~2 MB of ids it tripled every Generate and stayed resident in the
+/// router for the life of each in-flight request.
+pub(crate) fn wire_prompt_text(rendered_prompt: String, carries_media: bool) -> String {
+    if carries_media {
+        rendered_prompt
+    } else {
+        String::new()
+    }
+}
+
 impl IdStamp {
     /// Re-mint the retained plan's engine id(s) for a retry attempt. A plan
     /// shape that doesn't match the stamp is a build-stage wiring bug: fail
@@ -242,12 +304,8 @@ impl IdStamp {
     pub(crate) fn restamp(&self, plan: &mut ExecutionPlan) -> Result<(), Response> {
         match self {
             Self::Exact => Ok(()),
-            Self::Suffixed { base } => {
-                plan.set_request_id(format!("{base}-{}", uuid::Uuid::now_v7()))
-            }
-            Self::Minted { prefix } => {
-                plan.set_request_id(format!("{prefix}{}", uuid::Uuid::now_v7()))
-            }
+            Self::Suffixed { base } => plan.set_request_id(suffixed_id(base, uuid::Uuid::now_v7())),
+            Self::Minted { prefix } => plan.set_request_id(minted_id(prefix, uuid::Uuid::now_v7())),
             Self::Batch(batch) => {
                 let ExecutionPlan::Batch {
                     shared_request_id,
@@ -267,7 +325,7 @@ impl IdStamp {
                 let shared = batch
                     .stable_shared
                     .clone()
-                    .unwrap_or_else(|| format!("{}{}", batch.prefix, uuid::Uuid::now_v7()));
+                    .unwrap_or_else(|| minted_id(batch.prefix, uuid::Uuid::now_v7()));
                 for (i, request) in requests.iter_mut().enumerate() {
                     request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
                 }
@@ -370,22 +428,206 @@ impl SamplingBaseline {
     }
 }
 
+/// A structural tag the table derives for where a worker's engine starts the
+/// grammar (`regular::symphony::AutoTag`, `regular::symphony::AnswerTag`): the
+/// attempt stamp asks it for the worker each retry takes, as request building
+/// asked it for the first.
+pub(crate) trait TagForStart: fmt::Debug + Send + Sync {
+    /// The tag for an engine whose grammar starts at `start`, in the
+    /// `vocabulary` of structural-tag nodes its compiler takes, or `None`
+    /// where the table gives that engine no tag.
+    fn tag_for(
+        &self,
+        start: GrammarStart,
+        vocabulary: utils::TagVocabulary,
+    ) -> Result<Option<String>, String>;
+
+    /// The request's own JSON schema, where the tag is a JSON answer's: the
+    /// constraint a worker the table gives no tag takes in its place, the
+    /// engine's own, serialized only when a request takes it; `None` where
+    /// no tag leaves the request unconstrained (the `auto` tag).
+    fn schema(&self) -> Option<&serde_json::Value>;
+}
+
+/// A request's tool constraint as each attempt's worker must take it. Request
+/// building gives the first attempt's worker the shape its engine needs; a
+/// retry gives the worker it selects the same treatment, since a tag already
+/// shaped for one engine cannot be shaped for another: the registry's tags
+/// from the unshaped form preparation produced, the table's from what derives
+/// them for a start.
+#[derive(Clone, Debug)]
+pub(crate) enum ToolConstraintStamp {
+    /// A forced tool call's constraint as preparation built it (the older
+    /// registry's, or the table's tag for the start the model's workers name
+    /// together), with the name of the tool parser that shapes the registry's
+    /// (`utils::tool_constraints_for_worker`).
+    Registry {
+        /// The `(kind, value)` pair preparation produced, before any worker shaped it.
+        constraint: (String, String),
+        /// The configured tool parser the shaping reads its reasoning prefix from.
+        parser: Option<String>,
+        /// The table built the tag for an engine that starts the grammar at
+        /// the first token: the shaping leaves such a tag as it is, so every
+        /// retry says so with it (`regular::symphony::Prepared::Constraint`).
+        first_token: bool,
+    },
+    /// The table's tag the selected worker took, shaped for where its engine
+    /// starts the grammar: the `auto` tag its policy chose, or a JSON
+    /// answer's; the retry's worker gets it derived again for its own start.
+    /// Where the table gives that engine none, the `auto` tag leaves the
+    /// request unconstrained, and a JSON answer's gives way to the request's
+    /// own schema, the engine's constraint ([`TagForStart::schema`]), from
+    /// which a later retry takes the tag back. An `auto` tag is captured only
+    /// where the first worker got a tag: a plan built without one carries no
+    /// stamp, so a retry's worker the table would give one goes without it
+    /// too.
+    Table(Arc<dyn TagForStart>),
+}
+
+impl ToolConstraintStamp {
+    /// Capture the stamp for a built request that carries the forced call's
+    /// structural tag. Nothing is captured for a JSON-schema constraint (no
+    /// shape to follow) or when the backend's builder let the request's
+    /// `response_format` outrank the tool constraint: the request then
+    /// carries the body's own constraint, a schema, a grammar, a regex, or
+    /// the body's own structural tag, told from the forced call's by
+    /// `own_format`, the `response_format` as the builder read it (`None`
+    /// where the constraint set it aside). `first_token` says the table
+    /// built the tag for an engine that starts the grammar at the first
+    /// token.
+    pub(crate) fn capture(
+        unshaped: Option<(String, String)>,
+        parser: Option<&str>,
+        first_token: bool,
+        request: &ProtoGenerateRequest,
+        own_format: Option<&ResponseFormat>,
+    ) -> Option<Self> {
+        let constraint = unshaped.filter(|(kind, _)| kind == "structural_tag")?;
+        let carried = request.structural_tag()?;
+        // The body's own tag rides as its builder wrote it
+        // (`response_format_constraint`): a request that carries it keeps it
+        // on every retry.
+        if let Some(own @ ResponseFormat::StructuralTag { .. }) = own_format {
+            if serde_json::to_string(own).is_ok_and(|tag| tag == carried) {
+                return None;
+            }
+        }
+        Some(Self::Registry {
+            constraint,
+            parser: parser.map(str::to_string),
+            first_token,
+        })
+    }
+
+    /// Capture the stamp for a built request that carries the table's tag,
+    /// with what derives the tag for a worker's start; for a JSON answer's, a
+    /// request that carries the answer's schema instead, the engine's own
+    /// where the table gave the first worker no tag ([`TagForStart::schema`]).
+    /// Nothing is captured when the backend's builder let the request's
+    /// `response_format` outrank an `auto` tag, as for [`Self::capture`].
+    pub(crate) fn capture_table(
+        tag: Arc<dyn TagForStart>,
+        request: &ProtoGenerateRequest,
+    ) -> Option<Self> {
+        let carried = request.structural_tag().is_some()
+            || (request.json_schema().is_some() && tag.schema().is_some());
+        if !carried {
+            return None;
+        }
+        Some(Self::Table(tag))
+    }
+
+    /// Write the constraint, shaped for `workers`, over the request's
+    /// structural tag; a table's tag the retry's worker gets none of leaves
+    /// the request unconstrained, as a first attempt on that worker would be.
+    fn restamp(
+        &self,
+        request: &mut ProtoGenerateRequest,
+        workers: &WorkerSelection,
+        tool_parser_factory: &ToolParserFactory,
+    ) -> Result<(), Response> {
+        let failed = |e: String| {
+            error!(
+                function = "restamp_plan_for_attempt",
+                error = %e,
+                "Failed to shape the tool constraint for the retry's worker"
+            );
+            error::internal_error(
+                "invalid_tool_constraint",
+                format!("Invalid tool constraint: {e}"),
+            )
+        };
+        // Whether the shape for this worker leads with the thought for an engine
+        // that starts the grammar at the first token, or the table built it so:
+        // the request says so where its dialect has a switch for the gate
+        // behind a reasoning parser, as the first attempt's build did
+        // (`GenerateRequestBuildOptions`).
+        let first_token = match self {
+            Self::Registry {
+                constraint,
+                parser,
+                first_token,
+            } => {
+                let (shaped, led) = utils::tool_constraints_for_worker(
+                    tool_parser_factory,
+                    parser.as_deref(),
+                    Some(constraint.clone()),
+                    Some(workers),
+                )
+                .map_err(failed)?;
+                if let Some((_, tag)) = shaped {
+                    request.set_structural_tag(tag);
+                }
+                led || *first_token
+            }
+            Self::Table(tag) => {
+                let decoding = utils::WorkerDecoding::of(Some(workers));
+                let shaped = tag
+                    .tag_for(decoding.start, decoding.vocabulary)
+                    .map_err(failed)?;
+                let first_token = shaped.is_some() && decoding.start == GrammarStart::FirstToken;
+                match (shaped, tag.schema()) {
+                    // A JSON answer's: the tag, or the request's own schema
+                    // where the table gives this worker none, the one in the
+                    // other's place.
+                    (shaped, Some(schema)) => {
+                        request.restore_answer_constraint(match shaped {
+                            Some(tag) => AnswerConstraint::StructuralTag(tag),
+                            None => AnswerConstraint::JsonSchema(schema.to_string()),
+                        });
+                    }
+                    (Some(tag), None) => request.restore_structural_tag(tag),
+                    (None, None) => request.clear_structural_tag(),
+                }
+                first_token
+            }
+        };
+        request.set_grammar_from_first_token(first_token);
+        Ok(())
+    }
+}
+
 /// Re-stamp the retained plan for a retry attempt's newly selected workers:
 /// fresh engine ids per [`IdStamp`], the new worker's sampling defaults
-/// (re-applied over the build-time baseline), and fresh PD
-/// bootstrap/rendezvous rooms. EPD encode bootstrap info is deliberately
-/// untouched — those rooms are the rendezvous with encode jobs the first
-/// dispatch already launched.
+/// (re-applied over the build-time baseline), the tool constraint in the
+/// shape the new worker's engine needs ([`ToolConstraintStamp`]), and fresh
+/// PD bootstrap/rendezvous rooms. EPD
+/// encode bootstrap info is deliberately untouched — those rooms are the
+/// rendezvous with encode jobs the first dispatch already launched.
 pub(crate) fn restamp_plan_for_attempt(
     plan: &mut ExecutionPlan,
     stamp: &AttemptStamp,
     workers: &WorkerSelection,
+    tool_parser_factory: &ToolParserFactory,
 ) -> Result<(), Response> {
     stamp.id.restamp(plan)?;
     for request in plan.generate_requests_mut() {
         if let (Some(mask), Some(baseline)) = (stamp.sampling_mask, &stamp.sampling_baseline) {
             baseline.restore_masked(request, mask)?;
             apply_sampling_defaults_with_mask(request, mask, Some(workers));
+        }
+        if let Some(tool_constraint) = &stamp.tool_constraint {
+            tool_constraint.restamp(request, workers, tool_parser_factory)?;
         }
         if stamp.inject_pd_metadata {
             maybe_inject_pd_metadata(request, workers);
@@ -400,9 +642,7 @@ pub(crate) fn restamp_plan_for_attempt(
 /// In PD mode the decode worker is authoritative because it produces visible
 /// output tokens. The resolved request is then sent through the existing PD
 /// flow unchanged.
-pub(crate) fn sampling_defaults_for_request(
-    workers: Option<&WorkerSelection>,
-) -> Option<SamplingDefaults> {
+fn sampling_defaults_for_request(workers: Option<&WorkerSelection>) -> Option<SamplingDefaults> {
     let worker = match workers? {
         WorkerSelection::Single { worker } => worker,
         WorkerSelection::Disaggregated { decode, .. } => decode,
@@ -417,7 +657,7 @@ pub(crate) fn sampling_defaults_for_request(
         Ok(defaults) => defaults,
         Err(e) => {
             warn!(
-                worker_url = %worker.url(),
+                worker_url = %worker.redacted_url(),
                 error = %e,
                 "Ignoring invalid default sampling params label"
             );
@@ -582,61 +822,6 @@ fn apply_tokenspeed_sampling_defaults(
     apply_opt!(repetition_penalty);
 }
 
-/// Convert single-token stop strings into `stop_token_ids` entries so the engine
-/// can halt generation early for the common case (e.g. `["."]`, `["\n"]`).
-///
-/// The proto `stop_token_ids` field is a flat list of single token ids, so a
-/// multi-token stop string cannot be represented there — pushing its sub-tokens
-/// would stop far too eagerly (on any one of them). Multi-token, empty, and
-/// unknown stops are therefore left to the router-side `StopSequenceDecoder`,
-/// which detokenizes worker output and trims the stop text. Existing
-/// `stop_token_ids` are preserved and deduped.
-fn encode_single_token_stops(
-    stops: Vec<String>,
-    stop_token_ids: &mut Vec<u32>,
-    tokenizer: Option<&Arc<dyn Tokenizer>>,
-) {
-    // Without a tokenizer we cannot encode (not expected on paths that resolve
-    // one to tokenize the prompt). Safe: the strings are already dropped by the
-    // caller, so the router-side decoder remains the source of truth.
-    let Some(tokenizer) = tokenizer else {
-        if !stops.is_empty() {
-            warn!(
-                "No tokenizer available to encode string stop sequences; \
-                 relying on router-side stop decoder only"
-            );
-        }
-        return;
-    };
-
-    for stop in stops {
-        if stop.is_empty() {
-            continue;
-        }
-        // add_special_tokens=false: we want the literal token(s) for the stop
-        // string, not a BOS/EOS-wrapped encoding.
-        match tokenizer.encode(&stop, false) {
-            Ok(encoding) => match encoding.token_ids() {
-                [id] => {
-                    if !stop_token_ids.contains(id) {
-                        stop_token_ids.push(*id);
-                    }
-                }
-                ids => debug!(
-                    stop = %stop,
-                    token_count = ids.len(),
-                    "string stop is not single-token; handled by router-side stop decoder"
-                ),
-            },
-            Err(e) => warn!(
-                stop = %stop,
-                error = %e,
-                "Failed to encode string stop sequence; relying on router-side stop decoder"
-            ),
-        }
-    }
-}
-
 /// Router-authoritative string-`stop` resolution for backends whose engine
 /// cannot match string stops itself.
 ///
@@ -669,7 +854,7 @@ pub(crate) fn resolve_string_stops(
         ProtoGenerateRequest::Sglang(req) => {
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -679,7 +864,7 @@ pub(crate) fn resolve_string_stops(
             // not part of shared stop resolution.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -692,7 +877,7 @@ pub(crate) fn resolve_string_stops(
             // stops at EOS itself, so its translation carries no frontend ids.
             if let Some(params) = req.sampling_params.as_mut() {
                 let stops = std::mem::take(&mut params.stop);
-                encode_single_token_stops(stops.clone(), &mut params.stop_token_ids, tokenizer);
+                encode_single_token_stops(&stops, &mut params.stop_token_ids, tokenizer);
                 return stops;
             }
         }
@@ -704,7 +889,8 @@ pub(crate) fn resolve_string_stops(
 /// Inject PD bootstrap metadata when the runtime's rendezvous travels as
 /// SGLang-style `DisaggregatedParams` (bootstrap host/port/room).
 ///
-/// vLLM kv_transfer_params are handled in the request_execution stage.
+/// `kv_transfer_params`, the connector forms' handoff, are built and relayed
+/// by the sequential dispatch (`routers::grpc::sequential_pd`).
 pub(crate) fn maybe_inject_pd_metadata(
     request: &mut ProtoGenerateRequest,
     workers: &WorkerSelection,
@@ -760,12 +946,12 @@ fn inject_sglang_bootstrap_metadata(
 /// prefill and decode worker (`execute_parallel_pd` clones the request after
 /// this stage). Host/port name the PREFILL worker's Mooncake bootstrap server
 /// (the KV data source); the decode worker discovers it there by `bootstrap_room`.
-/// This KV leg is independent of any per-item encode->prefill bootstrap info.
+/// This KV handoff is independent of any per-item encode->prefill bootstrap info.
 pub(crate) fn maybe_inject_pd_rendezvous(
     request: &mut ProtoGenerateRequest,
     workers: &WorkerSelection,
 ) {
-    // The KV bootstrap leg is identical for plain PD and EPD; EPD just layers
+    // The KV bootstrap handoff is identical for plain PD and EPD; EPD just layers
     // encode assignments on the disaggregated worker selection.
     let (prefill, runtime_type) = match workers {
         WorkerSelection::Disaggregated {
@@ -783,15 +969,145 @@ pub(crate) fn maybe_inject_pd_rendezvous(
     }
 }
 
-/// Inject the KV bootstrap host/port/room into a generate request.
+/// The client that builds the request, from the clients a stage acquired, or
+/// the failure a stage reports when that stage has not run.
+fn builder_client<'a>(
+    clients: Option<&'a ClientSelection>,
+    function: &'static str,
+) -> Result<&'a BackendClient, Response> {
+    stage_output(clients, function).map(ClientSelection::builder)
+}
+
+/// The request's media, assembled for the engine that builds the request now
+/// that the worker is known: `None` for a request without media; otherwise
+/// the intermediate is taken (the prefill serialization needs it here), the
+/// pixel-drop assembly runs when an encode stage did, the plain one else, a
+/// failure is answered as the media error it is, and the request's share of
+/// the in-flight media budget is reserved for the inline bytes. The builder is
+/// resolved here rather than passed in, so a caller's borrow of the clients
+/// does not pin the whole context across the call.
+pub(crate) async fn assemble_prompt_media(
+    ctx: &mut RequestContext,
+    function: &'static str,
+) -> Result<Option<MultimodalData>, Response> {
+    let Some(intermediate) = ctx.state.multimodal_intermediate.take() else {
+        return Ok(None);
+    };
+    let builder = builder_client(ctx.state.clients.as_ref(), function)?;
+    // A rendezvous plan from EncodeStage selects the pixel-drop assembly path;
+    // a push plan keeps the pixels, its encoder takes the built prompt.
+    let assembled = if matches!(
+        ctx.state.encode_outputs,
+        Some(EncodeOutputs::Rendezvous { .. })
+    ) {
+        assemble_multimodal_data_after_encode(intermediate, builder, ctx.state.workers.as_ref())
+            .await
+    } else {
+        assemble_multimodal_data(intermediate, builder, ctx.state.workers.as_ref()).await
+    };
+    let data = assembled.map_err(|e| {
+        error!(function = function, error = %e, "Failed to assemble multimodal request");
+        assembly_error_response(&e)
+    })?;
+    ctx.state.multimodal_inflight = reserve_multimodal_inflight(
+        ctx.components
+            .multimodal
+            .as_ref()
+            .and_then(|multimodal| multimodal.inflight.as_deref()),
+        data.inline_bytes(),
+    )
+    .await?;
+    Ok(Some(data))
+}
+
+/// What a built generate request gets before it is planned, in the order the
+/// dispatch needs: the string `stop`s its engine cannot match resolved by the
+/// client, which reports the router's residual trim obligations; the PD
+/// metadata when the stage injects it; an EPD request's per-item encode
+/// bootstrap info (the dispatch plan stays on `encode_outputs` for request
+/// execution to take); the prefill->decode KV rendezvous for the backends
+/// that carry it in the request; and, for worker-side multimodal processing,
+/// the media references now that the wire is known. The last two land before
+/// the disaggregated dispatch clones the request, so both sides carry them.
+pub(crate) fn finish_generate_request(
+    ctx: &mut RequestContext,
+    proto_request: &mut ProtoGenerateRequest,
+    inject_pd_metadata: bool,
+    function: &'static str,
+) -> Result<(), Response> {
+    let builder = builder_client(ctx.state.clients.as_ref(), function)?;
+    ctx.state.response.router_stop_obligations =
+        builder.finalize_generate_request(proto_request, ctx.tokenizer_arc().as_ref());
+
+    if inject_pd_metadata {
+        if let Some(workers) = ctx.state.workers.as_ref() {
+            maybe_inject_pd_metadata(proto_request, workers);
+        }
+    }
+
+    if let Some(EncodeOutputs::Rendezvous { bootstrap_info, .. }) =
+        ctx.state.encode_outputs.as_mut()
+    {
+        proto_request.set_encode_bootstrap_info(std::mem::take(bootstrap_info));
+    }
+
+    if let Some(workers) = ctx.state.workers.as_ref() {
+        maybe_inject_pd_rendezvous(proto_request, workers);
+    }
+
+    if let Some(plan) = ctx.state.multimodal_refs.take() {
+        if builder.is_zmq() {
+            return Err(error::bad_request(
+                "multimodal_not_supported",
+                "media references require a supported gRPC worker",
+            ));
+        }
+        let refs =
+            assemble_media_refs(plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
+        proto_request
+            .set_media_refs(refs)
+            .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
+        ctx.state.media_refs_forwarded = true;
+    }
+    Ok(())
+}
+
+/// A disaggregated worker's bootstrap rendezvous `(host, port)` (a prefill
+/// worker's KV, an encode worker's embeddings): the operator's
+/// (its URL's host, the port given with it) where set, else what its engine
+/// declared at the handshake (a direct-ZMQ worker's URL names the gateway's
+/// own bind, not the engine's host), else the default port.
+pub(crate) fn bootstrap_rendezvous<'a>(
+    registered_host: &'a str,
+    registered_port: Option<u16>,
+    declared: Option<(&'a str, u16)>,
+) -> (&'a str, u16) {
+    let host = match registered_host {
+        "" => declared.map_or("", |(host, _)| host),
+        host => host,
+    };
+    let port = registered_port
+        .or_else(|| declared.map(|(_, port)| port))
+        .unwrap_or(DEFAULT_BOOTSTRAP_PORT);
+    (host, port)
+}
+
+/// Inject the KV bootstrap host/port/room into a generate request, at the
+/// prefill worker's [`bootstrap_rendezvous`].
 fn inject_kv_bootstrap_room(
     request: &mut ProtoGenerateRequest,
     prefill_worker: &Arc<dyn Worker>,
     dp_placement: DpPlacement,
 ) {
     let metadata = prefill_worker.metadata();
-    let hostname = metadata.bootstrap_host();
-    let bootstrap_port = metadata.bootstrap_port().unwrap_or(DEFAULT_BOOTSTRAP_PORT);
+    let backend = prefill_worker.backend_client_if_initialized();
+    let (hostname, bootstrap_port) = bootstrap_rendezvous(
+        metadata.bootstrap_host(),
+        metadata.bootstrap_port(),
+        backend
+            .as_deref()
+            .and_then(BackendClient::declared_bootstrap),
+    );
     // 63-bit room: no dedup, keep the space wide so the birthday collision
     // rate stays negligible. See the proto field doc.
     //
@@ -824,702 +1140,4 @@ fn inject_kv_bootstrap_room(
 }
 
 #[cfg(test)]
-mod request_id_tests {
-    use std::sync::Arc;
-
-    use openai_protocol::chat::ChatCompletionRequest;
-
-    use super::*;
-    use crate::tenant::TenantKey;
-
-    fn chat_request_type(rid: Option<&str>) -> RequestType {
-        RequestType::Chat(Arc::new(ChatCompletionRequest {
-            rid: rid.map(str::to_string),
-            ..Default::default()
-        }))
-    }
-
-    fn meta_with_request_id(id: &str) -> TenantRequestMeta {
-        TenantRequestMeta::new(TenantKey::new("test-tenant"))
-            .with_extension(RequestId(id.to_string()))
-    }
-
-    fn single_plan(request_id: &str) -> ExecutionPlan {
-        use smg_grpc_client::sglang_proto;
-
-        use crate::routers::grpc::proto_wrapper::ProtoRequest;
-        let request = ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
-            request_id: request_id.to_string(),
-            ..Default::default()
-        }));
-        ExecutionPlan::Single(ProtoRequest::Generate(request))
-    }
-
-    fn batch_plan(shared: &str, sub_ids: &[String]) -> ExecutionPlan {
-        use smg_grpc_client::sglang_proto;
-
-        use crate::routers::grpc::context::ExecutionPlanKind;
-        ExecutionPlan::Batch {
-            kind: ExecutionPlanKind::Single,
-            shared_request_id: shared.to_string(),
-            requests: sub_ids
-                .iter()
-                .map(|id| {
-                    ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
-                        request_id: id.clone(),
-                        ..Default::default()
-                    }))
-                })
-                .collect(),
-        }
-    }
-
-    fn plan_ids(plan: &ExecutionPlan) -> (String, Vec<String>) {
-        match plan {
-            ExecutionPlan::Batch {
-                shared_request_id,
-                requests,
-                ..
-            } => (
-                shared_request_id.clone(),
-                requests
-                    .iter()
-                    .map(|r| r.request_id().to_string())
-                    .collect(),
-            ),
-            other => (other.request_id().to_string(), Vec::new()),
-        }
-    }
-
-    #[test]
-    fn rid_is_used_exactly_outside_pd_and_stays_stable_on_restamp() {
-        let request_type = chat_request_type(Some("client-rid"));
-        let meta = meta_with_request_id("chatcmpl-mw");
-
-        let (id, stamp) = resolve_request_id_stamp(&request_type, Some(&meta), "chatcmpl-", false);
-        assert_eq!(id, "client-rid");
-
-        let mut plan = single_plan(&id);
-        stamp.restamp(&mut plan).unwrap();
-        assert_eq!(
-            plan.request_id(),
-            "client-rid",
-            "rid is the caller's contract"
-        );
-    }
-
-    #[test]
-    fn rid_gets_per_attempt_suffix_in_pd() {
-        let request_type = chat_request_type(Some("client-rid"));
-
-        let (id, stamp) = resolve_request_id_stamp(&request_type, None, "chatcmpl-", true);
-        assert!(id.starts_with("client-rid-") && id != "client-rid");
-
-        let mut plan = single_plan(&id);
-        stamp.restamp(&mut plan).unwrap();
-        let restamped = plan.request_id().to_string();
-        assert!(restamped.starts_with("client-rid-"));
-        assert_ne!(restamped, id, "each attempt gets a fresh engine id");
-    }
-
-    #[test]
-    fn middleware_id_is_base_with_per_execution_suffix() {
-        let request_type = chat_request_type(None);
-        let meta = meta_with_request_id("chatcmpl-mw");
-
-        let (first, stamp) =
-            resolve_request_id_stamp(&request_type, Some(&meta), "chatcmpl-", false);
-        assert!(first.starts_with("chatcmpl-mw-"));
-
-        let mut plan = single_plan(&first);
-        stamp.restamp(&mut plan).unwrap();
-        let second = plan.request_id().to_string();
-        assert!(second.starts_with("chatcmpl-mw-"));
-        assert_ne!(first, second);
-    }
-
-    #[test]
-    fn falls_back_to_prefixed_mint_without_rid_or_middleware_id() {
-        let request_type = chat_request_type(None);
-        let meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
-
-        let (id, stamp) = resolve_request_id_stamp(&request_type, Some(&meta), "chatcmpl-", false);
-        assert!(id.starts_with("chatcmpl-"));
-
-        let mut plan = single_plan(&id);
-        stamp.restamp(&mut plan).unwrap();
-        assert!(plan.request_id().starts_with("chatcmpl-"));
-        assert_ne!(plan.request_id(), id, "minted ids are fresh per attempt");
-    }
-
-    #[test]
-    fn batch_rid_subs_stay_stable_outside_pd() {
-        let request_type = chat_request_type(Some("client-rid"));
-        let (shared, stamp) = resolve_batch_id_stamp(&request_type, None, "cmpl_", false);
-        assert_eq!(shared, "client-rid");
-        assert!(!stamp.unique_subs);
-
-        let subs: Vec<String> = (0..2).map(|i| batch_sub_id(&shared, i, false)).collect();
-        assert_eq!(subs, ["client-rid-p0", "client-rid-p1"]);
-
-        let mut plan = batch_plan(&shared, &subs);
-        IdStamp::Batch(stamp).restamp(&mut plan).unwrap();
-        assert_eq!(plan_ids(&plan), (shared, subs), "rid batch ids are stable");
-    }
-
-    #[test]
-    fn batch_middleware_subs_are_unique_per_attempt_under_stable_shared() {
-        let request_type = chat_request_type(None);
-        let meta = meta_with_request_id("mw-id");
-        let (shared, stamp) = resolve_batch_id_stamp(&request_type, Some(&meta), "cmpl_", false);
-        assert_eq!(shared, "mw-id");
-        assert!(stamp.unique_subs);
-
-        let subs: Vec<String> = (0..2)
-            .map(|i| batch_sub_id(&shared, i, stamp.unique_subs))
-            .collect();
-        let mut plan = batch_plan(&shared, &subs);
-        IdStamp::Batch(stamp).restamp(&mut plan).unwrap();
-        let (restamped_shared, restamped_subs) = plan_ids(&plan);
-        assert_eq!(restamped_shared, "mw-id");
-        for (i, (before, after)) in subs.iter().zip(&restamped_subs).enumerate() {
-            assert!(after.starts_with(&format!("mw-id-p{i}-")));
-            assert_ne!(before, after, "sub engine ids must be fresh per attempt");
-        }
-    }
-
-    #[test]
-    fn batch_minted_shared_is_fresh_per_attempt() {
-        let request_type = chat_request_type(None);
-        let (shared, stamp) = resolve_batch_id_stamp(&request_type, None, "cmpl_", false);
-        assert!(shared.starts_with("cmpl_"));
-        assert!(stamp.stable_shared.is_none());
-
-        let subs: Vec<String> = (0..2).map(|i| batch_sub_id(&shared, i, false)).collect();
-        let mut plan = batch_plan(&shared, &subs);
-        IdStamp::Batch(stamp).restamp(&mut plan).unwrap();
-        let (restamped_shared, restamped_subs) = plan_ids(&plan);
-        assert!(restamped_shared.starts_with("cmpl_"));
-        assert_ne!(restamped_shared, shared);
-        assert_eq!(
-            restamped_subs,
-            [
-                format!("{restamped_shared}-p0"),
-                format!("{restamped_shared}-p1")
-            ]
-        );
-    }
-}
-
-#[cfg(test)]
-mod stop_resolution_tests {
-    use std::sync::Arc;
-
-    use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
-    use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto};
-
-    use super::{resolve_string_stops, ProtoGenerateRequest};
-
-    fn mock_tokenizer() -> Arc<dyn Tokenizer> {
-        // MockTokenizer vocab: "." => 6, "Hello" => 1, "world" => 2. `encode`
-        // splits on whitespace, so "." => [6] (single) and "Hello world" =>
-        // [1, 2] (multi); unknown words encode to [].
-        Arc::new(MockTokenizer::new())
-    }
-
-    fn sglang_request(stop: Vec<&str>, stop_token_ids: Vec<u32>) -> ProtoGenerateRequest {
-        ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
-            sampling_params: Some(sglang_proto::SamplingParams {
-                stop: stop.into_iter().map(str::to_string).collect(),
-                stop_token_ids,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
-    }
-
-    fn vllm_request(stop: Vec<&str>, stop_token_ids: Vec<u32>) -> ProtoGenerateRequest {
-        ProtoGenerateRequest::Vllm(Box::new(vllm_proto::GenerateRequest {
-            sampling_params: Some(vllm_proto::SamplingParams {
-                stop: stop.into_iter().map(str::to_string).collect(),
-                stop_token_ids,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
-    }
-
-    fn tokenspeed_request(stop: Vec<&str>, stop_token_ids: Vec<u32>) -> ProtoGenerateRequest {
-        ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
-            sampling_params: Some(tokenspeed_proto::SamplingParams {
-                stop: stop.into_iter().map(str::to_string).collect(),
-                stop_token_ids,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
-    }
-
-    fn tokenspeed_params(req: &ProtoGenerateRequest) -> &tokenspeed_proto::SamplingParams {
-        match req {
-            ProtoGenerateRequest::TokenSpeed(r) => r.sampling_params.as_ref().unwrap(),
-            _ => panic!("expected TokenSpeed request"),
-        }
-    }
-
-    fn sglang_params(req: &ProtoGenerateRequest) -> &sglang_proto::SamplingParams {
-        match req {
-            ProtoGenerateRequest::Sglang(r) => r.sampling_params.as_ref().unwrap(),
-            _ => panic!("expected SGLang request"),
-        }
-    }
-
-    fn vllm_params(req: &ProtoGenerateRequest) -> &vllm_proto::SamplingParams {
-        match req {
-            ProtoGenerateRequest::Vllm(r) => r.sampling_params.as_ref().unwrap(),
-            _ => panic!("expected vLLM request"),
-        }
-    }
-
-    #[test]
-    fn sglang_single_token_becomes_stop_token_id() {
-        let mut req = sglang_request(vec!["."], vec![]);
-        resolve_string_stops(&mut req, Some(&mock_tokenizer()), false);
-
-        let params = sglang_params(&req);
-        assert!(params.stop.is_empty(), "string stop should be cleared");
-        assert_eq!(params.stop_token_ids, vec![6]);
-    }
-
-    #[test]
-    fn sglang_multi_token_relies_on_router_decoder() {
-        // "Hello world" => [1, 2]: can't be a flat stop_token_id, so it must not
-        // be forwarded (would over-eagerly stop on any subtoken).
-        let mut req = sglang_request(vec!["Hello world"], vec![]);
-        resolve_string_stops(&mut req, Some(&mock_tokenizer()), false);
-
-        let params = sglang_params(&req);
-        assert!(params.stop.is_empty());
-        assert!(params.stop_token_ids.is_empty());
-    }
-
-    #[test]
-    fn sglang_mixed_only_single_token_forwarded_and_dedups() {
-        let mut req = sglang_request(vec![".", "Hello world"], vec![6, 42]);
-        resolve_string_stops(&mut req, Some(&mock_tokenizer()), false);
-
-        let params = sglang_params(&req);
-        assert!(params.stop.is_empty());
-        assert_eq!(
-            params.stop_token_ids,
-            vec![6, 42],
-            "existing ids kept, no dup"
-        );
-    }
-
-    #[test]
-    fn sglang_without_tokenizer_still_clears_strings() {
-        let mut req = sglang_request(vec!["."], vec![]);
-        resolve_string_stops(&mut req, None, false);
-
-        let params = sglang_params(&req);
-        assert!(
-            params.stop.is_empty(),
-            "strings dropped so worker won't 400"
-        );
-        assert!(params.stop_token_ids.is_empty());
-    }
-
-    #[test]
-    fn vllm_resolved_only_over_zmq() {
-        // gRPC vLLM keeps its strings (the servicer detokenizes engine-side).
-        let mut grpc = vllm_request(vec!["."], vec![]);
-        resolve_string_stops(&mut grpc, Some(&mock_tokenizer()), false);
-        let params = vllm_params(&grpc);
-        assert_eq!(
-            params.stop,
-            vec![".".to_string()],
-            "gRPC vLLM stop preserved"
-        );
-        assert!(params.stop_token_ids.is_empty());
-
-        // ZMQ vLLM (EngineCore sees token ids only) resolves like SGLang.
-        // EOS injection is the ZMQ client's own step, not stop resolution's
-        // (see zmq_client::fold_tokenizer_eos_backstop tests).
-        let mut zmq = vllm_request(vec!["."], vec![]);
-        resolve_string_stops(&mut zmq, Some(&mock_tokenizer()), true);
-        let params = vllm_params(&zmq);
-        assert!(params.stop.is_empty(), "ZMQ vLLM stop cleared");
-        assert_eq!(params.stop_token_ids, vec![6]);
-    }
-
-    #[test]
-    fn noop_when_no_string_stops() {
-        let mut req = sglang_request(vec![], vec![7]);
-        resolve_string_stops(&mut req, Some(&mock_tokenizer()), false);
-
-        let params = sglang_params(&req);
-        assert_eq!(params.stop_token_ids, vec![7], "unrelated ids untouched");
-    }
-
-    #[test]
-    fn tokenspeed_resolved_only_over_zmq() {
-        // A gRPC TokenSpeed request is never produced, but guard the gate: the
-        // strings must survive when is_zmq is false.
-        let mut grpc = tokenspeed_request(vec!["."], vec![]);
-        resolve_string_stops(&mut grpc, Some(&mock_tokenizer()), false);
-        let params = tokenspeed_params(&grpc);
-        assert_eq!(params.stop, vec![".".to_string()], "non-zmq stop preserved");
-        assert!(params.stop_token_ids.is_empty());
-
-        // Over ZMQ the token-only wire drops raw strings, so a single-token stop
-        // must ride as a stop_token_ids entry instead.
-        let mut zmq = tokenspeed_request(vec!["."], vec![]);
-        resolve_string_stops(&mut zmq, Some(&mock_tokenizer()), true);
-        let params = tokenspeed_params(&zmq);
-        assert!(params.stop.is_empty(), "ZMQ TokenSpeed stop cleared");
-        assert_eq!(params.stop_token_ids, vec![6]);
-    }
-
-    #[test]
-    fn tokenspeed_zmq_does_not_fold_eos() {
-        // Unlike vLLM EngineCore, the TokenSpeed scheduler stops at EOS itself,
-        // so resolution must not append the tokenizer's EOS ids (999).
-        let mut req = tokenspeed_request(vec!["."], vec![]);
-        resolve_string_stops(&mut req, Some(&mock_tokenizer()), true);
-        assert_eq!(
-            tokenspeed_params(&req).stop_token_ids,
-            vec![6],
-            "only the single-token stop, no EOS fold"
-        );
-    }
-
-    #[test]
-    fn resolution_returns_router_obligations() {
-        // Strings stripped for the engine come back as the router's trim duty.
-        let mut req = sglang_request(vec![".", "Hello world"], vec![]);
-        let obligations = resolve_string_stops(&mut req, Some(&mock_tokenizer()), false);
-        assert_eq!(
-            obligations,
-            vec![".".to_string(), "Hello world".to_string()]
-        );
-
-        // gRPC vLLM matches stops server-side: nothing left for the router.
-        let mut req = vllm_request(vec!["."], vec![]);
-        assert!(resolve_string_stops(&mut req, Some(&mock_tokenizer()), false).is_empty());
-    }
-
-    #[test]
-    fn pd_bootstrap_injection_skips_non_sglang_requests() {
-        use super::{Worker, WorkerSelection};
-        use crate::worker::{BasicWorkerBuilder, RuntimeType, WorkerType};
-
-        // An SGLang-runtime worker selection paired with a non-SGLang proto
-        // (e.g. a misreporting backend) must skip injection, not panic.
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://prefill:30000")
-                .worker_type(WorkerType::Prefill)
-                .build(),
-        );
-        let selection = WorkerSelection::Disaggregated {
-            encode_assignments: None,
-            prefill: worker.clone(),
-            decode: worker,
-            runtime_type: RuntimeType::Sglang,
-        };
-
-        let mut req = vllm_request(vec!["."], vec![7]);
-        let before = match &req {
-            ProtoGenerateRequest::Vllm(inner) => (**inner).clone(),
-            _ => panic!("vllm_request builds a Vllm variant"),
-        };
-        super::maybe_inject_pd_metadata(&mut req, &selection);
-        match &req {
-            ProtoGenerateRequest::Vllm(inner) => {
-                assert_eq!(**inner, before, "request must be untouched");
-            }
-            _ => panic!("variant must be unchanged"),
-        }
-    }
-
-    #[test]
-    fn tokenspeed_zmq_multi_token_relies_on_router_decoder() {
-        // "Hello world" => [1, 2]: not a flat stop id, so it must not forward.
-        let mut req = tokenspeed_request(vec!["Hello world"], vec![42]);
-        resolve_string_stops(&mut req, Some(&mock_tokenizer()), true);
-        let params = tokenspeed_params(&req);
-        assert!(params.stop.is_empty());
-        assert_eq!(params.stop_token_ids, vec![42], "existing ids kept");
-    }
-}
-
-#[cfg(test)]
-mod restamp_shape_mismatch_tests {
-    use std::sync::Arc;
-
-    use openai_protocol::chat::ChatCompletionRequest;
-    use smg_grpc_client::sglang_proto;
-
-    use super::*;
-    use crate::routers::{
-        error::extract_error_code_from_response,
-        grpc::{context::ExecutionPlanKind, proto_wrapper::ProtoRequest},
-    };
-
-    fn single_plan() -> ExecutionPlan {
-        ExecutionPlan::Single(ProtoRequest::Generate(ProtoGenerateRequest::Sglang(
-            Box::default(),
-        )))
-    }
-
-    fn batch_plan() -> ExecutionPlan {
-        ExecutionPlan::Batch {
-            kind: ExecutionPlanKind::Single,
-            shared_request_id: "cmpl_shared".to_string(),
-            requests: vec![ProtoGenerateRequest::Sglang(Box::default())],
-        }
-    }
-
-    /// A stamp/plan shape mismatch is a build-stage wiring bug; a warn-and-
-    /// continue would re-dispatch the previous attempt's engine ids.
-    #[test]
-    fn id_stamp_shape_mismatch_is_an_error() {
-        let batch_stamp = IdStamp::Batch(BatchIdStamp {
-            stable_shared: None,
-            prefix: "cmpl_",
-            unique_subs: false,
-        });
-        let response = batch_stamp
-            .restamp(&mut single_plan())
-            .expect_err("batch stamp on a single plan must fail");
-        assert_eq!(
-            extract_error_code_from_response(&response),
-            "id_stamp_plan_mismatch"
-        );
-
-        let minted_stamp = IdStamp::Minted { prefix: "cmpl_" };
-        let response = minted_stamp
-            .restamp(&mut batch_plan())
-            .expect_err("single stamp on a batch plan must fail");
-        assert_eq!(
-            extract_error_code_from_response(&response),
-            "id_stamp_plan_mismatch"
-        );
-    }
-
-    /// A baseline captured from one backend flavor cannot restore another.
-    #[test]
-    fn sampling_baseline_backend_mismatch_is_an_error() {
-        let baseline = SamplingBaseline::Vllm(vllm_proto::SamplingParams::default());
-        let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
-            sampling_params: Some(sglang_proto::SamplingParams::default()),
-            ..Default::default()
-        }));
-        let mask = SamplingDefaultsMask::from_request_type(&RequestType::Chat(Arc::new(
-            ChatCompletionRequest::default(),
-        )))
-        .expect("chat requests always carry a mask");
-        let response = baseline
-            .restore_masked(&mut request, mask)
-            .expect_err("cross-backend baseline must fail");
-        assert_eq!(
-            extract_error_code_from_response(&response),
-            "sampling_baseline_plan_mismatch"
-        );
-    }
-}
-
-#[cfg(test)]
-mod sampling_restamp_tests {
-    use std::sync::Arc;
-
-    use openai_protocol::chat::ChatCompletionRequest;
-    use smg_grpc_client::sglang_proto;
-
-    use super::*;
-    use crate::{
-        routers::grpc::{context::ExecutionPlanKind, proto_wrapper::ProtoRequest},
-        worker::{BasicWorkerBuilder, WorkerType},
-    };
-
-    fn worker_with_defaults(url: &str, defaults_json: Option<&str>) -> WorkerSelection {
-        let mut builder = BasicWorkerBuilder::new(url).worker_type(WorkerType::Regular);
-        if let Some(json) = defaults_json {
-            builder = builder.label(DEFAULT_SAMPLING_PARAMS_LABEL, json);
-        }
-        WorkerSelection::Single {
-            worker: Arc::new(builder.build()),
-        }
-    }
-
-    fn sglang_request() -> ProtoGenerateRequest {
-        ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
-            request_id: "sampling-restamp".to_string(),
-            sampling_params: Some(sglang_proto::SamplingParams {
-                temperature: 1.0,
-                top_k: 3,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }))
-    }
-
-    fn sglang_params(plan: &ExecutionPlan) -> &sglang_proto::SamplingParams {
-        match plan {
-            ExecutionPlan::Single(ProtoRequest::Generate(ProtoGenerateRequest::Sglang(req))) => {
-                req.sampling_params.as_ref().unwrap()
-            }
-            _ => panic!("expected single SGLang plan"),
-        }
-    }
-
-    /// Attempt N's effective sampling params must be exactly (request values)
-    /// + (worker N's defaults). A retry worker that omits a field the first
-    /// worker defaulted must fall back to the build-time baseline, never to
-    /// the first worker's value.
-    #[test]
-    fn retry_reapplies_defaults_from_the_baseline_not_the_previous_worker() {
-        let mask = SamplingDefaultsMask::from_request_type(&RequestType::Chat(Arc::new(
-            ChatCompletionRequest::default(),
-        )))
-        .expect("chat requests always carry a mask");
-
-        let worker_a = worker_with_defaults(
-            "grpc://worker-a:30000",
-            Some(r#"{"temperature":0.5,"top_k":7}"#),
-        );
-        let mut request = sglang_request();
-        let baseline = apply_sampling_defaults(&mut request, Some(mask), Some(&worker_a));
-        let stamp = AttemptStamp {
-            id: IdStamp::Exact,
-            sampling_mask: Some(mask),
-            sampling_baseline: baseline,
-            inject_pd_metadata: false,
-        };
-        let mut plan = ExecutionPlan::generate(ExecutionPlanKind::Single, request);
-        {
-            let params = sglang_params(&plan);
-            assert_eq!(params.temperature, 0.5, "worker A's default applied");
-            assert_eq!(params.top_k, 7);
-        }
-
-        // Worker B omits temperature: it must return to the baseline (1.0),
-        // not keep worker A's 0.5.
-        let worker_b = worker_with_defaults("grpc://worker-b:30000", Some(r#"{"top_k":9}"#));
-        restamp_plan_for_attempt(&mut plan, &stamp, &worker_b).unwrap();
-        {
-            let params = sglang_params(&plan);
-            assert_eq!(params.temperature, 1.0, "baseline restored, not worker A's");
-            assert_eq!(params.top_k, 9, "worker B's default applied");
-        }
-
-        // Worker C has no defaults label at all: everything returns to the
-        // baseline.
-        let worker_c = worker_with_defaults("grpc://worker-c:30000", None);
-        restamp_plan_for_attempt(&mut plan, &stamp, &worker_c).unwrap();
-        {
-            let params = sglang_params(&plan);
-            assert_eq!(params.temperature, 1.0);
-            assert_eq!(params.top_k, 3);
-        }
-    }
-}
-
-#[cfg(test)]
-mod epd_restamp_tests {
-    use std::sync::Arc;
-
-    use smg_grpc_client::tokenspeed_proto;
-
-    use super::*;
-    use crate::{
-        routers::grpc::{context::ExecutionPlanKind, proto_wrapper::EncodeItemBootstrapInfo},
-        worker::{BasicWorkerBuilder, RuntimeType, Worker, WorkerType},
-    };
-
-    fn tokenspeed_pd_pair(prefill_url: &str, decode_url: &str) -> WorkerSelection {
-        let prefill: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(prefill_url)
-                .worker_type(WorkerType::Prefill)
-                .build(),
-        );
-        let decode: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(decode_url)
-                .worker_type(WorkerType::Decode)
-                .build(),
-        );
-        WorkerSelection::Disaggregated {
-            encode_assignments: None,
-            prefill,
-            decode,
-            runtime_type: RuntimeType::TokenSpeed,
-        }
-    }
-
-    fn tokenspeed_rendezvous(
-        plan: &ExecutionPlan,
-    ) -> (
-        &tokenspeed_proto::EncodeBootstrapInfo,
-        &tokenspeed_proto::KvBootstrapInfo,
-    ) {
-        match plan {
-            ExecutionPlan::EncodePrefillDecode {
-                request: ProtoGenerateRequest::TokenSpeed(req),
-            } => (
-                req.encode_bootstrap_info.as_ref().unwrap(),
-                req.kv_bootstrap_info.as_ref().unwrap(),
-            ),
-            _ => panic!("expected a TokenSpeed EPD plan"),
-        }
-    }
-
-    /// An EPD retry re-selects only the prefill/decode pair. The PD KV room
-    /// must be re-minted for the new prefill, while the encode rooms must
-    /// survive untouched — the first attempt's encode jobs are already
-    /// parked at those rendezvous points, so re-minting them would strand
-    /// the embeddings.
-    #[test]
-    fn epd_restamp_remints_pd_room_and_keeps_encode_rooms() {
-        let mut request = ProtoGenerateRequest::TokenSpeed(Box::default());
-        request.set_encode_bootstrap_info(vec![EncodeItemBootstrapInfo {
-            item_index: 0,
-            bootstrap_host: "encode-worker".to_string(),
-            bootstrap_port: 9000,
-            bootstrap_room: 41,
-        }]);
-        request.set_kv_bootstrap_info("attempt1-prefill".to_string(), 8998, 42);
-        let mut plan = ExecutionPlan::generate(ExecutionPlanKind::EncodePrefillDecode, request);
-
-        let stamp = AttemptStamp {
-            id: IdStamp::Exact,
-            sampling_mask: None,
-            sampling_baseline: None,
-            inject_pd_metadata: false,
-        };
-        let retry_pair = tokenspeed_pd_pair("grpc://retry-prefill:30000", "grpc://decode:30000");
-        restamp_plan_for_attempt(&mut plan, &stamp, &retry_pair).unwrap();
-
-        let (encode, kv) = tokenspeed_rendezvous(&plan);
-        assert_eq!(
-            (
-                encode.items[0].bootstrap_host.as_str(),
-                encode.items[0].bootstrap_room
-            ),
-            ("encode-worker", 41),
-            "encode rendezvous must survive the retry"
-        );
-        assert_ne!(kv.bootstrap_room, 42, "PD KV room is re-minted per attempt");
-        let new_prefill_host = match &retry_pair {
-            WorkerSelection::Disaggregated { prefill, .. } => {
-                prefill.metadata().bootstrap_host().to_string()
-            }
-            WorkerSelection::Single { .. } => {
-                panic!("tokenspeed_pd_pair builds a disaggregated selection")
-            }
-        };
-        assert_eq!(
-            kv.bootstrap_host, new_prefill_host,
-            "KV rendezvous names the newly selected prefill"
-        );
-    }
-}
+mod tests;

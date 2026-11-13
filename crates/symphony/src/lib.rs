@@ -1,0 +1,61 @@
+//! Symphony: one parser for everything a model says.
+//!
+//! A model's output stream carries content, reasoning and tool calls interleaved in a format the
+//! model vendor chose. Symphony turns that stream into typed [`Event`]s through one object with one
+//! method, [`Parser::feed`], whose lifecycle is expressed as [`Input`]: the prompt the engine was
+//! given, each decoded delta, and the end of the stream. Every byte of output ends up in exactly
+//! one event, including bytes that were dropped or could not be parsed, so nothing disappears
+//! silently.
+//!
+//! This crate replaced the separate tool-call and reasoning parser crates on the gateway's request
+//! path: the gateway reads a model's output through it by default, and the older readers stay
+//! behind `--parser legacy` (or a request's `X-SMG-Parser: legacy`) and read the models no table
+//! reads yet. Its formats are proven against recorded fixtures before they are wired in. The
+//! design and the delivery plan live with the maintainers; the short version is in this crate's
+//! `README.md`.
+//!
+//! The standard this crate is held to is craftsmanship: code that reads as well as it runs, with no
+//! compromise kept for convenience. A change whose only reason is "this can be better" is welcome.
+//!
+//! Status: the public types below are the contract, [`adapt`] renders them for the Chat
+//! Completions, Responses and Messages APIs, streamed and whole, and [`Engine`] runs a [`Format`]
+//! table: the tables in [`formats`] are the families recorded so far, [`formats::for_model`] picks
+//! the one for a model id, and more follow. The crate's surface is this root: the modules it
+//! declares public and the names it re-exports, which the gateway, the bindings and the tests
+//! build on (`tests/parser/surface.rs` pins the list). The assemblers, the scanner and the token ledger
+//! are the engine's own.
+
+#![forbid(unsafe_code)]
+
+pub mod adapt;
+pub mod declared;
+pub mod engine;
+pub mod event;
+pub mod format;
+pub mod formats;
+pub mod gemma;
+pub mod grammar;
+mod ids;
+pub mod input;
+pub mod json;
+mod markers;
+pub mod parser;
+mod pythonic;
+pub mod shape;
+pub mod tagged;
+#[cfg(test)]
+pub(crate) mod testing;
+mod tokens;
+
+pub use declared::Declared;
+pub use engine::Engine;
+pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
+pub use format::{CallId, CallSyntax, Emits, Format, Whitespace};
+pub use grammar::{
+    Bound, Grammar, GrammarStart, Output, OutputAnswer, OutputChoice, OutputPosition,
+    OutputSpelling, Tag, Turn,
+};
+pub use ids::CallIds;
+pub use input::{EngineFinish, Input, TokenSpan};
+pub use parser::{ParseError, Parser};
+pub use shape::{Inferred, ValueRead};

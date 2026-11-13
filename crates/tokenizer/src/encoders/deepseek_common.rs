@@ -1,0 +1,1035 @@
+//! What the DeepSeek renderers (V3.2, V4, V4.1) share, implemented and
+//! tested once: the error type (`DsEncodingError`), the JSON spelling and
+//! the OpenAI-shape readers every one of them uses, the message read
+//! (`Turn`) with the two refusals every dialect spells the same way, the
+//! last-user index predicates, the quick-instruction task tokens, the
+//! tools-and-response-format section of a system or developer turn, and the
+//! V4 family's message preprocessing
+//! (tool-message merging, tool-result sorting, drop-thinking, DSML argument
+//! rendering, the tools template), which V4 and V4.1 run with their own DSML
+//! tag strings (V4 bare `invoke`/`parameter`; V4.1 ` invoke`/` parameter`
+//! with a leading space).
+//!
+//! V3.2's tool-message handling, drop-thinking role set, DSML argument
+//! rendering and tools template are different algorithms and texts under
+//! some of the same names; they stay in `deepseek_v32.rs`.
+
+use std::{borrow::Cow, fmt::Write as _, sync::OnceLock};
+
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
+use serde_json::{json, Value};
+use thiserror::Error;
+
+use super::{
+    marks::{self, control},
+    truthy,
+};
+
+// ---------------------------------------------------------------------------
+// The family's special tokens, shared by the V3.2, V4 and V4.1 renderers (each
+// re-exports the public ones under its own path). Copied verbatim from the
+// Python sources, which agree on them; a version's own markers stay with it.
+// ---------------------------------------------------------------------------
+pub const BOS_TOKEN: &str = "<｜begin▁of▁sentence｜>";
+pub const EOS_TOKEN: &str = "<｜end▁of▁sentence｜>";
+pub const THINKING_START_TOKEN: &str = "<think>";
+pub const THINKING_END_TOKEN: &str = "</think>";
+pub const DSML_TOKEN: &str = "｜DSML｜";
+#[cfg(test)]
+pub(super) const USER_SP_TOKEN: &str = "<｜User｜>";
+#[cfg(test)]
+pub(super) const ASSISTANT_SP_TOKEN: &str = "<｜Assistant｜>";
+#[cfg(test)]
+pub(super) const LATEST_REMINDER_SP_TOKEN: &str = "<｜latest_reminder｜>";
+
+// The same tokens as the renderers write them into a prompt: marked as the
+// renderer's own control tokens (see `marks`), so that the same spelling in
+// request text stays text. The flat `encode_messages` output strips the marks.
+pub(super) const BOS: &str = control!("<｜begin▁of▁sentence｜>");
+pub(super) const EOS: &str = control!("<｜end▁of▁sentence｜>");
+pub(super) const THINKING_START: &str = control!("<think>");
+pub(super) const THINKING_END: &str = control!("</think>");
+pub(super) const DSML: &str = control!("｜DSML｜");
+pub(super) const USER: &str = control!("<｜User｜>");
+pub(super) const ASSISTANT: &str = control!("<｜Assistant｜>");
+pub(super) const LATEST_REMINDER: &str = control!("<｜latest_reminder｜>");
+
+/// The grounding tokens of the V4 family. Their spellings in an assistant
+/// message's content or reasoning are the one place the family's reference
+/// library turns request text into control tokens (a vision model's earlier
+/// answer quotes them); every other spelling there stays text.
+const GROUNDING_TOKENS: [&str; 8] = [
+    "<｜ref｜>",
+    "<｜/ref｜>",
+    "<｜box｜>",
+    "<｜/box｜>",
+    "<｜point｜>",
+    "<｜/point｜>",
+    "<｜polygon｜>",
+    "<｜/polygon｜>",
+];
+
+/// Assistant content or reasoning with each grounding token in it marked as
+/// a control token, the rest left as it is; borrowed when it has none.
+pub(super) fn mark_grounding_tokens(text: &str) -> Cow<'_, str> {
+    static MATCHER: OnceLock<AhoCorasick> = OnceLock::new();
+    if !text.contains('<') {
+        return Cow::Borrowed(text);
+    }
+    let matcher = MATCHER.get_or_init(|| {
+        #[expect(
+            clippy::expect_used,
+            reason = "a fixed list of non-empty literal patterns always builds"
+        )]
+        AhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostLongest)
+            .build(GROUNDING_TOKENS)
+            .expect("the grounding tokens form an automaton")
+    });
+    let mut marked = String::new();
+    let mut cursor = 0;
+    for found in matcher.find_iter(text) {
+        marked.push_str(&text[cursor..found.start()]);
+        marked.push_str(&marks::mark(GROUNDING_TOKENS[found.pattern().as_usize()]));
+        cursor = found.end();
+    }
+    if cursor == 0 {
+        return Cow::Borrowed(text);
+    }
+    marked.push_str(&text[cursor..]);
+    Cow::Owned(marked)
+}
+
+/// DSML tag strings that differ between the V4-family DSML dialects.
+///
+/// V4 uses bare `invoke`/`parameter`; V4.1 uses ` invoke`/` parameter` (a
+/// leading space on each). The block name (`tool_calls` vs. ` calls`) is
+/// passed beside the tags where it is needed ([`render_v4_tools_template`]),
+/// since each renderer's `render_message` writes it on its own as well.
+#[derive(Debug)]
+pub(super) struct DsmlTags {
+    pub invoke: &'static str,
+    pub parameter: &'static str,
+}
+
+/// Errors raised when a message list is malformed: one type for the three
+/// renderers, each of which re-exports it under its own path as the error
+/// of its `encode_messages`. The first three variants are the refusals
+/// every dialect's reference raises with the same sentence; the rest are
+/// grouped by the dialects that raise them (V3.2; V4 and V4.1; V4.1).
+///
+/// `pub`, not `pub(super)`: `deepseek_common` itself stays a private module,
+/// so this is only ever reachable through the renderers' re-exports, never
+/// directly.
+#[derive(Debug, Error)]
+pub enum DsEncodingError {
+    #[error("Index {index} out of range for messages list of length {len}")]
+    IndexOutOfRange { index: usize, len: usize },
+    #[error("Invalid message for role `{role}`: {msg}")]
+    InvalidMessage { role: String, msg: String },
+    #[error("Unknown role: {0}")]
+    UnknownRole(String),
+    // --- V3.2 only -----------------------------------------------------
+    #[error("Invalid messages at {index}: {context}")]
+    InvalidToolMessages { index: usize, context: String },
+    #[error("No tool calls but found tool output")]
+    NoToolCalls,
+    #[error("thinking mode: invalid message without reasoning_content/tool_calls after last user message: {0}")]
+    MissingReasoningOrToolCalls(String),
+    #[error("Failed to parse tool-call arguments as JSON: {0}")]
+    InvalidToolArgumentsJson(#[source] serde_json::Error),
+    // --- V4 and V4.1 ---------------------------------------------------
+    #[error("DeepSeek V4 merges tool messages into user; preprocess via merge_tool_messages first (got tool message at index {0})")]
+    UnmergedToolRole(usize),
+    #[error(
+        "Invalid task `{0}`. Valid tasks are: action, query, authority, domain, title, read_url"
+    )]
+    InvalidTask(String),
+    // --- V4.1 only -----------------------------------------------------
+    #[error("Message text contains the image special token `<｜deepseek_image｜>`; images must be sent as image content parts")]
+    PlaceholderInText,
+    #[error("Invalid reasoning effort `{0}`: expected an integer within [1, 100] or one of low, medium, high, xhigh, max")]
+    InvalidReasoningEffort(String),
+    #[error("Unsupported content part type `{0}`: only text and image parts are supported")]
+    UnsupportedContentPart(String),
+}
+
+/// Mirrors V4's `find_last_user_index`: returns `None` if no user/developer
+/// message exists (Python returns -1).
+///
+/// V4.1 widens this definition (a mid-conversation system message also counts)
+/// and therefore keeps its own version; only the "is this index at or after
+/// the last user turn" predicate below is shared.
+pub(super) fn find_last_user_index(messages: &[Value]) -> Option<usize> {
+    for idx in (0..messages.len()).rev() {
+        let role = messages[idx].get("role").and_then(|v| v.as_str());
+        if matches!(role, Some("user") | Some("developer")) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Returns `true` when `index >= last_user_idx` in the Python sense, treating
+/// the "no user message" case (-1) as: every non-negative index satisfies it.
+///
+/// Used by [`drop_thinking_messages`] here and by every DeepSeek renderer's
+/// `render_message` (V3.2, V4 and V4.1).
+pub(super) fn at_or_after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
+    match last_user_idx {
+        Some(idx) => index >= idx,
+        None => true,
+    }
+}
+
+/// Returns `true` when `index > last_user_idx` in the Python sense, with the
+/// same reading of "no user message" as [`at_or_after_last_user`].
+pub(super) fn after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
+    match last_user_idx {
+        Some(idx) => index > idx,
+        None => true,
+    }
+}
+
+/// The quick-instruction task tokens (`<｜action｜>`, `<｜query｜>`, ...) of
+/// the V4 family, by the `task` a user message names, marked as the
+/// renderer's control tokens; `None` for a task the encoders reject.
+pub(super) fn task_sp_token(task: &str) -> Option<&'static str> {
+    match task {
+        "action" => Some(control!("<｜action｜>")),
+        "query" => Some(control!("<｜query｜>")),
+        "authority" => Some(control!("<｜authority｜>")),
+        "domain" => Some(control!("<｜domain｜>")),
+        "title" => Some(control!("<｜title｜>")),
+        "read_url" => Some(control!("<｜read_url｜>")),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preprocessing: merge tool messages and sort tool results.
+// ---------------------------------------------------------------------------
+/// What a user message's own `content_blocks` list means to a dialect's
+/// merge: V4's reference rebuilds every user message from its `content` (a
+/// list the message carries is dropped), V4.1's keeps the list it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IncomingBlocks {
+    Rebuilt,
+    Kept,
+}
+
+pub(super) fn merge_tool_messages(messages: &[Value], incoming: IncomingBlocks) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let msg = msg.clone();
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role == "tool" {
+            let tool_block = json!({
+                "type": "tool_result",
+                "tool_use_id": msg.get("tool_call_id").cloned().unwrap_or(Value::String(String::new())),
+                "content": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
+            });
+            // Append to a previous user message that already has content_blocks.
+            let appended = if let Some(prev) = merged.last_mut() {
+                let prev_role = prev.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                if prev_role == "user" && prev.get("content_blocks").is_some() {
+                    if let Some(blocks) = prev
+                        .get_mut("content_blocks")
+                        .and_then(|v| v.as_array_mut())
+                    {
+                        blocks.push(tool_block.clone());
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !appended {
+                merged.push(json!({
+                    "role": "user",
+                    "content_blocks": [tool_block],
+                }));
+            }
+        } else if role == "user" {
+            let own = match incoming {
+                IncomingBlocks::Kept => {
+                    msg.get("content_blocks").and_then(Value::as_array).cloned()
+                }
+                IncomingBlocks::Rebuilt => None,
+            }
+            .unwrap_or_else(|| {
+                vec![json!({
+                    "type": "text",
+                    "text": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
+                })]
+            });
+            let merged_into_prev = if let Some(prev) = merged.last_mut() {
+                let prev_role = prev.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                let prev_has_blocks = prev.get("content_blocks").is_some();
+                let prev_task_none = prev.get("task").map(Value::is_null).unwrap_or(true);
+                if prev_role == "user" && prev_has_blocks && prev_task_none {
+                    if let Some(blocks) = prev
+                        .get_mut("content_blocks")
+                        .and_then(|v| v.as_array_mut())
+                    {
+                        blocks.extend(own.iter().cloned());
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !merged_into_prev {
+                let mut new_msg = match incoming {
+                    // The reference keeps the message as written, its blocks set.
+                    IncomingBlocks::Kept => msg.clone(),
+                    IncomingBlocks::Rebuilt => json!({
+                        "role": "user",
+                        "content": msg.get("content").cloned().unwrap_or(Value::String(String::new())),
+                    }),
+                };
+                if let Some(obj) = new_msg.as_object_mut() {
+                    obj.insert("content_blocks".to_string(), Value::Array(own));
+                    // Preserve extra fields (task, wo_eos, mask, etc.).
+                    for key in ["task", "wo_eos", "mask"] {
+                        if let Some(v) = msg.get(key) {
+                            obj.insert(key.to_string(), v.clone());
+                        }
+                    }
+                }
+                merged.push(new_msg);
+            }
+        } else {
+            merged.push(msg);
+        }
+    }
+    merged
+}
+
+/// Sort `tool_result` blocks within user messages by the tool-call order
+/// of the *preceding* assistant turn.
+pub(super) fn sort_tool_results_by_call_order(messages: Vec<Value>) -> Vec<Value> {
+    let mut out = messages;
+    let mut last_tool_call_order: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for msg in &mut out {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role == "assistant" {
+            if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                last_tool_call_order.clear();
+                for (idx, tc) in tcs.iter().enumerate() {
+                    let tc_id = tc
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .or_else(|| {
+                            tc.get("function")
+                                .and_then(|f| f.get("id"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        });
+                    if let Some(id) = tc_id {
+                        last_tool_call_order.insert(id, idx);
+                    }
+                }
+            }
+        } else if role == "user" {
+            if let Some(blocks) = msg.get("content_blocks").and_then(|v| v.as_array()) {
+                let tool_blocks: Vec<&Value> = blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_result"))
+                    .collect();
+                if tool_blocks.len() > 1 && !last_tool_call_order.is_empty() {
+                    let mut sorted: Vec<Value> = tool_blocks.iter().map(|b| (*b).clone()).collect();
+                    sorted.sort_by_key(|b| {
+                        b.get("tool_use_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|id| last_tool_call_order.get(id).copied())
+                            .unwrap_or(0)
+                    });
+                    let mut sorted_idx = 0;
+                    let mut new_blocks: Vec<Value> = Vec::with_capacity(blocks.len());
+                    for block in blocks {
+                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                            new_blocks.push(sorted[sorted_idx].clone());
+                            sorted_idx += 1;
+                        } else {
+                            new_blocks.push(block.clone());
+                        }
+                    }
+                    if let Some(obj) = msg.as_object_mut() {
+                        obj.insert("content_blocks".to_string(), Value::Array(new_blocks));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Drop reasoning_content from earlier assistant turns and remove non-essential
+/// developer messages before the last user.
+///
+/// `last_user_idx` is passed in rather than recomputed because the two
+/// revisions disagree on what the "last user turn" is: V4 counts only
+/// user/developer messages ([`find_last_user_index`]), while V4.1 also counts
+/// mid-conversation system messages. The filtering itself is identical.
+pub(super) fn drop_thinking_messages(
+    messages: &[Value],
+    last_user_idx: Option<usize>,
+) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for (idx, msg) in messages.iter().enumerate() {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let always_keep = matches!(
+            role,
+            "user" | "system" | "tool" | "latest_reminder" | "direct_search_results"
+        ) || at_or_after_last_user(idx, last_user_idx);
+        if always_keep {
+            out.push(msg.clone());
+            continue;
+        }
+        if role == "assistant" {
+            let mut cloned = msg.clone();
+            if let Some(obj) = cloned.as_object_mut() {
+                obj.remove("reasoning_content");
+            }
+            out.push(cloned);
+        }
+        // developer + other roles before last_user_idx are dropped.
+    }
+    out
+}
+
+/// Encode a single tool call's `arguments` value into `<DSML_TOKEN><parameter>`
+/// blocks, mirroring the reference `encode_arguments_to_dsml` (HF
+/// `encoding.py`, identical in the engine's port).
+///
+/// `arguments` may arrive as a JSON *string* (raw OpenAI tool_calls) or as an
+/// already-parsed value — `model_gateway`'s `process_tool_call_arguments`
+/// parses the client's string before the chat template runs, so an object
+/// arrives as an object and any other payload (array, number, bool, null) as
+/// that value. A string is JSON-parsed at most twice (tolerating a
+/// double-encoded object), stopping at the first non-string result or the
+/// first parse failure. Whatever is then not an object — an unparsable
+/// string, a parsed or pre-parsed non-object, `Value::Null` for a call with no
+/// `arguments` at all — renders as the single parameter `arguments` holding
+/// the ORIGINAL value: `string="true"` with the raw text when it was a string,
+/// otherwise `string="false"` with its JSON. Never errors (unlike V3.2, which
+/// propagates a parse error).
+pub(super) fn encode_arguments_to_dsml(arguments: &Value, tags: &DsmlTags) -> String {
+    let mut parsed = arguments.clone();
+    // Tolerate JSON strings, including double-encoded ones.
+    for _ in 0..2 {
+        let Value::String(text) = &parsed else {
+            break;
+        };
+        match serde_json::from_str::<Value>(text) {
+            Ok(value) => parsed = value,
+            Err(_) => break,
+        }
+    }
+    // The fallback wraps the ORIGINAL `arguments`, not the parsed value.
+    let parameters: Vec<(&str, &Value)> = match parsed.as_object() {
+        Some(object) => object
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+            .collect(),
+        None => vec![("arguments", arguments)],
+    };
+    let mut parts = Vec::with_capacity(parameters.len());
+    for (key, value) in parameters {
+        let (is_str, value_str) = match value {
+            Value::String(text) => ("true", text.clone()),
+            other => ("false", to_json(other)),
+        };
+        parts.push(format!(
+            "<{DSML}{p} name=\"{key}\" string=\"{is_str}\">{value_str}</{DSML}{p}>",
+            p = tags.parameter,
+        ));
+    }
+    parts.join("\n")
+}
+
+/// Python's `to_json`: `json.dumps(value, ensure_ascii=False)`, spaced
+/// separators and raw UTF-8. Compact `serde_json::to_string` would change the
+/// prompt bytes the model was trained on.
+pub(super) fn to_json(value: &Value) -> String {
+    crate::json_dumps::to_string(value)
+}
+
+/// `[tool["function"] for tool in tools]`
+pub(super) fn tools_from_openai_format(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|tool| tool.get("function").cloned())
+        .collect()
+}
+
+/// `[{ "name": tc["function"]["name"], "arguments": tc["function"]["arguments"] } for tc in tool_calls]`
+pub(super) fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .filter_map(|tool_call| {
+            let function = tool_call.get("function")?;
+            Some(json!({
+                "name": function.get("name").cloned().unwrap_or(Value::Null),
+                "arguments": function.get("arguments").cloned().unwrap_or(Value::Null),
+            }))
+        })
+        .collect()
+}
+
+/// One message as the family's renderers read it: the fields of the
+/// OpenAI-shape value every renderer reads, read once, with the tools and
+/// tool calls in the encoders' shape and empty lists dropped the way Python's
+/// truthiness drops them (`if tools:`), and `response_format` dropped the
+/// same way (`if response_format:`), so a renderer reads it only when its
+/// reference would render it. A field only some arms read is read on demand
+/// ([`Turn::wo_eos`]), so a renderer that never asks pays no lookup.
+pub(super) struct Turn<'m> {
+    pub(super) index: usize,
+    pub(super) msg: &'m Value,
+    pub(super) role: &'m str,
+    pub(super) content: &'m str,
+    pub(super) tools: Option<Vec<Value>>,
+    /// The turn's response format when the reference would render one: its
+    /// encoders test the field with Python's truthiness (see [`truthy`]).
+    pub(super) response_format: Option<&'m Value>,
+    pub(super) tool_calls: Option<Vec<Value>>,
+    /// The gateway's protocol takes the `reasoning` spelling as an alias of
+    /// `reasoning_content`, so a history assistant's reasoning renders under
+    /// either spelling for every renderer: a superset of the engines' copies
+    /// of these encoders, each of which reads one spelling alone.
+    pub(super) reasoning_content: &'m str,
+}
+
+impl<'m> Turn<'m> {
+    /// The message at `index` of its conversation, refused past the end.
+    pub(super) fn read(index: usize, messages: &'m [Value]) -> Result<Self, DsEncodingError> {
+        let Some(msg) = messages.get(index) else {
+            return Err(DsEncodingError::IndexOutOfRange {
+                index,
+                len: messages.len(),
+            });
+        };
+        let tools = msg
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|tools| tools_from_openai_format(tools))
+            .filter(|tools| !tools.is_empty());
+        let tool_calls = msg
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .map(|tool_calls| tool_calls_from_openai_format(tool_calls))
+            .filter(|tool_calls| !tool_calls.is_empty());
+        Ok(Self {
+            index,
+            msg,
+            role: text(msg, "role"),
+            content: text(msg, "content"),
+            tools,
+            response_format: msg.get("response_format").filter(|v| truthy(v)),
+            tool_calls,
+            reasoning_content: text(msg, "reasoning_content"),
+        })
+    }
+
+    /// The content of a developer turn, which every dialect refuses empty.
+    pub(super) fn developer_content(&self) -> Result<&'m str, DsEncodingError> {
+        if self.content.is_empty() {
+            return Err(DsEncodingError::InvalidMessage {
+                role: self.role.to_string(),
+                msg: self.msg.to_string(),
+            });
+        }
+        Ok(self.content)
+    }
+
+    /// `wo_eos`: the message ends without the EOS token (read on demand by
+    /// the assistant arms of V4 and V4.1; V3.2 never asks).
+    pub(super) fn wo_eos(&self) -> bool {
+        self.msg
+            .get("wo_eos")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
+/// A string field of a message, empty when absent or not a string, as the
+/// references' `msg.get(key, "")` reads it.
+pub(super) fn text<'m>(msg: &'m Value, key: &str) -> &'m str {
+    msg.get(key).and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// The tool schemas as the tools templates take them: each tool's JSON, one
+/// per line.
+pub(super) fn tool_schemas(tools: &[Value]) -> String {
+    let schemas: Vec<String> = tools.iter().map(to_json).collect();
+    schemas.join("\n")
+}
+
+/// Python's `if msg.get("tools"):` — absent, null and `[]` are all falsy.
+pub(super) fn has_tools(msg: &Value) -> bool {
+    msg.get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tools| !tools.is_empty())
+}
+
+/// The V4 family's `TOOLS_TEMPLATE`, one text for both dialects: `block` is
+/// the tool-calls block name (`tool_calls` for V4, ` calls` for V4.1) and
+/// `tags` the invoke and parameter tags, around the `tool_schemas` lines.
+pub(super) fn render_v4_tools_template(block: &str, tags: &DsmlTags, tool_schemas: &str) -> String {
+    let dsml = DSML;
+    let invoke = tags.invoke;
+    let parameter = tags.parameter;
+    let tstart = THINKING_START;
+    let tend = THINKING_END;
+    format!(
+"## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<{dsml}{block}>\" block like the following:
+
+<{dsml}{block}>
+<{dsml}{invoke} name=\"$TOOL_NAME\">
+<{dsml}{parameter} name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{dsml}{parameter}>
+...
+</{dsml}{invoke}>
+<{dsml}{invoke} name=\"$TOOL_NAME2\">
+...
+</{dsml}{invoke}>
+</{dsml}{block}>
+
+String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.
+
+If thinking_mode is enabled (triggered by {tstart}), you MUST output your complete reasoning inside {tstart}...{tend} BEFORE any tool calls or final response.
+
+Otherwise, output directly after {tend} with tool calls or final response.
+
+### Available Tool Schemas
+
+{tool_schemas}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+"
+    )
+}
+
+/// The tools template and the response format a system or developer turn
+/// carries, each after a blank line, when the turn has them; `render_tools`
+/// is the dialect's tools template.
+pub(super) fn push_tools_and_response_format(
+    prompt: &mut String,
+    tools: Option<&[Value]>,
+    response_format: Option<&Value>,
+    render_tools: fn(&[Value]) -> String,
+) {
+    if let Some(tools) = tools {
+        prompt.push_str("\n\n");
+        prompt.push_str(&render_tools(tools));
+    }
+    if let Some(schema) = response_format {
+        prompt.push_str("\n\n");
+        let _ = write!(
+            prompt,
+            "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{}",
+            to_json(schema)
+        );
+    }
+}
+
+/// A system message: its content (the families' `system_msg_template` is
+/// "{content}"), then the tools and the response format it carries;
+/// `render_tools` is the dialect's tools template.
+pub(super) fn render_system_message(
+    prompt: &mut String,
+    turn: &Turn<'_>,
+    render_tools: fn(&[Value]) -> String,
+) {
+    prompt.push_str(turn.content);
+    push_tools_and_response_format(
+        prompt,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
+}
+
+/// The renderer-level pin the three renderers share: a history tool call
+/// whose `arguments` are already an object (the gateway parses the OpenAI
+/// string before a renderer runs) renders one DSML parameter per key through
+/// `encode`, spelled with the dialect's `parameter` tag. Dropping them once
+/// erased every historical call's parameters in multi-turn prompts.
+#[cfg(test)]
+pub(super) fn object_arguments_render_one_parameter_per_key_through<F, E>(
+    encode: F,
+    parameter: &str,
+) where
+    F: FnOnce(&[Value]) -> Result<String, E>,
+    E: std::fmt::Debug,
+{
+    let msgs = [
+        json!({ "role": "user", "content": "call my tool" }),
+        json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "type": "function",
+                "function": { "name": "search", "arguments": { "query": "deepseek", "limit": 5 } }
+            }]
+        }),
+    ];
+    let out = encode(&msgs).unwrap();
+    for line in [
+        format!("<{DSML_TOKEN}{parameter} name=\"query\" string=\"true\">deepseek</{DSML_TOKEN}{parameter}>"),
+        format!("<{DSML_TOKEN}{parameter} name=\"limit\" string=\"false\">5</{DSML_TOKEN}{parameter}>"),
+    ] {
+        assert!(out.contains(&line), "{line} is not in {out}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    /// The DSML arguments as the flat prompt spells them (the control-token
+    /// marks around `｜DSML｜` stripped).
+    fn dsml(arguments: &Value, tags: &DsmlTags) -> String {
+        marks::strip(&encode_arguments_to_dsml(arguments, tags)).into_owned()
+    }
+
+    /// The family's special tokens, as the three renderers' Python sources
+    /// spell them; each renderer re-exports these, so one value serves all.
+    #[test]
+    fn the_familys_special_tokens_are_the_ones_the_renderers_share() {
+        assert_eq!(BOS_TOKEN, "<｜begin▁of▁sentence｜>");
+        assert_eq!(EOS_TOKEN, "<｜end▁of▁sentence｜>");
+        assert_eq!(THINKING_START_TOKEN, "<think>");
+        assert_eq!(THINKING_END_TOKEN, "</think>");
+        assert_eq!(DSML_TOKEN, "｜DSML｜");
+        assert_eq!(USER_SP_TOKEN, "<｜User｜>");
+        assert_eq!(ASSISTANT_SP_TOKEN, "<｜Assistant｜>");
+        assert_eq!(LATEST_REMINDER_SP_TOKEN, "<｜latest_reminder｜>");
+    }
+
+    #[test]
+    fn the_marked_tokens_spell_the_special_tokens() {
+        for (marked, spelling) in [
+            (BOS, BOS_TOKEN),
+            (EOS, EOS_TOKEN),
+            (THINKING_START, THINKING_START_TOKEN),
+            (THINKING_END, THINKING_END_TOKEN),
+            (DSML, DSML_TOKEN),
+            (USER, USER_SP_TOKEN),
+            (ASSISTANT, ASSISTANT_SP_TOKEN),
+            (LATEST_REMINDER, LATEST_REMINDER_SP_TOKEN),
+        ] {
+            assert_eq!(marked, marks::mark(spelling));
+            assert_eq!(marks::strip(marked), spelling);
+        }
+        for task in [
+            "action",
+            "query",
+            "authority",
+            "domain",
+            "title",
+            "read_url",
+        ] {
+            let token = task_sp_token(task).unwrap();
+            assert_eq!(marks::strip(token), format!("<｜{task}｜>"));
+        }
+    }
+
+    #[test]
+    fn grounding_tokens_in_assistant_text_become_control_tokens_and_nothing_else_does() {
+        assert!(matches!(mark_grounding_tokens("plain"), Cow::Borrowed(_)));
+        assert!(matches!(
+            mark_grounding_tokens("a </think> b <｜User｜>"),
+            Cow::Borrowed(_)
+        ));
+        let marked =
+            mark_grounding_tokens("see <｜ref｜>cat<｜/ref｜><｜box｜>[[1,2,3,4]]<｜/box｜>.");
+        assert_eq!(
+            marked,
+            format!(
+                "see {}cat{}{}[[1,2,3,4]]{}.",
+                marks::mark("<｜ref｜>"),
+                marks::mark("<｜/ref｜>"),
+                marks::mark("<｜box｜>"),
+                marks::mark("<｜/box｜>")
+            )
+        );
+    }
+
+    /// V4.1's dialect (a leading space on both tags), the one the fixture
+    /// cases `assistant_tool_call_array_string_args` and
+    /// `assistant_tool_call_double_encoded_args` record end to end.
+    const V41_TAGS: DsmlTags = DsmlTags {
+        invoke: " invoke",
+        parameter: " parameter",
+    };
+    const V4_TAGS: DsmlTags = DsmlTags {
+        invoke: "invoke",
+        parameter: "parameter",
+    };
+
+    /// The helper is shared with V4: these are the three input shapes whose
+    /// V4 output changed when it started mirroring the reference (they used
+    /// to render an empty parameter list).
+    #[test]
+    fn v4_non_object_arguments_render_one_parameter_like_the_reference() {
+        assert_eq!(
+            dsml(&Value::Null, &V4_TAGS),
+            "<｜DSML｜parameter name=\"arguments\" string=\"false\">null</｜DSML｜parameter>"
+        );
+        assert_eq!(
+            dsml(&json!([1, 2]), &V4_TAGS),
+            "<｜DSML｜parameter name=\"arguments\" string=\"false\">[1, 2]</｜DSML｜parameter>"
+        );
+        assert_eq!(
+            dsml(&json!("\"{\\\"a\\\": 1}\""), &V4_TAGS),
+            "<｜DSML｜parameter name=\"a\" string=\"false\">1</｜DSML｜parameter>"
+        );
+    }
+
+    #[test]
+    fn object_arguments_render_one_parameter_per_key() {
+        assert_eq!(
+            dsml(&json!({"n": 3, "s": "raw <x>"}), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"n\" string=\"false\">3</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"s\" string=\"true\">raw <x></｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn string_arguments_that_parse_to_an_object_render_its_keys() {
+        assert_eq!(
+            dsml(&json!("{\"a\": 1}"), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn raw_string_arguments_that_parse_to_an_array_wrap_the_raw_string() {
+        // The reference wraps the ORIGINAL value: the client's raw string is
+        // one string parameter, not the array it parses to.
+        assert_eq!(
+            dsml(&json!("[1, 2]"), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"arguments\" string=\"true\">[1, 2]</｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn gateway_parsed_array_arguments_wrap_the_array_as_json() {
+        // `process_tool_call_arguments` has already parsed the client's
+        // `"[1, 2]"`, so the renderer receives the array itself.
+        assert_eq!(
+            dsml(&json!([1, 2]), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"arguments\" string=\"false\">[1, 2]</｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn number_and_bool_arguments_wrap_the_value_as_json() {
+        assert_eq!(
+            dsml(&json!(42), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"arguments\" string=\"false\">42</｜DSML｜ parameter>"
+        );
+        assert_eq!(
+            dsml(&json!(true), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"arguments\" string=\"false\">true</｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn null_arguments_wrap_null_as_json() {
+        assert_eq!(
+            dsml(&Value::Null, &V41_TAGS),
+            "<｜DSML｜ parameter name=\"arguments\" string=\"false\">null</｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn double_encoded_string_arguments_are_parsed_twice() {
+        // The JSON string `"{\"a\": 1}"`: the first parse yields the text
+        // `{"a": 1}`, the second the object.
+        assert_eq!(
+            dsml(&json!("\"{\\\"a\\\": 1}\""), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>"
+        );
+    }
+
+    #[test]
+    fn triple_encoded_string_arguments_stop_after_two_parses() {
+        // Encoding the object's text twice gives the double-encoded string
+        // above; a third time is one level too many for the reference, so the
+        // ORIGINAL text is wrapped verbatim.
+        let twice = serde_json::to_string("{\"a\": 1}").unwrap();
+        assert_eq!(twice, "\"{\\\"a\\\": 1}\"");
+        let thrice = serde_json::to_string(&twice).unwrap();
+        assert_eq!(
+            dsml(&Value::String(thrice.clone()), &V41_TAGS),
+            format!("<｜DSML｜ parameter name=\"arguments\" string=\"true\">{thrice}</｜DSML｜ parameter>")
+        );
+    }
+
+    #[test]
+    fn unparsable_string_arguments_are_wrapped_verbatim() {
+        assert_eq!(
+            dsml(&json!("{oops"), &V41_TAGS),
+            "<｜DSML｜ parameter name=\"arguments\" string=\"true\">{oops</｜DSML｜ parameter>"
+        );
+    }
+
+    /// The reference encoders test an optional section with Python's
+    /// truthiness, so a turn's response format is nothing for every falsy
+    /// value and the value itself otherwise.
+    #[test]
+    fn a_turns_response_format_is_the_references_truthy_value_or_nothing() {
+        for falsy in [
+            json!(null),
+            json!(false),
+            json!(0),
+            json!(""),
+            json!([]),
+            json!({}),
+        ] {
+            assert!(!truthy(&falsy), "{falsy}");
+            let msg = json!({ "role": "system", "content": "x", "response_format": falsy });
+            let turn = Turn::read(0, std::slice::from_ref(&msg)).unwrap();
+            assert!(turn.response_format.is_none(), "{msg}");
+        }
+        let schema = json!({ "type": "json_object" });
+        let msg = json!({ "role": "system", "content": "x", "response_format": schema });
+        let turn = Turn::read(0, std::slice::from_ref(&msg)).unwrap();
+        assert_eq!(turn.response_format, Some(&schema));
+        let bare = json!({ "role": "system", "content": "x" });
+        let turn = Turn::read(0, std::slice::from_ref(&bare)).unwrap();
+        assert!(turn.response_format.is_none());
+    }
+
+    /// The two refusals the read spells for every dialect: an index past the
+    /// end and a developer turn without content, in the family's sentences.
+    #[test]
+    fn the_read_refuses_an_index_past_the_end_and_an_empty_developer_turn() {
+        let messages = [json!({ "role": "developer", "content": "" })];
+        assert!(matches!(
+            Turn::read(1, &messages),
+            Err(DsEncodingError::IndexOutOfRange { index: 1, len: 1 })
+        ));
+        let turn = Turn::read(0, &messages).unwrap();
+        let err = turn.developer_content().unwrap_err();
+        assert!(
+            matches!(err, DsEncodingError::InvalidMessage { ref role, .. } if role == "developer"),
+            "{err}"
+        );
+        let spoken = [json!({ "role": "developer", "content": "Be brief." })];
+        let turn = Turn::read(0, &spoken).unwrap();
+        assert_eq!(turn.developer_content().unwrap(), "Be brief.");
+    }
+
+    /// The refusal sentences are the gateway's error bodies (its tokenizer
+    /// wrapper reports a renderer's error through `Display`), so each stays as
+    /// the renderers' references spell it.
+    #[test]
+    fn every_refusal_keeps_its_sentence() {
+        let parse_error = serde_json::from_str::<Value>("{not json").unwrap_err();
+        let parse_sentence = format!("Failed to parse tool-call arguments as JSON: {parse_error}");
+        let sentences = [
+            (
+                DsEncodingError::IndexOutOfRange { index: 3, len: 2 },
+                "Index 3 out of range for messages list of length 2".to_string(),
+            ),
+            (
+                DsEncodingError::InvalidMessage {
+                    role: "developer".to_string(),
+                    msg: "{}".to_string(),
+                },
+                "Invalid message for role `developer`: {}".to_string(),
+            ),
+            (
+                DsEncodingError::UnknownRole("narrator".to_string()),
+                "Unknown role: narrator".to_string(),
+            ),
+            (
+                DsEncodingError::InvalidToolMessages {
+                    index: 1,
+                    context: "{}".to_string(),
+                },
+                "Invalid messages at 1: {}".to_string(),
+            ),
+            (
+                DsEncodingError::NoToolCalls,
+                "No tool calls but found tool output".to_string(),
+            ),
+            (
+                DsEncodingError::MissingReasoningOrToolCalls("{}".to_string()),
+                "thinking mode: invalid message without reasoning_content/tool_calls after last user message: {}".to_string(),
+            ),
+            (
+                DsEncodingError::InvalidToolArgumentsJson(parse_error),
+                parse_sentence,
+            ),
+            (
+                DsEncodingError::UnmergedToolRole(4),
+                "DeepSeek V4 merges tool messages into user; preprocess via merge_tool_messages first (got tool message at index 4)".to_string(),
+            ),
+            (
+                DsEncodingError::InvalidTask("bogus".to_string()),
+                "Invalid task `bogus`. Valid tasks are: action, query, authority, domain, title, read_url".to_string(),
+            ),
+            (
+                DsEncodingError::PlaceholderInText,
+                "Message text contains the image special token `<｜deepseek_image｜>`; images must be sent as image content parts".to_string(),
+            ),
+            (
+                DsEncodingError::InvalidReasoningEffort("huge".to_string()),
+                "Invalid reasoning effort `huge`: expected an integer within [1, 100] or one of low, medium, high, xhigh, max".to_string(),
+            ),
+            (
+                DsEncodingError::UnsupportedContentPart("input_audio".to_string()),
+                "Unsupported content part type `input_audio`: only text and image parts are supported".to_string(),
+            ),
+        ];
+        for (error, sentence) in sentences {
+            assert_eq!(error.to_string(), sentence);
+        }
+    }
+
+    /// V4's reference rebuilds every user message from its content; V4.1's
+    /// keeps a `content_blocks` list the message carries (and builds one from
+    /// the content when it carries none).
+    #[test]
+    fn a_user_messages_own_content_blocks_are_rebuilt_or_kept_by_dialect() {
+        let with_block = [json!({
+            "role": "user",
+            "content": "ignored",
+            "content_blocks": [{ "type": "text", "text": "from the block" }],
+        })];
+        let rebuilt = merge_tool_messages(&with_block, IncomingBlocks::Rebuilt);
+        assert_eq!(
+            rebuilt[0]["content_blocks"],
+            json!([{ "type": "text", "text": "ignored" }])
+        );
+        let kept = merge_tool_messages(&with_block, IncomingBlocks::Kept);
+        assert_eq!(
+            kept[0]["content_blocks"],
+            json!([{ "type": "text", "text": "from the block" }])
+        );
+        assert_eq!(kept[0]["content"], json!("ignored"));
+        let without = [json!({ "role": "user", "content": "hello" })];
+        assert_eq!(
+            merge_tool_messages(&without, IncomingBlocks::Kept)[0]["content_blocks"],
+            json!([{ "type": "text", "text": "hello" }])
+        );
+    }
+}

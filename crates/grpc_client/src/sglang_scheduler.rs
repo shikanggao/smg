@@ -1,21 +1,25 @@
-use std::{future::Future, pin::Pin};
-
 use openai_protocol::{
-    chat::ChatCompletionRequest,
-    common::{ResponseFormat, StringOrArray},
-    completion::CompletionRequest,
-    generate::GenerateRequest,
-    messages::CreateMessageRequest,
-    responses::ResponsesRequest,
+    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+    messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::{
+    channel::Channel,
+    request_fields::{
+        body_format, completion_constraint, logit_bias_by_token_text, plain_constraint,
+        stop_strings, ConstraintKind, FormatSetAside, OutputConstraint, PlainSampling,
+    },
+    BoxedTraceInjector,
+};
 
 // Include the generated protobuf code
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod proto {
     #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
     tonic::include_proto!("sglang.grpc.scheduler");
@@ -38,71 +42,22 @@ pub struct SglangSchedulerClient {
 pub struct SglangGenerateRequestOptions {
     pub multimodal_inputs: Option<proto::MultimodalInputs>,
     pub tool_call_constraint: Option<(String, String)>,
+    /// Which of a chat body's own format fields `tool_call_constraint`
+    /// answers, read as absent; a Messages body names none.
+    pub format_set_aside: FormatSetAside,
     pub require_reasoning: bool,
 }
 
-impl AbortOnDropClient for SglangSchedulerClient {
-    fn abort_for_drop(
-        self,
-        request_id: String,
-    ) -> Pin<Box<dyn Future<Output = Result<(), tonic::Status>> + Send>> {
-        Box::pin(async move {
-            self.abort_request(request_id, "Stream dropped".to_string())
-                .await
-        })
-    }
-}
+crate::impl_abort_for_drop_with_reason!(SglangSchedulerClient);
 
 impl SglangSchedulerClient {
     crate::impl_engine_client_basics!(
+        proto,
         proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
         "SGLang scheduler"
     );
 
-    /// Submit a generation request (returns auto-aborting streaming response)
-    ///
-    /// The returned stream automatically sends an abort request when dropped,
-    /// ensuring proper cleanup even if the HTTP client disconnects or an error occurs.
-    /// Call `mark_completed()` on the stream after successful completion to prevent
-    /// unnecessary abort RPCs.
-    pub async fn generate(
-        &self,
-        req: proto::GenerateRequest,
-    ) -> Result<AbortOnDropStream, tonic::Status> {
-        let request_id = req.request_id.clone();
-        let mut client = self.client.clone();
-        let mut request = Request::new(req);
-
-        // Inject W3C trace context into gRPC metadata for distributed tracing
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
-
-        let response = client.generate(request).await?;
-
-        Ok(AbortOnDropStream::new(
-            response.into_inner(),
-            request_id,
-            self.clone(),
-        ))
-    }
-
-    /// Submit an embedding request
-    pub async fn embed(
-        &self,
-        req: proto::EmbedRequest,
-    ) -> Result<proto::EmbedResponse, tonic::Status> {
-        let mut client = self.client.clone();
-        let mut request = Request::new(req);
-
-        // Inject W3C trace context into gRPC metadata
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
-
-        let response = client.embed(request).await?;
-        Ok(response.into_inner())
-    }
+    crate::impl_embed!(proto);
 
     /// Abort a request
     pub async fn abort_request(
@@ -172,6 +127,36 @@ impl SglangSchedulerClient {
         }
     }
 
+    /// Build a prefill-only next-token scoring request with explicit defaults.
+    pub fn build_score_request(
+        request_id: String,
+        token_ids: Vec<u32>,
+        label_ids: Vec<u32>,
+    ) -> proto::GenerateRequest {
+        proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                input_ids: token_ids,
+                original_text: String::new(),
+            }),
+            sampling_params: Some(proto::SamplingParams {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: -1,
+                repetition_penalty: 1.0,
+                max_new_tokens: Some(0),
+                n: 1,
+                ..Default::default()
+            }),
+            return_logprob: true,
+            logprob_start_len: -1,
+            token_ids_logprob: label_ids,
+            stream: false,
+            require_reasoning: false,
+            ..Default::default()
+        }
+    }
+
     /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest
     #[expect(
         clippy::unused_self,
@@ -194,7 +179,9 @@ impl SglangSchedulerClient {
         )
     }
 
-    fn build_generate_request_from_chat_parts(
+    /// [`Self::build_generate_request_from_chat`] without a receiver, for
+    /// callers that hold no client (the ZMQ lane builds the same proto).
+    pub fn build_generate_request_from_chat_parts(
         request_id: String,
         body: &ChatCompletionRequest,
         processed_text: String,
@@ -202,8 +189,13 @@ impl SglangSchedulerClient {
         options: SglangGenerateRequestOptions,
     ) -> Result<proto::GenerateRequest, String> {
         // Build sampling params
-        let sampling_params =
-            Self::build_grpc_sampling_params_from_chat(body, options.tool_call_constraint)?;
+        let sampling_params = Self::build_grpc_sampling_params_from_chat(
+            body,
+            OutputConstraint {
+                tool: options.tool_call_constraint,
+                set_aside: options.format_set_aside,
+            },
+        )?;
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -211,7 +203,7 @@ impl SglangSchedulerClient {
                 original_text: processed_text,
                 input_ids: token_ids,
             }),
-            mm_inputs: options.multimodal_inputs,
+            mm_inputs: options.multimodal_inputs.map(Box::new),
             sampling_params: Some(sampling_params),
             return_logprob: body.logprobs,
             logprob_start_len: -1,
@@ -240,7 +232,8 @@ impl SglangSchedulerClient {
         Self::build_plain_generate_request_parts(request_id, body, original_text, token_ids)
     }
 
-    fn build_plain_generate_request_parts(
+    /// [`Self::build_plain_generate_request`] without a receiver.
+    pub fn build_plain_generate_request_parts(
         request_id: String,
         body: &GenerateRequest,
         original_text: Option<String>,
@@ -291,6 +284,24 @@ impl SglangSchedulerClient {
         token_ids: Vec<u32>,
         constraint: Option<(String, String)>,
     ) -> Result<proto::GenerateRequest, String> {
+        Self::build_generate_request_from_responses_parts(
+            request_id,
+            body,
+            processed_text,
+            token_ids,
+            constraint,
+        )
+    }
+
+    /// [`Self::build_generate_request_from_responses`] without a receiver,
+    /// for callers that hold no client (the ZMQ lane builds the same proto).
+    pub fn build_generate_request_from_responses_parts(
+        request_id: String,
+        body: &ResponsesRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        constraint: Option<(String, String)>,
+    ) -> Result<proto::GenerateRequest, String> {
         // Build sampling params from ResponsesRequest
         let sampling_params = Self::build_grpc_sampling_params_from_responses(body, constraint)?;
 
@@ -318,11 +329,11 @@ impl SglangSchedulerClient {
     /// Build gRPC SamplingParams from ChatCompletionRequest
     fn build_grpc_sampling_params_from_chat(
         request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<proto::SamplingParams, String> {
-        let stop_sequences = Self::extract_stop_strings(request);
+        let stop_sequences = stop_strings(request.stop.as_ref());
 
-        let max_new_tokens = request.max_completion_tokens;
+        let max_new_tokens = request.output_token_cap();
 
         // Hardcode to true: gRPC backends return raw token IDs, not decoded text.
         // Detokenization happens on the SMG Rust side (StopDecoder/Sequence).
@@ -344,60 +355,38 @@ impl SglangSchedulerClient {
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1),
-            constraint: Self::build_constraint_for_chat(request, tool_call_constraint)?,
+            logit_bias: logit_bias_by_token_text(request.logit_bias.as_ref()),
+            constraint: Self::build_constraint_for_chat(request, constraint)?,
             ..Default::default()
         })
-    }
-
-    /// Extract stop strings from request
-    fn extract_stop_strings(request: &ChatCompletionRequest) -> Vec<String> {
-        match &request.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        }
     }
 
     /// Build constraint for structured generation
     fn build_constraint_for_chat(
         request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
+        OutputConstraint { tool, set_aside }: OutputConstraint,
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
         let mut constraints = Vec::new();
 
-        // Handle response_format constraints
-        match &request.response_format {
-            Some(ResponseFormat::JsonObject) => {
-                // json_object mode - constrain to valid JSON object
-                let schema = serde_json::json!({"type": "object"});
-                let schema_str = serde_json::to_string(&schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
-                constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
-            }
-            Some(ResponseFormat::JsonSchema { json_schema }) => {
-                let schema_str = serde_json::to_string(&json_schema.schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
-                constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
-            }
-            Some(ResponseFormat::Text) | None => {
-                // No constraint for text format
-            }
+        let format = body_format(request, set_aside)?;
+        if let Some(constraint) = Self::constraint_of(format.format) {
+            constraints.push(constraint);
         }
 
-        if let Some(ebnf) = &request.ebnf {
+        if let Some(ebnf) = format.ebnf {
             constraints.push(proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
+                ebnf.to_string(),
             ));
         }
 
-        if let Some(regex) = &request.regex {
-            constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
+        if let Some(regex) = format.regex {
+            constraints.push(proto::sampling_params::Constraint::Regex(regex.to_string()));
         }
 
         // Handle tool call constraint from preparation stage.
         // If response_format already set a constraint, drop the tool constraint
         // (matches SGLang HTTP behavior where response_format takes priority).
-        if let Some((constraint_type, constraint_value)) = tool_call_constraint {
+        if let Some((constraint_type, constraint_value)) = tool {
             if constraints.is_empty() {
                 let tool_constraint = match constraint_type.as_str() {
                     "structural_tag" => {
@@ -442,8 +431,8 @@ impl SglangSchedulerClient {
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             repetition_penalty: request.repetition_penalty,
             max_new_tokens,
-            stop: vec![], // Does not pass through request.stop yet (follow-up fix)
-            stop_token_ids: vec![], // Handled by Harmony stop tokens
+            stop: stop_strings(request.stop.as_ref()),
+            stop_token_ids: vec![],     // Handled by Harmony stop tokens
             skip_special_tokens: false, // Keep special tokens for Harmony
             spaces_between_special_tokens: true,
             ignore_eos: false,
@@ -502,7 +491,8 @@ impl SglangSchedulerClient {
         )
     }
 
-    fn build_generate_request_from_messages_parts(
+    /// [`Self::build_generate_request_from_messages`] without a receiver.
+    pub fn build_generate_request_from_messages_parts(
         request_id: String,
         body: &CreateMessageRequest,
         processed_text: String,
@@ -518,7 +508,7 @@ impl SglangSchedulerClient {
                 original_text: processed_text,
                 input_ids: token_ids,
             }),
-            mm_inputs: options.multimodal_inputs,
+            mm_inputs: options.multimodal_inputs.map(Box::new),
             sampling_params: Some(sampling_params),
             return_logprob: false,
             logprob_start_len: -1,
@@ -575,6 +565,21 @@ impl SglangSchedulerClient {
         original_text: String,
         token_ids: Vec<u32>,
     ) -> Result<proto::GenerateRequest, String> {
+        Self::build_generate_request_from_completion_parts(
+            request_id,
+            body,
+            original_text,
+            token_ids,
+        )
+    }
+
+    /// [`Self::build_generate_request_from_completion`] without a receiver.
+    pub fn build_generate_request_from_completion_parts(
+        request_id: String,
+        body: &CompletionRequest,
+        original_text: String,
+        token_ids: Vec<u32>,
+    ) -> Result<proto::GenerateRequest, String> {
         let sampling_params = Self::build_grpc_sampling_params_from_completion(body)?;
 
         let grpc_request = proto::GenerateRequest {
@@ -600,13 +605,9 @@ impl SglangSchedulerClient {
     fn build_grpc_sampling_params_from_completion(
         request: &CompletionRequest,
     ) -> Result<proto::SamplingParams, String> {
-        let stop_sequences = match &request.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        };
+        let stop_sequences = stop_strings(request.stop.as_ref());
 
-        let constraint = Self::build_single_constraint_from_completion(request)?;
+        let constraint = Self::constraint_of(completion_constraint(request)?);
 
         Ok(proto::SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
@@ -625,129 +626,53 @@ impl SglangSchedulerClient {
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1),
+            logit_bias: logit_bias_by_token_text(request.logit_bias.as_ref()),
             constraint,
             ..Default::default()
         })
     }
 
-    fn build_single_constraint_from_completion(
-        request: &CompletionRequest,
-    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
-        let mut constraints = Vec::new();
-        if let Some(json_schema) = &request.json_schema {
-            constraints.push(proto::sampling_params::Constraint::JsonSchema(
-                json_schema.clone(),
-            ));
-        }
-        if let Some(regex) = &request.regex {
-            constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
-        }
-        if let Some(ebnf) = &request.ebnf {
-            constraints.push(proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
-            ));
-        }
-
-        match constraints.len() {
-            0 => Ok(None),
-            1 => Ok(constraints.pop()),
-            _ => Err("Multiple structured constraints are not allowed".to_string()),
-        }
-    }
-
-    fn build_single_constraint_from_plain(
-        params: &GenerateSamplingParams,
-    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
-        let mut constraints = Vec::new();
-        if let Some(json_schema) = &params.json_schema {
-            constraints.push(proto::sampling_params::Constraint::JsonSchema(
-                json_schema.clone(),
-            ));
-        }
-        if let Some(regex) = &params.regex {
-            constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
-        }
-        if let Some(ebnf) = &params.ebnf {
-            constraints.push(proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
-            ));
-        }
-
-        match constraints.len() {
-            0 => Ok(None),
-            1 => Ok(constraints.pop()),
-            _ => Err("Multiple structured constraints are not allowed".to_string()),
-        }
+    /// The engine's variant for the structured constraint a request names.
+    fn constraint_of(
+        constraint: Option<(ConstraintKind, String)>,
+    ) -> Option<proto::sampling_params::Constraint> {
+        constraint.map(|(kind, value)| match kind {
+            ConstraintKind::JsonSchema => proto::sampling_params::Constraint::JsonSchema(value),
+            ConstraintKind::Regex => proto::sampling_params::Constraint::Regex(value),
+            ConstraintKind::Ebnf => proto::sampling_params::Constraint::EbnfGrammar(value),
+            ConstraintKind::StructuralTag => {
+                proto::sampling_params::Constraint::StructuralTag(value)
+            }
+        })
     }
 
     fn build_sampling_params_from_plain(
         params: Option<&GenerateSamplingParams>,
     ) -> Result<proto::SamplingParams, String> {
-        let mut sampling = proto::SamplingParams {
-            temperature: 1.0,
-            top_p: 1.0,
-            top_k: -1,
-            repetition_penalty: 1.0,
-            n: 1,
-            skip_special_tokens: true,
+        let plain = PlainSampling::read(params);
+        Ok(proto::SamplingParams {
+            temperature: plain.temperature,
+            top_p: plain.top_p,
+            top_k: plain.top_k.unwrap_or(-1),
+            min_p: plain.min_p.unwrap_or(0.0),
+            frequency_penalty: plain.frequency_penalty.unwrap_or(0.0),
+            presence_penalty: plain.presence_penalty.unwrap_or(0.0),
+            repetition_penalty: plain.repetition_penalty,
+            max_new_tokens: plain.max_new_tokens,
+            stop: plain.stop,
+            stop_token_ids: plain.stop_token_ids,
+            skip_special_tokens: plain.skip_special_tokens,
             spaces_between_special_tokens: true,
+            ignore_eos: plain.ignore_eos,
+            no_stop_trim: plain.no_stop_trim,
+            n: plain.n,
+            min_new_tokens: plain.min_new_tokens.unwrap_or(0),
+            constraint: match params {
+                Some(p) => Self::constraint_of(plain_constraint(p)?),
+                None => None,
+            },
             ..Default::default()
-        };
-
-        let Some(p) = params else {
-            return Ok(sampling);
-        };
-
-        // Simple field mappings using a macro
-        macro_rules! map_field {
-            ($field:ident) => {
-                if let Some(val) = p.$field {
-                    sampling.$field = val;
-                }
-            };
-        }
-
-        map_field!(temperature);
-        map_field!(top_p);
-        map_field!(top_k);
-        map_field!(frequency_penalty);
-        map_field!(presence_penalty);
-        map_field!(repetition_penalty);
-        map_field!(min_p);
-        map_field!(ignore_eos);
-        map_field!(skip_special_tokens);
-        map_field!(no_stop_trim);
-
-        // Handle stop sequences
-        if let Some(stop) = &p.stop {
-            match stop {
-                StringOrArray::String(s) => sampling.stop.push(s.clone()),
-                StringOrArray::Array(arr) => sampling.stop.extend(arr.clone()),
-            }
-        }
-
-        // Handle stop token IDs
-        if let Some(stop_token_ids) = &p.stop_token_ids {
-            sampling.stop_token_ids.clone_from(stop_token_ids);
-        }
-
-        // Handle max_new_tokens
-        sampling.max_new_tokens = p.max_new_tokens;
-
-        // Handle min_new_tokens
-        if let Some(min_new_tokens) = p.min_new_tokens {
-            sampling.min_new_tokens = min_new_tokens;
-        }
-
-        // Handle n
-        if let Some(n) = p.n {
-            sampling.n = n;
-        }
-
-        // Handle constraints (exactly one allowed)
-        sampling.constraint = Self::build_single_constraint_from_plain(p)?;
-
-        Ok(sampling)
+        })
     }
 }
 
@@ -792,7 +717,10 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             num_used_tokens: load.num_used_tokens,
             max_total_num_tokens: load.max_total_num_tokens,
             token_usage: load.token_usage,
+            active_token_usage: None,
+            num_resident_tokens: None,
             gen_throughput: load.gen_throughput,
+            prefill_throughput: load.prefill_throughput,
             cache_hit_rate: load.cache_hit_rate,
             utilization: load.utilization,
             max_running_requests: load.max_running_requests,
@@ -832,6 +760,7 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
             dp_rank_count: resp.dp_rank_count,
             loads: resp.loads.into_iter().map(Into::into).collect(),
             aggregate,
+            sampled_at: None,
         }
     }
 }
@@ -841,11 +770,80 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::channel::testing::refused_endpoint;
 
     #[test]
-    fn test_proto_types_compilation() {
-        let _health_req = proto::HealthCheckRequest {};
-        // HealthCheckRequest is now empty - no fields to test
+    fn score_request_uses_unscaled_prefill_only_logprobs() {
+        let request = SglangSchedulerClient::build_score_request(
+            "score".to_string(),
+            vec![1, 2, 3],
+            vec![42, 5],
+        );
+        assert_eq!(request.request_id, "score");
+        assert_eq!(request.tokenized.unwrap().input_ids, vec![1, 2, 3]);
+        assert_eq!(request.token_ids_logprob, vec![42, 5]);
+        assert!(request.return_logprob);
+        assert_eq!(request.logprob_start_len, -1);
+        assert_eq!(request.top_logprobs_num, 0);
+        assert!(!request.stream && !request.require_reasoning);
+        let params = request.sampling_params.unwrap();
+        assert_eq!(params.max_new_tokens, Some(0));
+        assert_eq!(params.temperature, 1.0);
+        assert_eq!(params.top_p, 1.0);
+        assert_eq!(params.top_k, -1);
+        assert_eq!(params.repetition_penalty, 1.0);
+        assert_eq!(params.n, 1);
+        assert!(params.constraint.is_none() && params.logit_bias.is_empty());
+    }
+
+    /// A chat or completion request's `logit_bias` reaches the proto keyed by
+    /// the token id's text; a request without one sends an empty map.
+    #[test]
+    fn chat_and_completion_sampling_params_carry_logit_bias() {
+        let bias = json!({"1": -100, "2": 100});
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "logit_bias": bias
+        }))
+        .expect("a chat request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_chat(
+            &chat,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.logit_bias["1"], -100.0);
+        assert_eq!(params.logit_bias["2"], 100.0);
+        assert_eq!(params.logit_bias.len(), 2);
+        let completion: CompletionRequest = serde_json::from_value(json!({
+            "model": "m", "prompt": "hi", "logit_bias": bias
+        }))
+        .expect("a completion request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&completion)
+            .expect("build sampling params");
+        assert_eq!(params.logit_bias["1"], -100.0);
+        assert_eq!(params.logit_bias.len(), 2);
+        let plain: CompletionRequest =
+            serde_json::from_value(json!({"model": "m", "prompt": "hi"})).expect("a request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&plain)
+            .expect("build sampling params");
+        assert!(params.logit_bias.is_empty());
+    }
+
+    /// A completions `max_tokens` of zero reaches the proto as `Some(0)`, a
+    /// prefill-only turn (the prompt-scoring request, `echo` with `logprobs`),
+    /// not as an unset limit.
+    #[test]
+    fn completion_max_tokens_zero_reaches_the_proto_as_zero() {
+        let scoring: CompletionRequest = serde_json::from_value(json!({
+            "model": "m", "prompt": "hi", "echo": true, "logprobs": 1, "max_tokens": 0
+        }))
+        .expect("a completion request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&scoring)
+            .expect("build sampling params");
+        assert_eq!(
+            params.max_new_tokens,
+            Some(0),
+            "an explicit zero is prefill only, not an unset limit"
+        );
     }
 
     #[test]
@@ -923,12 +921,6 @@ mod tests {
         assert_eq!(params.temperature, 0.7);
         assert_eq!(params.max_new_tokens, Some(128));
         assert_eq!(params.stop, vec!["</s>"]);
-    }
-
-    #[test]
-    fn test_health_check_request() {
-        let _health_req = proto::HealthCheckRequest {};
-        // HealthCheckRequest is now empty - server generates its own test internally
     }
 
     #[test]
@@ -1020,6 +1012,29 @@ mod tests {
             SglangSchedulerClient::build_grpc_sampling_params_from_responses(&disabled, None)
                 .expect("build sampling params");
         assert_eq!(disabled_params.top_k, -1);
+    }
+
+    #[test]
+    fn a_responses_request_s_stop_sequences_reach_the_sampling_params() {
+        use openai_protocol::responses::ResponsesRequest;
+
+        // The string form, as the chat builder forwards it.
+        let request = ResponsesRequest {
+            stop: Some(openai_protocol::common::StringOrArray::String(
+                "STOP".to_string(),
+            )),
+            ..Default::default()
+        };
+        let params =
+            SglangSchedulerClient::build_grpc_sampling_params_from_responses(&request, None)
+                .expect("build sampling params");
+        assert_eq!(params.stop, vec!["STOP"]);
+
+        // A request without `stop` leaves the list empty.
+        let unset = ResponsesRequest::default();
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_responses(&unset, None)
+            .expect("build sampling params");
+        assert!(params.stop.is_empty());
     }
 
     #[test]
@@ -1137,9 +1152,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_connect_invalid_endpoint() {
-        let result = SglangSchedulerClient::connect("invalid://endpoint").await;
-        assert!(result.is_err());
+    async fn connect_fails_on_a_malformed_or_refused_endpoint() {
+        let malformed = SglangSchedulerClient::connect("not an endpoint").await;
+        assert!(
+            malformed.is_err(),
+            "a malformed endpoint fails before the dial"
+        );
+        let refused = refused_endpoint();
+        let result = SglangSchedulerClient::connect(&refused.url).await;
+        assert!(result.is_err(), "a refused dial fails the connect");
     }
 
     #[test]
@@ -1170,4 +1191,86 @@ mod tests {
     }
 
     // TODO: ModelInfo not in current proto - skip test
+
+    /// A `response_format` set aside for the builder reads as absent: the tag
+    /// stays the one constraint, where the body's schema wins when nothing is
+    /// set aside.
+    #[test]
+    fn a_response_format_set_aside_leaves_the_tag_as_the_one_constraint() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"type": "object"}}}
+        }))
+        .expect("a chat request");
+        let tag = Some(("structural_tag".to_string(), "tag".to_string()));
+        let constraint_of = |options: SglangGenerateRequestOptions| {
+            SglangSchedulerClient::build_generate_request_from_chat_parts(
+                "id".to_string(),
+                &request,
+                "hi".to_string(),
+                vec![1],
+                options,
+            )
+            .expect("built")
+            .sampling_params
+            .expect("sampling params")
+            .constraint
+        };
+
+        // The body's own format wins over a tool constraint on this engine.
+        assert_eq!(
+            constraint_of(SglangGenerateRequestOptions {
+                tool_call_constraint: tag.clone(),
+                ..Default::default()
+            }),
+            Some(proto::sampling_params::Constraint::JsonSchema(
+                r#"{"type":"object"}"#.to_string()
+            ))
+        );
+        // Set aside, it is not read, and the tag that answers it is the constraint.
+        assert_eq!(
+            constraint_of(SglangGenerateRequestOptions {
+                tool_call_constraint: tag,
+                format_set_aside: FormatSetAside {
+                    response_format: true,
+                    grammar: false,
+                },
+                ..Default::default()
+            }),
+            Some(proto::sampling_params::Constraint::StructuralTag(
+                "tag".to_string()
+            ))
+        );
+    }
+
+    /// Each constraint kind reaches the engine as its own variant; none stays none.
+    #[test]
+    fn constraint_of_maps_each_kind_to_the_engines_variant() {
+        use crate::request_fields::ConstraintKind;
+        for (kind, expected) in [
+            (
+                ConstraintKind::JsonSchema,
+                proto::sampling_params::Constraint::JsonSchema("v".to_string()),
+            ),
+            (
+                ConstraintKind::Regex,
+                proto::sampling_params::Constraint::Regex("v".to_string()),
+            ),
+            (
+                ConstraintKind::Ebnf,
+                proto::sampling_params::Constraint::EbnfGrammar("v".to_string()),
+            ),
+            (
+                ConstraintKind::StructuralTag,
+                proto::sampling_params::Constraint::StructuralTag("v".to_string()),
+            ),
+        ] {
+            assert_eq!(
+                SglangSchedulerClient::constraint_of(Some((kind, "v".to_string()))),
+                Some(expected)
+            );
+        }
+        assert_eq!(SglangSchedulerClient::constraint_of(None), None);
+    }
 }

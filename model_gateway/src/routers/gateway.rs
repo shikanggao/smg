@@ -8,33 +8,40 @@
 //! size of the pools they would select from, so traffic can migrate between
 //! HTTP and gRPC and between regular and disaggregated fleets gradually.
 
-use std::{future::Future, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, Mutex, PoisonError},
+};
 
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, HeaderValue},
+    response::Response,
 };
-use dashmap::DashMap;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
-    messages::CreateMessageRequest,
+    messages::{CountMessageTokensRequest, CreateMessageRequest},
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
     },
     rerank::RerankRequest,
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
     UNKNOWN_MODEL_ID,
 };
+use smg_data_connector::MemoryConfig;
 use smg_external_router::spec_for_provider;
 use tracing::{debug, info, warn};
 
@@ -42,37 +49,139 @@ use crate::{
     app_context::AppContext,
     config::RoutingMode,
     middleware::TenantRequestMeta,
+    policies::PolicyRegistry,
     routers::{
-        common::body_policy::REASON_MODEL_SELECTION,
+        common::{body_policy::REASON_MODEL_SELECTION, header_utils::ROUTING_KEY_HINT_MAX_BYTES},
         error as route_error,
         factory::{router_ids, RouterId},
+        grpc::regular::stages::decisions::supports_worker as supports_decisions_worker,
+        message_threads::{MessageThreads, ThreadTurn},
         BodyPolicy, RouterFactory, RouterTrait,
     },
     server::ServerConfig,
+    tenant::storage_tenant,
     worker::{ConnectionMode, ProviderType, RoutingPool, WorkerRegistry},
 };
 
-pub struct Gateway {
-    worker_registry: Arc<WorkerRegistry>,
-    routers: Arc<DashMap<RouterId, Arc<dyn RouterTrait>>>,
-    default_router: Arc<std::sync::RwLock<Option<RouterId>>>,
-    enable_igw: bool,
+/// A router family the weighted selection chooses among: its router and the
+/// pools whose workers give it weight. A disaggregated family needs every
+/// one of its pools before it takes any weight; the weight is then the pools'
+/// worker counts summed, so operators migrate traffic between HTTP and gRPC
+/// and between regular and disaggregated workers by moving workers. The
+/// gRPC PD family stands aside while the EPD family has weight: a fleet with
+/// encode workers is served as EPD.
+struct RouterFamily {
+    router: RouterId,
+    pools: &'static [RoutingPool],
+    /// A family whose weight takes this one's place.
+    shadowed_by: Option<RouterId>,
 }
 
-/// The answer when no router serves a request.
-const NO_ROUTER: (StatusCode, &str) = (
-    StatusCode::NOT_FOUND,
-    "No router available for this request",
-);
+/// The families in the order the weighted pick walks them. A family's shadow
+/// is judged on the shadowing family's own pools and router, not on the order
+/// of this table.
+const ROUTER_FAMILIES: [RouterFamily; 5] = [
+    RouterFamily {
+        router: router_ids::GRPC_EPD,
+        pools: &[
+            RoutingPool::GrpcEncode,
+            RoutingPool::GrpcPrefill,
+            RoutingPool::GrpcDecode,
+        ],
+        shadowed_by: None,
+    },
+    RouterFamily {
+        router: router_ids::GRPC_PD,
+        pools: &[RoutingPool::GrpcPrefill, RoutingPool::GrpcDecode],
+        shadowed_by: Some(router_ids::GRPC_EPD),
+    },
+    RouterFamily {
+        router: router_ids::HTTP_PD,
+        pools: &[RoutingPool::HttpPrefill, RoutingPool::HttpDecode],
+        shadowed_by: None,
+    },
+    RouterFamily {
+        router: router_ids::GRPC_REGULAR,
+        pools: &[RoutingPool::GrpcPipelineRegular],
+        shadowed_by: None,
+    },
+    RouterFamily {
+        router: router_ids::HTTP_REGULAR,
+        pools: &[RoutingPool::HttpRegular],
+        shadowed_by: None,
+    },
+];
+
+/// The default router, resolved when it is set or mounted and read per
+/// request as it is: a single-router gateway reached its one router through
+/// a hash of the id and a probe of the map on every request (about 0.5 % of
+/// a chat request's user instructions on the mock bed). `router` is `None`
+/// while the id names a router that is not mounted, which the lookup read as
+/// no router before.
+struct DefaultRouter {
+    id: RouterId,
+    router: Option<Arc<dyn RouterTrait>>,
+}
+
+pub struct Gateway {
+    worker_registry: Arc<WorkerRegistry>,
+    /// Copy-on-write: routers are registered at startup and only read per
+    /// request, so a wait-free `load()` replaces a `DashMap` shard lock (and a
+    /// `RwLock` for the default) that every request would contend on.
+    routers: ArcSwap<HashMap<RouterId, Arc<dyn RouterTrait>>>,
+    /// The mounted router of every family in [`ROUTER_FAMILIES`] order, read
+    /// by the weighted pick per request: the pick and the weights hashed every
+    /// family's id against the map, twice, on every request (a dozen SipHash
+    /// runs for five families); the array is resolved once, at the mount.
+    family_routers: ArcSwap<[Option<Arc<dyn RouterTrait>>; ROUTER_FAMILIES.len()]>,
+    default_router: ArcSwapOption<DefaultRouter>,
+    /// The mount path's lock: `register_router` and `set_default_router`
+    /// each read one swapped value and store another (the map, then the
+    /// default), and two of them interleaving could leave the default
+    /// without a router that is mounted; serialized, a mount and a default
+    /// named for it converge in either order. Requests never take it.
+    mounts: Mutex<()>,
+    enable_igw: bool,
+    /// The message threads of the Messages route: resolved before the
+    /// family routers see a request, stored after one answers.
+    threads: MessageThreads,
+    /// The policies' reading of the routing key, for a thread turn's lineage
+    /// key; `None` where a gateway is built without them (tests).
+    policies: Option<Arc<PolicyRegistry>>,
+}
+
+/// The answer when no router serves a request: the JSON error object, a 404
+/// under `no_router`, as the endpoint-specific misses answer.
+fn no_router() -> Response {
+    route_error::not_found("no_router", "No router available for this request")
+}
 
 impl Gateway {
     pub fn new(worker_registry: Arc<WorkerRegistry>) -> Self {
         Self {
             worker_registry,
-            routers: Arc::new(DashMap::new()),
-            default_router: Arc::new(std::sync::RwLock::new(None)),
+            routers: ArcSwap::from_pointee(HashMap::new()),
+            family_routers: ArcSwap::from_pointee(std::array::from_fn(|_| None)),
+            default_router: ArcSwapOption::empty(),
+            mounts: Mutex::new(()),
             enable_igw: false,
+            threads: MessageThreads::new(),
+            policies: None,
         }
+    }
+
+    /// The gateway with the policies a thread turn's routing key is read
+    /// through: the registry the routers select workers with.
+    pub fn with_policies(mut self, policies: Arc<PolicyRegistry>) -> Self {
+        self.policies = Some(policies);
+        self
+    }
+
+    /// The gateway with its message threads in a store bounded as the
+    /// operator's `memory` section says.
+    fn with_thread_bounds(mut self, memory: &MemoryConfig) -> Self {
+        self.threads = MessageThreads::from_config(memory);
+        self
     }
 
     fn try_register(
@@ -96,7 +205,18 @@ impl Gateway {
         config: &ServerConfig,
         app_context: &Arc<AppContext>,
     ) -> Result<Arc<Self>, String> {
-        let mut gateway = Self::new(app_context.worker_registry.clone());
+        let memory = config.router_config.memory.unwrap_or_default();
+        memory.validate()?;
+        info!(
+            "Message threads: at most {} turns, retention {}",
+            memory.max_responses,
+            memory
+                .retention()
+                .map_or_else(|| "none".to_string(), |r| format!("{} s", r.as_secs()))
+        );
+        let mut gateway = Self::new(app_context.worker_registry.clone())
+            .with_policies(app_context.policy_registry.clone())
+            .with_thread_bounds(&memory);
         gateway.enable_igw = config.router_config.enable_igw;
         let gateway = Arc::new(gateway);
 
@@ -161,71 +281,107 @@ impl Gateway {
     }
 
     pub fn register_router(&self, id: RouterId, router: Arc<dyn RouterTrait>) {
-        self.routers.insert(id.clone(), router);
+        let _mount = self.mounts.lock().unwrap_or_else(PoisonError::into_inner);
+        self.routers.rcu(|routers| {
+            let mut next: HashMap<_, _> = (**routers).clone();
+            next.insert(id.clone(), Arc::clone(&router));
+            next
+        });
+        if let Some(index) = ROUTER_FAMILIES
+            .iter()
+            .position(|family| family.router == id)
+        {
+            self.family_routers.rcu(|families| {
+                let mut next = (**families).clone();
+                next[index] = Some(Arc::clone(&router));
+                next
+            });
+        }
 
-        let mut default_router = self
-            .default_router
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        if default_router.is_none() {
-            *default_router = Some(id.clone());
-            info!("Set default router to {}", id.as_str());
+        match &*self.default_router.load() {
+            None => {
+                info!("Set default router to {}", id.as_str());
+                self.store_default_router(id, Some(router));
+            }
+            // The default named before its router was mounted, or mounted
+            // again under its id: the default reads the router just mounted.
+            Some(default) if default.id == id => self.store_default_router(id, Some(router)),
+            Some(_) => {}
         }
     }
 
     pub fn set_default_router(&self, id: RouterId) {
-        let mut default_router = self
-            .default_router
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        *default_router = Some(id);
+        let _mount = self.mounts.lock().unwrap_or_else(PoisonError::into_inner);
+        let router = self.routers.load().get(&id).cloned();
+        self.store_default_router(id, router);
+    }
+
+    fn store_default_router(&self, id: RouterId, router: Option<Arc<dyn RouterTrait>>) {
+        self.default_router
+            .store(Some(Arc::new(DefaultRouter { id, router })));
     }
 
     pub fn router_count(&self) -> usize {
-        self.routers.len()
+        self.routers.load().len()
     }
 
-    /// Selects a router by weighting available router types by their worker counts.
-    /// PD routers only receive weight when both prefill and decode workers are
-    /// present on the same protocol; EPD requires encode, prefill, and decode
-    /// workers over gRPC. Incomplete role sets contribute 0.
-    ///
-    /// Weighting the router selection lets operators gradually migrate traffic between
-    /// HTTP / gRPC and regular / prefill-decode disaggregation workers.
+    /// The families' weights for a model, in [`ROUTER_FAMILIES`] order: a
+    /// family's pools' worker counts summed when every pool has workers and
+    /// its router is mounted, else 0; 0 as well for a family shadowed by a
+    /// family that has weight.
+    fn family_weights(
+        &self,
+        size: impl Fn(RoutingPool) -> usize,
+    ) -> [usize; ROUTER_FAMILIES.len()] {
+        let mounted = self.family_routers.load();
+        // A family has weight when its router is mounted and every pool has workers.
+        let has_weight = |i: usize, family: &RouterFamily| {
+            mounted[i].is_some() && family.pools.iter().all(|pool| size(*pool) > 0)
+        };
+        let mut weights = [0usize; ROUTER_FAMILIES.len()];
+        for (i, family) in ROUTER_FAMILIES.iter().enumerate() {
+            let shadowed = family.shadowed_by.as_ref().is_some_and(|shadow| {
+                ROUTER_FAMILIES
+                    .iter()
+                    .enumerate()
+                    .any(|(j, other)| other.router == *shadow && has_weight(j, other))
+            });
+            if !shadowed && has_weight(i, family) {
+                weights[i] = family.pools.iter().map(|pool| size(*pool)).sum();
+            }
+        }
+        weights
+    }
+
+    /// One router drawn with probability proportional to its family's
+    /// weight, `weights` in [`ROUTER_FAMILIES`] order ([`Self::family_weights`]
+    /// for the model-serving draw; other routes weigh the families their own
+    /// way). A family whose router is not mounted takes no part; `None` when
+    /// none has weight.
     fn pick_router_by_weights(
         &self,
-        grpc_epd: usize,
-        grpc_pd: usize,
-        http_pd: usize,
-        grpc_regular: usize,
-        http_regular: usize,
+        weights: &[usize; ROUTER_FAMILIES.len()],
     ) -> Option<Arc<dyn RouterTrait>> {
-        let options: [(usize, &RouterId); 5] = [
-            (grpc_epd, &router_ids::GRPC_EPD),
-            (grpc_pd, &router_ids::GRPC_PD),
-            (http_pd, &router_ids::HTTP_PD),
-            (grpc_regular, &router_ids::GRPC_REGULAR),
-            (http_regular, &router_ids::HTTP_REGULAR),
-        ];
-
-        let total: usize = options
+        let mounted = self.family_routers.load();
+        let total: usize = mounted
             .iter()
-            .filter(|(weight, router_id)| *weight > 0 && self.routers.contains_key(*router_id))
-            .map(|(weight, _)| *weight)
+            .zip(weights)
+            .filter(|(router, weight)| **weight > 0 && router.is_some())
+            .map(|(_, weight)| *weight)
             .sum();
         if total == 0 {
             return None;
         }
-
         let pick = ((rand::random::<f64>() * total as f64) as usize).min(total - 1);
         let mut cum = 0usize;
-        for (weight, router_id) in &options {
-            if *weight == 0 || !self.routers.contains_key(*router_id) {
+        for (router, weight) in mounted.iter().zip(weights) {
+            let Some(router) = router else { continue };
+            if *weight == 0 {
                 continue;
             }
             cum += weight;
             if pick < cum {
-                return self.routers.get(*router_id).map(|r| r.clone());
+                return Some(Arc::clone(router));
             }
         }
         None
@@ -236,8 +392,9 @@ impl Gateway {
     fn external_router_for(&self, provider: Option<&ProviderType>) -> Option<Arc<dyn RouterTrait>> {
         let spec = spec_for_provider(provider)?;
         self.routers
+            .load()
             .get(&RouterId::new(spec.router_id))
-            .map(|router| Arc::clone(router.value()))
+            .cloned()
     }
 
     /// The router for `model_id` (the whole fleet when `None`), read from the
@@ -246,9 +403,11 @@ impl Gateway {
     /// pool-length reads rather than a walk over every worker.
     ///
     /// An external worker sends the request to its provider's router. A
-    /// disaggregated family is weighted only when both of its legs exist on
-    /// the wire the family selects over, which is how a leg on a transport
-    /// the family cannot use (ZMQ prefill or decode) no longer counts.
+    /// disaggregated family is weighted only when both of its pools exist on
+    /// the wire the family selects over, which is how a worker on a transport
+    /// the family cannot use (ZMQ prefill or decode) no longer counts; a
+    /// family with one pool missing takes the request only when no family
+    /// has weight (see [`Self::incomplete_disaggregated_router`]).
     fn select_router_for_model(&self, model_id: Option<&str>) -> Option<Arc<dyn RouterTrait>> {
         let snapshot = self
             .worker_registry
@@ -259,35 +418,82 @@ impl Gateway {
             }
         }
         let size = |pool: RoutingPool| snapshot.pool(pool).len();
-        let grpc_encode = size(RoutingPool::GrpcEncode);
-        let grpc_prefill = size(RoutingPool::GrpcPrefill);
-        let grpc_decode = size(RoutingPool::GrpcDecode);
-        let http_prefill = size(RoutingPool::HttpPrefill);
-        let http_decode = size(RoutingPool::HttpDecode);
-        let grpc_regular = size(RoutingPool::GrpcPipelineRegular);
-        let http_regular = size(RoutingPool::HttpRegular);
+        let weights = self.family_weights(size);
+        self.pick_router_by_weights(&weights).or_else(|| {
+            self.incomplete_disaggregated_router(
+                size(RoutingPool::GrpcEncode),
+                size(RoutingPool::GrpcPrefill) + size(RoutingPool::GrpcDecode),
+                size(RoutingPool::HttpPrefill) + size(RoutingPool::HttpDecode),
+            )
+        })
+    }
 
-        let grpc_epd_ready = grpc_encode > 0
-            && grpc_prefill > 0
-            && grpc_decode > 0
-            && self.routers.contains_key(&router_ids::GRPC_EPD);
-        let grpc_epd = if grpc_epd_ready {
-            grpc_encode + grpc_prefill + grpc_decode
-        } else {
-            0
-        };
-        // A disaggregated family needs both legs before it takes any weight.
-        let grpc_pd = if !grpc_epd_ready && grpc_prefill > 0 && grpc_decode > 0 {
-            grpc_prefill + grpc_decode
-        } else {
-            0
-        };
-        let http_pd = if http_prefill > 0 && http_decode > 0 {
-            http_prefill + http_decode
-        } else {
-            0
-        };
-        self.pick_router_by_weights(grpc_epd, grpc_pd, http_pd, grpc_regular, http_regular)
+    /// The router for a model whose only workers are the pools of a
+    /// disaggregated family with a pool missing (one pool restarting or not yet
+    /// discovered, the other still registered). Such a family takes no weight
+    /// in [`Self::select_router_for_model`], so a fleet with another family
+    /// that can serve the request sends it there; when none can, the request
+    /// still belongs to this family, whose selection refuses it with the pool
+    /// that is missing: a retryable 503 with a `Retry-After`, counted under
+    /// the family's labels. Falling to the default router instead answered
+    /// that the model does not exist (404 `model_not_found`) and counted the
+    /// refusal under that router's labels, for a model that is served and
+    /// merely has no complete pair at the moment. An encode pool is the EPD
+    /// family's alone: registered beside a missing prefill or decode pool it
+    /// makes that family the first choice, and registered alone it takes the
+    /// EPD router when one is mounted (whose selection answers the incomplete
+    /// set itself) and the default router otherwise, never the PD router,
+    /// whose refusal would count and log it as prefill/decode traffic.
+    /// `None` when no pool of the model is registered on either wire, or no
+    /// family's router is mounted: the default router's answer stands.
+    fn incomplete_disaggregated_router(
+        &self,
+        grpc_encode: usize,
+        grpc_pair_pools: usize,
+        http_pair_pools: usize,
+    ) -> Option<Arc<dyn RouterTrait>> {
+        let routers = self.routers.load();
+        let family = |ids: &[&RouterId]| ids.iter().find_map(|id| routers.get(*id).cloned());
+        if grpc_pair_pools > 0 || grpc_encode > 0 {
+            let ids: &[&RouterId] = match (grpc_encode > 0, grpc_pair_pools > 0) {
+                (true, true) => &[&router_ids::GRPC_EPD, &router_ids::GRPC_PD],
+                (true, false) => &[&router_ids::GRPC_EPD],
+                _ => &[&router_ids::GRPC_PD, &router_ids::GRPC_EPD],
+            };
+            if let Some(router) = family(ids) {
+                return Some(router);
+            }
+        }
+        if http_pair_pools > 0 {
+            return family(&[&router_ids::HTTP_PD]);
+        }
+        None
+    }
+
+    /// The router for a Messages request with `max_tokens: 0`. Its answer,
+    /// the public API's empty message carrying the prompt's token count, is
+    /// given by a router that renders the prompt itself (the gRPC families);
+    /// the HTTP relay refuses the shape. A model served over both wires goes
+    /// to a gRPC router whenever one serves it, so the answer does not depend
+    /// on the weighted draw; a disaggregated pool qualifies by its prefill
+    /// pool alone, as for count_tokens, since no worker takes part. A model no
+    /// gRPC pool serves takes the normal draw: the relay's refusal, an
+    /// external provider's router, or the default router's model_not_found.
+    fn select_router_for_empty_message(&self, model_id: &str) -> Option<Arc<dyn RouterTrait>> {
+        let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+        if !snapshot.pool(RoutingPool::External).is_empty() {
+            return self.select_router_for_request(Some(model_id));
+        }
+        let size = |pool| snapshot.pool(pool).len();
+        let grpc_prefill = size(RoutingPool::GrpcPrefill);
+        self.pick_router_by_weights(&[
+            grpc_prefill,
+            grpc_prefill,
+            0,
+            size(RoutingPool::GrpcPipelineRegular),
+            0,
+        ])
+        .or_else(|| self.select_router_for_request(Some(model_id)))
     }
 
     /// Whether an external worker serves `model` through a provider router
@@ -316,17 +522,13 @@ impl Gateway {
     ) -> Option<Arc<dyn RouterTrait>> {
         // In single-router mode (enable_igw=false), always use the default router
         if !self.enable_igw {
-            let default_router = self
-                .default_router
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref default_id) = *default_router {
+            if let Some(default) = &*self.default_router.load() {
                 debug!(
                     "Single-router mode: using default router {} for model {:?}",
-                    default_id.as_str(),
+                    default.id.as_str(),
                     model_id
                 );
-                return self.routers.get(default_id).map(|r| r.clone());
+                return default.router.clone();
             }
         }
 
@@ -340,21 +542,20 @@ impl Gateway {
                     return None;
                 }
             }
-            let default = self
-                .default_router
-                .read()
-                .unwrap_or_else(|e| e.into_inner());
-            default
+            self.default_router
+                .load()
                 .as_ref()
-                .and_then(|id| self.routers.get(id).map(|r| r.clone()))
+                .and_then(|default| default.router.clone())
         })
     }
 
-    /// Hand a request to the router that serves `model`, or answer `miss`.
+    /// Hand a request to the router that serves `model`, or answer with the
+    /// refusal `miss` builds (built on a miss alone: a request a router takes
+    /// pays nothing for it).
     async fn dispatch<F, Fut>(
         &self,
         model: Option<&str>,
-        miss: impl IntoResponse,
+        miss: impl FnOnce() -> Response,
         run: F,
     ) -> Response
     where
@@ -363,7 +564,98 @@ impl Gateway {
     {
         match self.select_router_for_request(model) {
             Some(router) => run(router).await,
-            None => miss.into_response(),
+            None => miss(),
+        }
+    }
+
+    /// The router of a Messages request: in IGW mode an empty message (a
+    /// `max_tokens` of 0) may go to a router that answers it without an
+    /// engine. Takes the request's `max_tokens`, not the request: a local
+    /// that was borrowed keeps its slot in the route's task across the awaits
+    /// that follow, a second copy of the request per plain request.
+    fn select_messages_router(
+        &self,
+        max_tokens: u32,
+        model_id: &str,
+    ) -> Option<Arc<dyn RouterTrait>> {
+        if self.enable_igw && max_tokens == 0 {
+            self.select_router_for_empty_message(model_id)
+        } else {
+            self.select_router_for_request(Some(model_id))
+        }
+    }
+
+    /// Under the routing-key override a plain request routes on its `rid`
+    /// lineage; a thread turn's `rid` is the minted message id by the time a
+    /// router reads it, so its client's key rides the configured routing-key
+    /// header instead, when the request set none. The headers with that key,
+    /// or `None` when nothing changes: no policies, the override off, no
+    /// client `rid`, a routing-key header already set (it wins), or a key
+    /// that is no header value.
+    fn thread_lineage_headers(
+        &self,
+        headers: Option<&HeaderMap>,
+        turn: Option<&ThreadTurn>,
+    ) -> Option<HeaderMap> {
+        let policies = self.policies.as_ref()?;
+        let rid = turn?.trace()?;
+        let key = policies.derive_rid_key(Some(rid))?;
+        if policies.resolve_routing_key(headers).is_some() {
+            return None;
+        }
+        let name = policies.routing_key_header()?.clone();
+        // The header carries the client's rid itself: placement strips its
+        // lineage suffixes once, as `derive_rid_key` does for a plain
+        // request, so both paths key a nested rid alike. A rid over the
+        // header's byte cap goes as the derived key, and placement's strip
+        // then takes a further suffix off a nested one: a key one level
+        // coarser than the plain request's, by choice, since no header would
+        // scatter the turns. A nested rid that crosses the cap mid-thread (a
+        // turn number gaining a digit, a `_r<n>` retry) moves to that coarser
+        // key at the crossing.
+        let carried = if rid.len() <= ROUTING_KEY_HINT_MAX_BYTES {
+            rid
+        } else {
+            key
+        };
+        let value = HeaderValue::from_str(carried).ok()?;
+        let mut with_key = headers.cloned().unwrap_or_default();
+        with_key.insert(name, value);
+        Some(with_key)
+    }
+
+    /// A thread turn: resolved before the router sees it (a create as it
+    /// came, a continue as the rebuilt conversation), routed under its
+    /// client's lineage key where the override asks one, stored after the
+    /// router answers.
+    async fn route_messages_thread(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: CreateMessageRequest,
+        model_id: &str,
+    ) -> Response {
+        let (body, turn) = match self
+            .threads
+            .resolve(body, storage_tenant(tenant_meta))
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(refused) => return refused,
+        };
+        let lineage = self.thread_lineage_headers(headers, turn.as_ref());
+        let headers = lineage.as_ref().or(headers);
+        let response = match self.select_messages_router(body.max_tokens, model_id) {
+            Some(router) => {
+                router
+                    .route_messages(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => no_router(),
+        };
+        match turn {
+            Some(turn) => self.threads.stored(turn, response).await,
+            None => response,
         }
     }
 }
@@ -384,10 +676,12 @@ impl RouterTrait for Gateway {
     }
 
     async fn health_generate(&self, req: Request<Body>) -> Response {
-        let miss = (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "No routers with healthy workers available",
-        );
+        let miss = || {
+            route_error::service_unavailable(
+                "no_routers",
+                "No routers with healthy workers available",
+            )
+        };
         self.dispatch(None, miss, |router| async move {
             router.health_generate(req).await
         })
@@ -395,7 +689,7 @@ impl RouterTrait for Gateway {
     }
 
     async fn get_server_info(&self, req: Request<Body>) -> Response {
-        let miss = (StatusCode::SERVICE_UNAVAILABLE, "No routers available");
+        let miss = || route_error::service_unavailable("no_routers", "No routers available");
         self.dispatch(None, miss, |router| async move {
             router.get_server_info(req).await
         })
@@ -404,18 +698,13 @@ impl RouterTrait for Gateway {
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
         // Model info is fleet-wide: the default router answers, else any.
-        let default_id = self
-            .default_router
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let router = match default_id {
-            Some(id) => self.routers.get(&id).map(|r| r.clone()),
-            None => self.routers.iter().next().map(|r| r.value().clone()),
+        let router = match self.default_router.load_full() {
+            Some(default) => default.router.clone(),
+            None => self.routers.load().values().next().cloned(),
         };
         match router {
             Some(router) => router.get_model_info(req).await,
-            None => (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response(),
+            None => route_error::service_unavailable("no_routers", "No routers available"),
         }
     }
 
@@ -432,7 +721,7 @@ impl RouterTrait for Gateway {
                 "/generate requests must include a model when IGW routing is enabled",
             );
         }
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
+        self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_generate(headers, tenant_meta, body, model_id)
                 .await
@@ -447,7 +736,7 @@ impl RouterTrait for Gateway {
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
+        self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_chat(headers, tenant_meta, body, model_id)
                 .await
@@ -462,7 +751,7 @@ impl RouterTrait for Gateway {
         body: CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
+        self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_completion(headers, tenant_meta, body, model_id)
                 .await
@@ -477,12 +766,69 @@ impl RouterTrait for Gateway {
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
-            router
-                .route_messages(headers, tenant_meta, body, model_id)
-                .await
-        })
-        .await
+        // A thread turn runs as its own boxed future: its locals (the chain
+        // walk, the rebuild, the answer read back) would otherwise size every
+        // plain request's task. The request is read by value and moved, never
+        // borrowed, before the awaits: a borrowed local keeps a second copy of
+        // the request in every plain request's task (`is_some()` borrows it;
+        // the `matches!` reads the discriminant in place).
+        #[expect(
+            clippy::redundant_pattern_matching,
+            reason = "is_some() borrows the request; a borrowed local keeps its slot in the task"
+        )]
+        if matches!(body.thread, Some(_)) {
+            return Box::pin(self.route_messages_thread(headers, tenant_meta, body, model_id))
+                .await;
+        }
+        match self.select_messages_router(body.max_tokens, model_id) {
+            Some(router) => {
+                router
+                    .route_messages(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => no_router(),
+        }
+    }
+
+    async fn route_messages_count_tokens(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: CountMessageTokensRequest,
+        model_id: &str,
+    ) -> Response {
+        let router = if self.enable_igw {
+            let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+            if snapshot.pool(RoutingPool::External).is_empty() {
+                // Counting needs only the model's tokenizer, which every
+                // self-hosted router holds: a disaggregated pool qualifies by
+                // its prefill pool alone, whichever gRPC family is mounted.
+                let size = |pool| snapshot.pool(pool).len();
+                let grpc_prefill = size(RoutingPool::GrpcPrefill);
+                self.pick_router_by_weights(&[
+                    grpc_prefill,
+                    grpc_prefill,
+                    size(RoutingPool::HttpPrefill),
+                    size(RoutingPool::GrpcPipelineRegular),
+                    size(RoutingPool::HttpRegular),
+                ])
+                // A model no pool serves goes to the default router, like
+                // every other route, so the answer is its model_not_found.
+                .or_else(|| self.select_router_for_request(Some(model_id)))
+            } else {
+                self.select_router_for_request(Some(model_id))
+            }
+        } else {
+            self.select_router_for_request(Some(model_id))
+        };
+        match router {
+            Some(router) => {
+                router
+                    .route_messages_count_tokens(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => no_router(),
+        }
     }
 
     async fn route_responses(
@@ -492,10 +838,12 @@ impl RouterTrait for Gateway {
         body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        let miss = (
-            StatusCode::NOT_FOUND,
-            "No router available to handle responses request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available to handle responses request",
+            )
+        };
         self.dispatch(Some(model_id), miss, |router| async move {
             router
                 .route_responses(headers, tenant_meta, body, model_id)
@@ -511,10 +859,12 @@ impl RouterTrait for Gateway {
         body: InteractionsRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let miss = (
-            StatusCode::NOT_FOUND,
-            "No router available to handle interactions request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available to handle interactions request",
+            )
+        };
         self.dispatch(model_id, miss, |router| async move {
             router
                 .route_interactions(headers, tenant_meta, body, model_id)
@@ -523,13 +873,22 @@ impl RouterTrait for Gateway {
         .await
     }
 
-    async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        let miss = (
-            StatusCode::NOT_FOUND,
-            format!("No router available to cancel response '{response_id}'"),
-        );
+    async fn cancel_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        response_id: &str,
+    ) -> Response {
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                format!("No router available to cancel response '{response_id}'"),
+            )
+        };
         self.dispatch(None, miss, |router| async move {
-            router.cancel_response(headers, response_id).await
+            router
+                .cancel_response(headers, tenant_meta, response_id)
+                .await
         })
         .await
     }
@@ -541,7 +900,7 @@ impl RouterTrait for Gateway {
         body: EmbeddingRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
+        self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_embeddings(headers, tenant_meta, body, model_id)
                 .await
@@ -556,12 +915,112 @@ impl RouterTrait for Gateway {
         body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
+        self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_classify(headers, tenant_meta, body, model_id)
                 .await
         })
         .await
+    }
+
+    async fn route_decisions(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: DecisionsRequest,
+        model_id: &str,
+    ) -> Response {
+        if model_id == UNKNOWN_MODEL_ID
+            || self
+                .worker_registry
+                .resolve_model_alias(model_id)
+                .as_deref()
+                == Some(UNKNOWN_MODEL_ID)
+        {
+            return route_error::model_not_found(model_id);
+        }
+        let router = if self.enable_igw {
+            let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+            if snapshot.is_empty() {
+                return route_error::model_not_found(model_id);
+            }
+            // Weight only transports that can serve this endpoint. The gRPC
+            // pipeline also filters its initial and retry worker selections.
+            let http = snapshot.pool(RoutingPool::HttpRegular).len();
+            let grpc = snapshot
+                .pool(RoutingPool::GrpcPipelineRegular)
+                .iter()
+                .filter(|worker| supports_decisions_worker(worker.as_ref()))
+                .count();
+            if http == 0 && grpc == 0 {
+                return route_error::not_implemented(
+                    "decisions_not_supported",
+                    "Decisions requires a regular HTTP or SGLang gRPC worker for this model",
+                );
+            }
+            self.pick_router_by_weights(&[0, 0, 0, grpc, http])
+        } else {
+            self.select_router_for_request(Some(model_id))
+        };
+        match router {
+            Some(router) => {
+                router
+                    .route_decisions(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => route_error::not_implemented(
+                "decisions_not_supported",
+                "Decisions requires a regular HTTP or SGLang gRPC router",
+            ),
+        }
+    }
+
+    async fn route_systemone(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: SystemOneRequest,
+        model_id: &str,
+    ) -> Response {
+        // SystemOne requires an explicit model; the internal wildcard must
+        // never select an unrelated model, including after alias resolution.
+        if model_id == UNKNOWN_MODEL_ID
+            || self
+                .worker_registry
+                .resolve_model_alias(model_id)
+                .as_deref()
+                == Some(UNKNOWN_MODEL_ID)
+        {
+            return route_error::model_not_found(model_id);
+        }
+        let router = if self.enable_igw {
+            let snapshot = self.worker_registry.get_routing_snapshot(model_id);
+            if snapshot.is_empty() {
+                return route_error::model_not_found(model_id);
+            }
+            // Native SystemOne is supported only by regular HTTP workers.
+            // Weighted family dispatch could select an unsupported transport.
+            if snapshot.pool(RoutingPool::HttpRegular).is_empty() {
+                return route_error::not_implemented(
+                    "systemone_not_supported",
+                    "SystemOne requires a regular HTTP worker for this model",
+                );
+            }
+            self.routers.load().get(&router_ids::HTTP_REGULAR).cloned()
+        } else {
+            self.select_router_for_request(Some(model_id))
+        };
+        match router {
+            Some(router) => {
+                router
+                    .route_systemone(headers, tenant_meta, body, model_id)
+                    .await
+            }
+            None => route_error::not_implemented(
+                "systemone_not_supported",
+                "SystemOne requires a regular HTTP router",
+            ),
+        }
     }
 
     async fn route_audio_transcriptions(
@@ -572,7 +1031,7 @@ impl RouterTrait for Gateway {
         audio: AudioFile,
         model_id: &str,
     ) -> Response {
-        self.dispatch(Some(model_id), NO_ROUTER, |router| async move {
+        self.dispatch(Some(model_id), no_router, |router| async move {
             router
                 .route_audio_transcriptions(headers, tenant_meta, body, audio, model_id)
                 .await
@@ -587,10 +1046,7 @@ impl RouterTrait for Gateway {
         body: RerankRequest,
         model_id: &str,
     ) -> Response {
-        let miss = (
-            StatusCode::NOT_FOUND,
-            "No router available for rerank request",
-        );
+        let miss = || route_error::not_found("no_router", "No router available for rerank request");
         self.dispatch(Some(model_id), miss, |router| async move {
             router
                 .route_rerank(headers, tenant_meta, body, model_id)
@@ -604,10 +1060,12 @@ impl RouterTrait for Gateway {
         headers: Option<&HeaderMap>,
         body: &RealtimeSessionCreateRequest,
     ) -> Response {
-        let miss = (
-            StatusCode::NOT_FOUND,
-            "No router available for realtime session request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available for realtime session request",
+            )
+        };
         let model = body.model.as_deref();
         self.dispatch(model, miss, |router| async move {
             router.route_realtime_session(headers, body).await
@@ -620,10 +1078,12 @@ impl RouterTrait for Gateway {
         headers: Option<&HeaderMap>,
         body: &RealtimeClientSecretCreateRequest,
     ) -> Response {
-        let miss = (
-            StatusCode::NOT_FOUND,
-            "No router available for realtime client secret request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available for realtime client secret request",
+            )
+        };
         let model = body.session.model.as_deref();
         self.dispatch(model, miss, |router| async move {
             router.route_realtime_client_secret(headers, body).await
@@ -636,10 +1096,12 @@ impl RouterTrait for Gateway {
         headers: Option<&HeaderMap>,
         body: &RealtimeTranscriptionSessionCreateRequest,
     ) -> Response {
-        let miss = (
-            StatusCode::NOT_FOUND,
-            "No router available for realtime transcription request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available for realtime transcription request",
+            )
+        };
         let model = body.model.as_deref();
         self.dispatch(model, miss, |router| async move {
             router
@@ -650,10 +1112,12 @@ impl RouterTrait for Gateway {
     }
 
     async fn route_realtime_ws(&self, req: Request<Body>, model: &str) -> Response {
-        let miss = (
-            StatusCode::NOT_FOUND,
-            "No router available for realtime WebSocket request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available for realtime WebSocket request",
+            )
+        };
         self.dispatch(Some(model), miss, |router| async move {
             router.route_realtime_ws(req, model).await
         })
@@ -661,10 +1125,12 @@ impl RouterTrait for Gateway {
     }
 
     async fn route_realtime_webrtc(&self, req: Request<Body>, model: &str) -> Response {
-        let miss = (
-            StatusCode::NOT_FOUND,
-            "No router available for realtime WebRTC request",
-        );
+        let miss = || {
+            route_error::not_found(
+                "no_router",
+                "No router available for realtime WebRTC request",
+            )
+        };
         self.dispatch(Some(model), miss, |router| async move {
             router.route_realtime_webrtc(req, model).await
         })
@@ -679,7 +1145,7 @@ impl RouterTrait for Gateway {
 impl std::fmt::Debug for Gateway {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Gateway")
-            .field("routers", &self.routers.len())
+            .field("routers", &self.routers.load().len())
             .field("enable_igw", &self.enable_igw)
             .field("workers_count", &self.worker_registry.get_all().len())
             .finish()
@@ -691,13 +1157,17 @@ mod tests {
     use std::collections::HashMap;
 
     use async_trait::async_trait;
+    use axum::{http::StatusCode, response::IntoResponse};
     use openai_protocol::model_card::ModelCard;
 
     use super::*;
     use crate::{
+        config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         middleware::{RouteRequestMeta, TenantKey},
-        routers::factory::router_ids,
-        worker::{BasicWorkerBuilder, CircuitBreakerConfig, WorkerRegistry, WorkerType},
+        routers::{factory::router_ids, tests::error_shape},
+        worker::{
+            BasicWorkerBuilder, CircuitBreakerConfig, RuntimeType, WorkerRegistry, WorkerType,
+        },
     };
 
     #[derive(Debug)]
@@ -707,6 +1177,16 @@ mod tests {
     impl RouterTrait for StubRouter {
         fn as_any(&self) -> &dyn std::any::Any {
             self
+        }
+
+        async fn route_messages_count_tokens(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: CountMessageTokensRequest,
+            _model_id: &str,
+        ) -> Response {
+            StatusCode::OK.into_response()
         }
 
         async fn route_generate(
@@ -780,6 +1260,34 @@ mod tests {
         manager
     }
 
+    /// The default router is whatever is mounted under its id, whenever it
+    /// is mounted: named before its router, it is no router until the mount;
+    /// mounted again under its id, it reads the new router; another router
+    /// mounted beside it does not move it.
+    #[test]
+    fn the_default_router_follows_the_router_mounted_under_its_id() {
+        let gateway = test_gateway(false);
+        gateway.set_default_router(router_ids::HTTP_PD);
+        assert!(gateway.select_router_for_request(None).is_none());
+
+        gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        let mounted = gateway
+            .select_router_for_request(None)
+            .expect("the default, once mounted");
+
+        gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        let remounted = gateway
+            .select_router_for_request(None)
+            .expect("the default, mounted again");
+        assert!(!Arc::ptr_eq(&mounted, &remounted));
+
+        gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(PdStubRouter));
+        let still = gateway
+            .select_router_for_request(Some("any-model"))
+            .expect("the default, with another router beside it");
+        assert!(Arc::ptr_eq(&remounted, &still));
+    }
+
     /// A lone router speaks for itself — a forward-capable one keeps
     /// streaming enabled, a buffering one shows its derived reason — and
     /// more than one router makes dispatch model-addressed.
@@ -843,6 +1351,660 @@ mod tests {
 
     fn test_tenant_meta() -> TenantRequestMeta {
         RouteRequestMeta::new(TenantKey::from("test-tenant"))
+    }
+
+    fn body<T: serde::de::DeserializeOwned>(json: serde_json::Value) -> T {
+        serde_json::from_value(json).expect("a request body")
+    }
+
+    /// With no router registered, each answer the gateway gives on its own is
+    /// the JSON error object: a 503 `no_routers` where it has no router to
+    /// ask, a 404 `no_router` where no router serves the request's model,
+    /// with the endpoint's own message or the shared one.
+    #[tokio::test]
+    async fn a_gateway_without_routers_answers_the_json_error_object() {
+        use serde_json::json;
+
+        let gateway = Gateway::new(Arc::new(WorkerRegistry::new()));
+        let meta = test_tenant_meta();
+        let empty = || Request::new(Body::empty());
+        let unavailable = [
+            (
+                gateway.health_generate(empty()).await,
+                "No routers with healthy workers available",
+            ),
+            (
+                gateway.get_server_info(empty()).await,
+                "No routers available",
+            ),
+            (
+                gateway.get_model_info(empty()).await,
+                "No routers available",
+            ),
+        ];
+        for (answer, message) in unavailable {
+            assert_eq!(
+                error_shape(answer).await,
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no_routers".to_owned(),
+                    message.to_owned()
+                )
+            );
+        }
+        let not_found = [
+            (
+                gateway
+                    .route_responses(None, &meta, body(json!({"model": "m", "input": "hi"})), "m")
+                    .await,
+                "No router available to handle responses request",
+            ),
+            (
+                gateway
+                    .route_interactions(None, &meta, body(json!({"input": "hi"})), Some("m"))
+                    .await,
+                "No router available to handle interactions request",
+            ),
+            (
+                gateway.cancel_response(None, &meta, "resp_1").await,
+                "No router available to cancel response 'resp_1'",
+            ),
+            (
+                gateway
+                    .route_rerank(
+                        None,
+                        &meta,
+                        body(json!({"query": "q", "documents": ["d"], "model": "m"})),
+                        "m",
+                    )
+                    .await,
+                "No router available for rerank request",
+            ),
+            (
+                gateway
+                    .route_realtime_session(None, &body(json!({"type": "realtime"})))
+                    .await,
+                "No router available for realtime session request",
+            ),
+            (
+                gateway
+                    .route_realtime_client_secret(
+                        None,
+                        &body(json!({"session": {"type": "realtime"}})),
+                    )
+                    .await,
+                "No router available for realtime client secret request",
+            ),
+            (
+                gateway
+                    .route_realtime_transcription_session(
+                        None,
+                        &body(json!({"type": "transcription"})),
+                    )
+                    .await,
+                "No router available for realtime transcription request",
+            ),
+            (
+                gateway.route_realtime_ws(empty(), "m").await,
+                "No router available for realtime WebSocket request",
+            ),
+            (
+                gateway.route_realtime_webrtc(empty(), "m").await,
+                "No router available for realtime WebRTC request",
+            ),
+            (
+                gateway
+                    .route_chat(
+                        None,
+                        &meta,
+                        body(
+                            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+                        ),
+                        "m",
+                    )
+                    .await,
+                "No router available for this request",
+            ),
+            (
+                gateway
+                    .route_completion(
+                        None,
+                        &meta,
+                        body(json!({"model": "m", "prompt": "hi"})),
+                        "m",
+                    )
+                    .await,
+                "No router available for this request",
+            ),
+            (
+                gateway
+                    .route_generate(None, &meta, body(json!({"model": "m", "text": "hi"})), "m")
+                    .await,
+                "No router available for this request",
+            ),
+            (
+                gateway
+                    .route_embeddings(None, &meta, body(json!({"model": "m", "input": "hi"})), "m")
+                    .await,
+                "No router available for this request",
+            ),
+            (
+                gateway
+                    .route_classify(None, &meta, body(json!({"model": "m", "input": "hi"})), "m")
+                    .await,
+                "No router available for this request",
+            ),
+            (
+                gateway
+                    .route_messages(
+                        None,
+                        &meta,
+                        body(json!({
+                            "model": "m", "max_tokens": 16,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })),
+                        "m",
+                    )
+                    .await,
+                "No router available for this request",
+            ),
+            (
+                gateway
+                    .route_messages_count_tokens(
+                        None,
+                        &meta,
+                        body(
+                            json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}),
+                        ),
+                        "m",
+                    )
+                    .await,
+                "No router available for this request",
+            ),
+        ];
+        for (answer, message) in not_found {
+            assert_eq!(
+                error_shape(answer).await,
+                (
+                    StatusCode::NOT_FOUND,
+                    "no_router".to_owned(),
+                    message.to_owned()
+                )
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    struct DecisionsStubRouter;
+
+    #[async_trait]
+    impl RouterTrait for DecisionsStubRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_decisions(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: DecisionsRequest,
+            _model_id: &str,
+        ) -> Response {
+            StatusCode::OK.into_response()
+        }
+
+        fn router_type(&self) -> &'static str {
+            "decisions"
+        }
+    }
+
+    async fn decision_status(gateway: &Gateway, model: &str) -> StatusCode {
+        let body = serde_json::from_value(serde_json::json!({
+            "model": model, "input": "evidence",
+            "questions": [{"type": "predicate", "instructions": "Is it evidence?"}]
+        }))
+        .unwrap();
+        gateway
+            .route_decisions(None, &test_tenant_meta(), body, model)
+            .await
+            .status()
+    }
+
+    /// A gateway over a mixed fleet: `http_regular` as the HTTP regular router,
+    /// stubs as the PD and gRPC routers (the gRPC one the default), and five
+    /// workers serving `m` with the alias `alias` (an HTTP regular one unless
+    /// `has_http_regular` is false, HTTP prefill and decode ones, a gRPC and a
+    /// ZMQ regular one).
+    fn mixed_fleet_gateway(
+        http_regular: Arc<dyn RouterTrait>,
+        has_http_regular: bool,
+    ) -> Arc<Gateway> {
+        let gateway = test_gateway(true);
+        gateway.register_router(router_ids::HTTP_REGULAR, http_regular);
+        gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(PdStubRouter));
+        gateway.set_default_router(router_ids::GRPC_REGULAR);
+        let workers = [
+            (ConnectionMode::Http, WorkerType::Regular),
+            (ConnectionMode::Http, WorkerType::Prefill),
+            (ConnectionMode::Http, WorkerType::Decode),
+            (ConnectionMode::Grpc, WorkerType::Regular),
+            (ConnectionMode::Zmq, WorkerType::Regular),
+        ];
+        for (index, (mode, role)) in workers.into_iter().enumerate() {
+            if index == 0 && !has_http_regular {
+                continue;
+            }
+            gateway
+                .worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("http://worker-{index}:8080"))
+                        .connection_mode(mode)
+                        .worker_type(role)
+                        .model(ModelCard::new("m").with_alias("alias"))
+                        .build(),
+                ))
+                .unwrap();
+        }
+        gateway
+    }
+
+    #[tokio::test]
+    async fn decisions_use_only_regular_http_workers_in_mixed_fleets() {
+        for has_http_regular in [true, false] {
+            let gateway = mixed_fleet_gateway(Arc::new(DecisionsStubRouter), has_http_regular);
+            let expected = if has_http_regular {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_IMPLEMENTED
+            };
+            for _ in 0..32 {
+                assert_eq!(decision_status(&gateway, "m").await, expected);
+                assert_eq!(decision_status(&gateway, "alias").await, expected);
+            }
+            assert_eq!(
+                decision_status(&gateway, "missing").await,
+                StatusCode::NOT_FOUND
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn decisions_use_regular_sglang_grpc_workers() {
+        let gateway = test_gateway(true);
+        gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(DecisionsStubRouter));
+        gateway
+            .worker_registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://worker:8080")
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::Sglang)
+                    .model(ModelCard::new("m").with_alias("alias"))
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(decision_status(&gateway, "m").await, StatusCode::OK);
+        assert_eq!(decision_status(&gateway, "alias").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn decisions_respect_single_router_configuration() {
+        let gateway = test_gateway(false);
+        gateway.register_router(router_ids::HTTP_REGULAR, Arc::new(DecisionsStubRouter));
+        assert_eq!(decision_status(&gateway, "m").await, StatusCode::OK);
+        gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        gateway.set_default_router(router_ids::HTTP_PD);
+        assert_eq!(
+            decision_status(&gateway, "m").await,
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
+    #[derive(Debug)]
+    struct SystemOneStubRouter;
+
+    #[async_trait]
+    impl RouterTrait for SystemOneStubRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_systemone(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            body: SystemOneRequest,
+            model_id: &str,
+        ) -> Response {
+            assert_eq!(body.model, model_id);
+            StatusCode::OK.into_response()
+        }
+
+        fn router_type(&self) -> &'static str {
+            "systemone"
+        }
+    }
+
+    async fn systemone_status(gateway: &Gateway, model: &str) -> StatusCode {
+        let body = serde_json::from_value(serde_json::json!({
+            "model": model,
+            "state": {"ticket": "evidence"},
+            "questions": {"evidence": {
+                "type": "noul", "criteria": {"true": "Has evidence", "false": "No evidence"}
+            }}
+        }))
+        .unwrap();
+        gateway
+            .route_systemone(None, &test_tenant_meta(), body, model)
+            .await
+            .status()
+    }
+
+    #[tokio::test]
+    async fn systemone_uses_only_regular_http_workers_in_mixed_fleets() {
+        for has_http_regular in [true, false] {
+            let gateway = mixed_fleet_gateway(Arc::new(SystemOneStubRouter), has_http_regular);
+            let expected = if has_http_regular {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_IMPLEMENTED
+            };
+            for _ in 0..32 {
+                assert_eq!(systemone_status(&gateway, "m").await, expected);
+                assert_eq!(systemone_status(&gateway, "alias").await, expected);
+            }
+            for unregistered_model in ["missing", "jev-latest", UNKNOWN_MODEL_ID] {
+                assert_eq!(
+                    systemone_status(&gateway, unregistered_model).await,
+                    StatusCode::NOT_FOUND
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn systemone_respects_single_router_configuration() {
+        let gateway = test_gateway(false);
+        gateway.register_router(router_ids::HTTP_REGULAR, Arc::new(SystemOneStubRouter));
+        assert_eq!(systemone_status(&gateway, "m").await, StatusCode::OK);
+        assert_eq!(
+            systemone_status(&gateway, UNKNOWN_MODEL_ID).await,
+            StatusCode::NOT_FOUND
+        );
+        for unsupported_router in [router_ids::HTTP_PD, router_ids::GRPC_REGULAR] {
+            gateway.register_router(unsupported_router.clone(), Arc::new(PdStubRouter));
+            gateway.set_default_router(unsupported_router);
+            assert_eq!(
+                systemone_status(&gateway, "m").await,
+                StatusCode::NOT_IMPLEMENTED
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn systemone_requires_a_registered_regular_http_router() {
+        let mut gateway = Gateway::new(Arc::new(WorkerRegistry::new()));
+        gateway.enable_igw = true;
+        gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        gateway
+            .worker_registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://worker:8080")
+                    .model(ModelCard::new("m"))
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(
+            systemone_status(&gateway, "m").await,
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+
+    /// Counting needs a tokenizer, not a decode pool or a wire: a pool of any
+    /// transport answers it, a disaggregated pool by its prefill workers
+    /// alone, and a deployment of gRPC workers only (the common one) answers
+    /// it from the gateway instead of reporting that no router exists. A
+    /// model no pool serves goes to the default router, whose own answer is
+    /// the 404 model_not_found (the gRPC router's tests cover it); only a
+    /// gateway with no router at all answers the 404 itself.
+    #[tokio::test]
+    async fn count_tokens_is_served_by_every_pool() {
+        let tenant = test_tenant_meta();
+        let body = |model: &str| -> CountMessageTokensRequest {
+            serde_json::from_value(serde_json::json!({
+                "model": model, "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap()
+        };
+        for (mode, role, router_id) in [
+            (
+                ConnectionMode::Http,
+                WorkerType::Regular,
+                router_ids::HTTP_REGULAR,
+            ),
+            (
+                ConnectionMode::Http,
+                WorkerType::Prefill,
+                router_ids::HTTP_PD,
+            ),
+            (
+                ConnectionMode::Grpc,
+                WorkerType::Regular,
+                router_ids::GRPC_REGULAR,
+            ),
+            (
+                ConnectionMode::Grpc,
+                WorkerType::Prefill,
+                router_ids::GRPC_PD,
+            ),
+        ] {
+            let gateway = test_gateway(true);
+            gateway.register_router(router_id.clone(), Arc::new(StubRouter));
+            gateway
+                .worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new("http://worker:8080")
+                        .connection_mode(mode)
+                        .worker_type(role)
+                        .model(ModelCard::new("m"))
+                        .build(),
+                ))
+                .unwrap();
+            // The served model and an unknown one both reach the router
+            // (the stub answers 200 to both); the unknown model's 404 is the
+            // router's to give, never a 501 an Anthropic SDK would read as
+            // "endpoint unsupported".
+            for model in ["m", "missing"] {
+                let response = gateway
+                    .route_messages_count_tokens(None, &tenant, body(model), model)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK, "{router_id:?} {model}");
+            }
+        }
+
+        let mut no_router = Gateway::new(Arc::new(WorkerRegistry::new()));
+        no_router.enable_igw = true;
+        let response = no_router
+            .route_messages_count_tokens(None, &tenant, body("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A Messages router that answers with its own name, so a test can read
+    /// which router the gateway chose.
+    #[derive(Debug)]
+    struct NamedMessagesRouter(&'static str);
+
+    #[async_trait]
+    impl RouterTrait for NamedMessagesRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_messages(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: CreateMessageRequest,
+            _model_id: &str,
+        ) -> Response {
+            (StatusCode::OK, self.0).into_response()
+        }
+
+        fn router_type(&self) -> &'static str {
+            self.0
+        }
+    }
+
+    fn message_request(max_tokens: u32) -> CreateMessageRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "m", "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap()
+    }
+
+    /// A plain Messages request's task holds the request once: a local
+    /// borrowed before the move keeps a second copy across the awaits (the
+    /// task read 1,072 bytes around a 488-byte request that way, 584 with
+    /// the request moved).
+    #[test]
+    fn a_plain_messages_task_holds_the_request_once() {
+        let gateway = test_gateway(true);
+        let meta = test_tenant_meta();
+        let task = gateway.route_messages(None, &meta, message_request(1), "m");
+        let task = size_of_val(&*task);
+        let request = size_of::<CreateMessageRequest>();
+        assert!(
+            task < 2 * request,
+            "the task is {task} bytes around a request of {request}"
+        );
+    }
+
+    /// The name of the router that answered a Messages request for `m`.
+    async fn messages_router(gateway: &Gateway, max_tokens: u32) -> String {
+        let response = gateway
+            .route_messages(None, &test_tenant_meta(), message_request(max_tokens), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn register_worker(gateway: &Gateway, url: &str, mode: ConnectionMode, role: WorkerType) {
+        gateway
+            .worker_registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .connection_mode(mode)
+                    .worker_type(role)
+                    .model(ModelCard::new("m"))
+                    .build(),
+            ))
+            .unwrap();
+    }
+
+    /// `max_tokens: 0` goes to a router that renders the prompt itself (the
+    /// gRPC families; the HTTP relay refuses the shape), so a model served
+    /// over both wires gets the same answer however its workers are split,
+    /// instead of one that follows the weighted draw; a disaggregated pool
+    /// qualifies by its prefill pool. A model no gRPC pool serves takes the
+    /// normal draw, and so does a positive `max_tokens`.
+    #[tokio::test]
+    async fn max_tokens_zero_goes_to_a_grpc_router_in_mixed_deployments() {
+        let gateway = test_gateway(true);
+        gateway.register_router(
+            router_ids::HTTP_REGULAR,
+            Arc::new(NamedMessagesRouter("http")),
+        );
+        gateway.register_router(
+            router_ids::GRPC_REGULAR,
+            Arc::new(NamedMessagesRouter("grpc")),
+        );
+        register_worker(
+            &gateway,
+            "grpc://worker-0:30000",
+            ConnectionMode::Grpc,
+            WorkerType::Regular,
+        );
+        for index in 1..=3 {
+            register_worker(
+                &gateway,
+                &format!("http://worker-{index}:8080"),
+                ConnectionMode::Http,
+                WorkerType::Regular,
+            );
+        }
+        let mut answered_by_grpc = 0;
+        for _ in 0..16 {
+            if messages_router(&gateway, 0).await == "grpc" {
+                answered_by_grpc += 1;
+            }
+        }
+        assert_eq!(
+            answered_by_grpc, 16,
+            "max_tokens: 0 followed the weighted draw between the routers"
+        );
+        assert!(["grpc", "http"].contains(&messages_router(&gateway, 1).await.as_str()));
+
+        let gateway = test_gateway(true);
+        gateway.register_router(
+            router_ids::HTTP_REGULAR,
+            Arc::new(NamedMessagesRouter("http")),
+        );
+        gateway.register_router(
+            router_ids::GRPC_PD,
+            Arc::new(NamedMessagesRouter("grpc-pd")),
+        );
+        register_worker(
+            &gateway,
+            "grpc://prefill:30000",
+            ConnectionMode::Grpc,
+            WorkerType::Prefill,
+        );
+        register_worker(
+            &gateway,
+            "grpc://decode:30000",
+            ConnectionMode::Grpc,
+            WorkerType::Decode,
+        );
+        for index in 1..=3 {
+            register_worker(
+                &gateway,
+                &format!("http://worker-{index}:8080"),
+                ConnectionMode::Http,
+                WorkerType::Regular,
+            );
+        }
+        for _ in 0..16 {
+            assert_eq!(messages_router(&gateway, 0).await, "grpc-pd");
+        }
+
+        let gateway = test_gateway(true);
+        gateway.register_router(
+            router_ids::HTTP_REGULAR,
+            Arc::new(NamedMessagesRouter("http")),
+        );
+        gateway.register_router(
+            router_ids::GRPC_REGULAR,
+            Arc::new(NamedMessagesRouter("grpc")),
+        );
+        register_worker(
+            &gateway,
+            "http://worker-1:8080",
+            ConnectionMode::Http,
+            WorkerType::Regular,
+        );
+        assert_eq!(messages_router(&gateway, 0).await, "http");
+
+        let mut no_router = Gateway::new(Arc::new(WorkerRegistry::new()));
+        no_router.enable_igw = true;
+        let response = no_router
+            .route_messages(None, &test_tenant_meta(), message_request(0), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     fn generate_request_without_model() -> GenerateRequest {
@@ -932,6 +2094,136 @@ mod tests {
         );
     }
 
+    /// A disaggregated pair with one pool missing (the other restarting) is
+    /// still that family's: the request goes to its router (the one of its
+    /// wire), whose selection refuses it with the missing pool (a retryable
+    /// 503), not to the default router, which answers that the model does
+    /// not exist. With no pool of the model registered at all the default
+    /// router's answer stands, and with a regular worker beside the
+    /// incomplete pair the weights decide, as before.
+    #[test]
+    fn an_incomplete_disaggregated_pair_keeps_its_family_instead_of_the_default_router() {
+        fn gateway_with(
+            workers: &[(WorkerType, ConnectionMode)],
+            families: &[(&RouterId, &'static str)],
+        ) -> Arc<Gateway> {
+            let registry = Arc::new(WorkerRegistry::new());
+            for (idx, (worker_type, mode)) in workers.iter().enumerate() {
+                let mut labels = HashMap::new();
+                labels.insert("model_id".to_string(), "model-x".to_string());
+                let worker = BasicWorkerBuilder::new(format!("http://worker{idx}:8080"))
+                    .worker_type(*worker_type)
+                    .connection_mode(*mode)
+                    .labels(labels)
+                    .circuit_breaker_config(CircuitBreakerConfig::default())
+                    .build();
+                registry.register(Arc::new(worker)).unwrap();
+            }
+            let mut manager = Gateway::new(registry);
+            manager.enable_igw = true;
+            let manager = Arc::new(manager);
+            // The first router registered is the default one; the families
+            // answer with their own names.
+            manager.register_router(router_ids::HTTP_REGULAR, Arc::new(StubRouter));
+            for (id, name) in families {
+                manager.register_router((*id).clone(), Arc::new(NamedMessagesRouter(name)));
+            }
+            manager
+        }
+        let both_pd = [
+            (&router_ids::GRPC_PD, "grpc_pd"),
+            (&router_ids::HTTP_PD, "http_pd"),
+        ];
+        let picked = |workers: &[(WorkerType, ConnectionMode)],
+                      families: &[(&RouterId, &'static str)]| {
+            gateway_with(workers, families)
+                .select_router_for_request(Some("model-x"))
+                .expect("a router")
+                .router_type()
+        };
+
+        // Only the decode worker of a gRPC pair is registered (the prefill is
+        // restarting): the gRPC PD router, not the default one.
+        assert_eq!(
+            picked(&[(WorkerType::Decode, ConnectionMode::Grpc)], &both_pd),
+            "grpc_pd"
+        );
+        // Only the prefill worker: the same.
+        assert_eq!(
+            picked(&[(WorkerType::Prefill, ConnectionMode::Grpc)], &both_pd),
+            "grpc_pd"
+        );
+        // An HTTP pair missing its prefill worker: the HTTP PD router, the one
+        // that selects from the HTTP pools.
+        assert_eq!(
+            picked(&[(WorkerType::Decode, ConnectionMode::Http)], &both_pd),
+            "http_pd"
+        );
+        // gRPC workers with only the EPD router mounted: the family's second id.
+        assert_eq!(
+            picked(
+                &[(WorkerType::Decode, ConnectionMode::Grpc)],
+                &[(&router_ids::GRPC_EPD, "grpc_epd")]
+            ),
+            "grpc_epd"
+        );
+        // An encode worker alone is the EPD family's: with no EPD router mounted
+        // the default router answers (as for a model nobody serves, its
+        // refusal counted and logged as regular traffic), never the PD
+        // router; with one mounted (every router is, under IGW) the EPD
+        // router, whose selection answers the incomplete set itself.
+        assert_eq!(
+            picked(&[(WorkerType::Encode, ConnectionMode::Grpc)], &both_pd),
+            "stub"
+        );
+        let with_epd = [
+            (&router_ids::GRPC_PD, "grpc_pd"),
+            (&router_ids::HTTP_PD, "http_pd"),
+            (&router_ids::GRPC_EPD, "grpc_epd"),
+        ];
+        assert_eq!(
+            picked(&[(WorkerType::Encode, ConnectionMode::Grpc)], &with_epd),
+            "grpc_epd"
+        );
+        // An encode worker beside a decode worker (the prefill missing): the EPD
+        // family first when it is mounted, the PD family otherwise.
+        assert_eq!(
+            picked(
+                &[
+                    (WorkerType::Encode, ConnectionMode::Grpc),
+                    (WorkerType::Decode, ConnectionMode::Grpc),
+                ],
+                &with_epd
+            ),
+            "grpc_epd"
+        );
+        assert_eq!(
+            picked(
+                &[
+                    (WorkerType::Encode, ConnectionMode::Grpc),
+                    (WorkerType::Decode, ConnectionMode::Grpc),
+                ],
+                &both_pd
+            ),
+            "grpc_pd"
+        );
+        // No worker of the model at all: the default router answers for a model
+        // nobody serves.
+        assert_eq!(picked(&[], &both_pd), "stub");
+        // A regular worker beside the incomplete pair: the weights decide,
+        // and the incomplete family has none.
+        assert_eq!(
+            picked(
+                &[
+                    (WorkerType::Decode, ConnectionMode::Grpc),
+                    (WorkerType::Regular, ConnectionMode::Http),
+                ],
+                &both_pd
+            ),
+            "stub"
+        );
+    }
+
     #[test]
     fn weighted_routing_selects_epd_for_grpc_epd_workers() {
         let registry = Arc::new(WorkerRegistry::new());
@@ -967,9 +2259,10 @@ mod tests {
     }
 
     #[test]
-    fn a_leg_on_a_transport_the_family_cannot_use_does_not_count() {
-        // A gRPC prefill worker and a ZMQ decode worker: the gRPC PD family
-        // selects from gRPC-only pools, so the fleet is not PD-ready and the
+    fn a_worker_on_a_transport_the_family_cannot_use_does_not_count() {
+        // A gRPC prefill worker and a ZMQ decode worker of a runtime whose
+        // ZMQ wire carries no rendezvous: the gRPC PD family's pools leave it
+        // out, so the fleet is not PD-ready and the
         // request must not be steered to a family that cannot select a pair.
         let registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type, connection) in [
@@ -1065,5 +2358,256 @@ mod tests {
             .select_router_for_request(Some("model-alias"))
             .expect("alias should select the PD router");
         assert_eq!(router.router_type(), "pd");
+    }
+
+    /// A router double that records the headers of each Messages request it
+    /// is handed and answers 200 with an empty body.
+    #[derive(Debug, Default)]
+    struct HeaderRecordingRouter {
+        seen: Mutex<Vec<Option<HeaderMap>>>,
+    }
+
+    #[async_trait]
+    impl RouterTrait for HeaderRecordingRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_messages(
+            &self,
+            headers: Option<&HeaderMap>,
+            _tenant_meta: &TenantRequestMeta,
+            _body: CreateMessageRequest,
+            _model_id: &str,
+        ) -> Response {
+            self.seen.lock().unwrap().push(headers.cloned());
+            StatusCode::OK.into_response()
+        }
+
+        fn router_type(&self) -> &'static str {
+            "recording"
+        }
+    }
+
+    impl HeaderRecordingRouter {
+        /// The headers of the last request this router was handed.
+        fn last_headers(&self) -> Option<HeaderMap> {
+            self.seen
+                .lock()
+                .unwrap()
+                .last()
+                .expect("a request was routed")
+                .clone()
+        }
+
+        /// The value under `name` on the last request this router was handed.
+        fn last_header(&self, name: &str) -> Option<String> {
+            let seen = self.seen.lock().unwrap();
+            let headers = seen.last().expect("a request was routed").as_ref()?;
+            let value = headers.get(name)?;
+            Some(value.to_str().expect("a text key").to_string())
+        }
+
+        /// The routing key of the last request this router was handed.
+        fn last_routing_key(&self) -> Option<String> {
+            self.last_header("x-smg-routing-key")
+        }
+    }
+
+    /// A gateway over one recording router, its policies built with the
+    /// routing-key override on or off.
+    fn recording_gateway(override_on: bool) -> (Gateway, Arc<HeaderRecordingRouter>) {
+        recording_gateway_with(RoutingKeyOverrideConfig {
+            enabled: override_on,
+            ..Default::default()
+        })
+    }
+
+    /// A gateway over one recording router, its policies built with the
+    /// given routing-key override.
+    fn recording_gateway_with(
+        config: RoutingKeyOverrideConfig,
+    ) -> (Gateway, Arc<HeaderRecordingRouter>) {
+        let policies = PolicyRegistry::with_override(PolicyConfig::RoundRobin, config);
+        let gateway =
+            Gateway::new(Arc::new(WorkerRegistry::new())).with_policies(Arc::new(policies));
+        let recorder = Arc::new(HeaderRecordingRouter::default());
+        gateway.register_router(router_ids::HTTP_REGULAR, recorder.clone());
+        gateway.set_default_router(router_ids::HTTP_REGULAR);
+        (gateway, recorder)
+    }
+
+    /// Under the routing-key override a thread turn routes on its client's
+    /// `rid` lineage, as a plain request does: the header carries the rid
+    /// itself when the request set none, so placement's one strip gives the
+    /// plain request's key, nested suffixes included; a rid over the header's
+    /// byte cap goes as its derived key, which places one suffix coarser, and
+    /// a nested rid crossing the cap mid-thread moves to that coarser key at
+    /// the crossing; a header the client set wins; without the override, a
+    /// client `rid` or a `thread`, nothing is added.
+    #[tokio::test]
+    async fn a_thread_turn_carries_its_client_lineage_as_the_routing_key_under_the_override() {
+        use serde_json::json;
+
+        let turn = |rid: serde_json::Value, thread: bool| -> CreateMessageRequest {
+            let mut request = json!({
+                "model": "m", "max_tokens": 8, "rid": rid,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if thread {
+                request["thread"] = json!({"type": "create"});
+            }
+            body(request)
+        };
+        let meta = test_tenant_meta();
+
+        let (gateway, seen) = recording_gateway(true);
+        let policies = gateway.policies.clone().expect("policies");
+        let placed = |seen: &HeaderRecordingRouter| -> Option<String> {
+            let headers = seen.last_headers()?;
+            policies
+                .sticky_header_key(Some(&headers))
+                .map(str::to_string)
+        };
+        gateway
+            .route_messages(None, &meta, turn(json!("conv_t2"), true), "m")
+            .await;
+        assert_eq!(
+            seen.last_routing_key().as_deref(),
+            Some("conv_t2"),
+            "the header carries the rid itself"
+        );
+        assert_eq!(
+            placed(&seen).as_deref(),
+            Some("conv"),
+            "placed once stripped"
+        );
+
+        gateway
+            .route_messages(None, &meta, turn(json!("conv_t1_t2"), true), "m")
+            .await;
+        assert_eq!(
+            placed(&seen).as_deref(),
+            policies.derive_rid_key(Some("conv_t1_t2")),
+            "a nested suffix keys as the plain request does"
+        );
+        assert_eq!(placed(&seen).as_deref(), Some("conv_t1"));
+
+        let base = "a".repeat(ROUTING_KEY_HINT_MAX_BYTES - 3);
+        let long = format!("{base}_t1_t2");
+        gateway
+            .route_messages(None, &meta, turn(json!(long), true), "m")
+            .await;
+        assert_eq!(
+            seen.last_routing_key().as_deref(),
+            policies.derive_rid_key(Some(&long)),
+            "a rid over the header's byte cap goes as its derived key"
+        );
+        assert_eq!(
+            placed(&seen).as_deref(),
+            Some(base.as_str()),
+            "placed one suffix coarser than the plain request's key"
+        );
+
+        let near = "b".repeat(ROUTING_KEY_HINT_MAX_BYTES - 6);
+        for (rid, key, why) in [
+            (
+                format!("{near}_t1_t9"),
+                format!("{near}_t1"),
+                "a nested rid at the cap goes whole and places once stripped",
+            ),
+            (
+                format!("{near}_t1_t10"),
+                near.clone(),
+                "one byte over the cap, it moves to the coarser key",
+            ),
+        ] {
+            gateway
+                .route_messages(None, &meta, turn(json!(rid), true), "m")
+                .await;
+            assert_eq!(placed(&seen).as_deref(), Some(key.as_str()), "{why}");
+        }
+
+        let mut mine = HeaderMap::new();
+        mine.insert("x-smg-routing-key", "mine".parse().unwrap());
+        gateway
+            .route_messages(Some(&mine), &meta, turn(json!("conv_t2"), true), "m")
+            .await;
+        assert_eq!(placed(&seen).as_deref(), Some("mine"));
+
+        gateway
+            .route_messages(None, &meta, turn(json!(null), true), "m")
+            .await;
+        assert_eq!(seen.last_routing_key(), None, "no client rid");
+
+        gateway
+            .route_messages(None, &meta, turn(json!("conv_t2"), false), "m")
+            .await;
+        assert_eq!(seen.last_routing_key(), None, "a plain request");
+
+        let (gateway, seen) = recording_gateway(false);
+        gateway
+            .route_messages(None, &meta, turn(json!("conv_t2"), true), "m")
+            .await;
+        assert_eq!(seen.last_routing_key(), None, "the override off");
+    }
+
+    /// With several routing-key names configured, the thread layer sends the
+    /// lineage key under the first, the one placement reads first; a client
+    /// header under a later name still wins, since the request then carries a
+    /// routing key already.
+    #[tokio::test]
+    async fn a_thread_turn_sends_its_lineage_key_under_the_first_configured_name() {
+        use serde_json::json;
+
+        let (gateway, seen) = recording_gateway_with(RoutingKeyOverrideConfig {
+            enabled: true,
+            headers: vec!["x-routing-key".to_string(), "x-smg-routing-key".to_string()],
+            ..Default::default()
+        });
+        let policies = gateway.policies.clone().expect("policies");
+        let meta = test_tenant_meta();
+        let turn = || -> CreateMessageRequest {
+            body(json!({
+                "model": "m", "max_tokens": 8, "rid": "conv_t2",
+                "thread": {"type": "create"},
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+        };
+        let placed = |seen: &HeaderRecordingRouter| -> Option<String> {
+            let headers = seen.last_headers()?;
+            policies
+                .sticky_header_key(Some(&headers))
+                .map(str::to_string)
+        };
+
+        gateway.route_messages(None, &meta, turn(), "m").await;
+        assert_eq!(
+            seen.last_header("x-routing-key").as_deref(),
+            Some("conv_t2"),
+            "the key goes out under the first configured name"
+        );
+        assert_eq!(
+            seen.last_header("x-smg-routing-key"),
+            None,
+            "nothing under the second"
+        );
+        assert_eq!(
+            placed(&seen).as_deref(),
+            Some("conv"),
+            "placed once stripped"
+        );
+
+        let mut mine = HeaderMap::new();
+        mine.insert("x-smg-routing-key", "mine".parse().unwrap());
+        gateway
+            .route_messages(Some(&mine), &meta, turn(), "m")
+            .await;
+        assert_eq!(
+            seen.last_header("x-routing-key"),
+            None,
+            "a client header under the second name wins: nothing is added under the first"
+        );
+        assert_eq!(placed(&seen).as_deref(), Some("mine"));
     }
 }

@@ -2,32 +2,27 @@ name: PR Test (SMG)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, release/** ]
     paths-ignore:
       - "docs/**"
       - "*.md"
   pull_request:
-    branches: [ main ]
+    branches: [ main, release/** ]
     types: [opened, synchronize, reopened]
-    paths-ignore:
-      - "docs/**"
-      - "*.md"
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# One group per PR and one for main: a newer push cancels the superseded run.
-# On main this tests HEAD rather than every intermediate commit: back-to-back
+# One group per PR and one per branch (main, release/*): a newer push cancels the
+# superseded run. On a branch this tests HEAD rather than every intermediate commit: back-to-back
 # merges otherwise stack full GPU matrices on one runner pool and time each
 # other out. Re-run an intermediate commit via workflow_dispatch if needed.
 concurrency:
-  group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'main' }}
+  group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
   cancel-in-progress: true
 
 env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
   GENAI_BENCH_IMAGE: ghcr.io/moirai-internal/genai-bench:0.0.4
 
 jobs:
@@ -60,7 +55,7 @@ jobs:
 
       - name: Run pre-commit checks
         env:
-          SKIP: rustfmt,clippy,no-commit-to-branch,branch-name-check,dco-check,no-ai-co-author
+          SKIP: rustfmt,rustfmt-symphony-fuzz,clippy,no-commit-to-branch,branch-name-check,dco-check,no-ai-co-author
         run: pre-commit run --all-files --show-diff-on-failure
 
   python-lint:
@@ -128,6 +123,11 @@ jobs:
           print("OK")
           PY
 
+      - name: Proto package unit tests
+        run: |
+          pip install pytest
+          pytest -q crates/grpc_client/python/tests
+
   build-wheel:
     # CPU-only Rust/wheel/Go-FFI/WASM compile — no GPU needed. Runs on the CPU
     # runner pool (which also tolerates the nvidia.com/gpu taint, so it can use
@@ -143,8 +143,8 @@ jobs:
       # source, so it missed on essentially every code PR (all-or-nothing), and
       # on a miss it *masked* the incremental compilation cache by skipping the
       # build entirely — which also meant rust-cache rarely got populated. The
-      # build now always runs and leans on rust-cache + sccache (set up in
-      # ./.github/actions/setup-rust), which degrade gracefully: with the
+      # build now always runs and leans on rust-cache (set up in
+      # ./.github/actions/setup-rust), which degrades gracefully: with the
       # dependency graph cached, only changed crates recompile.
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
@@ -208,10 +208,6 @@ jobs:
           retention-days: 1
           if-no-files-found: ignore
 
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
-
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
@@ -237,19 +233,27 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: smg-wheel
-          path: dist/
+          wheel-path: dist/
 
       - name: Install wheel
         run: pip install dist/*.whl
 
+      # The chart tests in bindings/python/tests/test_helm_chart_args.py render
+      # the chart and skip without helm. With helm here they run on every pull
+      # request, so a template edit that breaks one fails this job. The
+      # version is the chart workflow's (pr-helm.yml).
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.17.0
+
       - name: Run Python unit tests
         run: |
           cd bindings/python
-          python3 -m pip install pytest pytest-cov pytest-xdist
+          python3 -m pip install pytest pytest-asyncio pytest-cov pytest-xdist
           pytest -q tests --cov=smg --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=80
 
       - name: Run grpc_servicer unit tests
@@ -257,8 +261,34 @@ jobs:
           rm -f crates/grpc_client/python/smg_grpc_proto/proto
           mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
           cp crates/grpc_client/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
-          pip install ./crates/grpc_client/python
-          pytest -q grpc_servicer/tests
+          # msgspec and pydantic gate the sidecar-protocol, fake-redis and
+          # limit-options tests; numpy gates the Rust servicer's media bridge
+          # tests (it lends tensor buffers as numpy views). Modules gated on
+          # zmq or vllm still skip here (-rs lists them): the zmq ones import
+          # engine servicers that need torch, and the vllm cases run on the
+          # vLLM e2e lane.
+          pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq
+          pytest -q grpc_servicer/tests -rs
+
+      # The release tests drive scripts/release/release.sh, which runs `make`; this
+      # runner's image ships no build tools (go-unit-tests installs its own too).
+      - name: Install the tools the tooling tests drive
+        run: |
+          bash scripts/ci_apt_mirror.sh
+          bash scripts/ci_apt_update.sh sudo
+          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends make
+
+      # Every test under scripts/tests runs: the Python files as one pytest run, the
+      # shell tests one by one. The tools the step above can install come from there; a
+      # test that needs one it cannot skips itself and says so under -rs. A new test
+      # file runs from its first commit instead of waiting for a name here;
+      # scripts/tests/test_ci_tooling_tests.py pins this step. `python -m pytest`, not
+      # the console script: it puts the repository root on sys.path, which the tests
+      # that import `scripts.<module>` need to collect.
+      - name: Run CI tooling unit tests
+        run: |
+          python -m pytest -q -rs scripts/tests
+          for test in scripts/tests/test_*.sh; do bash "$test"; done
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
       # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
@@ -272,7 +302,17 @@ jobs:
           pip install ./e2e_test
           pytest -q --noconftest e2e_test/infra e2e_test/fixtures
 
-  unit-tests:
+  # --- Rust lint and tests (CPU) ---
+
+  # The Rust checks of a pull request run side by side: this job lints, and
+  # rust-tests below runs the test shards of scripts/ci_rust_tests.sh. Both
+  # restore the Rust cache entry the Rust Cache Warmer saves on main under the
+  # key `unit-tests` (every shard's test profile and every lint leg's
+  # dependency artifacts; see rust-cache-warmer.yml), so each of their jobs
+  # compiles only the workspace crates it checks. A failed or cancelled job
+  # of either fails finish.
+  rust-lint:
+    name: rust-lint (${{ matrix.leg }})
     needs: [detect-changes]
     if: >-
       always()
@@ -283,8 +323,27 @@ jobs:
         || needs.detect-changes.outputs.rust-ci == 'true'
       )
     runs-on: ${{ vars.SMG_RUNNER_CPU || (github.repository == 'smg-project/smg' && 'k8s-runner-cpu') || 'ubuntu-latest' }}
+    timeout-minutes: 45
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # clippy over every target with every feature, after rustfmt; the one
+          # leg that needs the OpenCV libraries (the opencv-video feature).
+          - leg: all-features
+            opencv: true
+            fmt: true
+          # The self-hosted-only build (no provider routers) and a
+          # single-provider build. Meaningful only because the gateway crate's
+          # self dev-dependency disables default features; see
+          # model_gateway/Cargo.toml.
+          - leg: self-hosted
+          - leg: anthropic-only
+          # The default feature set compiles without OpenCV: this leg never
+          # installs the libraries.
+          - leg: default-build
     steps:
       - uses: actions/checkout@v7
 
@@ -295,46 +354,78 @@ jobs:
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
-
-      - name: Verify default multimodal build does not require OpenCV
-        run: |
-          source "$HOME/.cargo/env"
-          cargo check -p llm-multimodal
-          cargo check --manifest-path bindings/python/Cargo.toml
-          cargo check --manifest-path bindings/golang/Cargo.toml
+        with:
+          cache-key: unit-tests
 
       - name: Install OpenCV build dependencies
+        if: matrix.opencv
         run: AUTO_INSTALL=1 bash scripts/install_opencv.sh
 
-      - name: Build WASM test fixtures
-        run: |
-          source "$HOME/.cargo/env"
-          bash crates/wasm/tests/fixtures/build_fixtures.sh
-
-      - name: Run lint
-        run: |
-          source "$HOME/.cargo/env"
-          rustup component add clippy
-          cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Lint the self-hosted-only build (no provider routers)
-        # Meaningful only because the crate's self dev-dependency disables
-        # default features; see model_gateway/Cargo.toml.
-        run: |
-          source "$HOME/.cargo/env"
-          cargo clippy -p smg -p smg-external-router --no-default-features --features smg/grpc-client,smg/jemalloc-stats --all-targets -- -D warnings
-
-      - name: Lint a single-provider build (Anthropic only)
-        run: |
-          source "$HOME/.cargo/env"
-          cargo clippy -p smg -p smg-external-router --no-default-features --features smg/grpc-client,smg/jemalloc-stats,smg/provider-anthropic --all-targets -- -D warnings
-
       - name: Run fmt
+        if: matrix.fmt
         run: |
           source "$HOME/.cargo/env"
           rustup component add --toolchain nightly-x86_64-unknown-linux-gnu rustfmt
           rustup toolchain install nightly --profile minimal
           cargo +nightly fmt -- --check
+          # The Symphony fuzz crate is a workspace of its own; the root's fmt does not reach it.
+          cargo +nightly fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all -- --check
+
+      - name: Lint
+        run: |
+          source "$HOME/.cargo/env"
+          rustup component add clippy
+          bash scripts/ci_rust_tests.sh lint ${{ matrix.leg }}
+
+      # The shard table is a partition of the workspace: every package, every
+      # gateway test binary and every radix-tree test binary in exactly one
+      # shard of rust-tests (cargo metadata only; one leg is enough).
+      - name: Check the Rust test shards
+        if: matrix.leg == 'default-build'
+        run: |
+          source "$HOME/.cargo/env"
+          bash scripts/ci_rust_tests.sh check
+
+  # One job per shard of scripts/ci_rust_tests.sh that a pull request can
+  # affect: detect-changes maps its rust-* path filters to the shard table and
+  # emits the matrix (every shard on a push to main or a dispatch). The build
+  # and the test run are separate steps so the test timeout bounds the tests:
+  # with nothing restored from the Rust cache, a gateway shard compiles the
+  # workspace's test profile up to the gateway first.
+  rust-tests:
+    name: rust-tests (${{ matrix.shard }})
+    needs: [detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.result == 'success'
+      && needs.detect-changes.outputs.rust-shards != '[]'
+    runs-on: ${{ vars.SMG_RUNNER_CPU || (github.repository == 'smg-project/smg' && 'k8s-runner-cpu') || 'ubuntu-latest' }}
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect-changes.outputs.rust-shards) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: unit-tests
+
+      - name: Build WASM test fixtures
+        if: contains(matrix.needs, 'wasm-fixtures')
+        run: |
+          source "$HOME/.cargo/env"
+          bash crates/wasm/tests/fixtures/build_fixtures.sh
 
       # --strict makes a fixture that fails to generate fail this step (the Rust
       # golden tests skip a missing fixture directory, so a silent skip here
@@ -342,31 +433,62 @@ jobs:
       # because a transient hub or pip failure should still leave a test
       # signal; the outcome is re-raised after the tests run.
       - name: Generate vision golden fixtures
+        if: contains(matrix.needs, 'golden')
         id: vision-golden
         continue-on-error: true
         run: |
           python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install transformers pillow numpy scipy
+          python -m pip install "transformers==5.20.2" pillow numpy scipy
           python crates/multimodal/scripts/generate_vision_golden.py --strict
 
       - name: Create isolated Postgres test database
+        if: contains(matrix.needs, 'postgres') && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_CPU != '')
         # No continue-on-error here: the Postgres regression suite must
         # actually run in CI, not silently no-op if this step fails (see PR
         # #1935 review discussion). `check --postgres` retries on its own
         # for transient pod-restart flakiness.
-        if: github.repository == 'smg-project/smg' || vars.SMG_RUNNER_CPU != ''
         run: |
           bash scripts/ci_agentic_svc_deps.sh check --postgres postgres-db
           bash scripts/ci_agentic_svc_deps.sh create-postgres-db postgres-db
 
-      - name: Run Rust tests
-        timeout-minutes: 30
+      # ffmpeg and ffprobe let the gated video sampling decode test run instead of returning early.
+      - name: Install ffmpeg
+        if: contains(matrix.needs, 'ffmpeg')
+        run: |
+          sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
+          export DEBIAN_FRONTEND=noninteractive
+          bash scripts/ci_apt_update.sh $sudo
+          bash scripts/ci_retry.sh 3 10 $sudo apt-get install -y --no-install-recommends ffmpeg
+
+      # libjpeg-turbo lets the TurboJPEG decode tests run instead of returning early.
+      - name: Install libjpeg-turbo
+        if: contains(matrix.needs, 'turbojpeg')
+        run: |
+          sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
+          export DEBIAN_FRONTEND=noninteractive
+          bash scripts/ci_apt_update.sh $sudo
+          bash scripts/ci_retry.sh 3 10 $sudo apt-get install -y --no-install-recommends libturbojpeg
+
+      - name: Build the Rust tests
+        timeout-minutes: 40
         run: |
           source "$HOME/.cargo/env"
-          cargo test
-          if [[ "${{ github.repository }}" == "smg-project/smg" || -n "${{ vars.SMG_RUNNER_CPU }}" ]]; then
-            cargo test -p data-connector --test postgres_integration -- --ignored --test-threads=1
-          fi
+          bash scripts/ci_rust_tests.sh build ${{ matrix.shard }}
+
+      - name: Run the Rust tests
+        timeout-minutes: ${{ matrix.test_timeout }}
+        env:
+          # Hosted forks run the normal shard tests without private Postgres.
+          SMG_SKIP_POSTGRES_TESTS: ${{ github.repository != 'smg-project/smg' && vars.SMG_RUNNER_CPU == '' && '1' || '' }}
+          # Where ffmpeg is installed, the video container agreement tests must
+          # run: a missing tool or encoder fails them instead of skipping them.
+          SMG_REQUIRE_VIDEO_TOOLS: ${{ contains(matrix.needs, 'ffmpeg') && '1' || '' }}
+          # Where libjpeg-turbo is installed, the TurboJPEG decode tests must
+          # run: a library that does not load fails them instead of skipping them.
+          SMG_REQUIRE_TURBOJPEG: ${{ contains(matrix.needs, 'turbojpeg') && '1' || '' }}
+        run: |
+          source "$HOME/.cargo/env"
+          bash scripts/ci_rust_tests.sh run ${{ matrix.shard }}
 
       - name: Fail if vision golden fixtures did not generate
         if: steps.vision-golden.outcome == 'failure'
@@ -375,12 +497,107 @@ jobs:
           exit 1
 
       - name: Cleanup Postgres test database
-        if: always() && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_CPU != '')
+        if: always() && contains(matrix.needs, 'postgres') && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_CPU != '')
         run: bash scripts/ci_agentic_svc_deps.sh cleanup-postgres-db postgres-db
 
-      - name: Show sccache stats
-        if: always()
-        run: sccache --show-stats
+  # --- Dependency audit ---
+
+  # cargo audit of Cargo.lock against the RustSec advisory database. A pull
+  # request that changes the dependency graph (the lockfile, a manifest, the
+  # audit's ignore list) fails here on an advisory that .cargo/audit.toml
+  # does not ignore; cargo-audit-nightly.yml runs the same script on main
+  # every day, for advisories published after the last lockfile change.
+  cargo-audit:
+    needs: [detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.result == 'success'
+      && (
+        github.event_name != 'pull_request'
+        || needs.detect-changes.outputs.dependencies == 'true'
+      )
+    runs-on: ${{ vars.SMG_RUNNER_CPU || (github.repository == 'smg-project/smg' && 'k8s-runner-cpu') || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # The advisory database is a git clone from github.com; see pre-commit
+      # for why the workflow token rides on every github.com git operation.
+      - name: Authenticate git for github.com
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+
+      - name: cargo audit
+        run: bash scripts/ci_cargo_audit.sh
+
+  # --- AArch64 ---
+
+  # The multimodal crate carries modules that compile only on AArch64 (the
+  # vector paths of pixel_convert and jpeg_turbo and of the vision stages
+  # orientation, rgb_runs and torch_resample), and the KV index's prefetch
+  # hint has an AArch64 arm. The jobs above run on x86_64 and never compile
+  # that code, so a compile error, a lint or a failing test in it surfaced
+  # first in a nightly image or a release build. This job lints the crates
+  # with target-specific code and runs their tests on an arm64 runner
+  # (GitHub-hosted, free for a public repository), on the pull requests the
+  # rust-lint job runs for. The cache key is the job's own: the action
+  # already keys by the runner's architecture, but this job's target
+  # directory holds another crate set and profile than the rust-tests shards',
+  # and the entry fills from the runs on main (the action saves on main
+  # only). The gateway binary's own AArch64 check
+  # (model_gateway/tests/startup/allocator_artifact_test.rs: jemalloc's 64 KiB page
+  # setting) is not run here: it builds the smg binary, which the hosted
+  # runner cannot afford on every pull request; it stays with the nightly
+  # image.
+  rust-aarch64:
+    needs: [detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.result == 'success'
+      && (
+        github.event_name != 'pull_request'
+        || needs.detect-changes.outputs.rust-ci == 'true'
+      )
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-aarch64
+
+      - name: Lint the crates with AArch64-only code
+        run: |
+          source "$HOME/.cargo/env"
+          rustup component add clippy
+          cargo clippy -p llm-multimodal -p kv-index --all-targets -- -D warnings
+
+      # libjpeg-turbo lets the TurboJPEG decode tests run instead of returning early.
+      - name: Install libjpeg-turbo
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          bash scripts/ci_apt_update.sh sudo
+          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends libturbojpeg
+
+      - name: Test the crates with AArch64-only code
+        env:
+          # The library is installed above: the TurboJPEG decode tests must run.
+          SMG_REQUIRE_TURBOJPEG: '1'
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test -p llm-multimodal -p kv-index
 
   # --- Benchmarks (standalone) ---
 
@@ -390,8 +607,13 @@ jobs:
   # summary (BENCH_ENFORCE_THRESHOLDS=1 makes it fail). Results are still
   # uploaded and summarized.
   benchmarks:
-    needs: build-wheel
-    if: github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_4 != ''
+    needs: [build-wheel, detect-changes]
+    # Neither for a docs-only change nor for a version-only one: its numbers are
+    # the commit's it inherits the card tier from.
+    if: >-
+      needs.detect-changes.outputs.docs-only != 'true'
+      && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_4 != '')
+      && needs.detect-changes.outputs.card-tier-from == ''
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
@@ -405,24 +627,11 @@ jobs:
       - name: Setup SGLang backend
         uses: ./.github/actions/setup-sglang
 
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: smg-wheel
-          path: wheel/
-
-      - name: Download WASM test fixtures
-        uses: actions/download-artifact@v8
-        with:
-          name: wasm-test-fixtures
-          path: crates/wasm/tests/fixtures/
-        continue-on-error: true
-
-      - name: Download Python client types
-        uses: actions/download-artifact@v8
-        with:
-          name: python-client-types
-          path: clients/python/smg_client/types/
+          wasm-fixtures: 'true'
+          client-types: 'true'
 
       - name: Install wheel and test dependencies
         run: |
@@ -466,36 +675,125 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # Initial advisory AMD PR performance slice: same regular HTTP/gRPC test,
+  # four TP1 workers and thresholds as NVIDIA. PD performance remains separate.
+  benchmarks-amd:
+    needs: [build-wheel, detect-changes]
+    if: >-
+      !cancelled()
+      && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_AMD_GPU_4 != '')
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_ON_PRS == 'true'
+      && vars.SMG_RUN_AMD_PR_BENCHMARK == 'true'
+      && github.event_name == 'pull_request'
+      && needs.build-wheel.result == 'success'
+      && needs.detect-changes.result == 'success'
+      && needs.detect-changes.outputs.docs-only != 'true'
+      && needs.detect-changes.outputs.card-tier-from == ''
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
+    container:
+      image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    continue-on-error: true
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      E2E_RUNTIME: sglang
+      E2E_MIN_SELECTED: '2'
+      GENAI_BENCH_TEST_TIMEOUT: '600'
+      E2E_AMD_REQUIRE_PASSING_CALL: '1'
+      E2E_STARTUP_TIMEOUT: '900'
+      ROUTER_LOCAL_MODEL_PATH: /models
+      BENCH_ENFORCE_THRESHOLDS: '0'
+      E2E_LOG_DIR: benchmark-logs-amd
+    steps:
+      - uses: actions/checkout@v7
+      - name: Mark owned processes
+        run: echo "E2E_JOB_MARKER=benchmark-amd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+      - name: Setup SGLang in its ROCm image
+        run: bash scripts/ci_setup_sglang_rocm_image.sh
+      - uses: ./.github/actions/download-build-artifacts
+        with:
+          wasm-fixtures: 'true'
+          client-types: 'true'
+      - name: Install wheel and test dependencies
+        run: |
+          pip uninstall -y smg || true
+          pip install wheel/*.whl
+          bash scripts/ci_install_e2e_deps.sh
+      - name: Install genai-bench
+        run: |
+          python3 -m venv "$RUNNER_TEMP/genai-bench"
+          bash scripts/ci_retry.sh 3 10 "$RUNNER_TEMP/genai-bench/bin/pip" install 'genai-bench==0.0.4' 'truststore<0.10.5'
+          echo "GENAI_BENCH_BIN=$RUNNER_TEMP/genai-bench/bin/genai-bench" >> "$GITHUB_ENV"
+      - name: Record runtime versions
+        run: |
+          mkdir -p benchmark-logs-amd
+          python3 -m pip freeze > benchmark-logs-amd/runtime-versions.txt
+          "$RUNNER_TEMP/genai-bench/bin/pip" freeze > benchmark-logs-amd/benchmark-versions.txt
+          printf '%s\n' "head=$GITHUB_SHA" "runner=$RUNNER_NAME" 'workers=4 protocol=http,grpc engine=sglang gpu=MI300' > benchmark-logs-amd/context.txt
+      - name: Run regular HTTP and gRPC benchmarks
+        run: |
+          SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 pytest e2e_test/benchmarks/test_regular_perf.py -s -vv --junitxml=benchmark-logs-amd/junit.xml
+      - name: Explain measurement scope
+        if: always()
+        run: echo 'AMD initial slice measures request throughput and latency for regular HTTP/gRPC. The existing NVML utilization sampler cannot measure AMD utilization; its utilization output is not acceptance evidence. PD performance remains a separate gap.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Qualify raw AMD benchmark measurements
+        id: qualify
+        if: always()
+        run: python3 scripts/ci/validate_pr_benchmark.py --output benchmark-logs-amd/qualification.json
+      - name: Summarize AMD results
+        if: always() && steps.qualify.outcome == 'success'
+        run: python3 e2e_test/benchmarks/summarize.py
+      - name: Reap owned processes
+        if: always() && env.E2E_JOB_MARKER != ''
+        run: python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER"
+      - name: Upload AMD performance results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: genai-bench-results-amd-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            benchmark_**/
+            benchmark-logs-amd/
+          retention-days: 30
+
   detect-changes:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
       packages: read
+      actions: read # the runs of the commit a version-only change inherits its card tier from
     outputs:
-      common: ${{ steps.filter.outputs.common }}
-      chat-completions: ${{ steps.filter.outputs.chat-completions }}
-      completions: ${{ steps.filter.outputs.completions }}
-      agentic: ${{ steps.filter.outputs.agentic }}
-      embeddings: ${{ steps.filter.outputs.embeddings }}
-      realtime: ${{ steps.filter.outputs.realtime }}
-      go-bindings: ${{ steps.filter.outputs.go-bindings }}
+      # The docs-only shortcut (defined in the "Decide the e2e lanes" step): a
+      # pull request that changes docs alone.
+      docs-only: ${{ steps.lanes.outputs.docs-only }}
+      # The version-only shortcut (the "Classify a version-only change" step): the
+      # commit whose passed run stands for this change's card tier; empty otherwise.
+      card-tier-from: ${{ steps.version-only.outputs.card-tier-from }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
+      # The rust-tests matrix: the shards of scripts/ci_rust_tests.sh a pull
+      # request can affect (every shard on a push or a dispatch); '[]' skips the job.
+      rust-shards: ${{ steps.rust-shards.outputs.rust-shards }}
+      dependencies: ${{ steps.filter.outputs.dependencies }}
+      # The GPU e2e lanes' decisions, one per area, from the tier table (the same step).
+      skip-chat-one-engine: ${{ steps.lanes.outputs.skip-chat-one-engine }}
+      skip-chat-completions: ${{ steps.lanes.outputs.skip-chat-completions }}
+      skip-completions: ${{ steps.lanes.outputs.skip-completions }}
+      skip-embeddings: ${{ steps.lanes.outputs.skip-embeddings }}
+      skip-realtime: ${{ steps.lanes.outputs.skip-realtime }}
+      skip-agentic: ${{ steps.lanes.outputs.skip-agentic }}
+      skip-vendor: ${{ steps.lanes.outputs.skip-vendor }}
+      skip-go-bindings: ${{ steps.lanes.outputs.skip-go-bindings }}
       tokenspeed-image: ${{ steps.tokenspeed-image.outputs.image }}
     steps:
       - uses: actions/checkout@v7
 
-      # Resolve the prebuilt TokenSpeed carrier image (built by
-      # ci-tokenspeed-image.yml, content-addressed by the pinned engine ref +
-      # image-tooling hash — see scripts/ci_tokenspeed_image_tag.sh). The
-      # lanes run bare on the runner pods, so the image is not a job
-      # container: setup-tokenspeed extracts its payload onto the runner
-      # (scripts/ci_fetch_tokenspeed_prebuilt.sh). Any failure — a missing
-      # image (e.g. a PR that bumps the ref or edits the tooling before the
-      # image exists), a broken ref file, a registry hiccup — resolves to
-      # empty, and the tokenspeed lanes fall back to the source build. This
-      # step must NEVER fail the job: a failed detect-changes silently skips
-      # every gated lane.
+      # Resolve the pinned nightly's carrier to an immutable digest.
+      # A missing image falls back to installing nightly wheels on the runner.
+      # Resolution must stay tolerant so detect-changes can gate other lanes.
       - name: Resolve TokenSpeed CI image
         id: tokenspeed-image
         env:
@@ -506,91 +804,45 @@ jobs:
           if [ -n "$tag" ]; then
             candidate="ghcr.io/${{ github.repository_owner }}/smg:${tag}"
             if docker login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GH_TOKEN" > /dev/null 2>&1 \
-               && docker manifest inspect "$candidate" > /dev/null 2>&1; then
-              image="$candidate"
+               && manifest="$(docker manifest inspect --verbose "$candidate" 2>/dev/null)"; then
+              digest="$(jq -r 'if type == "array" then .[] | select(.Descriptor.platform.os == "linux" and .Descriptor.platform.architecture == "amd64") | .Descriptor.digest else .Descriptor.digest // empty end' <<< "$manifest")"
+              if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                image="${candidate}@${digest}"
+              fi
             fi
           fi
           echo "image=${image}" >> "$GITHUB_OUTPUT"
           if [ -n "$image" ]; then
             echo "TokenSpeed lanes use prebuilt image: ${image}"
           else
-            echo "Prebuilt TokenSpeed image not available (tag: ${tag:-unresolved}); lanes build from source"
+            echo "Prebuilt TokenSpeed image not available (tag: ${tag:-unresolved}); lanes install nightly wheels"
           fi
       - uses: dorny/paths-filter@v4
         id: filter
         with:
+          # Lets a filter exclude paths with `!` patterns. Filters without them
+          # behave exactly as before: any changed file matching any pattern.
+          predicate-quantifier: 'some-with-excludes'
+          # Lists each filter's files (`<filter>_files`, one JSON line): the tier
+          # table of the "Decide the e2e lanes" step reads `all_files`.
+          list-files: json
           filters: |
-            common:
-              - 'model_gateway/**'
-              - 'crates/protocols/**'
-              - 'bindings/**'
-              - 'e2e_test/conftest.py'
-              - 'e2e_test/infra/**'
-              - 'e2e_test/fixtures/**'
-              - 'Cargo.lock'
-              - '.github/actions/**'
-              - '.github/workflows/pr-test-rust.yml'
-              - '.github/workflows/e2e-gpu-job.yml'
-              - 'scripts/ci_setup_python_venv.sh'
-              - 'scripts/ci_retry.sh'
-              - 'scripts/ci_apt_mirror.sh'
-              - 'scripts/ci_install_sglang.sh'
-              - 'scripts/ci_install_vllm.sh'
-              - 'scripts/ci_install_tokenspeed.sh'
-              - '.github/versions/tokenspeed.ref'
-              - 'scripts/ci_install_e2e_deps.sh'
-              - 'scripts/ci_killall_sglang.sh'
-              - 'scripts/ci_build_wheel.sh'
-              - 'crates/tokenizer/**'
-              - 'crates/tool_parser/**'
-              # Router-embedded crates: changes here alter gateway behavior
-              # across every API surface, so they must trigger the e2e lanes.
-              - 'crates/auth/**'
-              - 'crates/kv_index/**'
-              - 'crates/mesh/**'
-              - 'crates/mm_rdma/**'
-              - 'crates/rl/**'
-              - 'crates/wasm/**'
-              - 'crates/workflow/**'
-            chat-completions:
-              - 'crates/reasoning_parser/**'
-              - 'crates/multimodal/**'
-              - 'crates/grpc_client/**'
-              # The ZMQ wire crates drive the e2e-*-chat-zmq* lanes, which gate
-              # on this filter.
-              - 'crates/engine_zmq_client/**'
-              - 'crates/mock_worker/**'
-              - 'grpc_servicer/**'
-              - 'e2e_test/chat_completions/**'
-              - 'e2e_test/router/**'
-              - 'scripts/ci_install_vllm.sh'
-              - 'scripts/ci_install_trtllm.sh'
-              - 'scripts/ci_apt_mirror.sh'
-              - 'scripts/ci_install_tokenspeed.sh'
-              - 'scripts/ci_tokenspeed_image_tag.sh'
-              - 'scripts/ci_fetch_tokenspeed_prebuilt.sh'
-              - '.github/versions/tokenspeed.ref'
-            agentic:
-              - 'crates/mcp/**'
-              - 'crates/data_connector/**'
-              - 'e2e_test/responses/**'
-              - 'e2e_test/messages/**'
-              - 'scripts/ci_agentic_svc_deps.sh'
-              - 'scripts/ci_apt_mirror.sh'
-              - 'scripts/oracle_flyway/**'
-            completions:
-              - 'crates/grpc_client/**'
-              - 'grpc_servicer/**'
-              - 'e2e_test/completions/**'
-            embeddings:
-              - 'e2e_test/embeddings/**'
-            realtime:
-              - 'e2e_test/realtime/**'
-            go-bindings:
-              - 'e2e_test/bindings_go/**'
+            docs:
+              - '**/*.md'
+            non-docs:
+              - '**'
+              - '!**/*.md'
+            tests:
+              - 'e2e_test/**'
+              - '**/tests/**'
+              - '**/fixtures/**'
+            # Every changed file, for the tier table.
+            all:
+              - '**'
             rust-ci:
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
               - 'rustfmt.toml'
               - 'clippy.toml'
               - 'crates/**'
@@ -607,26 +859,558 @@ jobs:
               - '.github/actions/setup-rust/**'
               - 'scripts/ci_install_rust.sh'
               - 'scripts/ci_apt_mirror.sh'
+              - 'scripts/ci_apt_update.sh'
+              - 'scripts/ci_retry.sh'
+              - 'scripts/ci_install_build_deps.sh'
+              - 'scripts/ci_install_protoc.sh'
               - '.github/workflows/pr-test-rust.yml'
+              - 'scripts/ci_rust_tests.sh'
               - 'examples/wasm/wasm-guest-storage-hook/**'
               - 'examples/wasm/wasm-guest-storage-hook-passthrough/**'
+            # --- The Rust test shards (scripts/ci_rust_tests.sh) ---
+            # A shard of rust-tests runs on a pull request that touches a crate
+            # of its dependency closure (the directories below: every
+            # dependency kind, transitively) or the build infrastructure; a
+            # push to main runs every shard. scripts/tests/test_ci_rust_tests.py
+            # checks these lists against the manifests' path dependencies.
+            rust-infra: &rust-infra
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - '.github/actions/setup-rust/**'
+              - '.github/workflows/pr-test-rust.yml'
+              - 'scripts/ci_rust_tests.sh'
+              - 'scripts/ci_install_rust.sh'
+              - 'scripts/ci_apt_mirror.sh'
+              - 'scripts/ci_apt_update.sh'
+              - 'scripts/ci_retry.sh'
+              - 'scripts/ci_install_build_deps.sh'
+              - 'scripts/ci_install_protoc.sh'
+            # The gateway and everything it links: every crate but the radix tree,
+            # the OpenAPI generator (the gateway's control-plane route test reads
+            # its route list), plus the sources two gateway integration tests read from disk
+            # (the metrics catalogue test walks model_gateway, crates, clients,
+            # bindings and examples for recorder and family names, Rust sources
+            # only; the dashboard test reads the Helm chart), which the previous
+            # filter ran the gateway tests for too. The radix tree keeps its own
+            # shard: no gateway metric is named there.
+            rust-gateway: &rust-gateway
+              - *rust-infra
+              - 'model_gateway/**'
+              - 'crates/**'
+              - '!crates/radix_tree/**'
+              - 'clients/openapi-gen/**'
+              - 'bindings/python/src/**/*.rs'
+              - 'bindings/golang/src/**/*.rs'
+              - 'clients/**/*.rs'
+              - 'examples/**/*.rs'
+              - 'deploy/helm/smg/templates/grafana-dashboard.yaml'
+            rust-bindings:
+              - *rust-gateway
+              - 'bindings/python/Cargo.toml'
+              - 'bindings/python/build.rs'
+              - 'bindings/python/src/**'
+              - 'bindings/golang/Cargo.toml'
+              - 'bindings/golang/src/**'
+            rust-tokenizer:
+              - *rust-infra
+              - 'crates/tokenizer/**'
+              - 'crates/protocols/**'
+            rust-multimodal:
+              - *rust-infra
+              - 'crates/multimodal/**'
+            rust-symphony:
+              - *rust-infra
+              - 'crates/symphony/**'
+              - 'crates/tool_parser/**'
+              - 'crates/reasoning_parser/**'
+              - 'crates/response_template/**'
+              - 'crates/protocols/**'
+            rust-agentic:
+              - *rust-infra
+              - 'crates/data_connector/**'
+              - 'crates/mcp/**'
+              - 'crates/wasm/**'
+              - 'crates/workflow/**'
+              - 'examples/wasm/wasm-guest-storage-hook/**'
+              - 'examples/wasm/wasm-guest-storage-hook-passthrough/**'
+              - 'scripts/ci_agentic_svc_deps.sh'
+            rust-protocols:
+              - *rust-infra
+              - 'crates/protocols/**'
+              - 'crates/external_router/**'
+              - 'crates/auth/**'
+              - 'crates/rl/**'
+              - 'clients/rust/**'
+              - 'clients/openapi-gen/**'
+              - 'crates/data_connector/**'
+              - 'crates/mcp/**'
+            rust-engine:
+              - *rust-infra
+              - 'crates/grpc_client/**'
+              - 'crates/engine_zmq_client/**'
+              - 'crates/engine_zmq_adapter/**'
+              - 'crates/engine_servicer/**'
+              - 'crates/mock_worker/**'
+              - 'crates/gateway_perf/**'
+              - 'crates/protocols/**'
+              - 'crates/tokenizer/**'
+              - 'crates/kv_index/**'
+            rust-kv:
+              - *rust-infra
+              - 'crates/kv_index/**'
+              - 'crates/mesh/**'
+              - 'crates/mm_rdma/**'
+              - 'crates/policy_controller/**'
+              - 'crates/radix_tree/**'
+            rust-radix:
+              - *rust-infra
+              - 'crates/radix_tree/**'
+              - 'crates/kv_index/**'
+            # The dependency graph: the cargo-audit job runs on a pull request
+            # that changes it (or the audit's ignore list and script).
+            dependencies:
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - '**/Cargo.toml'
+              - '.cargo/audit.toml'
+              - 'scripts/ci_cargo_audit.sh'
+              - '.github/workflows/pr-test-rust.yml'
+
+      # The version-only shortcut: a change that moves nothing but the release version
+      # carriers (scripts/ci_version_only.py: the manifests' version lines and workspace
+      # pins, the lock file's entries for the workspace crates, the Python packages'
+      # version fields, the chart, the engine-image workflow's release tag) leaves every
+      # tested code path as the commit it was made on had it. When that commit's own push
+      # or dispatch run of this workflow passed, the lanes on GPU runners (the card tier)
+      # are inherited from it, on a push as on a pull request, and the host rows run as
+      # the tier table says. A pull request's run stands for nothing: it can pass with the
+      # card lanes skipped (the docs-only shortcut); a push or dispatch run keeps every
+      # lane, or inherits it by this very rule one commit earlier. The commit is the pull
+      # request's base, or the tip a push replaced; a manual run, a new branch and a
+      # commit with no such run keep every lane. release.sh check reads the same
+      # classifier when it takes the parent's run for such a head.
+      - name: Classify a version-only change
+        id: version-only
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The label ci:full: every lane and nothing inherited, decided here so the
+          # output, the summary and the lanes agree (the same expression the "Decide
+          # the e2e lanes" step reads for its own shortcut).
+          FORCE_FULL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          from=""
+          if [ "$FORCE_FULL" = "true" ]; then
+            echo "the label ci:full: every lane"
+          elif [[ ! "$BASE" =~ ^[0-9a-f]{40}$ || "$BASE" =~ ^0{40}$ ]]; then
+            echo "no commit to classify against (${BASE:-none}): every lane"
+          elif ! git fetch --quiet --depth=1 origin "$BASE"; then
+            echo "cannot fetch $BASE: every lane"
+          elif python3 scripts/ci_version_only.py "$BASE" HEAD; then
+            # the newest passed run of the base outside a pull request: a pull request's run can
+            # pass with the card lanes skipped, a push or dispatch run never does
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/pr-test-rust.yml/runs?head_sha=$BASE&per_page=20" \
+                    --jq '[.workflow_runs[] | select(.conclusion == "success" and .event != "pull_request")][0].html_url // empty' 2>/dev/null || true)
+            if [ -n "$run" ]; then
+              from=$BASE
+              echo "card tier inherited from $BASE ($run)" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "version-only on $BASE, which has no passed push or dispatch run of this workflow: every lane"
+            fi
+          fi
+          echo "card-tier-from=$from" >> "$GITHUB_OUTPUT"
+
+      # The docs-only shortcut and whether each GPU e2e lane skips, decided here once:
+      # the tier table below maps a changed path to the lanes it can reach. A
+      # lane's `if:` reads its `skip-<area>` output and adds only what is its
+      # own: `always() && !cancelled()`, its prerequisite's result and, on a pull
+      # request, this job's success; a lane with a row per engine passes the
+      # reusable job `enabled` per row, read from the same outputs (the
+      # representative engine's row from chat-one-engine, the other rows from
+      # chat-completions). The step runs when the filter failed too:
+      # its outputs then skip nothing, so a push still runs every lane, and a
+      # pull request runs none through the lanes' own condition on this job's
+      # result.
+      - name: Decide the e2e lanes
+        id: lanes
+        if: always()
+        env:
+          PULL_REQUEST: ${{ github.event_name == 'pull_request' }}
+          # The label `ci:full` runs every lane whatever the paths say. It is read
+          # from the event, so a pull request labelled after its last push takes
+          # it on the next push (or on a close and reopen).
+          FORCE_FULL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+          CHANGED_FILES: ${{ steps.filter.outputs.all_files }}
+          DOCS: ${{ steps.filter.outputs.docs }}
+          NON_DOCS: ${{ steps.filter.outputs.non-docs }}
+          TESTS: ${{ steps.filter.outputs.tests }}
+          CARD_TIER_FROM: ${{ steps.version-only.outputs.card-tier-from }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, re, sys
+
+          env = os.environ
+          pull_request = env.get("PULL_REQUEST") == "true"
+          # The label: every lane, and no docs-only shortcut (the version-only one
+          # yields to the label in its own step, so its output is read as it is).
+          force_full = pull_request and env.get("FORCE_FULL") == "true"
+          # The version-only shortcut (the step above): the commit whose passed run
+          # stands for this change's card tier; the lanes on GPU runners skip then.
+          card_tier_from = env.get("CARD_TIER_FROM", "")
+
+          # Only pull requests take the docs-only shortcut; a push keeps its coverage.
+          docs_only = (
+              pull_request
+              and not force_full
+              and env.get("DOCS") == "true"
+              and env.get("NON_DOCS") == "false"
+              and env.get("TESTS") == "false"
+          )
+          # The areas, one per skip-<area> output, each the gate of a group of lanes:
+          #   chat-one-engine   the chat and router suites on one engine, SGLang: the
+          #                     sglang rows of the chat, Python-servicer and gateway lanes
+          #                     (chat-completions implies it)
+          #   chat-completions  the chat and router suites on every engine: the chat,
+          #                     Python-servicer, worker-side multimodal, ZMQ, gateway, PD,
+          #                     EPD and 4-GPU lanes
+          #   completions, embeddings, realtime, go-bindings   that suite's lane
+          #   agentic           the Responses suite on an engine
+          #   vendor            the Responses, Messages and realtime suites on the cloud
+          #                     providers (CPU)
+          AREAS = ("chat-one-engine", "chat-completions", "completions",
+                   "embeddings", "realtime", "agentic", "vendor", "go-bindings")
+          # The card tier: the areas whose lanes take a GPU runner (the vendor lanes run on CPU).
+          CARD_AREAS = tuple(area for area in AREAS if area != "vendor")
+          FULL = " ".join(AREAS)
+          NONE = ""
+          # A gateway module no suite targets: one engine's chat and router suites, the
+          # Responses suite and the vendor rows read every response through it and
+          # witness a regression; the other engines' rows run the
+          # same gateway code and add nothing for it, and the completions,
+          # embeddings, realtime and Go suites drive paths of their own, named
+          # below where a change reaches them.
+          CORE = "chat-one-engine agentic vendor"
+          # The core, and the Go suite: the Go library links the gateway crate whole
+          # and calls these paths itself.
+          CORE_GO = CORE + " go-bindings"
+          # The core on every engine's chat family: the modules whose behaviour only
+          # the other engines' rows or the PD, EPD, DP and worker-side media lanes
+          # exercise (the policies the PD and EPD routers resolve, the KV index the
+          # cache-aware policy of the EPD suite reads, the media pipeline with its
+          # worker-side and 4-GPU classes, the tool parser whose forced-call grammars
+          # each engine's own backend compiles).
+          CORE_EVERY_ENGINE = "chat-completions agentic vendor"
+          CORE_EVERY_ENGINE_GO = CORE_EVERY_ENGINE + " go-bindings"
+          # One engine's own files reach the lanes with a row for that engine.
+          SGLANG = "chat-completions completions embeddings agentic go-bindings"
+          VLLM = "chat-completions completions embeddings realtime"
+          TRTLLM = "chat-completions"
+          TOKENSPEED = "chat-completions"
+
+          # The tier table: the lanes a changed path can reach. The first row a path
+          # matches decides; a path no row matches reaches every lane, so a new path
+          # runs the whole matrix until a row places it. `**` spans directories, `*`
+          # one segment of a path. A pull request runs the union over its files; a
+          # push and a manual run keep every lane.
+          TIERS = [
+              # documentation, licences, assets, lint and format configuration
+              ("**/*.md",                                        NONE),
+              ("**/LICENSE",                                     NONE),
+              ("docs/**",                                        NONE),
+              ("assets/**",                                      NONE),
+              (".gitignore",                                     NONE),
+              (".dockerignore",                                  NONE),
+              (".pre-commit-config.yaml",                        NONE),
+              ("clippy.toml",                                    NONE),
+              ("rustfmt.toml",                                   NONE),
+              ("ruff.toml",                                      NONE),
+              ("mypy.ini",                                       NONE),
+              ("Makefile",                                       NONE),
+              # deployment, images and examples no lane builds; the two WASM guests
+              # built with the wheel for the Responses suite's storage-hook cases
+              ("deploy/**",                                      NONE),
+              ("docker/**",                                      NONE),
+              ("examples/wasm/wasm-guest-storage-hook/**",       "agentic vendor"),
+              ("examples/wasm/wasm-guest-storage-hook-passthrough/**", "agentic vendor"),
+              ("examples/**",                                    NONE),
+              # the workspace: the manifest, the lock file and the toolchain shape every binary
+              ("Cargo.toml",                                     FULL),
+              ("Cargo.lock",                                     FULL),
+              ("rust-toolchain.toml",                            FULL),
+              (".cargo/audit.toml",                              NONE),
+              (".cargo/**",                                      FULL),
+              # this workflow, the GPU job and the actions the lanes run; an engine's
+              # setup action its rows; other workflows and the repository's automation none
+              (".github/workflows/pr-test-rust.yml",             FULL),
+              (".github/workflows/e2e-gpu-job.yml",              FULL),
+              (".github/workflows/**",                           NONE),
+              (".github/actions/setup-sglang/**",                SGLANG),
+              (".github/actions/setup-vllm/**",                  VLLM),
+              (".github/actions/setup-trtllm/**",                TRTLLM),
+              (".github/actions/setup-tokenspeed/**",            TOKENSPEED),
+              (".github/actions/setup-gh/**",                    NONE),
+              (".github/actions/publish-crate/**",               NONE),
+              (".github/actions/**",                             FULL),
+              (".github/versions/tokenspeed.ref",                TOKENSPEED),
+              (".github/versions/tokenspeed-nightly.txt",        TOKENSPEED),
+              (".github/versions/tokenspeed-engine.txt",         TOKENSPEED),
+              (".github/**",                                     NONE),
+              # the CI scripts: an engine's installers its rows; the agentic services the
+              # Responses, Messages and vendor lanes; the scripts of other workflows none;
+              # the scripts every lane runs (the venv, the wheel, the models, the logs) all
+              ("scripts/ci_install_sglang.sh",                   SGLANG),
+              ("scripts/ci_install_vllm.sh",                     VLLM),
+              ("scripts/ci_install_flashinfer_jit_cache.sh",     VLLM),
+              ("scripts/ci_install_trtllm.sh",                   TRTLLM),
+              ("scripts/ci_install_tokenspeed.sh",               TOKENSPEED),
+              ("scripts/ci_fetch_tokenspeed_prebuilt.sh",        TOKENSPEED),
+              ("scripts/ci_tokenspeed_image_tag.sh",             TOKENSPEED),
+              ("scripts/ci_tokenspeed_scheduler_pin.py",         TOKENSPEED),
+              ("scripts/ci_install_flashinfer.py",               TOKENSPEED),
+              ("scripts/ci_agentic_svc_deps.sh",                 "agentic vendor"),
+              ("scripts/oracle_flyway/**",                       "agentic vendor"),
+              ("scripts/ci_cargo_audit.sh",                      NONE),
+              ("scripts/ci_rust_tests.sh",                       NONE),
+              ("scripts/ci_gpu_runner_image.py",                 NONE),
+              ("scripts/ci_node_health.py",                      NONE),
+              ("scripts/ci_prune_tokenspeed_images.sh",          NONE),
+              ("scripts/ci_setup_sglang_rocm_image.sh",          SGLANG),
+              ("scripts/ci_setup_vllm_rocm_image.sh",             VLLM + " embeddings"),
+              ("scripts/ci_*",                                   FULL),
+              ("scripts/**",                                     NONE),
+              # the servicers: an engine's package its rows; the MLX servicer has its own
+              # workflow; the tests and their stub generator two rows run against a real
+              # engine; the shared modules and the package every lane
+              ("grpc_servicer/smg_grpc_servicer/sglang/**",      SGLANG),
+              ("grpc_servicer/smg_grpc_servicer/vllm/**",        VLLM),
+              ("grpc_servicer/smg_grpc_servicer/tokenspeed/**",  TOKENSPEED),
+              ("grpc_servicer/smg_grpc_servicer/mlx/**",         NONE),
+              ("grpc_servicer/tests/**",                         "chat-completions"),
+              ("grpc_servicer/scripts/**",                       "chat-completions"),
+              ("grpc_servicer/**",                               FULL),
+              # the e2e suites: a suite its lane; the suites of other workflows and the
+              # advisory benchmarks none; the harness, its fixtures and the client every lane
+              ("e2e_test/chat_completions/**",                   "chat-completions"),
+              ("e2e_test/router/**",                             "chat-completions"),
+              ("e2e_test/completions/**",                        "completions"),
+              ("e2e_test/embeddings/**",                         "embeddings"),
+              ("e2e_test/realtime/**",                           "realtime vendor"),
+              ("e2e_test/responses/**",                          "agentic vendor"),
+              ("e2e_test/messages/**",                           "agentic vendor"),
+              ("e2e_test/bindings_go/**",                        "go-bindings"),
+              ("e2e_test/benchmarks/**",                         NONE),
+              ("e2e_test/file_discovery/**",                     NONE),
+              ("e2e_test/kind_discovery/**",                     NONE),
+              ("e2e_test/mlx/**",                                NONE),
+              ("e2e_test/**",                                    FULL),
+              ("pytest.ini",                                     FULL),
+              ("clients/python/smg_client/api/completions.py",   "completions"),
+              ("clients/python/smg_client/api/embeddings.py",    "embeddings"),
+              ("clients/python/smg_client/api/responses.py",     "agentic vendor"),
+              ("clients/python/smg_client/api/messages.py",      "agentic vendor"),
+              ("clients/python/tests/**",                        NONE),
+              ("clients/python/**",                              FULL),
+              ("clients/openapi-gen/**",                         FULL),
+              ("clients/**",                                     NONE),
+              # the bindings: the wheel every lane installs; the Go library its lane
+              ("bindings/python/tests/**",                       NONE),
+              ("bindings/python/.coveragerc",                    NONE),
+              ("bindings/python/**",                             FULL),
+              ("bindings/golang/**",                             "go-bindings"),
+              # the gateway: its test trees none; the Responses and conversations
+              # endpoints their lanes; the modules no suite targets the core; the
+              # policies the core on every engine (the PD and EPD routers resolve
+              # them); the routers (the Symphony seam among them: it chooses the
+              # parser of every request), the workers, the configuration, the
+              # registration workflow, the server and the entry points every lane
+              ("model_gateway/tests/**",                         NONE),
+              ("model_gateway/test_harness/**",                  NONE),
+              ("model_gateway/src/routers/grpc/tokenizer_cache/**", NONE),
+              ("model_gateway/benches/**",                       NONE),
+              ("model_gateway/src/endpoints/responses/**",       "agentic vendor"),
+              ("model_gateway/src/endpoints/conversations/**",   "agentic vendor"),
+              ("model_gateway/src/endpoints/**",                 CORE),
+              ("model_gateway/src/middleware/**",                CORE),
+              ("model_gateway/src/observability/**",             CORE_GO),
+              ("model_gateway/src/rate_limit/**",                CORE),
+              ("model_gateway/src/policies/**",                  CORE_EVERY_ENGINE_GO),
+              ("model_gateway/src/mesh/**",                      CORE),
+              ("model_gateway/src/service_discovery/**",         CORE),
+              ("model_gateway/src/wasm/**",                      CORE),
+              ("model_gateway/src/server/tls.rs",                CORE),
+              ("model_gateway/src/version.rs",                   CORE),
+              ("model_gateway/src/server/posture.rs",            CORE),
+              ("model_gateway/src/tenant/**",                    CORE),
+              ("model_gateway/src/worker/rl_adapter.rs",         CORE),
+              ("model_gateway/**",                               FULL),
+              # the crates: test trees, benches, fuzzers, examples and tooling none (the
+              # WASM fixtures directory builds the storage-hook guests); crates no lane's
+              # binary links none; the tokenizer the Go lane alone (the Go library links it
+              # directly), its oracle for the gateway's lanes being the fixture parity gate
+              # (the render and encode of every registered model against the reference
+              # fixtures, in its own workflow on every pull request that touches the crate)
+              # and the crate's tests
+              ("crates/wasm/tests/fixtures/**",                  "agentic vendor"),
+              ("crates/*/tests/**",                              NONE),
+              ("crates/*/benches/**",                            NONE),
+              ("crates/*/fuzz/**",                               NONE),
+              ("crates/*/examples/**",                           NONE),
+              ("crates/*/docs/**",                               NONE),
+              ("crates/*/scripts/**",                            NONE),
+              ("crates/*/tools/**",                              NONE),
+              ("crates/grpc_client/go/**",                       NONE),
+              ("crates/mock_worker/**",                          NONE),
+              ("crates/gateway_perf/**",                         NONE),
+              ("crates/radix_tree/**",                           NONE),
+              # the policy controller crate: linked by no binary yet (its gateway host is
+              # a later change, which moves this row to the core)
+              ("crates/policy_controller/**",                    NONE),
+              ("crates/tokenizer/**",                            "go-bindings"),
+              # Symphony and the response templates it compiles: the default
+              # parser, read on every lane's chat, messages and responses path
+              ("crates/symphony/**",                             CORE_EVERY_ENGINE),
+              ("crates/response_template/**",                    CORE_EVERY_ENGINE),
+              # the Rust servicer and the ZMQ wire: lanes of the chat family
+              ("crates/engine_servicer/**",                      "chat-completions"),
+              ("crates/engine_zmq_client/**",                    "chat-completions"),
+              ("crates/engine_zmq_adapter/**",                   "chat-completions"),
+              # the Responses tools, and the provider routers' own subtrees; the rest
+              # of that crate (retry, SSE, headers, realtime, the OpenAI bridge) is
+              # re-exported and called by the gateway's own routers, on every lane
+              ("crates/mcp/**",                                  "agentic vendor"),
+              ("crates/external_router/src/openai/**",           "agentic vendor"),
+              ("crates/external_router/src/anthropic/**",        "agentic vendor"),
+              ("crates/external_router/src/gemini/**",           "agentic vendor"),
+              ("crates/external_router/**",                      FULL),
+              # crates the gateway links on every suite's path: the core; the Go
+              # library links the tool parser directly too (and the tokenizer, the
+              # protocols and the gRPC client: the tokenizer's row names the Go lane,
+              # the other two reach every lane); the tool parser, the media pipeline
+              # and the KV index the core on every engine (the forced-call grammars
+              # the parser builds, structural tags and JSON schemas, are compiled by
+              # each engine's own grammar backend and the tool-choice cases run them
+              # on every engine; the worker-side media lanes and the 4-GPU Llama-4
+              # class; the EPD suite's cache-aware policy)
+              ("crates/tool_parser/**",                          CORE_EVERY_ENGINE_GO),
+              ("crates/reasoning_parser/**",                     CORE),
+              ("crates/multimodal/**",                           CORE_EVERY_ENGINE),
+              ("crates/kv_index/**",                             CORE_EVERY_ENGINE_GO),
+              ("crates/data_connector/**",                       CORE),
+              ("crates/auth/**",                                 CORE),
+              ("crates/mesh/**",                                 CORE),
+              ("crates/mm_rdma/**",                              CORE),
+              ("crates/rl/**",                                   CORE),
+              ("crates/wasm/**",                                 CORE),
+              # the protocol types, the gRPC client with its proto package and the
+              # workflow engine of the worker registration: every lane
+              ("crates/protocols/**",                            FULL),
+              ("crates/grpc_client/**",                          FULL),
+              ("crates/workflow/**",                             FULL),
+              ("crates/**",                                      FULL),
+          ]
+
+          def pattern_regex(pattern):
+              out, i = "", 0
+              while i < len(pattern):
+                  if pattern.startswith("**/", i):
+                      out, i = out + "(?:.*/)?", i + 3
+                  elif pattern.startswith("**", i):
+                      out, i = out + ".*", i + 2
+                  elif pattern[i] == "*":
+                      out, i = out + "[^/]*", i + 1
+                  else:
+                      out, i = out + re.escape(pattern[i]), i + 1
+              return re.compile(out + r"\Z")
+
+          rows = [(pattern, pattern_regex(pattern), set(areas.split())) for pattern, areas in TIERS]
+          unknown = sorted({area for _, _, areas in rows for area in areas} - set(AREAS))
+          if unknown:
+              sys.exit(f"tier table: no lane area is named {unknown}; the areas are {list(AREAS)}")
+
+          def reach_of(path):
+              """The row that places a path and the areas it reaches: every area when no row does."""
+              for pattern, regex, areas in rows:
+                  if regex.match(path):
+                      return pattern, areas
+              return None, set(AREAS)
+
+          def named(areas):
+              return " ".join(area for area in AREAS if area in areas) or "none"
+
+          files = json.loads(env["CHANGED_FILES"]) if env.get("CHANGED_FILES") else None
+          if not pull_request:
+              reached, why = set(AREAS), "not a pull request"
+          elif force_full:
+              reached, why = set(AREAS), "the label ci:full"
+          elif files is None:
+              # The filter failed: its failure gates the pull request's lanes.
+              reached, why = set(AREAS), "no list of the changed files"
+          else:
+              reached = set()
+              for path in files:
+                  pattern, areas = reach_of(path)
+                  print(f"{path}: {pattern or 'no row'} -> {named(areas)}")
+                  reached |= areas
+              why = f"{len(files)} changed files"
+          # The chat family implies its one-engine rows: what every engine's chat
+          # lanes witness, the representative engine's rows witness too.
+          if "chat-completions" in reached:
+              reached.add("chat-one-engine")
+          print(f"{why}: lanes reached: {named(reached)}")
+
+          # No lane for a docs-only change; the host rows alone for a version-only one
+          # (its card tier is inherited); otherwise the lanes of the areas the changed
+          # paths reach (the tier table decides, Symphony's crate included).
+          skip = {
+              area: docs_only or (bool(card_tier_from) and area in CARD_AREAS) or area not in reached
+              for area in AREAS
+          }
+          # The vendor lanes have no docs-only shortcut.
+          skip["vendor"] = "vendor" not in reached
+          if card_tier_from:
+              print(f"card tier inherited from {card_tier_from}: the lanes on GPU runners skip")
+
+          decided = {"docs-only": docs_only}
+          decided.update((f"skip-{area}", skipped) for area, skipped in skip.items())
+          with open(env["GITHUB_OUTPUT"], "a") as outputs:
+              for name, value in decided.items():
+                  line = f"{name}={str(value).lower()}"
+                  print(line)
+                  print(line, file=outputs)
+          EOF
+      - name: Select the Rust test shards
+        id: rust-shards
+        env:
+          CHANGES: ${{ steps.filter.outputs.changes }}
+          EVERY_SHARD: ${{ github.event_name != 'pull_request' }}
+        run: |
+          shards=$(bash scripts/ci_rust_tests.sh matrix "$CHANGES" "$EVERY_SHARD")
+          echo "rust-shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "Rust test shards: $shards"
 
   # --- GPU E2E: organized by GPU tier + API, engine as matrix axis ---
 
   # === 1 GPU ===
 
+  # The chat suite per engine. The sglang row is the representative engine's:
+  # a change the tier table places in the core (chat-one-engine) runs it, the
+  # sglang row of the Python-servicer lane and the sglang row of the gateway
+  # lane, and nothing else of the chat family; the other rows run when every
+  # engine's family (chat-completions) is reached, as the family's other lanes
+  # do. A row that is not enabled skips inside the reusable job, before it
+  # takes a runner.
   e2e-1gpu-chat:
     name: e2e-1gpu-chat (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
       always()
-      && !cancelled()
       && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_1 != '')
+      && !cancelled()
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
     # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
     # Qwen2.5-14B) since they're tp=1.
     strategy:
@@ -659,6 +1443,9 @@ jobs:
             test_timeout: 26
             test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_loads.py
             min_selected: 114 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+            # The pinned engine runs on its Rust control plane and carries no
+            # in-process Python frontend, so its workers run the Rust servicer.
+            servicer_impl: rust
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -669,6 +1456,133 @@ jobs:
       test_dirs: ${{ matrix.test_dirs || 'e2e_test/chat_completions' }}
       min_selected: ${{ matrix.min_selected }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      servicer_impl: ${{ matrix.servicer_impl || '' }}
+      servicer_unit_tests: ${{ matrix.engine == 'vllm' }}
+      enabled: ${{ matrix.engine == 'sglang' || needs.detect-changes.outputs.skip-chat-completions != 'true' }}
+    secrets: inherit
+
+  # The vLLM row of e2e-1gpu-chat on an AMD Instinct self-hosted runner, in
+  # vLLM's ROCm image of the CI's vLLM pin (scripts/ci_install_vllm.sh). Off
+  # until AMD's runner is registered and SMG_RUN_AMD_LEGS is "true"; then it
+  # runs on pushes to main and dispatches, and SMG_RUN_AMD_ON_PRS = "true" adds
+  # the pull requests the vLLM row runs on.
+  e2e-1gpu-chat-amd:
+    name: e2e-1gpu-chat-amd (vllm)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_AMD_GPU_1 != '')
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      # Measured on the AMD runner: the suite's eight vLLM workers took 18:52
+      # to come up and the step 21:58 end to end before the servicers'
+      # planned warm-up; with it (the default level, up to 300 s per worker)
+      # the seven workers before gpt-oss-20b took 20:08 to come up, and
+      # gpt-oss-20b's own start (engine 2:36 + warm-up ~2:45) ran into the
+      # 30-minute step cap. The slowest composition seen (the earlier run's
+      # engine starts + the later run's warm-ups) projects to ~34 minutes;
+      # 45 keeps the ~30 % headroom the CUDA vLLM row keeps over its 24.
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/chat_completions
+      min_selected: 202 # the vLLM row's floor: both rows select the same cases
+      servicer_unit_tests: true
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
+  # The chat cases against the deprecated Python gRPC servicer
+  # (SMG_SGLANG_SERVICER_IMPL=python, SMG_VLLM_SERVICER_IMPL=python), named
+  # explicitly: the same workers and chat suite as the engine's e2e-1gpu-chat
+  # row, plus the admin-op and decisions cases that servicer serves through
+  # its own handlers. The servicer package's default is the Rust servicer, so
+  # every other vLLM and SGLang lane runs it, and this row is the one per
+  # engine that keeps the Python servicer's start, request path and control
+  # handlers covered until its removal: a launcher or binding change that
+  # breaks that start fails here and nowhere else. No tokenspeed row: the
+  # pinned engine has no Python frontend, and e2e-1gpu-chat's tokenspeed row
+  # runs the Rust servicer itself. The sglang row is the representative
+  # engine's (the chat lane says how).
+  e2e-1gpu-chat-python-servicer:
+    name: e2e-1gpu-chat-python-servicer (${{ matrix.engine }})
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_1 != '')
+      && !cancelled()
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The chat suite of e2e-1gpu-chat's sglang row (the Python servicer
+          # serves every case, so the harness deselects nothing here) plus the
+          # admin-op and decisions cases: the Python servicer serves those
+          # through its own handlers, which the router lanes no longer reach
+          # once they run the default (Rust) servicer. The budgets are four
+          # minutes over the chat row's for those extra cases.
+          - engine: sglang
+            timeout: 40
+            test_timeout: 32
+            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_decisions.py
+            min_selected: 204 # the sglang chat row's floor; the extra cases only raise the count
+          # The vLLM chat suite on the Python servicer (the suite and floor of
+          # e2e-1gpu-chat's vllm row) plus the flush-cache case the Python
+          # servicer serves through its own handler, two minutes over the chat
+          # row's budgets; the decisions cases are SGLang's alone.
+          - engine: vllm
+            timeout: 34
+            test_timeout: 26
+            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py
+            min_selected: 202 # the vllm chat row's floor; the extra case only raises the count
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: ${{ matrix.engine }}
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
+      timeout: ${{ matrix.timeout }}
+      test_timeout: ${{ matrix.test_timeout }}
+      test_dirs: ${{ matrix.test_dirs }}
+      min_selected: ${{ matrix.min_selected }}
+      servicer_impl: python
+      enabled: ${{ matrix.engine == 'sglang' || needs.detect-changes.outputs.skip-chat-completions != 'true' }}
+    secrets: inherit
+
+  # Worker-side media processing: the vLLM gRPC worker fetches and
+  # preprocesses media itself (SMG_VLLM_MM_PROCESSOR=inprocess) and the
+  # gateway, left in auto mode, forwards media references. Same multimodal
+  # cases as the chat lane plus the processing-location assertion.
+  e2e-1gpu-chat-mm-worker:
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_1 != '')
+      && !cancelled()
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
+      timeout: 28
+      test_timeout: 20
+      test_dirs: e2e_test/chat_completions/test_multimodal.py
+      mm_processing: worker
+      min_selected: 5 # the 6 Qwen3-VL cases on 1 GPU (Llama-4 Scout is a 4-GPU class)
     secrets: inherit
 
   e2e-1gpu-chat-zmq:
@@ -676,13 +1590,11 @@ jobs:
     needs: [build-wheel, detect-changes]
     if: >-
       always()
-      && !cancelled()
       && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_1 != '')
+      && !cancelled()
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     # Same single-worker chat suite as e2e-1gpu-chat, driven over the ZMQ
     # direct-backend wire. The collection hook deselects the gRPC-only
     # families (PD, EPD, multi-worker) for a ZMQ lane, so this covers the
@@ -702,6 +1614,10 @@ jobs:
             timeout: 60
             test_timeout: 48
             min_selected: 109 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+          - engine: sglang
+            timeout: 60
+            test_timeout: 48
+            min_selected: 209 # floor ≈ 95% of measured effective (220 of 229 selected ran with the multimodal module on; this lane's run 2026-10-26)
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -713,6 +1629,9 @@ jobs:
       connection_mode: zmq
       min_selected: ${{ matrix.min_selected }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      # The SGLang wire pins (grpc_servicer/tests/test_sglang_zmq_*) need a
+      # real SGLang plus pyzmq and msgspec; this is the lane that has them.
+      servicer_unit_tests: ${{ matrix.engine == 'sglang' }}
     secrets: inherit
 
   e2e-2gpu-chat-zmq-dp:
@@ -720,13 +1639,11 @@ jobs:
     needs: [build-wheel, detect-changes]
     if: >-
       always()
-      && !cancelled()
       && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_2 != '')
+      && !cancelled()
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     # The 1-GPU ZMQ suite with grouped workers: each ZMQ worker launches two
     # DP engines on one socket set (tp=1 models, one GPU per engine), so the
     # gateway's handshake, the connector's least-loaded selection, and
@@ -769,13 +1686,11 @@ jobs:
     needs: [build-wheel, detect-changes]
     if: >-
       always()
-      && !cancelled()
       && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_1 != '')
+      && !cancelled()
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-completions != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -801,13 +1716,11 @@ jobs:
     needs: [build-wheel, detect-changes]
     if: >-
       always()
-      && !cancelled()
       && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_1 != '')
+      && !cancelled()
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.embeddings == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-embeddings != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -833,13 +1746,11 @@ jobs:
     needs: [build-wheel, detect-changes]
     if: >-
       always()
-      && !cancelled()
       && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_1 != '')
+      && !cancelled()
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.realtime == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-realtime != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -851,18 +1762,18 @@ jobs:
       min_selected: 3 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     secrets: inherit
 
+  # The router suite per engine; the sglang row is the representative engine's
+  # (the chat lane says how).
   e2e-1gpu-gateway:
     name: e2e-1gpu-gateway (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
       always()
-      && !cancelled()
       && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_1 != '')
+      && !cancelled()
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -882,8 +1793,8 @@ jobs:
       runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
       timeout: ${{ matrix.timeout }}
       test_dirs: e2e_test/router
-      test_filter: "--ignore=e2e_test/router/test_pd_mmlu.py"
       min_selected: ${{ matrix.min_selected }}
+      enabled: ${{ matrix.engine == 'sglang' || needs.detect-changes.outputs.skip-chat-completions != 'true' }}
     secrets: inherit
 
   # === 2 GPU ===
@@ -895,13 +1806,11 @@ jobs:
     needs: [build-wheel, detect-changes]
     if: >-
       always()
-      && !cancelled()
       && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_1 != '')
+      && !cancelled()
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.agentic == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-agentic != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
@@ -919,13 +1828,11 @@ jobs:
     needs: [e2e-1gpu-gateway, detect-changes]
     if: >-
       always()
-      && !cancelled()
       && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_2 != '')
+      && !cancelled()
       && needs.e2e-1gpu-gateway.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -933,17 +1840,24 @@ jobs:
           - engine: sglang
             timeout: 40
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+          # The vLLM rows' job budget sits above the sum of their steps: the
+          # engine setup takes 3 to 9 minutes (its packages come from the
+          # network), the test step has 34, checkout, downloads, diagnostics
+          # and the log upload about 4. At 40 the job budget cancelled a long
+          # test step minutes before the step's own timeout would have failed
+          # it, and the leg ended "cancelled" with its cases passing instead
+          # of failing in the step that ran long (smg-project/smg-lab#170).
           - engine: vllm
-            timeout: 40
+            timeout: 50
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           - engine: vllm
             kv_backend: mooncake
-            timeout: 40
+            timeout: 50
             min_selected: 15 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
           # TokenSpeed prefill/decode over its Mooncake transfer, on the model
           # its disaggregation path is proven on (Qwen3.5-9B, fetched by id).
           # First run (34173426995): sequential PD passed; 32 concurrent
-          # requests deadlocked both legs because the spec's engine window was
+          # requests deadlocked both sides because the spec's engine window was
           # 4 (prefill waits for a decode that is never admitted). The window
           # now covers the suite's bursts; the over-window deadlock itself is
           # pinned by the topology suite. The prebuilt image is extracted, but
@@ -952,6 +1866,7 @@ jobs:
             timeout: 75
             test_timeout: 50
             min_selected: 10 # floor ≈ 95% of the 11 gRPC PD cases marked for tokenspeed
+            servicer_impl: rust # the pinned engine has no Python frontend
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -961,17 +1876,55 @@ jobs:
       test_timeout: ${{ matrix.test_timeout || 34 }}
       test_dirs: e2e_test/router
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
+      # The rank-pin cases read the servicer's per-request line.
+      worker_log_filter: info,engine_servicer::request=debug
       min_selected: ${{ matrix.min_selected }}
+      servicer_impl: ${{ matrix.servicer_impl || '' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
 
+  # The prefill and decode workers both advertise worker-side processing; the
+  # M-RoPE class takes the worker path and the Phi-3.5 class must stay on the
+  # router path.
+  e2e-2gpu-pd-mm-worker:
+    needs: [e2e-1gpu-chat-mm-worker, detect-changes]
+    if: >-
+      always()
+      && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_2 != '')
+      && !cancelled()
+      && needs.e2e-1gpu-chat-mm-worker.result == 'success'
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: "2"
+      runner: ${{ vars.SMG_RUNNER_GPU_2 || '2-gpu-h100' }}
+      timeout: 40
+      test_timeout: 34
+      test_dirs: e2e_test/router/test_pd_multimodal.py
+      mm_processing: worker
+      # The placement assertion reads the servicer's per-request line.
+      worker_log_filter: info,engine_servicer::request=debug
+      min_selected: 4 # the 4 PD multimodal cases
+    secrets: inherit
+
   # === 4 GPU ===
 
+  # The 4-GPU lanes follow their 1-GPU prerequisite and, like the PD lanes,
+  # run for every engine's family only: in the core tier the prerequisite runs
+  # its representative row alone and these lanes skip.
   e2e-4gpu-chat:
     name: e2e-4gpu-chat (${{ matrix.engine }})
-    needs: [e2e-1gpu-chat]
-    if: github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_4 != ''
+    needs: [e2e-1gpu-chat, detect-changes]
+    if: >-
+      always()
+      && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_4 != '')
+      && !cancelled()
+      && needs.e2e-1gpu-chat.result == 'success'
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -997,8 +1950,14 @@ jobs:
 
   e2e-4gpu-gateway:
     name: e2e-4gpu-gateway
-    needs: [e2e-1gpu-gateway]
-    if: github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_4 != ''
+    needs: [e2e-1gpu-gateway, detect-changes]
+    if: >-
+      always()
+      && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_4 != '')
+      && !cancelled()
+      && needs.e2e-1gpu-gateway.result == 'success'
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
@@ -1007,12 +1966,19 @@ jobs:
       timeout: 25
       test_dirs: e2e_test/router
       test_filter: "-k TestIGWMixedWorkerClassification"
+      provider_api_keys: true
     secrets: inherit
 
   e2e-4gpu-epd:
     name: e2e-4gpu-epd (tokenspeed)
     needs: [e2e-1gpu-chat, detect-changes]
-    if: github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_4 != ''
+    if: >-
+      always()
+      && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_4 != '')
+      && !cancelled()
+      && needs.e2e-1gpu-chat.result == 'success'
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: tokenspeed
@@ -1024,24 +1990,23 @@ jobs:
       extra_models: "Qwen/Qwen3.5-9B"
       min_selected: 6 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
       tokenspeed_prebuilt_image: ${{ needs.detect-changes.outputs.tokenspeed-image }}
+      servicer_impl: rust # the pinned engine has no Python frontend
     secrets: inherit
 
   # PD disaggregation under one 4-GPU topology (2 prefill + 2 decode) plus a
   # fleet assembled at runtime through the worker API, per engine. The full
   # topology sweep (1p1d .. 3p1d) runs in nightly-pd.yml; this lane guards
-  # every PR with the topology that exercises both legs' load balancing.
+  # every PR with the topology that exercises both pools' load balancing.
   e2e-4gpu-pd:
     name: e2e-4gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
     needs: [e2e-1gpu-gateway, detect-changes]
     if: >-
       always()
-      && !cancelled()
       && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_4 != '')
+      && !cancelled()
       && needs.e2e-1gpu-gateway.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1057,12 +2022,16 @@ jobs:
           - engine: tokenspeed
             timeout: 85
             test_timeout: 60
+            servicer_impl: rust # the pinned engine has no Python frontend
           # The other KV transport of each engine (TokenSpeed only has
           # Mooncake): the same slice on vLLM over Mooncake, and a 1p1d
           # smoke of SGLang over NIXL (its venv gets NIXL only on this row,
           # #2498). The peer-restart test stays out of the NIXL smoke: the
           # SGLang prefill segfaults when its decode comes back on the same
-          # address (#2503). The full sweeps run in nightly-pd.
+          # address (#2503). The smoke carries the 1p1d-http row too: the
+          # HTTP PD router is its own code path (pairing, error answers and
+          # the KV handoff on SGLang), and this is its one pull-request
+          # signal. The other HTTP rows and the full sweeps run in nightly-pd.
           - engine: vllm
             kv_backend: mooncake
             timeout: 50
@@ -1071,8 +2040,8 @@ jobs:
             kv_backend: nixl
             timeout: 60
             test_timeout: 50
-            test_filter: -k "1p1d and not http and not sole_leg_outage"
-            min_selected: 11
+            test_filter: -k "1p1d and not sole_leg_outage"
+            min_selected: 24
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1089,14 +2058,189 @@ jobs:
       test_filter: ${{ matrix.test_filter || '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol"' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       # floor ≈ 93% of the slice: 15 cases on sglang/tokenspeed, 17 on vllm
-      # (its two transport classes); the 1p1d smoke selects 13, floor 11
+      # (its two transport classes); the 1p1d smoke selects 26 with its HTTP
+      # row (run 42508847810), floor 24
       min_selected: ${{ matrix.min_selected || 14 }}
       kv_backend: ${{ matrix.kv_backend || '' }}
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
       # The mixed-transport fleet needs both vLLM backends installed whatever the lane's own
       vllm_extra_kv_backends: ${{ matrix.engine == 'vllm' && 'mooncake' || '' }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      servicer_impl: ${{ matrix.servicer_impl || '' }}
     secrets: inherit
+
+  # --- CPU E2E: the classes on the scripted mock worker ---
+
+  # The chat suite's classes that carry the mock engine marker, on the
+  # scripted mock worker (crates/mock_worker): the test states the model's
+  # answer (e2e_test/fixtures/mock_answers.py) and the gateway's tokenization,
+  # wire, decoding and parsing run against it on a CPU runner, no engine. Two
+  # of the classes run on no other lane: the constraint-failure and the
+  # reader-panic classes answer only the mock. The job builds the mock worker
+  # under a Rust cache key of its own, installs the wheel, and fetches the
+  # tokenizer files of the classes' models from ungated repositories at
+  # pinned revisions, no hub token. A few CPU minutes on every push and on
+  # every pull request that is not documentation-only, before any GPU lane
+  # takes a runner.
+  e2e-cpu-mock:
+    name: e2e-cpu-mock
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.docs-only != 'true'
+    runs-on: ${{ vars.SMG_RUNNER_CPU || (github.repository == 'smg-project/smg' && 'k8s-runner-cpu') || 'ubuntu-latest' }}
+    # A cold build of the mock worker and its dependencies takes minutes; the
+    # warm one (main's entry under the job's own cache key) a fraction.
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      E2E_ENGINE: mock
+      E2E_RUNTIME: mock
+      # No E2E_GPU_TIER: every class on the mock marker, whatever tier its
+      # engine rows need.
+      # The models of the classes on the mock marker (`@pytest.mark.model`,
+      # or its `mock=` override), each pinned to a revision of its hub
+      # repository as `repository@commit`, one per line (folded into one
+      # space-separated word list): a class that brings another model adds
+      # it here. Their tokenizer files land under the runner's temporary
+      # directory, one directory per model id, where the harness reads them
+      # (ROUTER_LOCAL_MODEL_PATH on the steps below).
+      MOCK_MODELS: >-
+        RedHatAI/Llama-3.2-1B-Instruct-FP8@6b92f62217b2f2d88f38575eadb157cf7a6dd5c9
+        Qwen/Qwen3-4B-Instruct-2507@cdbee75f17c01a7cc42f958dc650907174af0554
+        mistralai/Mistral-7B-Instruct-v0.3@c170c708c41dac9275d15a8fff4eca08d52bab71
+        RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8@870a1177ed082c0ba5dbefd62573ab8f91803f6a
+        deepseek-ai/DeepSeek-R1-Distill-Qwen-7B@916b56a44061fd5cd7d6a8fb632557ed4f724f60
+        Qwen/Qwen2.5-14B-Instruct@cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8
+        openai/gpt-oss-20b@6cee5e81ee83917806bbde320786a8fb61efebee
+        Qwen/Qwen3-VL-8B-Instruct@0c351dd01ed87e9c1b53cbc748cba10e6187ff3b
+      SHOW_ROUTER_LOGS: "1"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # A key of this job's own: it builds one crate in the dev profile, so an
+      # entry it saved under the unit-test shards' key after a lockfile change
+      # would be a fragment the shards and the cache warmer then restore as
+      # up to date.
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: e2e-cpu-mock
+
+      - name: Build the mock worker
+        run: |
+          source "$HOME/.cargo/env"
+          cargo build -p mock-worker --bin mock-worker
+
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
+        with:
+          client-types: 'true'
+
+      - name: Install wheel and test dependencies
+        run: |
+          pip uninstall -y smg || true
+          pip install wheel/*.whl
+          bash scripts/ci_install_e2e_deps.sh huggingface_hub
+
+      # A few megabytes per model, kept between runs so the hub serves one
+      # download per model list, not one per run (its rate limit answers a
+      # share of a busy day's requests with 429). The key follows the list
+      # (this file) and the specs; a run that misses fetches the files and
+      # saves the entry.
+      - name: Restore the tokenizer files
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/models
+          key: e2e-cpu-mock-tokenizers-${{ hashFiles('.github/workflows/pr-test-rust.yml', 'e2e_test/infra/model_specs.py') }}
+          restore-keys: |
+            e2e-cpu-mock-tokenizers-
+
+      # Every run fetches at the pinned revision: files already there at that
+      # revision are kept, anything else is replaced, so a restored entry can
+      # never hold another revision's files.
+      - name: Fetch the tokenizer files
+        env:
+          ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
+        run: |
+          # The model list word-splits on purpose, one pinned repository per word.
+          for pinned in $MOCK_MODELS; do
+            repository="${pinned%@*}"
+            revision="${pinned##*@}"
+            echo "$repository at $revision"
+            bash scripts/ci_retry.sh 3 30 hf download "$repository" --revision "$revision" \
+              --include '*.json' --local-dir "$ROUTER_LOCAL_MODEL_PATH/$repository"
+          done
+          # The Harmony vocab the gateway loads when a gpt-oss worker registers
+          # (from this directory, TIKTOKEN_ENCODINGS_BASE on the test step; a
+          # download on first use otherwise). Fetched only when the restored
+          # copy is missing or wrong: the digest is the one the loader checks.
+          mkdir -p "$ROUTER_LOCAL_MODEL_PATH/tiktoken"
+          vocab="$ROUTER_LOCAL_MODEL_PATH/tiktoken/o200k_base.tiktoken"
+          echo "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d  $vocab" | sha256sum -c --status 2>/dev/null \
+            || bash scripts/ci_retry.sh 3 30 curl -fsSL --connect-timeout 10 --max-time 120 -o "$vocab" \
+              https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken
+
+      - name: Run the mock e2e tests
+        timeout-minutes: 15
+        env:
+          SHOW_WORKER_LOGS: "0"
+          E2E_LOG_DIR: e2e-logs
+          # floor ≈ 95% of the 542 cases the mock marker selects: the chat
+          # completion, request-id, concurrency, reasoning-content, EOS
+          # stripping, function-calling, tool-choice (three models),
+          # multi-turn and sampling-defaults classes, the constraint-failure
+          # and the reader-panic classes, the completions classes, the
+          # context-length and load-report classes (the disaggregated ones
+          # included), the disaggregated topology (its gRPC rows, and its
+          # HTTP rows on the mock's HTTP prefill and decode workers),
+          # pairing-protocol, runtime-assembled fleet, Messages and
+          # Responses classes on mock prefill and decode workers, the
+          # Responses local
+          # classes (state, background, streaming events, sampling
+          # parameters, item references, the object shape), and the gpt-oss
+          # classes of chat and Responses on the Harmony token stream (the
+          # mock's tokenizer turns a scripted answer's channel markers into
+          # the special tokens), the scheduler-wire classes (a chat, a
+          # streamed and a tool-call turn through the gateway on each of the
+          # three gRPC protos the mock serves), the disaggregated
+          # scheduler-wire classes (a chat and a streamed turn on a prefill
+          # and a decode worker on the sglang and the vllm wires), the
+          # encode-prefill-decode scheduler-wire classes (a text and an image
+          # turn on an encode, a prefill and a decode worker on the vllm and
+          # the tokenspeed wires), and the worker API classes (the list routes,
+          # IGW mode, disable-health-check, the REST semantics)
+          E2E_MIN_SELECTED: "515"
+          MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
+          ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
+          TIKTOKEN_ENCODINGS_BASE: ${{ runner.temp }}/models/tiktoken
+        run: |
+          pytest e2e_test/chat_completions e2e_test/completions e2e_test/router e2e_test/responses \
+            --reruns 2 --reruns-delay 5 \
+            -s -vv
+
+      - name: Worker failure diagnostics
+        if: failure() || cancelled()
+        run: bash scripts/ci_dump_worker_logs.sh e2e-logs e2e-worker-logs-mock
+
+      - name: Upload worker logs
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-worker-logs-mock
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
 
   # --- Vendor E2E: CPU-only cloud backend tests ---
 
@@ -1105,13 +2249,11 @@ jobs:
     needs: [build-wheel, detect-changes]
     if: >-
       always()
+      && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_CPU != '')
       && !cancelled()
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.agentic == 'true')))
-      && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_CPU != '')
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-vendor != 'true'
     permissions:
       contents: read
     strategy:
@@ -1147,6 +2289,8 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     env:
       E2E_VENDOR: ${{ matrix.vendor }}
+      # Pod-local sidecar owns the real keys. Never map provider secrets here.
+      E2E_AI_KEY_PROXY: http://127.0.0.1:8787
       E2E_GPU_TIER: "0"
       SHOW_ROUTER_LOGS: "1"
     steps:
@@ -1162,24 +2306,11 @@ jobs:
         if: matrix.setup_agentic_deps
         run: bash scripts/ci_agentic_svc_deps.sh check --oracle oracle-db --brave brave-search-mcp
 
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: smg-wheel
-          path: wheel/
-
-      - name: Download WASM test fixtures
-        uses: actions/download-artifact@v8
-        with:
-          name: wasm-test-fixtures
-          path: crates/wasm/tests/fixtures/
-        continue-on-error: true
-
-      - name: Download Python client types
-        uses: actions/download-artifact@v8
-        with:
-          name: python-client-types
-          path: clients/python/smg_client/types/
+          wasm-fixtures: 'true'
+          client-types: 'true'
 
       - name: Install wheel and test dependencies
         run: |
@@ -1244,17 +2375,14 @@ jobs:
       - name: Install build tools
         run: |
           bash scripts/ci_apt_mirror.sh
-          sudo apt-get update
-          sudo apt-get install -y build-essential
+          bash scripts/ci_apt_update.sh sudo
+          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y build-essential
 
-      - name: Download Go FFI library
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: go-ffi-library
-          path: bindings/golang/target/release/
-
-      - name: Verify Go FFI library
-        run: ls -la bindings/golang/target/release/libsmg_go.*
+          wheel: 'false'
+          go-ffi-library: 'true'
 
       - name: Run Go unit tests
         run: |
@@ -1269,13 +2397,11 @@ jobs:
     needs: [build-wheel, detect-changes]
     if: >-
       always()
-      && !cancelled()
       && (github.repository == 'smg-project/smg' || vars.SMG_RUNNER_GPU_1 != '')
+      && !cancelled()
       && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request'
-          || (needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.go-bindings == 'true')))
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-go-bindings != 'true'
     runs-on: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     # 19 min on a quiet host (SGLang setup ~6.5 min, Go ~4 min, tests ~6.5
@@ -1298,26 +2424,11 @@ jobs:
           cache: true
           cache-dependency-path: bindings/golang/go.sum
 
-      - name: Download Go FFI library
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: go-ffi-library
-          path: bindings/golang/target/release/
-
-      - name: Verify Go FFI library
-        run: ls -la bindings/golang/target/release/libsmg_go.*
-
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: smg-wheel
-          path: wheel/
-
-      - name: Download Python client types
-        uses: actions/download-artifact@v8
-        with:
-          name: python-client-types
-          path: clients/python/smg_client/types/
+          go-ffi-library: 'true'
+          client-types: 'true'
 
       - name: Install wheel and test dependencies
         run: |
@@ -1370,20 +2481,10 @@ jobs:
           cache: true
           cache-dependency-path: bindings/golang/go.sum
 
-      - name: Download Go FFI library
-        uses: actions/download-artifact@v8
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
         with:
-          name: go-ffi-library
-          path: bindings/golang/target/release/
-
-      - name: Verify Go FFI library
-        run: ls -la bindings/golang/target/release/libsmg_go.*
-
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: smg-wheel
-          path: wheel/
+          go-ffi-library: 'true'
 
       - name: Install wheel
         run: |
@@ -1413,7 +2514,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, unit-tests, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || (github.repository == 'smg-project/smg' && 'k8s-runner-cpu') || 'ubuntu-latest' }}
     permissions:
@@ -1422,9 +2523,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
-      # Self-check: every e2e-* job defined in this workflow must gate merge
-      # via finish.needs AND the failure check below. Keeps a new (or
-      # forgotten) lane from silently becoming non-blocking.
+      # Self-check: every e2e-* and rust-* job defined in this workflow must
+      # gate merge via finish.needs AND the failure check below. Keeps a new
+      # (or forgotten) lane from silently becoming non-blocking.
       - name: Gate-integrity lint
         run: |
           python3 - <<'EOF'
@@ -1432,9 +2533,9 @@ jobs:
 
           path = ".github/workflows/pr-test-rust.yml"
           src = open(path).read()
-          jobs = re.findall(r"^  (e2e-[a-z0-9_-]*):", src, re.M)
+          jobs = re.findall(r"^  ((?:e2e|rust)-[a-z0-9_-]*):", src, re.M)
           if not jobs:
-              sys.exit("gate-integrity lint: found no e2e-* job definitions; lint is broken")
+              sys.exit("gate-integrity lint: found no e2e-*/rust-* job definitions; lint is broken")
           fin = re.search(r"^  finish:\n(.*?)(?=^  \S|\Z)", src, re.M | re.S)
           if not fin:
               sys.exit("gate-integrity lint: could not locate the finish job")
@@ -1455,38 +2556,57 @@ jobs:
           missing_check = sorted(j for j in jobs if f"needs.{j}.result" not in check_body)
           if missing_needs or missing_check:
               if missing_needs:
-                  print(f"e2e jobs missing from finish.needs: {missing_needs}")
+                  print(f"e2e/rust jobs missing from finish.needs: {missing_needs}")
               if missing_check:
-                  print(f"e2e jobs missing from the finish failure check: {missing_check}")
+                  print(f"e2e/rust jobs missing from the finish failure check: {missing_check}")
               sys.exit(1)
-          print(f"OK: all {len(jobs)} e2e-* jobs gate merge: {sorted(jobs)}")
+          print(f"OK: all {len(jobs)} e2e-*/rust-* jobs gate merge: {sorted(jobs)}")
           EOF
 
       - name: Check CI result
         run: |
-          if [[ "${{ needs.pre-commit.result }}" == "failure" || \
-                "${{ needs.python-lint.result }}" == "failure" || \
-                "${{ needs.grpc-proto-build-check.result }}" == "failure" || \
-                "${{ needs.build-wheel.result }}" == "failure" || \
-                "${{ needs.python-unit-tests.result }}" == "failure" || \
-                "${{ needs.unit-tests.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-chat.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-chat-zmq.result }}" == "failure" || \
-                "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-completions.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-embeddings.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-realtime.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-gateway.result }}" == "failure" || \
-                "${{ needs.e2e-1gpu-responses.result }}" == "failure" || \
-                "${{ needs.e2e-2gpu-pd.result }}" == "failure" || \
-                "${{ needs.e2e-4gpu-chat.result }}" == "failure" || \
-                "${{ needs.e2e-4gpu-gateway.result }}" == "failure" || \
-                "${{ needs.e2e-4gpu-epd.result }}" == "failure" || \
-                "${{ needs.e2e-4gpu-pd.result }}" == "failure" || \
-                "${{ needs.e2e-vendor.result }}" == "failure" || \
-                "${{ needs.go-unit-tests.result }}" == "failure" || \
-                "${{ needs.go-bindings-e2e.result }}" == "failure" ]]; then
-            echo "One or more jobs failed"
+          # A job that runs into its timeout-minutes ends "cancelled", not
+          # "failure", and fails this gate the same way (smg-project/smg-lab#171).
+          # A run cancelled as a whole ends with this gate failed too: it did
+          # not pass, and finish stays a verdict on every head.
+          bad='^(failure|cancelled)$'
+          # detect-changes selects the lanes: when it fails or is cancelled, the
+          # Rust lint and test jobs and the benchmarks skip on every event, and
+          # every e2e lane skips on a pull request (on a push the e2e lanes, the
+          # EPD lane included, run on its empty outputs); a skipped job passes this
+          # check, so its own result gates here (smg-project/smg-lab#172).
+          if [[ "${{ needs.detect-changes.result }}" =~ $bad || \
+                "${{ needs.pre-commit.result }}" =~ $bad || \
+                "${{ needs.python-lint.result }}" =~ $bad || \
+                "${{ needs.grpc-proto-build-check.result }}" =~ $bad || \
+                "${{ needs.build-wheel.result }}" =~ $bad || \
+                "${{ needs.python-unit-tests.result }}" =~ $bad || \
+                "${{ needs.rust-lint.result }}" =~ $bad || \
+                "${{ needs.rust-tests.result }}" =~ $bad || \
+                "${{ needs.cargo-audit.result }}" =~ $bad || \
+                "${{ needs.rust-aarch64.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-python-servicer.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-mm-worker.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-zmq.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-completions.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-embeddings.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-realtime.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-gateway.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-responses.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-pd.result }}" =~ $bad || \
+                "${{ needs.e2e-2gpu-pd-mm-worker.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-chat.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-gateway.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-epd.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-pd.result }}" =~ $bad || \
+                "${{ needs.e2e-cpu-mock.result }}" =~ $bad || \
+                "${{ needs.e2e-vendor.result }}" =~ $bad || \
+                "${{ needs.go-unit-tests.result }}" =~ $bad || \
+                "${{ needs.go-bindings-e2e.result }}" =~ $bad ]]; then
+            echo "One or more jobs failed or were cancelled"
             exit 1
           else
             echo "All jobs completed successfully"

@@ -2,7 +2,7 @@
 
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::chat::ChatCompletionRequest;
-use smg::routers::grpc::utils::{resolve_user_thinking, should_mark_reasoning_started};
+use smg::routers::grpc::utils::chat_reasoning_starts_in_prefill;
 use uuid::Uuid;
 
 /// Helper function to generate tool call ID (matches router implementation)
@@ -26,17 +26,13 @@ pub fn generate_tool_call_id(
 }
 
 /// Determine whether the SGLang gRPC request should ask the backend to count
-/// reasoning tokens for this chat request.
+/// reasoning tokens for this chat request, from the request alone: the guess
+/// of the entry point that renders nothing
+/// (`sgl_chat_requires_reasoning_with_tokenizer`). The streaming path renders
+/// and decides from its rendered prompt (`chat_stream::start_chat_stream`).
 pub(crate) fn chat_requires_reasoning(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
-    should_mark_reasoning_started(
-        resolve_user_thinking(
-            request.chat_template_kwargs.as_ref(),
-            request.reasoning_effort.as_deref(),
-            tokenizer,
-        ),
-        tokenizer,
-    )
+    chat_reasoning_starts_in_prefill(request, tokenizer)
 }

@@ -1,21 +1,26 @@
-use std::{future::Future, pin::Pin};
+use std::{collections::HashMap, future::Future, pin::Pin};
 
 use openai_protocol::{
-    chat::ChatCompletionRequest,
-    common::{ResponseFormat, StringOrArray},
-    completion::CompletionRequest,
-    generate::GenerateRequest,
-    messages::CreateMessageRequest,
-    responses::ResponsesRequest,
-    sampling_params::SamplingParams as GenerateSamplingParams,
+    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
+    messages::CreateMessageRequest, responses::ResponsesRequest,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::{
+    channel::Channel,
+    request_fields::{
+        body_format, completion_constraint, plain_constraint, stop_strings, ConstraintKind,
+        OutputConstraint, PlainSampling,
+    },
+    AbortOnDropClient, BoxedTraceInjector,
+};
 
 // Include the generated protobuf code
-#[expect(clippy::allow_attributes)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
 pub mod proto {
     #![allow(
         clippy::all,
@@ -52,37 +57,10 @@ impl AbortOnDropClient for TrtllmServiceClient {
 
 impl TrtllmServiceClient {
     crate::impl_engine_client_basics!(
+        proto,
         proto::trtllm_service_client::TrtllmServiceClient<Channel>,
         "TensorRT-LLM"
     );
-
-    /// Submit a generation request (returns auto-aborting streaming response)
-    ///
-    /// The returned stream automatically sends an abort request when dropped,
-    /// ensuring proper cleanup even if the HTTP client disconnects or an error occurs.
-    /// Call `mark_completed()` on the stream after successful completion to prevent
-    /// unnecessary abort RPCs.
-    pub async fn generate(
-        &self,
-        req: proto::GenerateRequest,
-    ) -> Result<AbortOnDropStream, tonic::Status> {
-        let request_id = req.request_id.clone();
-        let mut client = self.client.clone();
-        let mut request = Request::new(req);
-
-        // Inject W3C trace context into gRPC metadata for distributed tracing
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
-
-        let response = client.generate(request).await?;
-
-        Ok(AbortOnDropStream::new(
-            response.into_inner(),
-            request_id,
-            self.clone(),
-        ))
-    }
 
     /// Abort a request
     pub async fn abort_request(
@@ -106,6 +84,23 @@ impl TrtllmServiceClient {
     }
 
     crate::impl_get_tokenizer!();
+    /// `GetLoads`: the engine's load per data-parallel rank, the router's
+    /// fallback poll for the records it takes over `SubscribeKvEvents`.
+    pub async fn get_loads(
+        &self,
+        include: Vec<String>,
+    ) -> Result<proto::GetLoadsResponse, tonic::Status> {
+        debug!("Requesting TensorRT-LLM load metrics");
+        let request = Request::new(proto::GetLoadsRequest {
+            dp_rank: None,
+            include,
+        });
+        let mut client = self.client.clone();
+        let response = client.get_loads(request).await?;
+        debug!("TensorRT-LLM load metrics response received");
+        Ok(response.into_inner())
+    }
+
     crate::impl_subscribe_kv_events!();
 
     /// Build a TensorRT-LLM GenerateRequest from OpenAI ChatCompletionRequest
@@ -120,8 +115,28 @@ impl TrtllmServiceClient {
         processed_text: String,
         token_ids: Vec<u32>,
         multimodal_input: Option<proto::MultimodalInput>,
-        tool_call_constraint: Option<(String, String)>, // (constraint_type, constraint_value)
+        constraint: OutputConstraint,
     ) -> Result<proto::GenerateRequest, String> {
+        Self::build_generate_request_from_chat_parts(
+            request_id,
+            body,
+            processed_text,
+            token_ids,
+            multimodal_input,
+            constraint,
+        )
+    }
+
+    /// [`Self::build_generate_request_from_chat`] without a receiver.
+    pub fn build_generate_request_from_chat_parts(
+        request_id: String,
+        body: &ChatCompletionRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        multimodal_input: Option<proto::MultimodalInput>,
+        constraint: OutputConstraint,
+    ) -> Result<proto::GenerateRequest, String> {
+        refuse_logit_bias(body.logit_bias.as_ref())?;
         // Build sampling config
         let sampling_config = Self::build_sampling_config_from_chat(body);
 
@@ -129,11 +144,11 @@ impl TrtllmServiceClient {
         let output_config = Self::build_output_config_from_chat(body);
 
         // Build guided decoding params if needed
-        let guided_decoding = Self::build_guided_decoding_from_chat(body, tool_call_constraint)?;
+        let guided_decoding = Self::build_guided_decoding_from_chat(body, constraint)?;
 
-        let stop = Self::extract_stop_strings(body.stop.as_ref());
+        let stop = stop_strings(body.stop.as_ref());
 
-        let max_tokens = body.max_completion_tokens.unwrap_or(2048);
+        let max_tokens = body.output_token_cap().unwrap_or(2048);
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -149,19 +164,10 @@ impl TrtllmServiceClient {
             stop,
             stop_token_ids: vec![],
             ignore_eos: body.ignore_eos,
-            bad: vec![],
-            bad_token_ids: vec![],
             guided_decoding,
-            embedding_bias: vec![],
-            lora_config: None,
-            prompt_tuning_config: None,
             multimodal_input,
-            kv_cache_retention: None,
-            disaggregated_params: None,
-            lookahead_config: None,
-            cache_salt_id: None,
-            arrival_time: None,
-            include_stop_token_in_output: false,
+            include_stop_token_in_output: body.no_stop_trim,
+            ..Default::default()
         };
 
         Ok(grpc_request)
@@ -172,10 +178,6 @@ impl TrtllmServiceClient {
         clippy::unused_self,
         reason = "method receiver kept for consistent public API across gRPC backends"
     )]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "returns Result for API consistency with sglang/vllm backends which can fail"
-    )]
     pub fn build_plain_generate_request(
         &self,
         request_id: String,
@@ -183,7 +185,18 @@ impl TrtllmServiceClient {
         original_text: Option<String>,
         token_ids: Vec<u32>,
     ) -> Result<proto::GenerateRequest, String> {
-        let sampling_config = Self::build_sampling_config_from_plain(body.sampling_params.as_ref());
+        Self::build_plain_generate_request_parts(request_id, body, original_text, token_ids)
+    }
+
+    /// [`Self::build_plain_generate_request`] without a receiver.
+    pub fn build_plain_generate_request_parts(
+        request_id: String,
+        body: &GenerateRequest,
+        original_text: Option<String>,
+        token_ids: Vec<u32>,
+    ) -> Result<proto::GenerateRequest, String> {
+        let plain = PlainSampling::read(body.sampling_params.as_ref());
+        let sampling_config = Self::build_sampling_config_from_plain(&plain);
         let output_config = proto::OutputConfig {
             logprobs: if body.return_logprob.unwrap_or(false) {
                 Some(body.top_logprobs_num.unwrap_or(0))
@@ -198,21 +211,12 @@ impl TrtllmServiceClient {
             return_perf_metrics: false,
         };
 
-        // Build guided decoding from plain sampling params
-        let guided_decoding = if let Some(params) = &body.sampling_params {
-            Self::build_guided_decoding_from_plain(params)
-        } else {
-            None
+        let guided_decoding = match &body.sampling_params {
+            Some(params) => Self::guide_of(plain_constraint(params)?),
+            None => None,
         };
 
-        let max_tokens = body
-            .sampling_params
-            .as_ref()
-            .and_then(|p| p.max_new_tokens)
-            .unwrap_or(2048);
-
-        let stop =
-            Self::extract_stop_strings(body.sampling_params.as_ref().and_then(|p| p.stop.as_ref()));
+        let max_tokens = plain.max_new_tokens.unwrap_or(2048);
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -225,26 +229,13 @@ impl TrtllmServiceClient {
             output_config: Some(output_config),
             max_tokens,
             streaming: body.stream,
-            stop,
-            stop_token_ids: vec![],
-            ignore_eos: body
-                .sampling_params
-                .as_ref()
-                .and_then(|p| p.ignore_eos)
-                .unwrap_or(false),
-            bad: vec![],
-            bad_token_ids: vec![],
+            stop: plain.stop,
+            stop_token_ids: plain.stop_token_ids,
+            ignore_eos: plain.ignore_eos,
             guided_decoding,
-            embedding_bias: vec![],
-            lora_config: None,
-            prompt_tuning_config: None,
             multimodal_input: None,
-            kv_cache_retention: None,
-            disaggregated_params: None,
-            lookahead_config: None,
-            cache_salt_id: None,
-            arrival_time: None,
-            include_stop_token_in_output: false,
+            include_stop_token_in_output: plain.no_stop_trim,
+            ..Default::default()
         };
 
         Ok(grpc_request)
@@ -289,34 +280,16 @@ impl TrtllmServiceClient {
             output_config: Some(output_config),
             max_tokens,
             streaming: body.stream.unwrap_or(false),
-            stop: vec![], // Does not pass through body.stop yet (follow-up fix)
+            stop: stop_strings(body.stop.as_ref()),
             stop_token_ids: vec![],
             ignore_eos: false,
-            bad: vec![],
-            bad_token_ids: vec![],
             guided_decoding,
-            embedding_bias: vec![],
-            lora_config: None,
-            prompt_tuning_config: None,
             multimodal_input: None,
-            kv_cache_retention: None,
-            disaggregated_params: None,
-            lookahead_config: None,
-            cache_salt_id: None,
-            arrival_time: None,
             include_stop_token_in_output: false,
+            ..Default::default()
         };
 
         Ok(grpc_request)
-    }
-
-    /// Extract stop strings from an optional StringOrArray
-    fn extract_stop_strings(stop: Option<&StringOrArray>) -> Vec<String> {
-        match stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        }
     }
 
     /// Build SamplingConfig from ChatCompletionRequest
@@ -370,53 +343,33 @@ impl TrtllmServiceClient {
     /// Build GuidedDecodingParams from ChatCompletionRequest
     fn build_guided_decoding_from_chat(
         request: &ChatCompletionRequest,
-        tool_call_constraint: Option<(String, String)>,
+        OutputConstraint { tool, set_aside }: OutputConstraint,
     ) -> Result<Option<proto::GuidedDecodingParams>, String> {
         // Collect non-tool constraint (response_format, ebnf, regex)
-        let mut guided = None;
-
-        match &request.response_format {
-            Some(ResponseFormat::JsonObject) => {
-                let schema = serde_json::json!({"type": "object"});
-                let schema_str = serde_json::to_string(&schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
-                guided = Some(proto::GuidedDecodingParams {
-                    guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
-                    guide: schema_str,
-                });
-            }
-            Some(ResponseFormat::JsonSchema { json_schema }) => {
-                let schema_str = serde_json::to_string(&json_schema.schema)
-                    .map_err(|e| format!("Failed to serialize JSON schema: {e}"))?;
-                guided = Some(proto::GuidedDecodingParams {
-                    guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
-                    guide: schema_str,
-                });
-            }
-            Some(ResponseFormat::Text) | None => {}
-        }
+        let format = body_format(request, set_aside)?;
+        let mut guided = Self::guide_of(format.format);
 
         if guided.is_none() {
-            if let Some(ebnf) = &request.ebnf {
+            if let Some(ebnf) = format.ebnf {
                 guided = Some(proto::GuidedDecodingParams {
                     guide_type: proto::guided_decoding_params::GuideType::EbnfGrammar as i32,
-                    guide: ebnf.clone(),
+                    guide: ebnf.to_string(),
                 });
             }
         }
 
         if guided.is_none() {
-            if let Some(regex) = &request.regex {
+            if let Some(regex) = format.regex {
                 guided = Some(proto::GuidedDecodingParams {
                     guide_type: proto::guided_decoding_params::GuideType::Regex as i32,
-                    guide: regex.clone(),
+                    guide: regex.to_string(),
                 });
             }
         }
 
         // Tool call constraint — drop if another constraint already set
         // (matches TRT-LLM HTTP behavior where response_format takes priority)
-        if let Some((constraint_type, constraint_value)) = tool_call_constraint {
+        if let Some((constraint_type, constraint_value)) = tool {
             if guided.is_some() {
                 warn!("Constrained decoding is not compatible with tool calls, dropping tool constraint");
             } else {
@@ -496,7 +449,7 @@ impl TrtllmServiceClient {
         processed_text: String,
         token_ids: Vec<u32>,
         multimodal_input: Option<proto::MultimodalInput>,
-        tool_call_constraint: Option<(String, String)>,
+        constraint: OutputConstraint,
     ) -> Result<proto::GenerateRequest, String> {
         let sampling_config = Self::build_sampling_config_from_messages(body);
         let output_config = proto::OutputConfig {
@@ -509,7 +462,7 @@ impl TrtllmServiceClient {
             return_perf_metrics: false,
         };
 
-        let guided_decoding = Self::build_guided_decoding_from_responses(tool_call_constraint)?;
+        let guided_decoding = Self::build_guided_decoding_from_responses(constraint.tool)?;
 
         let stop = body.stop_sequences.clone().unwrap_or_default();
         let max_tokens = body.max_tokens;
@@ -528,19 +481,10 @@ impl TrtllmServiceClient {
             stop,
             stop_token_ids: vec![],
             ignore_eos: false,
-            bad: vec![],
-            bad_token_ids: vec![],
             guided_decoding,
-            embedding_bias: vec![],
-            lora_config: None,
-            prompt_tuning_config: None,
             multimodal_input,
-            kv_cache_retention: None,
-            disaggregated_params: None,
-            lookahead_config: None,
-            cache_salt_id: None,
-            arrival_time: None,
             include_stop_token_in_output: false,
+            ..Default::default()
         };
 
         Ok(grpc_request)
@@ -586,9 +530,10 @@ impl TrtllmServiceClient {
         original_text: String,
         token_ids: Vec<u32>,
     ) -> Result<proto::GenerateRequest, String> {
+        refuse_logit_bias(body.logit_bias.as_ref())?;
         let sampling_config = Self::build_sampling_config_from_completion(body);
         let output_config = proto::OutputConfig {
-            logprobs: body.logprobs.map(|v| v.min(5) as i32),
+            logprobs: body.logprobs.map(|v| v.min(20) as i32),
             prompt_logprobs: None,
             return_context_logits: false,
             return_generation_logits: false,
@@ -597,13 +542,9 @@ impl TrtllmServiceClient {
             return_perf_metrics: false,
         };
 
-        let guided_decoding = Self::build_guided_decoding_from_completion(body)?;
+        let guided_decoding = Self::guide_of(completion_constraint(body)?);
 
-        let stop = match &body.stop {
-            Some(StringOrArray::String(s)) => vec![s.clone()],
-            Some(StringOrArray::Array(arr)) => arr.clone(),
-            None => vec![],
-        };
+        let stop = stop_strings(body.stop.as_ref());
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -619,19 +560,10 @@ impl TrtllmServiceClient {
             stop,
             stop_token_ids: body.stop_token_ids.clone().unwrap_or_default(),
             ignore_eos: body.ignore_eos,
-            bad: vec![],
-            bad_token_ids: vec![],
             guided_decoding,
-            embedding_bias: vec![],
-            lora_config: None,
-            prompt_tuning_config: None,
             multimodal_input: None,
-            kv_cache_retention: None,
-            disaggregated_params: None,
-            lookahead_config: None,
-            cache_salt_id: None,
-            arrival_time: None,
             include_stop_token_in_output: body.no_stop_trim,
+            ..Default::default()
         };
 
         Ok(grpc_request)
@@ -662,135 +594,326 @@ impl TrtllmServiceClient {
         }
     }
 
-    fn build_guided_decoding_from_completion(
-        request: &CompletionRequest,
-    ) -> Result<Option<proto::GuidedDecodingParams>, String> {
-        let mut guides = Vec::new();
-
-        if let Some(json_schema) = &request.json_schema {
-            guides.push((
-                proto::guided_decoding_params::GuideType::JsonSchema,
-                json_schema.clone(),
-            ));
-        }
-        if let Some(regex) = &request.regex {
-            guides.push((
-                proto::guided_decoding_params::GuideType::Regex,
-                regex.clone(),
-            ));
-        }
-        if let Some(ebnf) = &request.ebnf {
-            guides.push((
-                proto::guided_decoding_params::GuideType::EbnfGrammar,
-                ebnf.clone(),
-            ));
-        }
-
-        match guides.len() {
-            0 => Ok(None),
-            1 => {
-                #[expect(clippy::expect_used, reason = "INVARIANT: checked len == 1 above")]
-                let (guide_type, guide) = guides.pop().expect("checked len == 1");
-                Ok(Some(proto::GuidedDecodingParams {
-                    guide_type: guide_type as i32,
-                    guide,
-                }))
+    /// The engine's guide for the structured constraint a request names.
+    fn guide_of(
+        constraint: Option<(ConstraintKind, String)>,
+    ) -> Option<proto::GuidedDecodingParams> {
+        constraint.map(|(kind, guide)| {
+            let guide_type = match kind {
+                ConstraintKind::JsonSchema => proto::guided_decoding_params::GuideType::JsonSchema,
+                ConstraintKind::Regex => proto::guided_decoding_params::GuideType::Regex,
+                ConstraintKind::Ebnf => proto::guided_decoding_params::GuideType::EbnfGrammar,
+                ConstraintKind::StructuralTag => {
+                    proto::guided_decoding_params::GuideType::StructuralTag
+                }
+            };
+            proto::GuidedDecodingParams {
+                guide_type: guide_type as i32,
+                guide,
             }
-            _ => Err("Multiple structured constraints are not allowed".to_string()),
-        }
+        })
     }
 
-    fn build_sampling_config_from_plain(
-        params: Option<&GenerateSamplingParams>,
-    ) -> proto::SamplingConfig {
-        let mut config = proto::SamplingConfig {
+    fn build_sampling_config_from_plain(plain: &PlainSampling) -> proto::SamplingConfig {
+        proto::SamplingConfig {
             beam_width: 1,
-            num_return_sequences: 1,
-            top_k: None,
-            top_p: Some(1.0),
+            num_return_sequences: plain.n,
+            top_k: plain.top_k.map(|k| k.max(0)),
+            top_p: Some(plain.top_p),
             top_p_min: None,
             top_p_reset_ids: None,
             top_p_decay: None,
-            seed: None,
-            temperature: Some(1.0),
-            min_tokens: None,
+            seed: plain.sampling_seed,
+            temperature: Some(plain.temperature),
+            min_tokens: plain.min_new_tokens,
             beam_search_diversity_rate: None,
-            repetition_penalty: Some(1.0),
-            presence_penalty: None,
-            frequency_penalty: None,
+            repetition_penalty: Some(plain.repetition_penalty),
+            presence_penalty: plain.presence_penalty,
+            frequency_penalty: plain.frequency_penalty,
             prompt_ignore_length: None,
             length_penalty: None,
             early_stopping: None,
             no_repeat_ngram_size: None,
-            min_p: None,
+            min_p: plain.min_p,
             beam_width_array: vec![],
-        };
-
-        let Some(p) = params else {
-            return config;
-        };
-
-        if let Some(val) = p.temperature {
-            config.temperature = Some(val);
         }
-        if let Some(val) = p.top_p {
-            config.top_p = Some(val);
-        }
-        if let Some(val) = p.top_k {
-            config.top_k = Some(val.max(0));
-        }
-        if let Some(val) = p.frequency_penalty {
-            config.frequency_penalty = Some(val);
-        }
-        if let Some(val) = p.presence_penalty {
-            config.presence_penalty = Some(val);
-        }
-        if let Some(val) = p.repetition_penalty {
-            config.repetition_penalty = Some(val);
-        }
-        if let Some(val) = p.min_p {
-            config.min_p = Some(val);
-        }
-        config.min_tokens = p.min_new_tokens;
-        if let Some(n) = p.n {
-            config.num_return_sequences = n;
-        }
-
-        config
-    }
-
-    fn build_guided_decoding_from_plain(
-        params: &GenerateSamplingParams,
-    ) -> Option<proto::GuidedDecodingParams> {
-        if let Some(json_schema) = &params.json_schema {
-            return Some(proto::GuidedDecodingParams {
-                guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
-                guide: json_schema.clone(),
-            });
-        }
-        if let Some(regex) = &params.regex {
-            return Some(proto::GuidedDecodingParams {
-                guide_type: proto::guided_decoding_params::GuideType::Regex as i32,
-                guide: regex.clone(),
-            });
-        }
-        if let Some(ebnf) = &params.ebnf {
-            return Some(proto::GuidedDecodingParams {
-                guide_type: proto::guided_decoding_params::GuideType::EbnfGrammar as i32,
-                guide: ebnf.clone(),
-            });
-        }
-        None
     }
 }
+
+/// The engine's wire carries a bias over the whole vocabulary as a dense
+/// vector sized by the engine (`embedding_bias`), not the request's sparse
+/// map, and the gateway does not know that size; a request that carries a
+/// bias is refused rather than served without it.
+fn refuse_logit_bias(bias: Option<&HashMap<String, f32>>) -> Result<(), String> {
+    match bias {
+        Some(bias) if !bias.is_empty() => Err("logit_bias is not supported on this worker: the \
+             engine takes a dense bias over its whole vocabulary, which the gateway does not \
+             build from the request's map"
+            .to_string()),
+        _ => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proto → protocol type conversions (load metrics)
+// ---------------------------------------------------------------------------
+
+// The measured input capacity stays absent when the servicer reports none.
+crate::impl_rank_load_conversions!(proto);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A request with a `logit_bias` is refused: the wire has no sparse map.
+    /// (The completion builder keeps a receiver, and a lazy channel needs the
+    /// runtime.)
+    #[tokio::test]
+    async fn a_logit_bias_is_refused_on_this_wire() {
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "logit_bias": {"1": -100}
+        }))
+        .expect("a chat request");
+        let error = TrtllmServiceClient::build_generate_request_from_chat_parts(
+            "r".to_string(),
+            &chat,
+            "hi".to_string(),
+            vec![1],
+            None,
+            OutputConstraint::default(),
+        )
+        .expect_err("refused");
+        assert!(error.contains("logit_bias"), "{error}");
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": "hi", "logit_bias": {"1": -100}
+        }))
+        .expect("a completion request");
+        let client = TrtllmServiceClient {
+            client: proto::trtllm_service_client::TrtllmServiceClient::new(
+                Channel::unconnected(
+                    "http://127.0.0.1:1",
+                    crate::channel::DEFAULT_CONNECT_TIMEOUT,
+                )
+                .expect("a channel to nowhere"),
+            ),
+            trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
+        };
+        let error = client
+            .build_generate_request_from_completion(
+                "r".to_string(),
+                &completion,
+                "hi".to_string(),
+                vec![1],
+            )
+            .expect_err("refused");
+        assert!(error.contains("logit_bias"), "{error}");
+        let plain: CompletionRequest =
+            serde_json::from_value(serde_json::json!({"model": "m", "prompt": "hi"}))
+                .expect("a request");
+        assert!(client
+            .build_generate_request_from_completion(
+                "r".to_string(),
+                &plain,
+                "hi".to_string(),
+                vec![1]
+            )
+            .is_ok());
+    }
+    use crate::channel::testing::refused_endpoint;
+
+    /// A poll's answer reaches the worker's report rank for rank, the
+    /// measured capacity included where the servicer reports one.
     #[test]
-    fn test_proto_types_compilation() {
-        let _health_req = proto::HealthCheckRequest {};
+    fn a_get_loads_answer_converts_rank_for_rank() {
+        let response = proto::GetLoadsResponse {
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            version: "1.0".into(),
+            dp_rank_count: 2,
+            loads: vec![
+                proto::SchedulerLoad {
+                    dp_rank: 0,
+                    num_running_reqs: 3,
+                    num_waiting_reqs: 1,
+                    num_total_reqs: 4,
+                    num_used_tokens: 640,
+                    max_total_num_tokens: 6_400,
+                    token_usage: 0.1,
+                    gen_throughput: 800.0,
+                    cache_hit_rate: 0.5,
+                    utilization: 0.1,
+                    max_running_requests: 32,
+                    num_waiting_uncached_tokens: 500,
+                    prefill_throughput: Some(12_000.0),
+                },
+                proto::SchedulerLoad {
+                    dp_rank: 1,
+                    ..Default::default()
+                },
+            ],
+        };
+        let loads = openai_protocol::worker::WorkerLoadResponse::from(response);
+        assert_eq!(
+            (
+                loads.dp_rank_count,
+                loads.loads.len(),
+                loads.version.as_str()
+            ),
+            (2, 2, "1.0")
+        );
+        let rank0 = &loads.loads[0];
+        assert_eq!(
+            (
+                rank0.dp_rank,
+                rank0.num_running_reqs,
+                rank0.num_waiting_reqs,
+                rank0.num_total_reqs
+            ),
+            (0, 3, 1, 4)
+        );
+        assert_eq!(
+            (
+                rank0.num_used_tokens,
+                rank0.max_total_num_tokens,
+                rank0.max_running_requests
+            ),
+            (640, 6_400, 32)
+        );
+        assert_eq!(
+            (
+                rank0.token_usage,
+                rank0.gen_throughput,
+                rank0.cache_hit_rate,
+                rank0.utilization
+            ),
+            (0.1, 800.0, 0.5, 0.1)
+        );
+        assert_eq!(
+            (rank0.num_waiting_uncached_tokens, rank0.prefill_throughput),
+            (500, Some(12_000.0))
+        );
+        assert_eq!(
+            (loads.loads[1].dp_rank, loads.loads[1].prefill_throughput),
+            (1, None)
+        );
+    }
+
+    #[test]
+    fn plain_sampling_seed_and_stop_token_ids_reach_the_request() {
+        let body: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "sampling_params": {"sampling_seed": 7, "stop_token_ids": [1, 2]}
+        }))
+        .unwrap();
+        let request = TrtllmServiceClient::build_plain_generate_request_parts(
+            "r".into(),
+            &body,
+            None,
+            vec![3],
+        )
+        .unwrap();
+        assert_eq!(request.sampling_config.unwrap().seed, Some(7));
+        assert_eq!(request.stop_token_ids, vec![1, 2]);
+    }
+
+    /// A `response_format` set aside for the builder reads as absent: the tag
+    /// stays the request's one guide, where the body's schema wins when nothing
+    /// is set aside.
+    #[test]
+    fn a_response_format_set_aside_leaves_the_tag_as_the_one_guide() {
+        use crate::request_fields::FormatSetAside;
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": {"type": "object"}}}
+        }))
+        .expect("a chat request");
+        let tag = Some(("structural_tag".to_string(), "tag".to_string()));
+        let guide_of = |constraint: OutputConstraint| {
+            TrtllmServiceClient::build_generate_request_from_chat_parts(
+                "id".to_string(),
+                &request,
+                "hi".to_string(),
+                vec![1],
+                None,
+                constraint,
+            )
+            .expect("built")
+            .guided_decoding
+            .map(|guided| (guided.guide_type, guided.guide))
+        };
+
+        // The body's own format wins over a tool constraint on this engine.
+        assert_eq!(
+            guide_of(OutputConstraint::tool(tag.clone())),
+            Some((
+                proto::guided_decoding_params::GuideType::JsonSchema as i32,
+                r#"{"type":"object"}"#.to_string()
+            ))
+        );
+        // Set aside, it is not read, and the tag that answers it is the guide.
+        assert_eq!(
+            guide_of(OutputConstraint {
+                tool: tag,
+                set_aside: FormatSetAside {
+                    response_format: true,
+                    grammar: false,
+                },
+            }),
+            Some((
+                proto::guided_decoding_params::GuideType::StructuralTag as i32,
+                "tag".to_string()
+            ))
+        );
+    }
+
+    /// A plain request names at most one structured constraint, as a completion
+    /// request does: two are refused with the completion path's words, one still
+    /// reaches the request as its guide.
+    #[test]
+    fn a_plain_request_with_two_structured_constraints_is_refused_as_a_completion_is() {
+        let schema = "{\"type\":\"object\"}";
+        let two: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "sampling_params": {"json_schema": schema, "regex": "[a-z]+"}
+        }))
+        .unwrap();
+        let refused = TrtllmServiceClient::build_plain_generate_request_parts(
+            "r".into(),
+            &two,
+            None,
+            vec![3],
+        )
+        .unwrap_err();
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": "hi",
+            "json_schema": schema,
+            "regex": "[a-z]+"
+        }))
+        .unwrap();
+        let on_completions = completion_constraint(&completion).unwrap_err();
+        assert_eq!(refused, on_completions);
+        assert_eq!(refused, "Multiple structured constraints are not allowed");
+
+        let one: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "sampling_params": {"regex": "[a-z]+"}
+        }))
+        .unwrap();
+        let request = TrtllmServiceClient::build_plain_generate_request_parts(
+            "r".into(),
+            &one,
+            None,
+            vec![3],
+        )
+        .unwrap();
+        assert_eq!(
+            request.guided_decoding,
+            Some(proto::GuidedDecodingParams {
+                guide_type: proto::guided_decoding_params::GuideType::Regex as i32,
+                guide: "[a-z]+".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -833,11 +956,6 @@ mod tests {
         let config = gen_req.sampling_config.unwrap();
         assert_eq!(config.temperature, Some(0.7));
         assert_eq!(config.top_p, Some(0.9));
-    }
-
-    #[test]
-    fn test_health_check_request() {
-        let _health_req = proto::HealthCheckRequest {};
     }
 
     #[test]
@@ -893,9 +1011,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_connect_invalid_endpoint() {
-        let result = TrtllmServiceClient::connect("invalid://endpoint").await;
-        assert!(result.is_err());
+    async fn a_responses_request_s_stop_sequences_reach_the_engine_request() {
+        use openai_protocol::responses::ResponsesRequest;
+
+        // A client over a lazy channel nothing listens on (made under the
+        // runtime a channel needs): the builders dial nothing.
+        let client = TrtllmServiceClient {
+            client: proto::trtllm_service_client::TrtllmServiceClient::new(
+                Channel::unconnected(
+                    "http://127.0.0.1:1",
+                    crate::channel::DEFAULT_CONNECT_TIMEOUT,
+                )
+                .expect("a channel to nowhere"),
+            ),
+            trace_injector: std::sync::Arc::new(crate::NoopTraceInjector),
+        };
+        let build = |request: &ResponsesRequest| {
+            client
+                .build_generate_request_from_responses(
+                    "r".to_string(),
+                    request,
+                    String::new(),
+                    vec![1],
+                    None,
+                )
+                .expect("build request")
+        };
+
+        // The string form, as the chat builder forwards it.
+        let request = ResponsesRequest {
+            stop: Some(openai_protocol::common::StringOrArray::String(
+                "STOP".to_string(),
+            )),
+            ..Default::default()
+        };
+        assert_eq!(build(&request).stop, vec!["STOP"]);
+
+        // A request without `stop` leaves the list empty.
+        assert!(build(&ResponsesRequest::default()).stop.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_fails_on_a_malformed_or_refused_endpoint() {
+        let malformed = TrtllmServiceClient::connect("not an endpoint").await;
+        assert!(
+            malformed.is_err(),
+            "a malformed endpoint fails before the dial"
+        );
+        let refused = refused_endpoint();
+        let result = TrtllmServiceClient::connect(&refused.url).await;
+        assert!(result.is_err(), "a refused dial fails the connect");
     }
 
     #[test]
@@ -939,5 +1104,38 @@ mod tests {
             proto::guided_decoding_params::GuideType::JsonSchema as i32
         );
         assert_eq!(guided.guide, r#"{"type": "object"}"#);
+    }
+
+    /// Each constraint kind reaches the engine as its guide type; none stays none.
+    #[test]
+    fn guide_of_maps_each_kind_to_the_engines_guide_type() {
+        use crate::request_fields::ConstraintKind;
+        for (kind, guide_type) in [
+            (
+                ConstraintKind::JsonSchema,
+                proto::guided_decoding_params::GuideType::JsonSchema,
+            ),
+            (
+                ConstraintKind::Regex,
+                proto::guided_decoding_params::GuideType::Regex,
+            ),
+            (
+                ConstraintKind::Ebnf,
+                proto::guided_decoding_params::GuideType::EbnfGrammar,
+            ),
+            (
+                ConstraintKind::StructuralTag,
+                proto::guided_decoding_params::GuideType::StructuralTag,
+            ),
+        ] {
+            assert_eq!(
+                TrtllmServiceClient::guide_of(Some((kind, "v".to_string()))),
+                Some(proto::GuidedDecodingParams {
+                    guide_type: guide_type as i32,
+                    guide: "v".to_string(),
+                })
+            );
+        }
+        assert_eq!(TrtllmServiceClient::guide_of(None), None);
     }
 }

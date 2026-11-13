@@ -9,25 +9,27 @@ use crate::routers::{
     error as grpc_error,
     grpc::{
         common::stages::BuildStage,
-        context::{BuildOutput, ExecutionPlanKind, RequestContext, RequestType},
+        context::{BuildOutput, PlanSettings, RequestContext, RequestType},
     },
 };
 
 /// Request building stage for chat and generate pipelines
 ///
 /// These two request types share a single pipeline instance and are dispatched
-/// here. All other request types have dedicated pipelines and wire their own
-/// request building stages directly.
+/// here, through the inner stages' inherent futures: the stage call boxes once
+/// (this stage's `async_trait` future), not once more for the inner stage. All
+/// other request types have dedicated pipelines and wire their own request
+/// building stages directly.
 pub(crate) struct ChatGenerateRequestBuildingStage {
     chat_stage: ChatRequestBuildingStage,
     generate_stage: GenerateRequestBuildingStage,
 }
 
 impl ChatGenerateRequestBuildingStage {
-    pub fn new(inject_pd_metadata: bool, plan_kind: ExecutionPlanKind) -> Self {
+    pub fn new(settings: PlanSettings) -> Self {
         Self {
-            chat_stage: ChatRequestBuildingStage::new(inject_pd_metadata, plan_kind),
-            generate_stage: GenerateRequestBuildingStage::new(inject_pd_metadata, plan_kind),
+            chat_stage: ChatRequestBuildingStage::new(settings),
+            generate_stage: GenerateRequestBuildingStage::new(settings),
         }
     }
 }
@@ -36,8 +38,8 @@ impl ChatGenerateRequestBuildingStage {
 impl BuildStage for ChatGenerateRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         match &ctx.input.request_type {
-            RequestType::Chat(_) => self.chat_stage.build(ctx).await,
-            RequestType::Generate(_) => self.generate_stage.build(ctx).await,
+            RequestType::Chat(_) => self.chat_stage.build_plan(ctx).await,
+            RequestType::Generate(_) => self.generate_stage.build_plan(ctx),
             request_type => {
                 error!(
                     function = "ChatGenerateRequestBuildingStage::build",

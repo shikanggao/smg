@@ -12,17 +12,24 @@
 //! - [`serialize`]: tensor byte/dtype serialization used by assembly.
 //! - [`transport`]: SHM-vs-inline transport resolution and `/dev/shm`
 //!   namespace verification.
+//! - [`refs`]: router-vs-worker processing resolution and the media-reference
+//!   payload for workers that process media themselves.
 
-use std::{
-    collections::HashSet,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashSet, sync::Arc};
 
+use axum::response::Response;
 use llm_multimodal::{
-    AudioClip, EncoderFieldLayouts, ImageFrame, Modality, PlaceholderRange,
+    hub::HubFetchError, AudioClip, EncoderFieldLayouts, EncoderInputFormat, ImageFrame,
+    MediaConnectorError, MediaFault, Modality, MultiModalError, PlaceholderRange,
     PreprocessedEncoderInputs, VideoClip,
 };
 use llm_tokenizer::{Encoding, TokenizerTrait};
+
+use crate::routers::{
+    common::retry::mark_non_retryable,
+    error,
+    grpc::{proto_wrapper::VLLM_MROPE_GRID_KEYS, utils::message_utils::invalid_multimodal_request},
+};
 
 /// Bridges the gateway's tokenizer to the model registry's local tokenizer
 /// seam: `llm-multimodal` deliberately depends on no tokenizer crate, so the
@@ -50,39 +57,175 @@ mod assemble;
 mod capability;
 mod config;
 mod detect;
+pub(crate) mod ec_push;
+mod encoder_budget;
+mod inflight;
+mod item_limits;
 mod pixel_cache;
 mod plan;
 mod process;
+mod refs;
 mod serialize;
+mod settings;
+mod transparency;
 mod transport;
+pub mod worker;
 
+#[cfg(test)]
+pub(crate) use assemble::tests::single_image_intermediate;
 pub(crate) use assemble::{
     assemble_multimodal_data, assemble_multimodal_data_after_encode,
     assemble_tokenspeed_for_encode, encode_routing_hashes,
 };
-pub(crate) use capability::ensure_backend_supports_modalities;
+pub(crate) use capability::{
+    ensure_backend_supports_modalities, ensure_model_accepts_media, fleet_reads_format,
+    request_needs_vision, worker_language_model_only, SUPPORTS_VISION_LABEL,
+};
 pub(crate) use config::{
     load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
     MultimodalConfigRegistry, MultimodalModelConfig,
 };
 pub(crate) use detect::{media_plan_chat, media_plan_messages};
+pub(crate) use encoder_budget::engine_encoder_budget;
+pub(crate) use inflight::{
+    reserve_multimodal_inflight, InflightPermit, UNIT_BYTES as INFLIGHT_UNIT_BYTES,
+};
+pub(crate) use item_limits::engine_item_limits;
 pub(crate) use plan::{
-    prepare_placeholder_tokens, resolve_media_part_order, validate_rendered_media_anchors,
-    PlaceholderTokens,
+    anchor_rendered_markers, prepare_placeholder_tokens, resolve_media_part_order,
+    validate_rendered_media_anchors, MediaPlan, PlaceholderTokens,
 };
 pub(crate) use process::process_multimodal_plan;
-pub(crate) use transport::{init_mm_transport_defaults, mm_rdma_exporter};
+pub(crate) use refs::{
+    assemble_media_refs, ensure_selection_supports_media_refs, media_refs_pipeline_pin,
+    models_without_media_processing, pool_processes_media_refs,
+    registration_lacks_media_processing, resolve_mm_processing, worker_accepts_media_refs,
+    worker_runs_gateway_pipeline, worker_supports_ec_transfer, MmProcessing, MmRefsError,
+    GATEWAY_PIPELINE_PROCESSOR,
+};
+pub(crate) use serialize::WireMismatch;
+pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
+pub(crate) use transparency::engine_transparency_policy;
+pub(crate) use transport::{
+    init_mm_transport_defaults, mm_rdma_exporter, mm_shared_image_wire_dtype_over,
+};
 
-/// Whether verbose multimodal timing logs are enabled via `SMG_LOG_MM_TIMING`.
-/// Read from the environment once and cached; the flag is not expected to change
-/// at runtime, and this is called on every multimodal request.
-fn log_mm_timing_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("SMG_LOG_MM_TIMING")
-            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false)
+/// The response for an error of assembling or planning a request's
+/// multimodal data: the typed wire mismatch is the gateway's own transient
+/// state (the model's workers changed between preparation and selection),
+/// answered with a retryable status; anything else is the request's.
+pub(crate) fn assembly_error_response(error: &anyhow::Error) -> Response {
+    if WireMismatch::is(error) {
+        error::service_unavailable("multimodal_wire_changed", format!("{error}"))
+    } else {
+        error::bad_request("multimodal_not_supported", format!("{error}"))
+    }
+}
+
+/// The client-facing message for a media pipeline failure: the whole error
+/// chain, so the cause (the URL whose fetch ran out of its budget, the clip
+/// the decoder refused) reaches the caller, not only the outermost context.
+pub(crate) fn processing_failed_message(error: &anyhow::Error) -> String {
+    format!("Multimodal processing failed: {error:#}")
+}
+
+/// The media connector's own error in a pipeline failure's chain, if any:
+/// the verdict both pipelines answer the client by, the router-side one
+/// directly ([`processing_failed_response`]) and the worker-side one through
+/// the trailers of the worker's refusal (`worker::classify`).
+pub(crate) fn media_verdict(error: &anyhow::Error) -> Option<&MediaConnectorError> {
+    error.chain().find_map(|cause| {
+        if let Some(media) = cause.downcast_ref::<MediaConnectorError>() {
+            return Some(media);
+        }
+        match cause.downcast_ref::<MultiModalError>() {
+            Some(MultiModalError::Media(media)) => Some(media),
+            _ => None,
+        }
     })
+}
+
+/// The client's answer for a failure of the router-side media pipeline, by
+/// the connector's verdict on it, the same the worker-side pipeline reports
+/// for the same failure: a failure of the request's own media (a reference it
+/// got wrong, an origin that refuses or answers 4xx, a clip over a size cap)
+/// is a 400 under the media's code (`invalid_multimodal_request` for media
+/// refused as the request sent it, `media_fetch_failed`, `media_too_large`);
+/// a failure of the media's host for now (an origin that does not deliver
+/// within the fetch budget, answers 5xx or breaks the transfer) a 502 under
+/// the same code, so a client can tell what to fix from what to retry, and
+/// terminal for the retry layer (another attempt would meet the same host);
+/// this process's own fault (a scratch file, a decoder it cannot run, a
+/// decode task that died) a 500; a failure with no verdict in its chain (a
+/// part the pipeline does not take, a model it has no spec for) stays a 400
+/// `multimodal_processing_failed`.
+/// An item the engine could never place ([`encoder_budget::ItemOverEncoderBudget`])
+/// is a 400 under a code of its own, so a client can tell the item's size from a
+/// fetch or a decode that failed. A video part on a process without a video
+/// decoder ([`process::VideoDecoderUnavailable`], known at start-up) is the
+/// media stage's own refusal, `400 invalid_multimodal_request` in the words
+/// of a modality the model does not take. A configuration file the model's
+/// hub failed to serve is answered by [`config_unavailable_response`].
+pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
+    const PIPELINE_CODE: &str = "multimodal_processing_failed";
+    let message = processing_failed_message(error);
+    if encoder_budget::ItemOverEncoderBudget::is(error) {
+        return error::bad_request(encoder_budget::ITEM_OVER_ENCODER_BUDGET_CODE, message);
+    }
+    if process::VideoDecoderUnavailable::is(error) {
+        return invalid_multimodal_request(format!("{error:#}"));
+    }
+    if let Some(response) = config_unavailable_response(error) {
+        return response;
+    }
+    if let Some(media) = media_verdict(error) {
+        return match media.fault() {
+            MediaFault::Client => error::bad_request(media.code().as_str(), message),
+            MediaFault::Transient => {
+                let mut response = error::bad_gateway(media.code().as_str(), message);
+                mark_non_retryable(&mut response);
+                response
+            }
+            MediaFault::Internal => error::internal_error(PIPELINE_CODE, message),
+        };
+    }
+    let ours = error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<MultiModalError>(),
+            Some(MultiModalError::Join(_))
+        ) || cause.downcast_ref::<tokio::task::JoinError>().is_some()
+    });
+    if ours {
+        error::internal_error(PIPELINE_CODE, message)
+    } else {
+        error::bad_request(PIPELINE_CODE, message)
+    }
+}
+
+/// The client's answer when the model's hub failed to serve a configuration
+/// file ([`HubFetchError`] in the chain), on every path a request's media
+/// is resolved: a 502 under `multimodal_config_unavailable` with a generic
+/// message, since the fault is upstream of the gateway and the message of the
+/// chain names the hub's address. The response is left retryable: nothing of
+/// the model is kept from the failed attempt, so the next request resolves
+/// the checkpoint again (unlike a media host's transient fault, which the
+/// same host would repeat). The cause (the file, the hub's answer) is for the
+/// log at the call site. `None` for any other failure.
+pub(crate) fn config_unavailable_response(error: &anyhow::Error) -> Option<Response> {
+    HubFetchError::is(error).then(|| {
+        error::bad_gateway(
+            "multimodal_config_unavailable",
+            "The model's configuration could not be fetched from the model hub; \
+             retry the request",
+        )
+    })
+}
+
+/// Whether verbose multimodal timing logs are enabled (`--log-mm-timing` /
+/// `SMG_LOG_MM_TIMING`). Resolved once at startup; called on every multimodal
+/// request.
+pub(crate) fn log_mm_timing_enabled() -> bool {
+    mm_settings().log_mm_timing.value
 }
 
 /// Output of the multimodal processing pipeline.
@@ -104,6 +247,9 @@ pub(crate) struct MultimodalIntermediate {
     /// Independently preprocessed modality batches sharing one expanded prompt.
     /// A single-modality request is represented by a one-element vector.
     batches: Vec<PrecomputedMultimodalIntermediate>,
+    /// The format the spec's processors emitted the batches in
+    /// (`ModelProcessorSpec::encoder_input_format`).
+    encoder_input_format: EncoderInputFormat,
 }
 
 impl MultimodalIntermediate {
@@ -124,11 +270,36 @@ impl MultimodalIntermediate {
                 "multimodal intermediate contains an empty {modality} batch"
             );
         }
-        Ok(Self { batches })
+        Ok(Self {
+            batches,
+            encoder_input_format: EncoderInputFormat::Reference,
+        })
+    }
+
+    pub(crate) fn with_encoder_input_format(mut self, format: EncoderInputFormat) -> Self {
+        self.encoder_input_format = format;
+        self
+    }
+
+    pub(crate) fn encoder_input_format(&self) -> EncoderInputFormat {
+        self.encoder_input_format
     }
 
     pub(crate) fn batches(&self) -> &[PrecomputedMultimodalIntermediate] {
         &self.batches
+    }
+
+    /// Whether a batch carries the grid tensors a disaggregated decode side
+    /// derives its positions from ([`VLLM_MROPE_GRID_KEYS`]): such a side
+    /// cannot be served by a decode worker without a vision encoder.
+    pub(crate) fn has_mrope_grids(&self) -> bool {
+        self.batches.iter().any(|batch| {
+            batch
+                .preprocessed
+                .model_specific
+                .keys()
+                .any(|key| VLLM_MROPE_GRID_KEYS.contains(&key.as_str()))
+        })
     }
 
     pub(crate) fn into_batches(self) -> Vec<PrecomputedMultimodalIntermediate> {
@@ -193,4 +364,458 @@ pub(crate) struct PrecomputedMultimodalIntermediate {
     pub field_layouts: EncoderFieldLayouts,
     /// Tensor keys that should remain on CPU (vLLM `keep_on_cpu` hint).
     pub keep_on_cpu_keys: Vec<String>,
+    /// Wire key for the primary encoder tensor when the model's forward does
+    /// not take `pixel_values` (DeepSeek-V4.1 takes `patches`); `None` keeps
+    /// the default name.
+    pub encoder_input_key: Option<String>,
+}
+
+/// Sets the decoder availability gauges (`smg_mm_turbojpeg_available`,
+/// `smg_mm_webp_available`) on the recorder in force and returns what they
+/// read: the call [`report_jpeg_decoder`] makes every time it runs, kept
+/// apart so a test can run it against a recorder of its own. The gateway
+/// installs its Prometheus recorder before its report (`server.rs`): a gauge
+/// set before that lands in the no-op recorder and never reaches /metrics,
+/// which is why the gauges are set on every report and not once.
+pub(crate) fn record_decoder_availability() -> (bool, bool) {
+    use crate::observability::metrics::Metrics;
+    let available = llm_multimodal::jpeg_turbo::turbojpeg_available();
+    Metrics::set_mm_turbojpeg_available(available);
+    let webp = llm_multimodal::webp_native::webp_available();
+    Metrics::set_mm_webp_available(webp);
+    (available, webp)
+}
+
+/// Say once which JPEG and WebP decoders this process has, and publish them:
+/// without libjpeg-turbo the pure-Rust decoder's pixels differ from PIL's by a
+/// few levels, an embedding shift against an engine that decodes with PIL;
+/// without libwebp the WebP fallback is correct but several times slower.
+pub(crate) fn report_jpeg_decoder() {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    // The gauges on every call, the log lines once: a caller that builds the
+    // multimodal components before the start-up installs its recorder would
+    // otherwise consume the once block on the no-op recorder, and the
+    // start-up's own call could set neither gauge.
+    let (available, _webp) = record_decoder_availability();
+    ONCE.get_or_init(|| {
+        if available {
+            tracing::info!("JPEG decode uses libjpeg-turbo with PIL's defaults");
+        } else {
+            tracing::warn!(
+                "libturbojpeg not found: JPEGs decode with the pure-Rust decoder, whose pixels \
+                 differ from PIL's by a few levels; install libjpeg-turbo for exact parity with \
+                 an engine that decodes with PIL, or start with `--mm-turbojpeg require` to \
+                 refuse to serve without it"
+            );
+        }
+        match llm_multimodal::webp_native::webp_version() {
+            Some(version) => tracing::info!(%version, "WebP decode uses libwebp"),
+            None => tracing::info!(
+                "libwebp not found: WebP files decode with the pure-Rust decoder (the same \
+                 pixels, several times the cost); install libwebp for the faster decode"
+            ),
+        }
+        match llm_multimodal::missing_video_decoder() {
+            None => tracing::info!("video decode has its decoder"),
+            Some(why) => tracing::warn!(
+                "video input cannot be decoded by this process: {why}; a request with a video \
+                 part is refused up front until it can"
+            ),
+        }
+    });
+}
+
+/// Apply the operator's TurboJPEG policy to this process. Under `require` a
+/// process whose loader did not find the library does not come up, with the
+/// library and the gauge named, instead of serving the fallback decoder's
+/// pixels behind the one warning above; under `prefer` nothing changes. The
+/// router calls it once at start-up, in every routing mode, before anything
+/// binds (a gRPC router created behind the gateway's try-register would
+/// otherwise log its refusal and the process would start without it), and
+/// again where its components and the worker pipeline are built, for an
+/// embedded or test caller; the line under `require` is said once.
+pub(crate) fn enforce_jpeg_decoder_policy(
+    policy: llm_multimodal::jpeg_turbo::TurboJpegPolicy,
+) -> anyhow::Result<()> {
+    static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    llm_multimodal::jpeg_turbo::enforce_policy(policy).map_err(|error| {
+        anyhow::anyhow!("{error} (the gauge smg_mm_turbojpeg_available reads 0 for this process)")
+    })?;
+    if policy == llm_multimodal::jpeg_turbo::TurboJpegPolicy::Require {
+        SAID.get_or_init(|| {
+            tracing::info!("libjpeg-turbo is required by the TurboJPEG policy and was loaded");
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use axum::body::to_bytes;
+    use http::StatusCode;
+    use llm_multimodal::{hub::HubFetchError, MediaConnectorError, Modality, MultiModalError};
+
+    use super::{
+        config_unavailable_response, encoder_budget::ItemOverEncoderBudget,
+        processing_failed_message, processing_failed_response, record_decoder_availability,
+        report_jpeg_decoder, Response,
+    };
+    use crate::{middleware::test_support::json_of, routers::common::retry::NonRetryable};
+
+    async fn status_and_error(response: Response) -> (u16, serde_json::Value) {
+        let status = response.status().as_u16();
+        (status, json_of(response).await)
+    }
+
+    /// A configuration file the model's hub failed to serve is a 502 under its
+    /// own code with a generic message: the hub's answer and its address stay
+    /// out of the body, and the response carries no non-retryable mark, since
+    /// the next request resolves the checkpoint again. Any other failure is
+    /// not this answer.
+    #[tokio::test]
+    async fn a_processor_config_the_hub_failed_to_serve_answers_a_502_without_the_cause() {
+        let failed = anyhow::Error::from(HubFetchError {
+            model: "org/name".to_string(),
+            file: "preprocessor_config.json",
+            cause: "request error: HTTP status server error (503 Service Unavailable) for url \
+                    (http://hub.internal/org/name/resolve/main/preprocessor_config.json)"
+                .to_string(),
+        })
+        .context("Failed to resolve model config directory for 'org/name'");
+        let response = processing_failed_response(&failed);
+        assert!(
+            response.extensions().get::<NonRetryable>().is_none(),
+            "a hub failure is retried by the next request"
+        );
+        let (status, json) = status_and_error(response).await;
+        assert_eq!(status, 502);
+        assert_eq!(json["error"]["code"], "multimodal_config_unavailable");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(
+            !message.contains("hub.internal") && !message.contains("503"),
+            "the cause stays out of the body: {message}"
+        );
+        assert!(
+            message.contains("configuration could not be fetched"),
+            "the body says what was not fetched: {message}"
+        );
+
+        assert!(config_unavailable_response(&anyhow::anyhow!("decode failed")).is_none());
+    }
+
+    /// An item the engine could never place answers under a code of its own,
+    /// a 400 like every other processing failure, with the item's size and
+    /// the budget in the message; a failure of another kind keeps its code.
+    #[tokio::test]
+    async fn an_item_over_the_engines_budget_answers_under_its_own_code() {
+        let over = anyhow::Error::new(ItemOverEncoderBudget {
+            modality: Modality::Video,
+            position: 1,
+            count: 1,
+            feature_tokens: 192_001,
+            sampled_frames: Some(900),
+            budget: 192_000,
+        })
+        .context("Failed to process the plan");
+        let (status, json) = status_and_error(processing_failed_response(&over)).await;
+        assert_eq!(status, 400);
+        assert_eq!(json["error"]["type"], "invalid_request_error");
+        assert_eq!(json["error"]["code"], "multimodal_item_too_large");
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("192001 feature tokens (900 sampled frames)")
+                && message.contains("192000-token encoder budget"),
+            "{message}"
+        );
+
+        let (status, json) = status_and_error(processing_failed_response(&anyhow::anyhow!(
+            "decode failed"
+        )))
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(json["error"]["code"], "multimodal_processing_failed");
+    }
+
+    /// A fetch that ran out of its budget is reported with its URL and the
+    /// budget, not as the bare "failed to finalize" context around it.
+    #[test]
+    fn a_processing_failure_names_its_cause() {
+        let error = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
+            url: "https://media.example/clip.mp4".to_string(),
+            budget: Duration::from_secs(30),
+        }))
+        .context("Failed to finalize multimodal tracker");
+        assert_eq!(
+            processing_failed_message(&error),
+            "Multimodal processing failed: Failed to finalize multimodal tracker: media fetch of \
+             https://media.example/clip.mp4 timed out after 30s"
+        );
+    }
+
+    /// The status, the `x-smg-error-code` header and the JSON body of an answer.
+    async fn answer(response: Response) -> (StatusCode, String, serde_json::Value) {
+        let status = response.status();
+        let header = response
+            .headers()
+            .get("x-smg-error-code")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let bytes = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("the answer's body");
+        let body = serde_json::from_slice(&bytes).expect("a JSON envelope");
+        (status, header, body)
+    }
+
+    /// A fetch that ran out of its budget and an origin that answered 5xx are
+    /// the media host's trouble for now, a 502 `server_error` under
+    /// `media_fetch_failed`; a host that cannot be resolved is the request's
+    /// own input, a 400 `invalid_request_error` under the same code; a
+    /// malformed data URL, a parameter out of range and a host the policy
+    /// refuses are the request's own as sent, 400s under
+    /// `invalid_multimodal_request`; a clip
+    /// over the decoded-size cap and an item over the input cap are 400s
+    /// under `media_too_large`; a scratch file that failed on this side and
+    /// a preprocessing task that died are 500 `server_error`s; a failure with
+    /// no connector verdict keeps the pipeline's own 400 code. The message is
+    /// the whole chain in every case.
+    #[tokio::test]
+    async fn a_pipeline_failure_is_answered_by_the_connectors_verdict() {
+        let finalize = |media: MediaConnectorError| {
+            anyhow::Error::new(MultiModalError::Media(media))
+                .context("Failed to finalize multimodal tracker")
+        };
+        let origin_answered = |status: u16| {
+            let response = reqwest::Response::from(
+                http::Response::builder()
+                    .status(status)
+                    .body("")
+                    .expect("a response"),
+            );
+            finalize(MediaConnectorError::Http(
+                response
+                    .error_for_status()
+                    .expect_err("a 5xx is the fetch's error"),
+            ))
+        };
+        let died = tokio::task::spawn_blocking(|| panic!("the preprocessor died"))
+            .await
+            .expect_err("the task panicked");
+        let died = anyhow::Error::new(died).context("Preprocessing task panicked");
+        let cases = [
+            (
+                finalize(MediaConnectorError::Timeout {
+                    url: "https://media.example/video_251mb.mp4".to_string(),
+                    budget: Duration::from_secs(30),
+                }),
+                StatusCode::BAD_GATEWAY,
+                "media_fetch_failed",
+                "server_error",
+            ),
+            (
+                origin_answered(503),
+                StatusCode::BAD_GATEWAY,
+                "media_fetch_failed",
+                "server_error",
+            ),
+            (
+                origin_answered(404),
+                StatusCode::BAD_REQUEST,
+                "media_fetch_failed",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::UnresolvableHost {
+                    host: "media.invalid".to_string(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                }),
+                StatusCode::BAD_REQUEST,
+                "media_fetch_failed",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::DataUrl(
+                    "missing comma in data url".to_string(),
+                )),
+                StatusCode::BAD_REQUEST,
+                "invalid_multimodal_request",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::InvalidMaxLongSidePixel {
+                    value: 0,
+                    factor: 28,
+                }),
+                StatusCode::BAD_REQUEST,
+                "invalid_multimodal_request",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::DisallowedAddress {
+                    host: "127.0.0.1".to_string(),
+                    address: std::net::IpAddr::from([127, 0, 0, 1]),
+                    class: "loopback",
+                }),
+                StatusCode::BAD_REQUEST,
+                "invalid_multimodal_request",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::DecodedTooLarge {
+                    media: "video RGB",
+                    bytes: 2_208_384_000,
+                    limit: 1_073_741_824,
+                    knob: "SMG_VIDEO_MAX_DECODED_BYTES",
+                }),
+                StatusCode::BAD_REQUEST,
+                "media_too_large",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::PayloadTooLarge {
+                    media: "video",
+                    limit: 268_435_456,
+                }),
+                StatusCode::BAD_REQUEST,
+                "media_too_large",
+                "invalid_request_error",
+            ),
+            (
+                finalize(MediaConnectorError::DecodeIo(std::io::Error::other(
+                    "No space left on device (os error 28)",
+                ))),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "multimodal_processing_failed",
+                "server_error",
+            ),
+            (
+                died,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "multimodal_processing_failed",
+                "server_error",
+            ),
+            (
+                anyhow::Error::new(MultiModalError::UnsupportedContent("image_embeds"))
+                    .context("Failed to push content part"),
+                StatusCode::BAD_REQUEST,
+                "multimodal_processing_failed",
+                "invalid_request_error",
+            ),
+            (
+                anyhow::anyhow!("Multimodal not supported for model: m"),
+                StatusCode::BAD_REQUEST,
+                "multimodal_processing_failed",
+                "invalid_request_error",
+            ),
+        ];
+        for (error, status, code, kind) in cases {
+            let message = processing_failed_message(&error);
+            let (answered, header, body) = answer(processing_failed_response(&error)).await;
+            assert_eq!(answered, status, "{message}: {body}");
+            assert_eq!(header, code, "{message}");
+            assert_eq!(body["error"]["code"], code, "{message}: {body}");
+            assert_eq!(body["error"]["type"], kind, "{message}: {body}");
+            assert_eq!(body["error"]["message"], message, "{body}");
+        }
+    }
+
+    /// A video part on a process without a video decoder is the media
+    /// stage's own refusal: a 400 `invalid_multimodal_request` whose message
+    /// names what is missing, never a server error.
+    #[tokio::test]
+    async fn a_video_part_without_a_decoder_is_the_media_stages_refusal() {
+        let refused = anyhow::Error::new(super::process::VideoDecoderUnavailable {
+            why: "ffmpeg executable not found; install ffmpeg to decode video_url inputs",
+        });
+        let (status, header, body) = answer(processing_failed_response(&refused)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(header, "invalid_multimodal_request");
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            "Invalid multimodal request: video input cannot be decoded by this process: ffmpeg \
+             executable not found; install ffmpeg to decode video_url inputs",
+            "{body}"
+        );
+    }
+
+    /// The media host's trouble is answered as the host's (a 502) and is
+    /// terminal for the retry layer: another attempt, on this worker or
+    /// another, would fetch from the same host; the request's own fault stays
+    /// a 400, terminal by its status.
+    #[test]
+    fn a_media_hosts_failure_is_terminal_for_the_retry_layer() {
+        use crate::routers::common::retry::is_retryable_response;
+
+        let timed_out = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
+            url: "https://media.example/clip.mp4".to_string(),
+            budget: Duration::from_secs(30),
+        }))
+        .context("Failed to finalize multimodal tracker");
+        let response = processing_failed_response(&timed_out);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            !is_retryable_response(&response),
+            "a media host's failure is not replayed"
+        );
+
+        let wrong = anyhow::Error::new(MultiModalError::Media(
+            MediaConnectorError::UnsupportedScheme("ftp".to_string()),
+        ))
+        .context("Failed to finalize multimodal tracker");
+        let response = processing_failed_response(&wrong);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!is_retryable_response(&response));
+    }
+
+    /// The decoder availability gauges land in the recorder in force when the
+    /// report runs: the gateway installs its recorder first (`server.rs`),
+    /// so `smg_mm_turbojpeg_available` and `smg_mm_webp_available` are on
+    /// /metrics under every policy; a report made before the recorder would
+    /// set them on the no-op one, once, and they would never appear.
+    #[test]
+    fn the_decoder_availability_gauges_land_in_the_installed_recorder() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (available, webp) =
+            ::metrics::with_local_recorder(&recorder, record_decoder_availability);
+        let rendered = handle.render();
+        let reads = |name: &str, value: bool| {
+            rendered.lines().any(|line| {
+                line.starts_with(name) && line.ends_with(if value { " 1" } else { " 0" })
+            })
+        };
+        assert!(reads("smg_mm_turbojpeg_available", available), "{rendered}");
+        assert!(reads("smg_mm_webp_available", webp), "{rendered}");
+    }
+
+    /// The report sets the gauges on every call, the log lines once: a report
+    /// made before the gateway's recorder exists (a caller building the
+    /// components early) does not leave the start-up's own report with
+    /// nothing to set.
+    #[test]
+    fn a_second_report_still_sets_the_gauges_on_the_recorder_in_force() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        // The first report, on whatever recorder is in force here: the once
+        // block is consumed by it (or was, by another test of this process).
+        report_jpeg_decoder();
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, report_jpeg_decoder);
+        let rendered = handle.render();
+        for gauge in ["smg_mm_turbojpeg_available", "smg_mm_webp_available"] {
+            assert!(
+                rendered.lines().any(|line| line.starts_with(gauge)
+                    && (line.ends_with(" 1") || line.ends_with(" 0"))),
+                "{gauge} is set by the second report:\n{rendered}"
+            );
+        }
+    }
 }

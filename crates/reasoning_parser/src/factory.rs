@@ -6,9 +6,10 @@ use parking_lot::RwLock;
 
 use crate::{
     parsers::{
-        BaseReasoningParser, CohereCmdParser, DeepSeekR1Parser, Glm45Parser, InklingParser,
-        KimiK3Parser, KimiParser, MiniMaxParser, MinimaxM3Parser, NanoV3Parser, PassthroughParser,
-        Qwen3Parser, QwenThinkingParser, Step3Parser,
+        BaseReasoningParser, CohereCmdParser, DeepSeekR1Parser, DeepSeekV41Parser, Gemma4Parser,
+        Glm45Parser, HyV4Parser, InklingParser, KimiK3Parser, KimiParser, MiniMaxParser,
+        MinimaxM3Parser, NanoV3Parser, PassthroughParser, Qwen3Parser, QwenThinkingParser,
+        Step3Parser,
     },
     traits::{ParserConfig, ReasoningParser, DEFAULT_MAX_BUFFER_SIZE},
 };
@@ -130,6 +131,8 @@ impl ParserFactory {
         // starts with in_reasoning=false
         registry.register_parser("qwen3", || Box::new(Qwen3Parser::new()));
 
+        registry.register_parser("gemma4", || Box::new(Gemma4Parser::new()));
+
         // starts with in_reasoning=true
         registry.register_parser("qwen3_thinking", || Box::new(QwenThinkingParser::new()));
 
@@ -145,6 +148,7 @@ impl ParserFactory {
 
         // MiniMax M3: <mm:think> / </mm:think>, always_in_reasoning=false
         registry.register_parser("minimax_m3", || Box::new(MinimaxM3Parser::new()));
+        registry.register_parser("hy_v4", || Box::new(HyV4Parser::new()));
 
         // uses <|START_THINKING|> / <|END_THINKING|>
         registry.register_parser("cohere_cmd", || Box::new(CohereCmdParser::new()));
@@ -174,6 +178,10 @@ impl ParserFactory {
             )
         });
 
+        // V4.1 prefills <think> like V4, but its spaced DSML tool block can
+        // end reasoning implicitly: own state machine (parsers/deepseek_v41.rs).
+        registry.register_parser("deepseek_v41", || Box::new(DeepSeekV41Parser::new()));
+
         registry.register_parser("kimi_k25", || {
             let config = ParserConfig {
                 think_start_token: "<think>".to_string(),
@@ -199,7 +207,16 @@ impl ParserFactory {
         // Kimi K3 XTML think channel (structural <|open|>/<|close|>/<|sep|> tokens).
         registry.register_parser("kimi_k3", || Box::new(KimiK3Parser::new()));
 
+        registry.register_pattern("gemma-4", "gemma4");
+        registry.register_pattern("gemma4", "gemma4");
+        registry.register_pattern("hy4", "hy_v4");
+        registry.register_pattern("hy_v4", "hy_v4");
         registry.register_pattern("deepseek-r1", "deepseek_r1");
+        // V4.1 before V4: first substring hit wins and "deepseek-v4" is a
+        // substring of every V4.1 model id.
+        registry.register_pattern("deepseek-v4.1", "deepseek_v41");
+        registry.register_pattern("deepseek_v41", "deepseek_v41");
+        registry.register_pattern("deepseek-v41", "deepseek_v41");
         registry.register_pattern("deepseek-v4", "deepseek_v4");
         registry.register_pattern("deepseek_v4", "deepseek_v4");
         registry.register_pattern("deepseek-v3.1", "deepseek_v31");
@@ -306,6 +323,10 @@ mod tests {
         );
         assert_eq!(
             factory.create("DEEPSEEK_V4_LOCAL").model_type(),
+            "deepseek_v4"
+        );
+        assert_eq!(
+            factory.create("deepseek-ai/DeepSeek-V4-Pro").model_type(),
             "deepseek_v4"
         );
 

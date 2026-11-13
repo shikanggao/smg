@@ -4,21 +4,31 @@
 //! and business logic for worker management. The service orchestrates
 //! WorkerRegistry and JobQueue operations.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use openai_protocol::worker::{WorkerErrorResponse, WorkerInfo, WorkerSpec, WorkerUpdateRequest};
+use openai_protocol::worker::{
+    WorkerErrorResponse, WorkerInfo, WorkerListOrigin, WorkerSpec, WorkerStatus,
+    WorkerUpdateRequest,
+};
 use serde_json::json;
+use smg_auth::AuditResource;
 use tracing::warn;
 
 use crate::{
-    config::{validate_worker_url, RouterConfig},
+    config::{unused_credentials_warning, validate_worker_url, RouterConfig},
     routers::provider_support,
-    worker::{registry::WorkerId, worker::worker_to_info, WorkerRegistry, WorkerType},
+    service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL},
+    worker::{
+        basic::{merge_labels, worker_to_info},
+        endpoint::Endpoint,
+        registry::WorkerId,
+        Worker, WorkerRegistry, WorkerType,
+    },
     workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
 
@@ -29,7 +39,210 @@ use crate::{
 fn validate_worker_url_request(url: &str) -> Result<(), WorkerServiceError> {
     validate_worker_url(url).map_err(|e| WorkerServiceError::BadRequest {
         message: e.to_string(),
-    })
+    })?;
+    if let Some(warning) = unused_credentials_warning(url) {
+        warn!("{warning}");
+    }
+    Ok(())
+}
+
+/// Longest URL a registration takes: longer ones are not addresses of a
+/// worker but a mistake or a probe, and every log line and metric label
+/// derived from the URL would carry them.
+const MAX_WORKER_URL_BYTES: usize = 2048;
+/// Most labels a worker carries (an engine reports a few dozen); held at
+/// registration, at the admin check of a PATCH and again where the PATCH
+/// merges into the worker.
+pub(crate) const MAX_WORKER_LABELS: usize = 128;
+const MAX_LABEL_KEY_BYTES: usize = 128;
+const MAX_LABEL_VALUE_BYTES: usize = 4096;
+/// Labels the routers read as the decode window, a positive count
+/// (`Worker::max_running_requests`, which saturates a figure wider than
+/// 65535); any other value is read as "not reported", silently.
+const WINDOW_LABELS: [&str; 2] = ["max_running_requests", "max_num_seqs"];
+/// Labels the routers read as a positive count.
+const COUNT_LABELS: [&str; 1] = ["dp_size"];
+/// Labels the routers read as a boolean, spelled `"true"` or `"false"`; any
+/// other spelling is read as unset, silently.
+const BOOLEAN_LABELS: [&str; 2] = ["supports_vision", "realtime"];
+
+fn bad_request(message: String) -> WorkerServiceError {
+    WorkerServiceError::BadRequest { message }
+}
+
+/// The bounds a registration body must satisfy before any job is queued:
+/// the URL's length; the labels' count, charset and size, the shape of the
+/// labels the routers read as numbers or booleans and none under the prefix
+/// reserved for discovery; the fields the routers rely on (a positive,
+/// finite cost; a KV block size and a data-parallel size of at least 1; a
+/// rank only with a size and below it; a bootstrap port that is a port). A
+/// violation is a `400 Bad Request` naming the field.
+fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
+    if spec.url.len() > MAX_WORKER_URL_BYTES {
+        return Err(bad_request(format!(
+            "url is {} bytes long; at most {MAX_WORKER_URL_BYTES} are accepted",
+            spec.url.len()
+        )));
+    }
+    validate_labels(&spec.labels)?;
+    validate_cost(spec.cost)?;
+    if spec.kv_block_size == Some(0) {
+        return Err(bad_request(
+            "kv_block_size must be at least 1 (tokens per KV block)".to_string(),
+        ));
+    }
+    if spec.bootstrap_port == Some(0) {
+        return Err(bad_request(
+            "bootstrap_port must be a port from 1 to 65535".to_string(),
+        ));
+    }
+    match (spec.dp_rank, spec.dp_size) {
+        (Some(_), None) => Err(bad_request(
+            "dp_rank needs dp_size: the rank is a position in a data-parallel group of that size"
+                .to_string(),
+        )),
+        (_, Some(0)) => Err(bad_request("dp_size must be at least 1".to_string())),
+        (Some(rank), Some(size)) if rank >= size => Err(bad_request(format!(
+            "dp_rank {rank} is not below dp_size {size}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The bounds of an update: the fields it may change, under the same rules.
+fn validate_update(update: &WorkerUpdateRequest) -> Result<(), WorkerServiceError> {
+    if let Some(cost) = update.cost {
+        validate_cost(cost)?;
+    }
+    if let Some(labels) = &update.labels {
+        validate_labels(labels)?;
+    }
+    Ok(())
+}
+
+/// The cost weighs the worker in the policies' arithmetic: finite and above 0.
+fn validate_cost(cost: f32) -> Result<(), WorkerServiceError> {
+    if !cost.is_finite() || cost <= 0.0 {
+        return Err(bad_request(format!(
+            "cost must be a finite number above 0 (baseline 1.0), not {cost}"
+        )));
+    }
+    Ok(())
+}
+
+/// A rejected key as the error shows it: whole when short, else its first
+/// characters and its length, so a key the size of the payload limit does
+/// not come back as a body (or a log line) of that size.
+fn shown_key(key: &str) -> String {
+    const SHOWN: usize = 64;
+    if key.chars().count() <= SHOWN {
+        return format!("{key:?}");
+    }
+    let head: String = key.chars().take(SHOWN).collect();
+    format!("{head:?}... ({} bytes)", key.len())
+}
+
+/// The labels a PATCH would leave on the worker: the request's merged into
+/// the existing ones (`UpdateWorkerPropertiesStep` keeps every key it does not
+/// name, except a running window under the other name when the request sets
+/// one, see `merge_labels`), held to the same cap as a registration, so repeated updates cannot
+/// grow a worker past it; an update that adds no key (a rewrite of keys the
+/// worker has) passes, so a worker over the cap through the labels discovered
+/// at registration can still be updated. This is the early check against the
+/// labels the worker has when the request arrives, for a clear 400; the merge
+/// runs later in the queued job, where `UpdateWorkerPropertiesStep` holds the
+/// cap again, under the same condition, over the labels it actually merges,
+/// so PATCHes queued together cannot pass it between them.
+fn validate_merged_labels(
+    existing: &HashMap<String, String>,
+    update: &HashMap<String, String>,
+) -> Result<(), WorkerServiceError> {
+    let merged = merge_labels(existing, update).len();
+    if merged > existing.len() && merged > MAX_WORKER_LABELS {
+        return Err(bad_request(format!(
+            "{merged} labels on the worker after this update ({} now, {} new); at most \
+             {MAX_WORKER_LABELS} are accepted",
+            existing.len(),
+            merged - existing.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerServiceError> {
+    if labels.len() > MAX_WORKER_LABELS {
+        return Err(bad_request(format!(
+            "{} labels; at most {MAX_WORKER_LABELS} are accepted",
+            labels.len()
+        )));
+    }
+    for (key, value) in labels {
+        if key.is_empty()
+            || key.len() > MAX_LABEL_KEY_BYTES
+            || !key.chars().all(|c| c.is_ascii_graphic())
+        {
+            return Err(bad_request(format!(
+                "label key {} must be 1 to {MAX_LABEL_KEY_BYTES} printable ASCII characters \
+                 without spaces",
+                shown_key(key)
+            )));
+        }
+        // Discovery decides which workers it owns, and the health checker
+        // which it may remove, by these labels: one set here would hand a
+        // manual worker to a provider, or forge a discovered worker's record.
+        if key.starts_with(DISCOVERY_LABEL_PREFIX) {
+            return Err(bad_request(format!(
+                "label '{key}' is under '{DISCOVERY_LABEL_PREFIX}', a prefix reserved for \
+                 worker discovery"
+            )));
+        }
+        if value.len() > MAX_LABEL_VALUE_BYTES || value.chars().any(char::is_control) {
+            return Err(bad_request(format!(
+                "label '{key}' must be at most {MAX_LABEL_VALUE_BYTES} bytes without control \
+                 characters"
+            )));
+        }
+        let key_str = key.as_str();
+        if WINDOW_LABELS.contains(&key_str) && !value.parse::<u64>().is_ok_and(|n| n >= 1) {
+            return Err(bad_request(format!(
+                "label '{key}' must be a positive count, not {value:?}"
+            )));
+        }
+        if COUNT_LABELS.contains(&key_str) && !value.parse::<u64>().is_ok_and(|n| n >= 1) {
+            return Err(bad_request(format!(
+                "label '{key}' must be a positive integer, not {value:?}"
+            )));
+        }
+        if BOOLEAN_LABELS.contains(&key_str) && value != "true" && value != "false" {
+            return Err(bad_request(format!(
+                "label '{key}' must be \"true\" or \"false\", not {value:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A worker a discovery provider registered takes its spec and labels from
+/// its discovery source, which is authoritative: a PUT, or a PATCH of its
+/// labels, would disagree with the source until the source next changes the
+/// worker and overwrites the edit. What no provider publishes (priority,
+/// cost, API key, health checks) is still a PATCH's to change, and a DELETE
+/// stays allowed; the provider adds the worker back while it still
+/// publishes it.
+fn refuse_discovery_owned(worker: &dyn Worker) -> Result<(), WorkerServiceError> {
+    match discovery_provider(worker) {
+        Some(provider) => Err(WorkerServiceError::DiscoveryOwned {
+            url: worker.url().to_string(),
+            provider: provider.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// The provider that owns `worker`, from the provenance label the
+/// reconciler writes; `None` for a worker registered locally.
+fn discovery_provider(worker: &dyn Worker) -> Option<&String> {
+    worker.metadata().spec.labels.get(DISCOVERY_PROVIDER_LABEL)
 }
 
 /// Error types for worker service operations
@@ -43,6 +256,18 @@ pub enum WorkerServiceError {
     BadRequest { message: String },
     /// Worker with this URL already exists (duplicate POST)
     Conflict { url: String, worker_id: WorkerId },
+    /// A worker at this URL is being removed: its removal drains it for
+    /// `drain_secs` before the URL is free (a POST inside that window)
+    RemovalInProgress {
+        url: String,
+        worker_id: WorkerId,
+        drain_secs: u64,
+    },
+    /// A create for this URL is still in flight (concurrent POST)
+    CreateInProgress { url: String, worker_id: WorkerId },
+    /// A discovery provider owns the worker (a PUT, or a PATCH of labels, of a
+    /// discovered worker)
+    DiscoveryOwned { url: String, provider: String },
     /// The spec targets a provider whose router this build does not carry
     ProviderNotCompiled {
         url: String,
@@ -62,6 +287,11 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => "BAD_REQUEST",
             Self::BadRequest { .. } => "BAD_REQUEST",
             Self::Conflict { .. } => "WORKER_ALREADY_EXISTS",
+            // The worker is still registered at the URL while it drains: the
+            // code the window answered before; the message says what holds.
+            Self::RemovalInProgress { .. } => "WORKER_ALREADY_EXISTS",
+            Self::CreateInProgress { .. } => "WORKER_CREATE_IN_PROGRESS",
+            Self::DiscoveryOwned { .. } => "WORKER_DISCOVERY_OWNED",
             Self::ProviderNotCompiled { .. } => "PROVIDER_NOT_COMPILED",
             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
@@ -74,6 +304,9 @@ impl WorkerServiceError {
             Self::InvalidId { .. } => StatusCode::BAD_REQUEST,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Conflict { .. } => StatusCode::CONFLICT,
+            Self::RemovalInProgress { .. } => StatusCode::CONFLICT,
+            Self::CreateInProgress { .. } => StatusCode::CONFLICT,
+            Self::DiscoveryOwned { .. } => StatusCode::CONFLICT,
             Self::ProviderNotCompiled { .. } => StatusCode::BAD_REQUEST,
             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -100,6 +333,33 @@ impl std::fmt::Display for WorkerServiceError {
                     Use PUT /workers/{id} to replace or PATCH /workers/{id} to update."
                 )
             }
+            Self::RemovalInProgress {
+                url,
+                worker_id,
+                drain_secs,
+            } => {
+                let id = worker_id.as_str();
+                write!(
+                    f,
+                    "Worker at URL '{url}' with ID {id} is being removed; its removal drains \
+                    it for {drain_secs}s, the worker's configured drain, before the URL is \
+                    free. Retry once GET /workers/{id} answers 404."
+                )
+            }
+            Self::CreateInProgress { url, worker_id } => {
+                let id = worker_id.as_str();
+                write!(
+                    f,
+                    "Worker creation already in progress for URL '{url}' with ID {id}. \
+                    Poll GET /workers/{id}."
+                )
+            }
+            Self::DiscoveryOwned { url, provider } => write!(
+                f,
+                "Worker '{url}' is owned by the '{provider}' discovery provider. \
+                Its spec and labels come from its discovery source: change them there, \
+                not with a PUT or a PATCH of labels."
+            ),
             Self::ProviderNotCompiled {
                 url,
                 family,
@@ -119,11 +379,24 @@ impl std::error::Error for WorkerServiceError {}
 
 impl IntoResponse for WorkerServiceError {
     fn into_response(self) -> Response {
+        // A registration refused for a removal in progress says when to
+        // retry: the drain window, a second at least.
+        let retry_after = if let Self::RemovalInProgress { drain_secs, .. } = &self {
+            Some(http::HeaderValue::from((*drain_secs).max(1)))
+        } else {
+            None
+        };
         let error = WorkerErrorResponse {
             error: self.to_string(),
             code: self.error_code().to_string(),
         };
-        (self.status_code(), Json(error)).into_response()
+        let mut response = (self.status_code(), Json(error)).into_response();
+        if let Some(retry_after) = retry_after {
+            response
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, retry_after);
+        }
+        response
     }
 }
 
@@ -144,12 +417,15 @@ impl IntoResponse for CreateWorkerResult {
             "location": self.location,
             "message": "Worker addition queued for background processing"
         });
-        (
-            StatusCode::ACCEPTED,
-            [(http::header::LOCATION, self.location)],
-            Json(response),
+        AuditResource::name(
+            (
+                StatusCode::ACCEPTED,
+                [(http::header::LOCATION, self.location)],
+                Json(response),
+            )
+                .into_response(),
+            self.worker_id.as_str(),
         )
-            .into_response()
     }
 }
 
@@ -167,7 +443,10 @@ impl IntoResponse for DeleteWorkerResult {
             "worker_id": self.worker_id.as_str(),
             "message": "Worker removal queued for background processing"
         });
-        (StatusCode::ACCEPTED, Json(response)).into_response()
+        AuditResource::name(
+            (StatusCode::ACCEPTED, Json(response)).into_response(),
+            self.worker_id.as_str(),
+        )
     }
 }
 
@@ -185,7 +464,10 @@ impl IntoResponse for UpdateWorkerResult {
             "worker_id": self.worker_id.as_str(),
             "message": "Worker update queued for background processing"
         });
-        (StatusCode::ACCEPTED, Json(response)).into_response()
+        AuditResource::name(
+            (StatusCode::ACCEPTED, Json(response)).into_response(),
+            self.worker_id.as_str(),
+        )
     }
 }
 
@@ -284,27 +566,41 @@ impl WorkerService {
         &self,
         config: WorkerSpec,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
+        validate_spec(&config)?;
         validate_worker_url_request(&config.url)?;
         Self::require_provider_router(&config)?;
 
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
             warn!(
-                "Adding worker {} without API key while router has API key configured. \
-                Worker will be accessible without authentication. \
-                If the worker requires the same API key as the router, please specify it explicitly.",
-                config.url
+                "Adding worker {} without an API key while the gateway has one configured: \
+                the gateway's key ends at its auth middleware, so requests reach this worker \
+                with no credential. If the worker requires a key (the gateway's or its own), \
+                register it with that key explicitly.",
+                Endpoint::redacted_str(&config.url)
             );
         }
 
         let worker_url = config.url.clone();
+        let queue = self.get_job_queue()?;
 
         // Reserve (or retrieve) a stable ID for the 202 response.
-        // If this URL already has an active worker, reject with 409.
+        // If this URL already has an active worker, reject with 409. A worker
+        // its removal is draining holds the URL for the drain window; that
+        // answer says so and when to retry, instead of offering a PUT or a
+        // PATCH of a worker that is leaving.
         let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
-        if self.worker_registry.get(&worker_id).is_some() {
-            return Err(WorkerServiceError::Conflict {
-                url: worker_url,
-                worker_id,
+        if let Some(existing) = self.worker_registry.get(&worker_id) {
+            return Err(if existing.status() == WorkerStatus::Draining {
+                WorkerServiceError::RemovalInProgress {
+                    url: worker_url,
+                    worker_id,
+                    drain_secs: existing.metadata().health_config.drain_settle_secs,
+                }
+            } else {
+                WorkerServiceError::Conflict {
+                    url: worker_url,
+                    worker_id,
+                }
             });
         }
 
@@ -313,10 +609,21 @@ impl WorkerService {
             registration_mode: WorkerRegistrationMode::CreateOnly,
         };
 
-        self.get_job_queue()?
-            .submit(job)
-            .await
-            .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
+        // Exactly one create per URL is in flight at a time, so that attempt alone
+        // owns the reservation and a failed one can safely release it. A second
+        // create is told to poll the first rather than silently merged into it,
+        // since its spec may differ (#1533).
+        let submitted = queue.submit_if_idle(job).await.map_err(|e| {
+            // No 202 goes out, so nothing may keep this URL reserved (#1533).
+            self.worker_registry.release_reservation(&worker_url);
+            WorkerServiceError::QueueSubmitFailed { message: e }
+        })?;
+        if !submitted {
+            return Err(WorkerServiceError::CreateInProgress {
+                url: worker_url,
+                worker_id,
+            });
+        }
 
         let location = format!("/workers/{}", worker_id.as_str());
 
@@ -356,7 +663,12 @@ impl WorkerService {
                 .ok_or_else(|| WorkerServiceError::NotFound {
                     worker_id: worker_id_raw.to_string(),
                 })?;
+        // Before the body is read: a discovered worker's own spec, sent back,
+        // carries the reserved labels, and the useful answer is where to make
+        // the change, not which labels to strip.
+        refuse_discovery_owned(existing.as_ref())?;
         let url = existing.url().to_string();
+        validate_spec(&config)?;
         Self::require_provider_router(&config)?;
 
         // A data-parallel router expands one spec into one worker per rank,
@@ -409,12 +721,18 @@ impl WorkerService {
     }
 
     /// List all workers with their info, optionally filtered to workers
-    /// serving `model`. Building each `WorkerInfo` is cheap: `WorkerSpec`
-    /// is shared via `Arc`, so there is no per-worker spec deep clone.
+    /// serving `model` and to the workers of one `origin` (registered
+    /// locally, or by a discovery provider). Building each `WorkerInfo` is
+    /// cheap: `WorkerSpec` is shared via `Arc`, so there is no per-worker
+    /// spec deep clone.
     ///
     /// The counts reflect the returned (filtered) list, not the whole
     /// registry.
-    pub fn list_workers(&self, model: Option<&str>) -> ListWorkersResult {
+    pub fn list_workers(
+        &self,
+        model: Option<&str>,
+        origin: Option<WorkerListOrigin>,
+    ) -> ListWorkersResult {
         let mut worker_infos = Vec::new();
         let mut prefill_count = 0;
         let mut decode_count = 0;
@@ -423,6 +741,12 @@ impl WorkerService {
         for (worker_id, worker) in self.worker_registry.get_all_with_ids() {
             if let Some(model) = model {
                 if !worker.supports_model(model) {
+                    continue;
+                }
+            }
+            if let Some(origin) = origin {
+                let discovered = discovery_provider(worker.as_ref()).is_some();
+                if discovered != (origin == WorkerListOrigin::Discovery) {
                     continue;
                 }
             }
@@ -493,7 +817,7 @@ impl WorkerService {
 
         let job = Job::RemoveWorker {
             url: url.clone(),
-            expected_revision: None,
+            expected_revisions: None,
         };
 
         let job_queue = self.get_job_queue()?;
@@ -519,6 +843,17 @@ impl WorkerService {
             .ok_or_else(|| WorkerServiceError::NotFound {
                 worker_id: worker_id_raw.to_string(),
             })?;
+        let worker = self.worker_registry.get_by_url(&url);
+        // Only a PATCH of labels edits what a provider publishes. Decided
+        // before the body is validated, as for a PUT, so reserved labels sent
+        // to a discovered worker are told where to make the change.
+        if let (Some(_), Some(worker)) = (&update.labels, &worker) {
+            refuse_discovery_owned(worker.as_ref())?;
+        }
+        validate_update(&update)?;
+        if let (Some(labels), Some(worker)) = (&update.labels, &worker) {
+            validate_merged_labels(&worker.metadata().spec.labels, labels)?;
+        }
 
         let job = Job::UpdateWorker {
             url: url.clone(),
@@ -540,7 +875,10 @@ mod tests {
     use openai_protocol::model_card::ModelCard;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::{
+        worker::{BasicWorkerBuilder, WorkerType},
+        workflow::JobQueueConfig,
+    };
 
     fn make_service(registry: Arc<WorkerRegistry>) -> WorkerService {
         WorkerService::new(
@@ -569,7 +907,7 @@ mod tests {
         );
         let service = make_service(registry);
 
-        let result = service.list_workers(None);
+        let result = service.list_workers(None, None);
         assert_eq!(result.workers.len(), 2);
         assert_eq!(result.total, 2);
         assert_eq!(result.regular_count, 2);
@@ -586,7 +924,7 @@ mod tests {
         );
         let service = make_service(registry);
 
-        let result = service.list_workers(Some("moonshotai/Kimi-K2.5"));
+        let result = service.list_workers(Some("moonshotai/Kimi-K2.5"), None);
         assert_eq!(result.workers.len(), 1);
         assert_eq!(
             result.workers[0].model_id.as_deref(),
@@ -595,7 +933,7 @@ mod tests {
         assert_eq!(result.total, 1);
         assert_eq!(result.regular_count, 1);
 
-        let result = service.list_workers(Some("no-such-model"));
+        let result = service.list_workers(Some("no-such-model"), None);
         assert!(result.workers.is_empty());
         assert_eq!(result.total, 0);
         assert_eq!(result.regular_count, 0);
@@ -607,7 +945,7 @@ mod tests {
         register_worker(&registry, "http://wildcard:30000", None);
         let service = make_service(registry);
 
-        let result = service.list_workers(Some("moonshotai/Kimi-K2.5"));
+        let result = service.list_workers(Some("moonshotai/Kimi-K2.5"), None);
         assert_eq!(result.workers.len(), 1);
         assert_eq!(result.total, 1);
     }
@@ -658,5 +996,536 @@ mod tests {
             .expect_err("queue is uninitialized in the test harness");
 
         assert!(matches!(err, WorkerServiceError::QueueNotInitialized));
+    }
+
+    #[tokio::test]
+    async fn create_worker_releases_reservation_when_submission_fails() {
+        let registry = Arc::new(WorkerRegistry::new());
+        // A queue whose AppContext is gone rejects every submission.
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        // Idempotent, so this is the id create_worker will hand out.
+        let reserved = registry.reserve_id_for_url("grpc://10.0.0.5:8000");
+
+        let err = service
+            .create_worker(worker_spec("grpc://10.0.0.5:8000"))
+            .await
+            .expect_err("submission must fail without an AppContext");
+        assert!(matches!(err, WorkerServiceError::QueueSubmitFailed { .. }));
+
+        // The 202 was never sent, so nothing may keep the URL reserved (#1533).
+        assert!(registry.get_url_by_id(&reserved).is_none());
+    }
+
+    /// The status, the body and the Retry-After header of an error's answer.
+    async fn answer(err: WorkerServiceError) -> (StatusCode, serde_json::Value, Option<String>) {
+        let response = err.into_response();
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(http::header::RETRY_AFTER)
+            .map(|value| value.to_str().expect("a visible header").to_string());
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("a JSON body"),
+            retry_after,
+        )
+    }
+
+    /// A registration of a URL whose worker is being removed is refused for
+    /// the drain window under the code it had, with an answer that says what
+    /// holds: the removal in progress, the drain, when to retry, and a
+    /// Retry-After of the drain. A live worker's refusal keeps its hint to
+    /// replace or update it.
+    #[tokio::test]
+    async fn create_worker_names_the_removal_in_progress_of_a_draining_worker() {
+        use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let queue = Arc::new(std::sync::OnceLock::new());
+        queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                std::sync::Weak::new(),
+            ))
+            .ok();
+        let service = WorkerService::new(Arc::clone(&registry), queue, RouterConfig::default());
+        let url = "grpc://10.0.0.8:8000";
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .health_config(HealthCheckConfig {
+                    drain_settle_secs: 7,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(Arc::clone(&worker)).unwrap();
+        let id = registry.reserve_id_for_url(url);
+
+        let (status, body, retry_after) = answer(
+            service
+                .create_worker(worker_spec(url))
+                .await
+                .expect_err("a live worker holds the URL"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "WORKER_ALREADY_EXISTS", "{body}");
+        let message = body["error"].as_str().expect("a message");
+        assert!(
+            message.contains(&format!("Use PUT /workers/{}", id.as_str())),
+            "a live worker's refusal hints at the replacement: {message}"
+        );
+        assert_eq!(retry_after, None, "a live worker's refusal has no retry");
+
+        worker.set_status(WorkerStatus::Draining);
+        let (status, body, retry_after) = answer(
+            service
+                .create_worker(worker_spec(url))
+                .await
+                .expect_err("a draining worker holds the URL for its drain"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "WORKER_ALREADY_EXISTS", "{body}");
+        let message = body["error"].as_str().expect("a message");
+        assert!(
+            message.contains("is being removed")
+                && message.contains("for 7s, the worker's configured drain"),
+            "the refusal names the removal and its drain: {message}"
+        );
+        assert!(
+            message.contains(&format!("GET /workers/{} answers 404", id.as_str())),
+            "the refusal says when to retry: {message}"
+        );
+        assert!(
+            !message.contains("PUT"),
+            "no replacement of a worker that is leaving: {message}"
+        );
+        assert_eq!(
+            retry_after.as_deref(),
+            Some("7"),
+            "Retry-After carries the drain window"
+        );
+    }
+
+    /// A registration whose labels or fields the routers could not read is
+    /// refused at the boundary with a 400 naming the field, before any job
+    /// is queued; one they can read passes the boundary (and stops at the
+    /// uninitialized queue of this harness).
+    #[tokio::test]
+    async fn create_worker_refuses_labels_and_fields_the_routers_cannot_read() {
+        let service = make_service(Arc::new(WorkerRegistry::new()));
+        let url = "grpc://10.0.0.5:8000";
+        let thousand: serde_json::Map<String, serde_json::Value> =
+            (0..1000).map(|i| (format!("k{i}"), json!("v"))).collect();
+        let refused = [
+            (
+                json!({"url": url, "labels": {"max_running_requests": "abc"}}),
+                "max_running_requests",
+            ),
+            (
+                json!({"url": url, "labels": {"max_running_requests": "0"}}),
+                "max_running_requests",
+            ),
+            (
+                json!({"url": url, "labels": {"dp_size": "zero"}}),
+                "dp_size",
+            ),
+            (
+                json!({"url": url, "labels": {"supports_vision": "maybe"}}),
+                "supports_vision",
+            ),
+            (
+                json!({"url": url, "labels": {"note": "x".repeat(4097)}}),
+                "note",
+            ),
+            (json!({"url": url, "labels": thousand}), "labels"),
+            (
+                json!({"url": url, "labels": {"key with space\nnewline": "v"}}),
+                "label key",
+            ),
+            (json!({"url": url, "cost": 0}), "cost"),
+            (json!({"url": url, "cost": -1.0}), "cost"),
+            (json!({"url": url, "kv_block_size": 0}), "kv_block_size"),
+            (json!({"url": url, "dp_rank": 1}), "dp_rank"),
+            (json!({"url": url, "dp_rank": 2, "dp_size": 2}), "dp_rank"),
+            (json!({"url": url, "bootstrap_port": 0}), "bootstrap_port"),
+            (
+                json!({"url": format!("grpc://{}:1", "a".repeat(2049))}),
+                "url",
+            ),
+        ];
+        for (body, field) in refused {
+            let spec: WorkerSpec =
+                serde_json::from_value(body.clone()).expect("a spec the type takes");
+            let err = service
+                .create_worker(spec)
+                .await
+                .expect_err(&body.to_string());
+            assert!(
+                matches!(err, WorkerServiceError::BadRequest { .. }),
+                "{body}: {err}"
+            );
+            assert!(err.to_string().contains(field), "{body}: {err}");
+        }
+        // A window wider than 65535 passes the boundary: the routers saturate
+        // it. A window set here is the worker's only window, kept as set on
+        // every dp-aware rank worker; only a discovered one is divided per rank.
+        let spec: WorkerSpec = serde_json::from_value(json!({
+            "url": url, "cost": 2.5, "kv_block_size": 16, "dp_rank": 1, "dp_size": 2,
+            "labels": {
+                "max_running_requests": "256", "max_num_seqs": "70000",
+                "supports_vision": "true", "served_model_name": "m"
+            }
+        }))
+        .expect("a valid spec");
+        assert!(matches!(
+            service
+                .create_worker(spec)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+    }
+
+    /// An update is held to the same rules for the fields it may change.
+    #[tokio::test]
+    async fn update_worker_refuses_a_cost_or_labels_the_routers_cannot_read() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "grpc://10.0.0.5:8000", Some("m"));
+        let id = registry.reserve_id_for_url("grpc://10.0.0.5:8000");
+        let service = make_service(Arc::clone(&registry));
+        for body in [
+            json!({"cost": 0}),
+            json!({"cost": -2.0}),
+            json!({"labels": {"supports_vision": "yes"}}),
+            json!({"labels": {"max_running_requests": "many"}}),
+        ] {
+            let update: WorkerUpdateRequest =
+                serde_json::from_value(body.clone()).expect("an update the type takes");
+            let err = service
+                .update_worker(id.as_str(), update)
+                .await
+                .expect_err(&body.to_string());
+            assert!(
+                matches!(err, WorkerServiceError::BadRequest { .. }),
+                "{body}: {err}"
+            );
+        }
+        let update: WorkerUpdateRequest =
+            serde_json::from_value(json!({"cost": 1.5, "labels": {"max_running_requests": "64"}}))
+                .expect("a valid update");
+        assert!(matches!(
+            service
+                .update_worker(id.as_str(), update)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+    }
+
+    /// The early check counts the labels the merge leaves: a window set by
+    /// the update replaces a discovered one under the other name, so swapping
+    /// the window's name on a full worker passes (as the step would take it),
+    /// while a new key on a full worker is refused.
+    #[test]
+    fn the_early_cap_check_counts_the_labels_the_merge_leaves() {
+        let mut full: HashMap<String, String> = (1..MAX_WORKER_LABELS)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        full.insert("max_num_seqs".to_string(), "256".to_string());
+        assert_eq!(full.len(), MAX_WORKER_LABELS);
+        let swap = HashMap::from([("max_running_requests".to_string(), "512".to_string())]);
+        assert!(validate_merged_labels(&full, &swap).is_ok());
+        assert_eq!(merge_labels(&full, &swap).len(), MAX_WORKER_LABELS);
+        let new_key = HashMap::from([("k_new".to_string(), "v".to_string())]);
+        let message = validate_merged_labels(&full, &new_key)
+            .expect_err("a 129th label")
+            .to_string();
+        assert!(
+            message.contains("129 labels on the worker after this update (128 now, 1 new)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("new); at most 128 are accepted"),
+            "{message}"
+        );
+    }
+
+    /// The label cap holds for the worker, not the request: a PATCH merges
+    /// its labels into the existing ones, so one that would leave more than
+    /// the cap on the worker is refused, while one that only rewrites keys
+    /// the worker has is taken.
+    #[tokio::test]
+    async fn update_worker_holds_the_label_cap_over_the_merged_labels() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let full: HashMap<String, String> = (0..MAX_WORKER_LABELS)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        let worker = BasicWorkerBuilder::new("grpc://10.0.0.6:8000")
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .labels(full)
+            .build();
+        registry.register(Arc::new(worker)).unwrap();
+        let id = registry.reserve_id_for_url("grpc://10.0.0.6:8000");
+        let service = make_service(Arc::clone(&registry));
+        let one_more: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k_new": "v"}})).expect("an update");
+        let err = service
+            .update_worker(id.as_str(), one_more)
+            .await
+            .expect_err("a 129th label");
+        assert!(
+            matches!(&err, WorkerServiceError::BadRequest { message } if message.contains("129 labels on the worker")),
+            "{err}"
+        );
+        let rewrite: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k0": "w", "k1": "w"}})).expect("an update");
+        assert!(matches!(
+            service
+                .update_worker(id.as_str(), rewrite)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+    }
+
+    /// A worker over the cap through the labels discovered at registration
+    /// still takes an update that adds no key through the endpoint: a rewrite
+    /// of keys it has reaches the queue, a new key is refused by name.
+    #[tokio::test]
+    async fn update_worker_over_the_cap_takes_a_rewrite_through_the_endpoint() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let over: HashMap<String, String> = (0..MAX_WORKER_LABELS + 20)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        let worker = BasicWorkerBuilder::new("grpc://10.0.0.7:8000")
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .labels(over)
+            .build();
+        registry.register(Arc::new(worker)).unwrap();
+        let id = registry.reserve_id_for_url("grpc://10.0.0.7:8000");
+        let service = make_service(Arc::clone(&registry));
+        let rewrite: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k3": "w"}})).expect("an update");
+        assert!(matches!(
+            service
+                .update_worker(id.as_str(), rewrite)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+        let adds: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k_new": "v"}})).expect("an update");
+        let err = service
+            .update_worker(id.as_str(), adds)
+            .await
+            .expect_err("a new key on a worker over the cap");
+        assert!(
+            matches!(&err, WorkerServiceError::BadRequest { message } if message.contains("149 labels on the worker") && message.contains("1 new")),
+            "{err}"
+        );
+    }
+
+    /// No request can write the labels discovery reads ownership from: a
+    /// key under the reserved prefix is a 400 naming it on a POST, on a PUT
+    /// and on a PATCH of a manual worker, before any job is queued; a key
+    /// that only resembles the prefix passes.
+    #[tokio::test]
+    async fn a_label_under_the_discovery_prefix_is_refused_on_post_put_and_patch() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "grpc://10.0.0.8:8000", Some("m"));
+        let id = registry.reserve_id_for_url("grpc://10.0.0.8:8000");
+        let service = make_service(Arc::clone(&registry));
+        let refused = |err: WorkerServiceError, key: &str| {
+            assert!(
+                matches!(&err, WorkerServiceError::BadRequest { message }
+                    if message.contains(&format!("'{key}'"))
+                        && message.contains("reserved for worker discovery")),
+                "{key}: {err}"
+            );
+        };
+        for key in [
+            "smg.ai/discovery-provider",
+            "smg.ai/discovery-id",
+            "smg.ai/discovery-spec-hash",
+            "smg.ai/discovery-anything",
+        ] {
+            let labels = json!({ key: "file" });
+            let post: WorkerSpec =
+                serde_json::from_value(json!({"url": "grpc://10.0.0.9:8000", "labels": labels}))
+                    .expect("a spec");
+            refused(service.create_worker(post).await.expect_err("POST"), key);
+            let put: WorkerSpec =
+                serde_json::from_value(json!({"url": "grpc://10.0.0.8:8000", "labels": labels}))
+                    .expect("a spec");
+            refused(
+                service
+                    .replace_worker(id.as_str(), put)
+                    .await
+                    .expect_err("PUT"),
+                key,
+            );
+            let patch: WorkerUpdateRequest =
+                serde_json::from_value(json!({ "labels": labels })).expect("an update");
+            refused(
+                service
+                    .update_worker(id.as_str(), patch)
+                    .await
+                    .expect_err("PATCH"),
+                key,
+            );
+        }
+        let lookalikes = json!({
+            "smg.ai/discovery": "v",
+            "smg.ai/discoveryid": "v",
+            "x/smg.ai/discovery-id": "v",
+        });
+        let post: WorkerSpec =
+            serde_json::from_value(json!({"url": "grpc://10.0.0.9:8000", "labels": lookalikes}))
+                .expect("a spec");
+        assert!(matches!(
+            service
+                .create_worker(post)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+    }
+
+    /// A discovered worker's spec and labels are changed at its discovery
+    /// source: a PUT of it is a 409 naming its provider, whatever the body —
+    /// the worker's own spec sent back included — and so is a PATCH that
+    /// carries labels, reserved ones included. A PATCH of what no provider
+    /// publishes, and a DELETE, are taken (the provider adds a deleted
+    /// worker back while it still publishes it).
+    #[tokio::test]
+    async fn put_and_a_label_patch_of_a_discovered_worker_are_refused_naming_its_provider() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "grpc://10.0.0.10:8000";
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .label(DISCOVERY_PROVIDER_LABEL, "consul")
+            .label("smg.ai/discovery-id", "node-1:8000")
+            .build();
+        registry.register(Arc::new(worker)).unwrap();
+        let id = registry.reserve_id_for_url(url);
+        let service = make_service(Arc::clone(&registry));
+        let owned = |err: WorkerServiceError| {
+            assert_eq!(err.status_code(), StatusCode::CONFLICT, "{err}");
+            assert_eq!(err.error_code(), "WORKER_DISCOVERY_OWNED");
+            let message = err.to_string();
+            assert!(message.contains("'consul' discovery provider"), "{message}");
+            assert!(message.contains("discovery source"), "{message}");
+        };
+        let own_spec = (*registry.get(&id).expect("registered").metadata().spec).clone();
+        for put in [worker_spec(url), own_spec] {
+            owned(
+                service
+                    .replace_worker(id.as_str(), put)
+                    .await
+                    .expect_err("PUT"),
+            );
+        }
+        for body in [
+            json!({"labels": {"env": "prod"}}),
+            json!({"priority": 5, "labels": {"env": "prod"}}),
+            json!({"labels": {DISCOVERY_PROVIDER_LABEL: "file"}}),
+        ] {
+            let patch: WorkerUpdateRequest = serde_json::from_value(body).expect("an update");
+            owned(
+                service
+                    .update_worker(id.as_str(), patch)
+                    .await
+                    .expect_err("PATCH"),
+            );
+        }
+        for body in [
+            json!({"priority": 5}),
+            json!({"cost": 2.0}),
+            json!({"api_key": "rotated"}),
+            json!({"health": {"timeout_secs": 9}}),
+        ] {
+            let patch: WorkerUpdateRequest =
+                serde_json::from_value(body.clone()).expect("an update");
+            assert!(
+                matches!(
+                    service.update_worker(id.as_str(), patch).await,
+                    Err(WorkerServiceError::QueueNotInitialized)
+                ),
+                "{body} reaches the queue"
+            );
+        }
+        assert!(matches!(
+            service
+                .delete_worker(id.as_str())
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+    }
+
+    /// A rejected key is not echoed whole: a key the size of the payload
+    /// limit comes back as its first characters and its length.
+    #[test]
+    fn a_rejected_label_key_is_shown_truncated() {
+        let long = "k".repeat(1 << 20);
+        let labels: HashMap<String, String> = [(long.clone(), "v".to_string())].into();
+        let err = validate_labels(&labels).expect_err("a key over the cap");
+        let WorkerServiceError::BadRequest { message } = err else {
+            panic!("expected a bad request, got {err}");
+        };
+        assert!(message.len() < 512, "{} bytes", message.len());
+        assert!(
+            message.contains(&format!("({} bytes)", long.len())),
+            "{message}"
+        );
+        let short: HashMap<String, String> = [("has space".to_string(), "v".to_string())].into();
+        let err = validate_labels(&short).expect_err("a key with a space");
+        assert!(err.to_string().contains("\"has space\""), "{err}");
+    }
+
+    #[test]
+    fn list_workers_by_origin_tells_local_from_discovered() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "http://local:30000", None);
+        let discovered: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://discovered:30000")
+                .worker_type(WorkerType::Regular)
+                .label(DISCOVERY_PROVIDER_LABEL, "file")
+                .build(),
+        );
+        registry.register(discovered).unwrap();
+        let service = make_service(registry);
+        let urls = |result: ListWorkersResult| -> Vec<String> {
+            result.workers.iter().map(|w| w.spec.url.clone()).collect()
+        };
+
+        assert_eq!(
+            urls(service.list_workers(None, Some(WorkerListOrigin::Local))),
+            ["http://local:30000"],
+            "local: the worker the API registered"
+        );
+        assert_eq!(
+            urls(service.list_workers(None, Some(WorkerListOrigin::Discovery))),
+            ["http://discovered:30000"],
+            "discovery: the worker a provider owns"
+        );
+        assert_eq!(service.list_workers(None, None).total, 2, "no origin: both");
     }
 }

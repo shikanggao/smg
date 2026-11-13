@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 
+from .constants import SERVICER_WARMUP_BUDGET_SECS
+
 # Environment variable for local model paths (CI uses local copies for speed)
 ROUTER_LOCAL_MODEL_PATH = os.environ.get("ROUTER_LOCAL_MODEL_PATH", "")
 # Nightly benchmarks skip --enforce-eager for performance measurement
@@ -41,6 +43,25 @@ MODEL_SPECS: dict[str, dict] = {
         "model": _resolve_model_path("meta-llama/Llama-3.2-1B-Instruct"),
         "tp": 1,
         "features": ["chat", "streaming", "tool_choice"],
+    },
+    # The same checkpoint's tokenizer and chat template from an ungated
+    # repository: what the classes on the mock engine read, so the CPU lane
+    # fetches the files without a hub token (the mock needs no weights, only
+    # the tokenizer files). Not a model any engine lane runs: no features, and
+    # no tier downloads it.
+    "RedHatAI/Llama-3.2-1B-Instruct-FP8": {
+        "model": _resolve_model_path("RedHatAI/Llama-3.2-1B-Instruct-FP8"),
+        "tp": 1,
+        "features": [],
+        "skip_tier_download": True,
+    },
+    # The primary chat model's tokenizer and chat template from an ungated
+    # repository, for the classes on the mock engine (as above).
+    "RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8": {
+        "model": _resolve_model_path("RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"),
+        "tp": 1,
+        "features": [],
+        "skip_tier_download": True,
     },
     # Function calling specialist
     "Qwen/Qwen2.5-7B-Instruct": {
@@ -142,28 +163,21 @@ MODEL_SPECS: dict[str, dict] = {
         "model": _resolve_model_path("openai/gpt-oss-120b"),
         "tp": 4,
         "features": ["chat", "streaming", "reasoning", "harmony"],
-        "startup_timeout": 600,
+        # The engine's own start, then the servicer's planned warm-up (its budget).
+        "startup_timeout": 600 + SERVICER_WARMUP_BUDGET_SECS,
         "vllm_args": [
             "--structured-outputs-config",
             '{"enable_in_reasoning": true}',
         ],
     },
-    # MiniMax M2 - nightly benchmarks
-    "minimaxai/minimax-m2": {
-        "model": _resolve_model_path("minimaxai/minimax-m2"),
-        "tp": 4,
-        "features": ["chat", "streaming", "function_calling", "reasoning"],
-        "sglang_args": ["--trust-remote-code"],
-        "vllm_args": ["--trust-remote-code"],
-    },
-    # Vision-language model for multimodal benchmarks (MMMU)
+    # Vision-language model for the multimodal chat tests
     "Qwen/Qwen3-VL-8B-Instruct": {
         "model": _resolve_model_path("Qwen/Qwen3-VL-8B-Instruct"),
         "tp": 1,
         "features": ["chat", "streaming", "multimodal"],
     },
     # Standard-RoPE vision model for the PD multimodal KV-isolation test:
-    # M-RoPE models (Qwen-VL) cannot decode on the tensor-stripped PD leg.
+    # M-RoPE models (Qwen-VL) cannot decode on the tensor-stripped PD side.
     "microsoft/Phi-3.5-vision-instruct": {
         "model": _resolve_model_path("microsoft/Phi-3.5-vision-instruct"),
         "tp": 1,
@@ -181,7 +195,8 @@ MODEL_SPECS: dict[str, dict] = {
         "model": _resolve_model_path("Qwen/Qwen3.5-9B"),
         "tp": 1,
         "features": ["chat", "streaming", "multimodal", "moe"],
-        "startup_timeout": 600,
+        # The engine's own start, then the servicer's planned warm-up (its budget).
+        "startup_timeout": 600 + SERVICER_WARMUP_BUDGET_SECS,
         "tokenspeed_args": [
             "--attention-backend",
             "fa3",
@@ -202,25 +217,7 @@ MODEL_SPECS: dict[str, dict] = {
         # keep it out of the tier-wide pre-download; the EPD job fetches it by id.
         "skip_tier_download": True,
     },
-    # Llama-4-Maverick (17B with 128 experts, FP8) - Nightly benchmarks
-    "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8": {
-        "model": _resolve_model_path("meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"),
-        "tp": 8,  # Tensor parallelism across 8 GPUs
-        "features": ["chat", "streaming", "function_calling", "moe"],
-        "sglang_args": [
-            "--trust-remote-code",
-            "--context-length=163840",  # 160K context length (SGLang)
-            "--attention-backend=fa3",  # fa3 attention backend
-            "--mem-fraction-static=0.82",  # 82% GPU memory for static allocation
-        ],
-        "vllm_args": [
-            "--trust-remote-code",
-            "--max-model-len=163840",  # 160K context length (vLLM)
-            "--attention-backend=FLASHINFER",  # FLASHINFER attention backend
-        ],
-        "startup_timeout": 1200,  # Large MoE model may need extra download/load time
-    },
-    # Llama-4-Scout (17B with 16 experts) - Nightly benchmarks and Multimodal tests
+    # Llama-4-Scout (17B with 16 experts) - Multimodal tests
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
         "model": _resolve_model_path("meta-llama/Llama-4-Scout-17B-16E-Instruct"),
         "tp": 4,
@@ -228,7 +225,7 @@ MODEL_SPECS: dict[str, dict] = {
         "sglang_args": [
             "--context-length=196608",
             "--attention-backend=fa3",
-            "--cuda-graph-max-bs=256",
+            "--cuda-graph-max-bs-decode=256",
             "--max-running-requests=300",
             "--mem-fraction-static=0.85",
             "--enable-multimodal",
@@ -236,35 +233,9 @@ MODEL_SPECS: dict[str, dict] = {
         "vllm_args": [
             "--max-model-len=196608",
         ],
-        "startup_timeout": 1200,  # Large MoE model may need extra download/load time
-    },
-    # Llama-3.3-70B - Nightly benchmarks
-    "meta-llama/Llama-3.3-70B-Instruct": {
-        "model": _resolve_model_path("meta-llama/Llama-3.3-70B-Instruct"),
-        "tp": 4,
-        "features": ["chat", "streaming", "function_calling"],
-        "sglang_args": [
-            "--mem-fraction-static=0.9",
-        ],
-        "vllm_args": [
-            "--max-model-len=131072",
-            "--gpu-memory-utilization=0.9",
-            "--enable-chunked-prefill",
-        ],
-    },
-    # Llama-3.3-70B FP8 - Nightly benchmarks
-    "RedHatAI/Llama-3.3-70B-Instruct-FP8-dynamic": {
-        "model": _resolve_model_path("RedHatAI/Llama-3.3-70B-Instruct-FP8-dynamic"),
-        "tp": 4,
-        "features": ["chat", "streaming", "function_calling"],
-        "sglang_args": [
-            "--mem-fraction-static=0.9",
-        ],
-        "vllm_args": [
-            "--max-model-len=131072",
-            "--gpu-memory-utilization=0.9",
-            "--enable-chunked-prefill",
-        ],
+        # A large MoE model may need extra download/load time, then the servicer's
+        # planned warm-up (its budget).
+        "startup_timeout": 1200 + SERVICER_WARMUP_BUDGET_SECS,
     },
     # MLX (Apple Silicon). Smallest Qwen3 with tool calling + thinking (~400 MB).
     "mlx-community/Qwen3-0.6B-4bit": {

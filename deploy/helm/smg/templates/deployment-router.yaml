@@ -1,3 +1,5 @@
+{{- include "smg.validateDiscovery" . -}}
+{{- include "smg.validateAdmission" . -}}
 apiVersion: apps/v1
 {{- if .Values.router.mesh.enabled }}
 kind: StatefulSet
@@ -16,6 +18,15 @@ spec:
   {{- if .Values.router.mesh.enabled }}
   serviceName: {{ include "smg.fullname" . }}-router-headless
   podManagementPolicy: Parallel
+  {{- else }}
+  {{- /* /readiness follows the engine: it answers 503 until a worker's engine
+       reports healthy, tens of minutes for a large checkpoint. The rollout's
+       progress deadline covers the gateway's own start-up bound
+       (--worker-startup-timeout-secs, 1800 s by default) and the chart's tail
+       after it instead of the Kubernetes default of 600 s, so a router waiting
+       for its engine is not reported as a failed rollout (values.yaml,
+       router.progressDeadlineSeconds; README, Readiness Deadlines). */}}
+  progressDeadlineSeconds: {{ .Values.router.progressDeadlineSeconds }}
   {{- end }}
   selector:
     matchLabels:
@@ -26,6 +37,22 @@ spec:
       annotations:
         {{- if .Values.router.mesh.enabled }}
         sglang.ai/mesh-port: {{ .Values.router.mesh.port | quote }}
+        {{- end }}
+        {{- /* The key is read from a file at start-up, so a rotated auth.apiKey
+             must roll the pods: the chart-managed Secret's content is on the pod
+             template. An existingSecret the chart does not see needs a rollout
+             restart. */}}
+        {{- if and .Values.auth.apiKey (not .Values.auth.existingSecret) }}
+        checksum/auth: {{ .Values.auth.apiKey | sha256sum }}
+        {{- end }}
+        {{- if and .Values.auth.controlPlane.apiKeys (not .Values.auth.controlPlane.existingSecret) }}
+        checksum/control-plane: {{ .Values.auth.controlPlane.apiKeys | sha256sum }}
+        {{- end }}
+        {{- if include "smg.historySecretManaged" . }}
+        checksum/history-secret: {{ include (print $.Template.BasePath "/secret-history.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if include "smg.oracleSecretManaged" . }}
+        checksum/oracle-secret: {{ include (print $.Template.BasePath "/secret-oracle.yaml") . | sha256sum }}
         {{- end }}
         {{- with .Values.router.podAnnotations }}
         {{- toYaml . | nindent 8 }}
@@ -42,6 +69,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "smg.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ add (int .Values.router.shutdownGracePeriodSeconds) (int .Values.router.terminationGraceMarginSeconds) }}
       containers:
         - name: router
           image: "{{ include "smg.routerImage" . }}"
@@ -55,6 +83,11 @@ spec:
             - name: metrics
               containerPort: {{ .Values.router.metrics.port }}
               protocol: TCP
+            {{- if .Values.router.adminPort }}
+            - name: admin
+              containerPort: {{ .Values.router.adminPort }}
+              protocol: TCP
+            {{- end }}
             {{- if .Values.router.mesh.enabled }}
             - name: mesh
               containerPort: {{ .Values.router.mesh.port }}
@@ -66,13 +99,13 @@ spec:
           {{- end }}
           livenessProbe:
             httpGet:
-              path: /health
+              path: {{ .Values.router.livenessProbe.path }}
               port: http
             initialDelaySeconds: {{ .Values.router.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.router.livenessProbe.periodSeconds }}
           readinessProbe:
             httpGet:
-              path: /health
+              path: {{ .Values.router.readinessProbe.path }}
               port: http
             initialDelaySeconds: {{ .Values.router.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.router.readinessProbe.periodSeconds }}
@@ -100,15 +133,132 @@ spec:
                   name: {{ include "smg.fullname" . }}-hf-token
                   key: token
             {{- end }}
+            {{- with include "smg.historySecretName" . }}
+            - name: {{ include "smg.historyUrlEnv" $ }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ include "smg.historySecretKey" $ }}
+            {{- end }}
+            {{- with include "smg.oracleSecretName" . }}
+            {{- $secret := . }}
+            {{- range (include "smg.oracleCredentials" $ | fromJsonArray) }}
+            - name: {{ .env }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: {{ .key }}
+            {{- end }}
+            {{- end }}
+            {{- /* Consul discovery takes its ACL token and TLS files from Consul's
+                 own variables only, never from flags: the token from an
+                 existing Secret, the files from one mounted below. */}}
+            {{- if eq (.Values.router.discovery.provider | default "") "consul" }}
+            {{- with .Values.router.discovery.consul.token }}
+            {{- if .existingSecret }}
+            - name: CONSUL_HTTP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .existingSecret }}
+                  key: {{ .secretKey | default "token" }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- range (include "smg.consulTlsFiles" . | fromJsonArray) }}
+            - name: {{ .env }}
+              value: {{ printf "/etc/smg/consul-tls/%s" .path | quote }}
+            {{- end }}
             {{- with .Values.router.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if include "smg.authSecretName" . }}
+            - name: auth
+              mountPath: /etc/smg/auth
+              readOnly: true
+            {{- end }}
+            {{- if include "smg.controlPlaneSecretName" . }}
+            - name: control-plane
+              mountPath: /etc/smg/control-plane
+              readOnly: true
+            {{- end }}
+            {{- if and (eq (.Values.router.discovery.provider | default "") "file") .Values.router.discovery.file.configMap.name }}
+            - name: discovery-manifest
+              mountPath: /etc/smg/discovery
+              readOnly: true
+            {{- end }}
+            {{- if .Values.router.tenantRateLimit.configMap.name }}
+            - name: rate-limit
+              mountPath: /etc/smg/rate-limit
+              readOnly: true
+            {{- end }}
+            {{- if .Values.router.priorityScheduler.configMap.name }}
+            - name: scheduler
+              mountPath: /etc/smg/scheduler
+              readOnly: true
+            {{- end }}
+            {{- if include "smg.consulTlsFiles" . | fromJsonArray }}
+            - name: consul-tls
+              mountPath: /etc/smg/consul-tls
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if include "smg.authSecretName" . }}
+        - name: auth
+          secret:
+            secretName: {{ include "smg.authSecretName" . }}
+            items:
+              - key: {{ include "smg.authSecretKey" . }}
+                path: {{ include "smg.authSecretKey" . }}
+        {{- end }}
+        {{- if include "smg.controlPlaneSecretName" . }}
+        - name: control-plane
+          secret:
+            secretName: {{ include "smg.controlPlaneSecretName" . }}
+            items:
+              - key: {{ include "smg.controlPlaneSecretKey" . }}
+                path: {{ include "smg.controlPlaneSecretKey" . }}
+        {{- end }}
+        {{- /* The whole ConfigMap, not a subPath of it: the kubelet projects an
+             update by swapping a symlink in this directory, which the
+             gateway's watch on it reports. Optional, as the gateway waits for
+             a manifest not there yet, so the ConfigMap can follow the release. */}}
+        {{- if and (eq (.Values.router.discovery.provider | default "") "file") .Values.router.discovery.file.configMap.name }}
+        - name: discovery-manifest
+          configMap:
+            name: {{ .Values.router.discovery.file.configMap.name }}
+            optional: true
+        {{- end }}
+        {{- /* Whole ConfigMaps, as the discovery manifest, kept so for a later
+             file watch: the kubelet's symlink swap brings an edit to the file,
+             but the gateway reads both files once at start, so an edit takes
+             effect on the next rollout restart of the router. Not optional: a
+             pod waits for a ConfigMap not there yet instead of starting
+             without it. */}}
+        {{- if .Values.router.tenantRateLimit.configMap.name }}
+        - name: rate-limit
+          configMap:
+            name: {{ .Values.router.tenantRateLimit.configMap.name }}
+        {{- end }}
+        {{- if .Values.router.priorityScheduler.configMap.name }}
+        - name: scheduler
+          configMap:
+            name: {{ .Values.router.priorityScheduler.configMap.name }}
+        {{- end }}
+        {{- with include "smg.consulTlsFiles" . | fromJsonArray }}
+        - name: consul-tls
+          secret:
+            secretName: {{ $.Values.router.discovery.consul.tls.existingSecret }}
+            items:
+              {{- range . }}
+              - key: {{ .key }}
+                path: {{ .path }}
+              {{- end }}
+        {{- end }}
       {{- with .Values.router.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

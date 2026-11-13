@@ -1,5 +1,5 @@
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, HashMap},
     hash::{Hash, Hasher},
 };
 
@@ -40,6 +40,50 @@ impl std::fmt::Debug for EncodeJob {
     }
 }
 
+/// How the active renderer expects media content to reach its template.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MediaHandling {
+    /// Resolve and preprocess media using the model's multimodal configuration.
+    #[default]
+    Preprocess,
+    /// The template renders media as plain text. Preserve authored content order
+    /// and skip media processing; the resulting prompt needs only text tokenization.
+    TemplateText,
+}
+
+/// Renderer behaviours the gateway mirrors when it prepares a request, so
+/// the rendered prompt and the request handling never disagree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RendererCapabilities {
+    /// Resolved when the renderer is loaded or its template is replaced.
+    pub media_handling: MediaHandling,
+    /// The renderer reads `enable_thinking` as an alias of its thinking key.
+    pub enable_thinking_alias: bool,
+    /// With `add_generation_prompt` false and `continue_final_message` set
+    /// the renderer continues a trailing assistant message itself (no EOS, no
+    /// generation header); the gateway must keep the message instead of
+    /// popping it into a text prefix.
+    pub native_assistant_continuation: bool,
+    /// The renderer parses tool-call `arguments` strings itself with the
+    /// reference's tolerance (non-object and double-encoded values), or its
+    /// template writes them as the text the request sent (a template that
+    /// concatenates them cannot render an object); the gateway must forward
+    /// them as written instead of pre-parsing them.
+    pub raw_tool_call_arguments: bool,
+    /// The renderer's reference writes a turn of its own for user and
+    /// developer messages only: a `system` message after the first renders
+    /// as bare text with no role marker, glued to the text before it (the
+    /// assistant header after it follows the reference's own rule, not the
+    /// message's role). On the Messages path the gateway renders a
+    /// `system`-role message sent inside `messages[]` past the leading run
+    /// of system messages (the system prompt, which every renderer writes,
+    /// whether it came as the top-level `system` or as the first messages)
+    /// as a user turn at its position for such a renderer; elsewhere the
+    /// message is forwarded in place, for the templates that render a
+    /// system turn anywhere.
+    pub leading_system_only: bool,
+}
+
 /// How the `text` of a [`ChatTemplateOutput`] becomes token ids.
 #[derive(Debug)]
 pub enum PromptEncoding {
@@ -56,6 +100,23 @@ pub struct ChatTemplateOutput {
     /// The flat prompt, for logs, routing, and `original_text`.
     pub text: String,
     pub encoding: PromptEncoding,
+    /// Prompt tokens the provider does not bill (K3's response-channel stub); 0 for flat renderers.
+    pub unbilled_prompt_tokens: u32,
+    /// The prompt ends inside the final message, kept and left open as
+    /// `continue_final_message` asks. False when that was not asked for, and
+    /// when a template could not continue the message and its text follows
+    /// the generation prompt instead: the completion then starts wherever
+    /// that prompt leaves it, inside a reasoning block it opens for one.
+    pub continued_final_message: bool,
+    /// The prompt is rendered for generation, as `add_generation_prompt: true`
+    /// renders it: the renderer's generation header follows the last turn
+    /// where its reference writes one. False when the request asked for no
+    /// header and the renderer honoured it, and when the final message was
+    /// continued instead. A renderer with an encoder of its own writes the
+    /// header whatever the request asked, as the engines' own encoders do,
+    /// and reports true; the reasoning decisions read this rather than the
+    /// request, since nothing opens a reasoning block without the header.
+    pub generation_prompt: bool,
 }
 
 /// Core encoding trait - separate from decoding for modularity
@@ -64,9 +125,157 @@ pub trait Encoder: Send + Sync {
     fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>>;
 }
 
+/// Per-stream state that turns generated token ids into text one at a time.
+///
+/// Implementations own whatever they need (pending bytes, a decode window)
+/// and must produce, over a whole stream, steps and finish together, the
+/// text [`Decoder::decode`] gives for all of its ids, a character the
+/// stream's end cut short included, as the replacement character (the one
+/// exception, a ByteFallback vocabulary's window, is named at
+/// [`finish_into`](Self::finish_into)).
+pub trait IncrementalDecoder: Send + Sync {
+    /// Feed one token; returns the text that became final with it (empty when
+    /// the token only extends a multi-byte character or is skipped).
+    fn step(&mut self, token_id: TokenIdType) -> Result<String>;
+
+    /// Feed one token; appends the text that became final with it to `out`
+    /// and says whether there was any (none when the token only extends a
+    /// multi-byte character or is skipped). The default goes through
+    /// [`step`](Self::step); a decoder that has the text at hand appends it
+    /// without a string of its own per token.
+    fn step_into(&mut self, token_id: TokenIdType, out: &mut String) -> Result<bool> {
+        let text = self.step(token_id)?;
+        out.push_str(&text);
+        Ok(!text.is_empty())
+    }
+
+    /// The stream's end: appends the text the decoder still holds, rendered
+    /// as [`Decoder::decode`] renders the end of the same ids: a complete
+    /// character as it is, a stray invalid byte and an incomplete trailing
+    /// sequence (the start of a character the model never finished) as the
+    /// replacement character. The one exception is a ByteFallback
+    /// vocabulary's window, which keeps a cut character's byte tokens off
+    /// its end: its decoder renders the whole byte run around them as
+    /// replacement characters, rewriting text already sent. Says whether
+    /// anything was appended. The default is for a decoder that holds
+    /// nothing back between steps.
+    fn finish_into(&mut self, out: &mut String) -> Result<bool> {
+        let _ = out;
+        Ok(false)
+    }
+
+    /// Forget all state, as for a new stream.
+    fn reset(&mut self);
+}
+
+/// What one incremental decode step, or finishing a sequence, produced.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DecodeStep {
+    /// Newly decoded text; `None` while the step holds an incomplete character.
+    pub text: Option<String>,
+    /// The decoder chain rewrote text that was already emitted (an invalid byte
+    /// collapsed a byte run, a replacement spanned the emitted boundary). `text`
+    /// is then the best-effort remainder: nothing already emitted is retracted.
+    pub prefix_mismatch: bool,
+}
+
+impl DecodeStep {
+    /// The step's text, empty when it held.
+    pub fn into_text(self) -> String {
+        self.text.unwrap_or_default()
+    }
+}
+
+/// What one incremental decode step appended into the caller's buffer, and
+/// the report the step makes ([`DecodeStep::prefix_mismatch`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AppendedStep {
+    /// The step appended text; `false` while it holds an incomplete character.
+    pub appended: bool,
+    /// As [`DecodeStep::prefix_mismatch`].
+    pub prefix_mismatch: bool,
+}
+
+/// Appends a step's text to `out`, or hands the string itself over when `out`
+/// has no allocation yet (a cleared buffer kept for reuse, a stream's delta or
+/// the stop jail, keeps its capacity and is appended to); whether there was
+/// any.
+pub(crate) fn append_step_text(text: Option<String>, out: &mut String) -> bool {
+    match text {
+        Some(text) if !text.is_empty() => {
+            if out.capacity() == 0 {
+                *out = text;
+            } else {
+                out.push_str(&text);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// What a window's end releases: `decoded`, the window's text, past the
+/// emitted `prefix`; or, when the decode no longer starts with the emitted
+/// text, what follows their common prefix, reported as a rewritten prefix
+/// (nothing already emitted is retracted).
+pub(crate) fn past_emitted(decoded: &str, prefix: &str) -> DecodeStep {
+    let (text, prefix_mismatch) = match decoded.strip_prefix(prefix) {
+        Some(rest) => (rest.to_string(), false),
+        None => {
+            let common = decoded
+                .char_indices()
+                .zip(prefix.chars())
+                .find(|((_, a), b)| a != b)
+                .map_or_else(|| decoded.len().min(prefix.len()), |((index, _), _)| index);
+            crate::decode_activity::note_prefix_mismatch(false);
+            (decoded[common..].to_string(), true)
+        }
+    };
+    DecodeStep {
+        text: (!text.is_empty()).then_some(text),
+        prefix_mismatch,
+    }
+}
+
 /// Core decoding trait - can be implemented independently
 pub trait Decoder: Send + Sync {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String>;
+
+    /// Whether the configured decoder contains ByteFallback byte-run buffering.
+    fn uses_byte_fallback(&self) -> bool {
+        false
+    }
+
+    /// Release text buffered by incremental decoding at end of input. A
+    /// decoder whose final text no longer starts with what it emitted reports
+    /// `prefix_mismatch` and returns the remainder instead of failing. The
+    /// default releases what [`decode_step`](Self::decode_step) holds: the
+    /// window's decode past the emitted prefix, and leaves the window empty;
+    /// a window that holds the bytes of a character the end cut short (a
+    /// tiktoken vocabulary without its per-id table) releases them as
+    /// `decode` renders them, the replacement character. A Hugging Face
+    /// vocabulary with byte fallback overrides this: its window keeps a cut
+    /// character's byte tokens off its end (see
+    /// [`IncrementalDecoder::finish_into`]).
+    fn finish_decode(
+        &self,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<DecodeStep> {
+        // Nothing past the emitted text: a stream that ended on a settled
+        // token, or a seeded sequence that generated nothing.
+        let step = if ids.len() <= *prefix_index {
+            DecodeStep::default()
+        } else {
+            past_emitted(&self.decode(ids, skip_special_tokens)?, prefix)
+        };
+        ids.clear();
+        prefix.clear();
+        *prefix_index = 0;
+        Ok(step)
+    }
 
     /// Incremental decode step — called once per generated token.
     ///
@@ -74,9 +283,11 @@ pub trait Decoder: Send + Sync {
     /// produce incremental text output. The default implementation uses the
     /// double-decode algorithm (decode prefix, decode prefix+new, diff).
     ///
-    /// HuggingFace overrides this with the native `step_decode_stream` from the
-    /// `tokenizers` crate, which uses the same algorithm internally but avoids
-    /// trait-method overhead for the two `decode()` calls.
+    /// HuggingFace overrides this with its own copy of that algorithm run on the
+    /// concrete tokenizer (no trait-method overhead for the two `decode()`
+    /// calls) which, where the decode no longer starts with the emitted text,
+    /// emits the remainder instead of failing (see
+    /// [`decode_step_reporting`](Self::decode_step_reporting) for the report).
     fn decode_step(
         &self,
         token_id: TokenIdType,
@@ -117,6 +328,84 @@ pub trait Decoder: Send + Sync {
             Ok(None)
         }
     }
+
+    /// Eager text observation for engine-side stop matching. Unlike client
+    /// output, this must observe a stop at its original generated-token count.
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        self.decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    /// [`decode_step`](Self::decode_step) (or the eager variant) with the
+    /// step's diagnostics: a backend that recovers from a rewritten prefix
+    /// reports it here. The default reports nothing.
+    fn decode_step_reporting(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+    ) -> Result<DecodeStep> {
+        let text = if eager {
+            self.decode_step_eager(token_id, ids, prefix, prefix_index, skip_special_tokens)?
+        } else {
+            self.decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)?
+        };
+        Ok(DecodeStep {
+            text,
+            prefix_mismatch: false,
+        })
+    }
+
+    /// [`decode_step_reporting`](Self::decode_step_reporting), with the
+    /// step's text appended to `out` instead of returned in a string of its
+    /// own: a stream that collects its text in one buffer takes each token's
+    /// text without a string per token. The default appends the reporting
+    /// step's text; a backend whose step can write the text straight from its
+    /// tables overrides it.
+    #[expect(clippy::too_many_arguments)]
+    fn decode_step_into(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+        out: &mut String,
+    ) -> Result<AppendedStep> {
+        let step = self.decode_step_reporting(
+            token_id,
+            ids,
+            prefix,
+            prefix_index,
+            skip_special_tokens,
+            eager,
+        )?;
+        Ok(AppendedStep {
+            appended: append_step_text(step.text, out),
+            prefix_mismatch: step.prefix_mismatch,
+        })
+    }
+
+    /// A dedicated per-stream decoder, when the backend has a cheaper
+    /// algorithm than [`decode_step`](Self::decode_step) (byte-level BPE
+    /// vocabularies do). `None`, the default, means callers use `decode_step`.
+    fn incremental_decoder(
+        &self,
+        skip_special_tokens: bool,
+    ) -> Option<Box<dyn IncrementalDecoder>> {
+        let _ = skip_special_tokens;
+        None
+    }
 }
 
 /// Combined tokenizer trait
@@ -128,6 +417,14 @@ pub trait Tokenizer: Encoder + Decoder {
 
     /// Enable downcasting to concrete types
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// The `response_template` object of `tokenizer_config.json`, if any.
+    ///
+    /// The value is kept verbatim. Parser selection decides whether it
+    /// describes a supported output format.
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        None
+    }
 
     /// Apply chat template to messages. Default returns an error for tokenizers without template support.
     fn apply_chat_template(
@@ -144,13 +441,19 @@ pub trait Tokenizer: Encoder + Decoder {
     /// `continue_final_message` prefill applied. The default appends the
     /// prefill to the flat rendering and reports [`PromptEncoding::FromText`];
     /// renderers whose ids are not a function of the text override it and
-    /// hand back a deferred encode instead.
+    /// hand back a deferred encode instead. The default reports a requested
+    /// `continue_final_message` as honored, and the generation header as
+    /// `add_generation_prompt` asked for it; renderers that can fall back
+    /// from a continuation, or write the header whatever was asked, override
+    /// this to report what they did.
     fn apply_chat_template_with_encoding(
         &self,
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
+        let continued_final_message = params.continue_final_message;
+        let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
         let mut text = self.apply_chat_template(messages, params)?;
         if let Some(prefix) = assistant_prefix {
             text.push_str(prefix);
@@ -158,12 +461,43 @@ pub trait Tokenizer: Encoder + Decoder {
         Ok(ChatTemplateOutput {
             text,
             encoding: PromptEncoding::FromText,
+            unbilled_prompt_tokens: 0,
+            continued_final_message,
+            generation_prompt: generation_prompt_unless_continued && !continued_final_message,
         })
+    }
+
+    /// [`Self::apply_chat_template_with_encoding`] on messages the caller
+    /// hands over. A renderer that shapes the messages before it renders
+    /// them (the Jinja renderer gives an OpenAI-format template every string
+    /// content as a one-item text part list) shapes them in place instead of
+    /// copying every message; the default renders the slice as borrowed.
+    fn apply_chat_template_with_encoding_owned(
+        &self,
+        messages: Vec<serde_json::Value>,
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        self.apply_chat_template_with_encoding(&messages, params, assistant_prefix)
     }
 
     /// Get the content format expected by the chat template.
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
         ChatTemplateContentFormat::default()
+    }
+
+    /// The content format of the template a request renders through, by
+    /// whether the request declares tools: a checkpoint can ship one template
+    /// for requests with tools and another for those without (see
+    /// `ChatTemplateState::content_format_for_tools`), and the request's
+    /// message content takes the shape of the one that renders it. The
+    /// default template's format for a tokenizer with one template.
+    fn chat_template_content_format_for_request(
+        &self,
+        has_tools: bool,
+    ) -> ChatTemplateContentFormat {
+        let _ = has_tools;
+        self.chat_template_content_format()
     }
 
     /// Get the thinking toggle support for this template.
@@ -183,9 +517,48 @@ pub trait Tokenizer: Encoder + Decoder {
         &[]
     }
 
+    /// `chat_template_kwargs.reasoning_effort` values that switch this
+    /// tokenizer's renderer out of thinking mode. Empty when the renderer
+    /// has no such word of its own (the protocol-level `none`/`minimal`
+    /// still apply).
+    fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Whether the template injects `<think>` in the generation prompt.
     fn think_in_prefill(&self) -> bool {
         false
+    }
+
+    /// Whether the generation prompt opens a `<think>` block it does not
+    /// close, so a completion starts inside reasoning. Stricter than
+    /// `think_in_prefill`: a template that writes an empty, closed
+    /// `<think></think>` (a non-thinking template) injects the tag but opens
+    /// nothing. Arms the reasoning parser of a template without a thinking
+    /// switch.
+    fn prefill_opens_think_block(&self) -> bool {
+        self.think_in_prefill()
+    }
+
+    /// Renderer behaviours the gateway mirrors when it prepares a request.
+    fn renderer_capabilities(&self) -> RendererCapabilities {
+        RendererCapabilities::default()
+    }
+
+    /// The thinking mode this tokenizer's renderer renders for the template
+    /// kwargs and the request-level toggle it is handed
+    /// ([`ChatTemplateParams::template_kwargs`] and
+    /// [`ChatTemplateParams::thinking`]), for a renderer that resolves the
+    /// mode by its own rule rather than through the template's toggle key.
+    /// The gateway arms its reasoning parser from the same answer, so the
+    /// prompt and the parser never disagree. `None`: the renderer has no
+    /// rule of its own and the gateway's generic resolution applies.
+    fn native_thinking_mode(
+        &self,
+        _template_kwargs: Option<&HashMap<String, serde_json::Value>>,
+        _thinking: Option<bool>,
+    ) -> Option<bool> {
+        None
     }
 
     /// Set or override the chat template.
@@ -204,6 +577,30 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Models can have multiple EOS tokens (e.g., Llama 3: end_of_text + eom_id + eot_id).
     fn eos_token_ids(&self) -> &[TokenIdType] {
         &[]
+    }
+
+    /// The added tokens that are not special and are extracted from the raw
+    /// text, in the same pass as the special tokens (`normalized: false`):
+    /// strings the tokenizer takes whole before pre-tokenization. A cache
+    /// that splits text at special tokens must not split inside one of these
+    /// (a special token can be a substring of a longer added token), so it
+    /// matches them too, as text that is never a boundary. The added tokens
+    /// matched after normalization, on the pieces that pass leaves, are not
+    /// listed: they can never take a raw-pass token's place. Empty when a
+    /// tokenizer has none.
+    fn added_token_strings(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The added tokens, special or not, that are matched after
+    /// normalization rather than on the raw text (`normalized: true`). A
+    /// cache that splits text at special tokens does not split at any of
+    /// these, whatever a configuration calls them (a BOS or EOS named there
+    /// can be such a token): where they are extracted depends on the
+    /// normalized text and on the other tokens of that pass. Empty when a
+    /// tokenizer has none.
+    fn added_tokens_after_normalization(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -226,6 +623,17 @@ impl Encoding {
             Encoding::Hf(inner) => inner.get_ids(),
             Encoding::Plain(inner) => inner,
             Encoding::Tiktoken(inner) => inner,
+        }
+    }
+
+    /// The token ids, taken out of the encoding: the vector itself for the
+    /// encodings that own one (the direct and tiktoken paths, and every
+    /// exact-cache hit), a copy for the library's own encoding, which keeps
+    /// its ids behind a borrow.
+    pub fn into_token_ids(self) -> Vec<TokenIdType> {
+        match self {
+            Encoding::Hf(inner) => inner.get_ids().to_vec(),
+            Encoding::Plain(inner) | Encoding::Tiktoken(inner) => inner,
         }
     }
 
@@ -258,4 +666,20 @@ pub struct SpecialTokens {
     pub cls_token: Option<String>,
     pub mask_token: Option<String>,
     pub additional_special_tokens: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_encoding_that_owns_its_ids_hands_them_out_without_a_copy() {
+        for owned in [Encoding::Plain, Encoding::Tiktoken] {
+            let ids = vec![7u32, 8, 9];
+            let buffer = ids.as_ptr();
+            let taken = owned(ids).into_token_ids();
+            assert_eq!(taken, [7, 8, 9]);
+            assert_eq!(taken.as_ptr(), buffer, "the vector moved, not copied");
+        }
+    }
 }

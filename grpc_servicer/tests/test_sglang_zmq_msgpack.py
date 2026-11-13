@@ -1,0 +1,1114 @@
+"""The headless msgpack-over-ZMQ transport for SGLang's scheduler: the wire
+shapes SMG relies on, and a loopback through a fake SMG that binds the three
+sockets. Needs an SGLang install (its io_struct and sampling params)."""
+
+import array
+import ctypes
+import logging
+import os
+import struct
+import tempfile
+import threading
+import time
+
+import pytest
+
+# The wire rides on pyzmq and msgspec and is pinned against SGLang's own
+# structs. The plain unit-test job installs msgspec but neither pyzmq nor
+# SGLang and skips this module; the SGLang ZMQ e2e lane runs it.
+msgspec = pytest.importorskip("msgspec")
+zmq = pytest.importorskip("zmq")
+sglang_io = pytest.importorskip("sglang.srt.managers.io_struct")
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
+from smg_grpc_servicer.sglang import zmq_msgpack as wire  # noqa: E402
+
+AbortReq = sglang_io.AbortReq
+BatchTokenIDOutput = sglang_io.BatchTokenIDOutput
+TokenizedGenerateReqInput = sglang_io.TokenizedGenerateReqInput
+VOCAB = 1000
+
+
+def _positional_request(rid="r1", input_ids=(1, 2, 3), n=1, stream=True, top_k=-1):
+    """What SMG emits: the tagged positional prefix through ``stream`` with a
+    nested positional SamplingParams and token ids as a plain list."""
+    sampling = SamplingParams(max_new_tokens=8, temperature=0.0, top_k=top_k, n=n)
+    sampling_arr = msgspec.msgpack.decode(msgspec.msgpack.encode(sampling))
+    return [
+        "TokenizedGenerateReqInput",
+        rid,
+        None,  # http_worker_ipc
+        None,  # input_text
+        list(input_ids),
+        None,  # input_embeds
+        None,  # mm_inputs
+        None,  # token_type_ids
+        sampling_arr,
+        False,  # return_logprob
+        -1,  # logprob_start_len
+        0,  # top_logprobs_num
+        None,  # token_ids_logprob
+        stream,
+    ]
+
+
+def _wait(predicate, what, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, what
+        time.sleep(0.02)
+
+
+def test_request_decodes_from_the_frontend_prefix_with_list_ids():
+    frames = [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(_positional_request())]
+    (req,) = wire.decode_request_frames(frames)
+    assert isinstance(req, TokenizedGenerateReqInput)
+    assert req.rid == "r1" and req.stream is True
+    assert isinstance(req.input_ids, array.array) and list(req.input_ids) == [1, 2, 3]
+    assert req.sampling_params.max_new_tokens == 8
+    # Trailing fields SMG did not send keep their defaults.
+    assert req.require_reasoning is False and req.routed_dp_rank is None
+
+
+def test_request_decodes_from_the_sampling_prefix_the_frontend_sends():
+    """SMG sends the sampling params through ``custom_params`` (the API
+    parameters); the scheduler's own fields after them, and whatever a
+    release inserts before those, take their defaults, so one encoding serves
+    the releases whose field order differs there."""
+    request = _positional_request()
+    fields = list(SamplingParams.__struct_fields__)
+    request[8] = request[8][: fields.index("custom_params") + 1]
+    frames = [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(request)]
+    (req,) = wire.decode_request_frames(frames)
+    params = req.sampling_params
+    assert (params.max_new_tokens, params.top_k, params.n) == (8, 1, 1)
+    assert params.is_normalized is False and params.stop_strs is None
+
+
+def test_request_decodes_the_bootstrap_triple_from_its_slots():
+    """A prefill/decode request's rendezvous rides the scheduler's own slots
+    (the extended prefix through ``require_reasoning``, the defaulted slots
+    between at their defaults): the plugin decodes it as SGLang's tokenizer
+    manager would have set it."""
+    fields = list(TokenizedGenerateReqInput.__struct_fields__)
+    request = _positional_request(rid="pd") + [
+        False,  # return_sampling_mask
+        False,  # return_flat_raw_top_logprobs
+        False,  # return_hidden_states
+        False,  # return_routed_experts
+        0,  # routed_experts_start_len
+        False,  # return_indexer_topk
+        None,  # session_id
+        None,  # session_params
+        None,  # lora_id
+        None,  # custom_logit_processor
+        None,  # positional_embed_overrides
+        "10.0.0.7",  # bootstrap_host
+        8998,  # bootstrap_port
+        41,  # bootstrap_room
+        None,  # bootstrap_pair_key
+        None,  # decode_tp_size
+        None,  # routed_dp_rank
+        None,  # disagg_prefill_dp_rank
+        None,  # routing_key
+        False,  # require_reasoning
+    ]
+    assert len(request) == fields.index("require_reasoning") + 2  # the tag at element 0
+    assert request[fields.index("bootstrap_host") + 1] == "10.0.0.7"
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, msgspec.msgpack.encode(request)])
+    assert (req.bootstrap_host, req.bootstrap_port, req.bootstrap_room) == ("10.0.0.7", 8998, 41)
+    assert req.require_reasoning is False and req.lora_id is None
+
+
+def test_request_decodes_the_encode_dispatch_slots_as_the_frontend_sets_them():
+    """A language-only worker's request whose media went to the encoders
+    carries the three slots the scheduler's receiver reads, past the
+    defaulted ones through ``return_entropy``: the wait flag, the assignment
+    keyed by the modality (its enum value on the wire) and the encoder
+    snapshot; the prompt text rides ``input_text`` for the rebuild."""
+    from sglang.srt.managers.schedule_batch import Modality
+
+    fields = list(TokenizedGenerateReqInput.__struct_fields__)
+    request = _positional_request(rid="epd") + [
+        False,  # return_sampling_mask
+        False,  # return_flat_raw_top_logprobs
+        False,  # return_hidden_states
+        False,  # return_routed_experts
+        0,  # routed_experts_start_len
+        False,  # return_indexer_topk
+        None,  # session_id
+        None,  # session_params
+        None,  # lora_id
+        None,  # custom_logit_processor
+        None,  # positional_embed_overrides
+        None,  # bootstrap_host
+        None,  # bootstrap_port
+        None,  # bootstrap_room
+        None,  # bootstrap_pair_key
+        None,  # decode_tp_size
+        None,  # routed_dp_rank
+        None,  # disagg_prefill_dp_rank
+        None,  # routing_key
+        False,  # require_reasoning
+        None,  # priority
+        None,  # extra_key
+        False,  # no_logs
+        False,  # return_bytes
+        False,  # return_entropy
+        True,  # need_wait_for_mm_inputs
+        {1: [1, 0]},  # num_items_assigned: Modality.IMAGE -> per-encoder counts
+        ["grpc://10.0.0.8:30001", "grpc://10.0.0.9:30001"],  # encoder_urls
+    ]
+    request[3] = "<|vision_start|><|image_pad|><|vision_end|>What is this?"
+    assert len(request) == fields.index("encoder_urls") + 2  # the tag at element 0
+    assert fields.index("need_wait_for_mm_inputs") == 38
+    assert fields.index("num_items_assigned") == 39
+    assert fields.index("encoder_urls") == 40
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, msgspec.msgpack.encode(request)])
+    assert req.need_wait_for_mm_inputs is True
+    assert req.num_items_assigned == {Modality.IMAGE: [1, 0]}
+    assert req.encoder_urls == ["grpc://10.0.0.8:30001", "grpc://10.0.0.9:30001"]
+    assert req.input_text == "<|vision_start|><|image_pad|><|vision_end|>What is this?"
+    assert req.mm_inputs is None and req.require_reasoning is False
+
+
+def test_the_encode_dispatch_failure_notice_decodes_as_the_schedulers_own_request():
+    """The notice the Rust servicer sends after a request whose dispatch
+    failed (the bytes its wire test pins) is the scheduler's own
+    ``EncoderDispatchErrorReq``, passed through the ADD decode untouched for
+    the scheduler's receiver to consume; its layout is declared for the
+    handshake check like the requests'."""
+    rust_pinned = bytes.fromhex(
+        "95b7456e636f64657244697370617463684572726f72526571a56570642d31c0d925456e636f6465206661"
+        "696c656420666f722072657175657374206570642d313a20626f6f6dcd01f6"
+    )
+    (notice,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, rust_pinned])
+    assert isinstance(notice, sglang_io.EncoderDispatchErrorReq)
+    assert (notice.rid, notice.error_msg, notice.error_code) == (
+        "epd-1",
+        "Encode failed for request epd-1: boom",
+        502,
+    )
+    assert wire.request_layouts()["EncoderDispatchErrorReq"] == [
+        "rid",
+        "http_worker_ipc",
+        "error_msg",
+        "error_code",
+    ]
+
+
+def test_request_decodes_the_routed_dp_rank_from_its_slot():
+    """A request the Router pins to a data-parallel rank carries the rank in
+    the scheduler's own ``routed_dp_rank`` slot (the extended prefix, the
+    defaulted slots around it at their defaults): the plugin decodes it as
+    SGLang's tokenizer manager would have set it from the API's pin."""
+    fields = list(TokenizedGenerateReqInput.__struct_fields__)
+    request = _positional_request(rid="dp") + [
+        False,  # return_sampling_mask
+        False,  # return_flat_raw_top_logprobs
+        False,  # return_hidden_states
+        False,  # return_routed_experts
+        0,  # routed_experts_start_len
+        False,  # return_indexer_topk
+        None,  # session_id
+        None,  # session_params
+        None,  # lora_id
+        None,  # custom_logit_processor
+        None,  # positional_embed_overrides
+        None,  # bootstrap_host
+        None,  # bootstrap_port
+        None,  # bootstrap_room
+        None,  # bootstrap_pair_key
+        None,  # decode_tp_size
+        1,  # routed_dp_rank
+        None,  # disagg_prefill_dp_rank
+        None,  # routing_key
+        False,  # require_reasoning
+    ]
+    assert len(request) == fields.index("require_reasoning") + 2  # the tag at element 0
+    assert request[fields.index("routed_dp_rank") + 1] == 1
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, msgspec.msgpack.encode(request)])
+    assert req.routed_dp_rank == 1
+    assert (req.bootstrap_host, req.bootstrap_port, req.bootstrap_room) == (None, None, None)
+    assert req.disagg_prefill_dp_rank is None and req.require_reasoning is False
+
+
+def test_the_ready_response_declares_the_request_structs_field_order():
+    """The field order SMG checks the prefixes it encodes against: the
+    installed release's own declaration, which pins where the prefixes end."""
+    layouts = wire.request_layouts()
+    assert layouts["SamplingParams"][:4] == [
+        "max_new_tokens",
+        "stop",
+        "stop_token_ids",
+        "stop_regex",
+    ]
+    assert layouts["SamplingParams"].index("custom_params") == 25
+    assert layouts["TokenizedGenerateReqInput"][:2] == ["rid", "http_worker_ipc"]
+    assert layouts["TokenizedGenerateReqInput"].index("lora_id") == 21
+    assert layouts["TokenizedGenerateReqInput"].index("require_reasoning") == 32
+    assert layouts["TokenizedEmbeddingReqInput"].index("dimensions") == 11
+    # The multimodal payload's structs, every slot of which SMG writes.
+    assert layouts["MultimodalProcessorOutput"][:4] == [
+        "mm_items",
+        "input_ids",
+        "padded_input_ids",
+        "im_token_id",
+    ]
+    assert layouts["MultimodalDataItem"] == [
+        "modality",
+        "hash",
+        "pad_value",
+        "offsets",
+        "format",
+        "feature",
+        "precomputed_embeddings",
+        "keep_device_embedding",
+        "model_specific_data",
+    ]
+
+
+# The `ADD` payload the Rust servicer sends for a request carrying one image:
+# rid `mm`, ids `[1, 7, 7, 7, 2]`, default sampling params, and in the
+# `mm_inputs` slot the scheduler's processor output of one item whose feature
+# is `torch.arange(8, dtype=torch.float32).reshape(2, 4) * 0.5`, with
+# `image_grid_thw = [[1, 2, 2]]` (int64), offsets `[(1, 3)]` and
+# `im_token_id = 7`; the same constant is pinned in `protocol/sglang/request.rs`
+# (`the_payload_the_plugins_test_decodes_is_pinned`), so a change there is a
+# change here.
+RUST_MM_REQUEST = (
+    "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c094919901c0c091"
+    "92010301c734020000001093920204a7666c6f61743332a3637075000000000000003f0000803f0000c03f0000004000"
+    "0020400000404000006040c0c281ae696d6167655f677269645f746877c72a020000000e93920103a5696e743634a363"
+    "7075010000000000000002000000000000000200000000000000c0c007c0dc001acc"
+    "80c0c0c0cb3ff0000000000000cb3ff0000000000000ffcb0000000000000000cb0000000000000000cb000000000000"
+    "0000cb3ff00000000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c2ff00c0c2"
+)
+
+
+def test_the_rust_servicers_media_decodes_as_the_schedulers_processor_output():
+    """The slot decodes through the scheduler's own hooks into the object the
+    Python servicer builds for the same request: the tensors bitwise, the
+    offsets, the token id, the modality, and the slots neither side fills at
+    the scheduler's defaults (its hash and pad value are its own to derive)."""
+    torch = pytest.importorskip("torch")
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalInputFormat,
+        MultimodalProcessorOutput,
+    )
+
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, bytes.fromhex(RUST_MM_REQUEST)])
+    assert req.rid == "mm" and list(req.input_ids) == [1, 7, 7, 7, 2]
+    media = req.mm_inputs
+    assert isinstance(media, MultimodalProcessorOutput)
+    assert media.im_token_id == 7 and media.padded_input_ids is None
+    (item,) = media.mm_items
+    assert item.modality is Modality.IMAGE and item.format is MultimodalInputFormat.NORMAL
+    assert item.hash is None and item.pad_value is None
+    assert item.offsets == [(1, 3)]
+    expected = torch.arange(8, dtype=torch.float32).reshape(2, 4) * 0.5
+    assert item.feature.dtype is torch.float32 and item.feature.device.type == "cpu"
+    assert torch.equal(item.feature, expected)
+    grid = item.model_specific_data["image_grid_thw"]
+    assert grid.dtype is torch.int64 and torch.equal(grid, torch.tensor([[1, 2, 2]]))
+
+
+# The `ADD` message the Rust servicer sends for the same request on a
+# scheduler whose plugin resolves auxiliary frames, with the feature
+# `torch.arange(8192, dtype=torch.float32) * 0.5` (32 KiB, the frame bar): the
+# payload carries SMG's frame-reference extension (type 100) over
+# `[[8192], "float32", 1]` in the feature's slot (the frame's one-based index in
+# the data's place), the grid inline; behind it ride the pixels, then the empty metadata map. The
+# same constant is pinned in `protocol/sglang/request.rs`
+# (`the_framed_payload_the_plugins_test_decodes_is_pinned`).
+RUST_MM_FRAMED_REQUEST = (
+    "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c094919901c0c0919201"
+    "0301c70e649391cd2000a7666c6f6174333201c0c281ae696d6167655f677269645f746877c72a020000000e93920103"
+    "a5696e743634a3637075010000000000000002000000000000000200000000000000c0c007c0dc001acc80c0c0c0cb3f"
+    "f0000000000000cb3ff0000000000000ffcb0000000000000000cb0000000000000000cb0000000000000000cb3ff000"
+    "00000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c2ff00c0c2"
+)
+
+
+def _framed_pixels():
+    torch = pytest.importorskip("torch")
+    return torch.arange(8192, dtype=torch.float32) * 0.5
+
+
+def _framed_message(meta: bytes = b"\x80") -> list:
+    """``[type, payload, pixels, metadata]`` as the receiver sees them: the
+    frames are writable buffers (a zmq frame's buffer is)."""
+    pixels = bytearray(_framed_pixels().numpy().tobytes())
+    return [wire.REQ_TYPE_ADD, bytes.fromhex(RUST_MM_FRAMED_REQUEST), pixels, meta]
+
+
+def test_a_tensor_sent_as_a_frame_is_built_over_the_frame_without_a_copy():
+    """The feature's slot names its frame; the tensor the scheduler gets is
+    the frame's memory itself (no copy: its storage address is the frame's),
+    equal to the sender's values, and it outlives the receiver's frame list;
+    the small grid rides inline as before."""
+    torch = pytest.importorskip("torch")
+    frames = _framed_message()
+    frame_address = ctypes.addressof(ctypes.c_char.from_buffer(frames[2]))
+    (req,) = wire.decode_request_frames(frames)
+    assert req.rid == "mm" and list(req.input_ids) == [1, 7, 7, 7, 2]
+    (item,) = req.mm_inputs.mm_items
+    assert item.feature.dtype is torch.float32 and tuple(item.feature.shape) == (8192,)
+    assert torch.equal(item.feature, _framed_pixels())
+    assert item.feature.data_ptr() == frame_address, "the tensor is the frame, not a copy"
+    grid = item.model_specific_data["image_grid_thw"]
+    assert grid.dtype is torch.int64 and torch.equal(grid, torch.tensor([[1, 2, 2]]))
+    assert item.offsets == [(1, 3)] and req.mm_inputs.im_token_id == 7
+    del frames
+    assert float(item.feature.sum()) == float(_framed_pixels().sum())
+
+
+def test_a_frame_reference_outside_the_message_or_of_the_wrong_length_is_refused():
+    """A frame index the message has no frame for, or a frame whose length is
+    not the tensor's, is a decode error by name (the request is answered, not
+    served from a plausible tensor of wrong numbers)."""
+    pytest.importorskip("torch")
+    missing = _framed_message()
+    del missing[2]  # [type, payload, metadata]: no tensor frame at all
+    with pytest.raises(Exception, match="frame index 1 is outside the 0 tensor frame"):
+        wire.decode_request_frames(missing)
+    short = _framed_message()
+    short[2] = short[2][:-4]
+    with pytest.raises(Exception, match="holds 32764 bytes, float32 \\[8192\\] needs 32768"):
+        wire.decode_request_frames(short)
+
+
+def test_the_metadata_frame_is_the_last_frame_behind_the_tensors():
+    """The request's metadata rides as the message's last frame, behind the
+    tensor frames when there are any, where a message without tensor frames
+    has always carried it."""
+    pytest.importorskip("torch")
+    meta = msgspec.msgpack.encode({"trace_headers": {"traceparent": "00-aa-bb-01"}})
+
+    class Traces:
+        seen: list = []
+
+        def attach(self, request, headers):
+            self.seen.append((request.rid, headers))
+            return True
+
+    traces = Traces()
+    wire.decode_request_frames(_framed_message(meta=meta), traces)
+    wire.decode_request_frames([wire.REQ_TYPE_ADD, bytes.fromhex(RUST_MM_REQUEST), meta], traces)
+    assert traces.seen == [("mm", {"traceparent": "00-aa-bb-01"})] * 2
+
+
+def test_the_ready_response_declares_that_frames_are_resolved():
+    """What SMG reads at the handshake before it frames a tensor: the key goes
+    out on every registration (an older plugin sent none, and SMG reads an
+    absent key as "every tensor inline")."""
+    ready = wire.WireEngineCoreReadyResponse()
+    assert ready.tensor_aux_frames is True
+    assert msgspec.msgpack.decode(wire.encode(ready))["tensor_aux_frames"] is True
+
+
+def test_abort_frame_fans_out_one_abort_per_rid():
+    aborts = wire.decode_request_frames([wire.REQ_TYPE_ABORT, msgspec.msgpack.encode(["a", "b"])])
+    assert [a.rid for a in aborts] == ["a", "b"]
+    assert all(isinstance(a, AbortReq) for a in aborts)
+    with pytest.raises(ValueError):
+        wire.decode_request_frames([b"\x07", b""])
+
+
+def _full_output():
+    none2 = [None, None]
+    # Fields this SGLang version has that we do not set stay None (the slim
+    # output never reads them; required ones vary across versions).
+    unset = {name: None for name in BatchTokenIDOutput.__struct_fields__}
+    return BatchTokenIDOutput(
+        **unset
+        | dict(
+            rids=["a", "b"],
+            http_worker_ipcs=none2,
+            finished_reasons=[None, {"type": "stop", "matched": 42}],
+            decoded_texts=["", ""],
+            decode_ids=[array.array("q"), array.array("q")],
+            read_offsets=[0, 0],
+            output_ids=[array.array("q", [10]), array.array("q", [20, 21])],
+            skip_special_tokens=[True, True],
+            spaces_between_special_tokens=[True, True],
+            no_stop_trim=[False, False],
+            prompt_tokens=[3, 4],
+            reasoning_tokens=[0, 0],
+            completion_tokens=[1, 2],
+            cached_tokens=[0, 1],
+            input_token_logprobs_val=none2,
+            input_token_logprobs_idx=none2,
+            output_token_logprobs_val=[None, [-0.5, -0.25]],
+            output_token_logprobs_idx=[None, [20, 21]],
+            input_top_logprobs_val=none2,
+            input_top_logprobs_idx=none2,
+            output_top_logprobs_val=[None, [[-0.5, -1.0]]],
+            output_top_logprobs_idx=[None, [[21, 22]]],
+            input_token_ids_logprobs_val=none2,
+            input_token_ids_logprobs_idx=none2,
+            output_token_ids_logprobs_val=none2,
+            output_token_ids_logprobs_idx=none2,
+            output_token_entropy_val=None,
+            output_token_sampling_mask=None,
+            output_hidden_states=None,
+            routed_experts=None,
+            indexer_topk=None,
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
+        )
+    )
+
+
+def test_slim_output_pins_its_positional_layout():
+    slim = wire.BatchTokenIDSlimOutput.from_full(
+        _full_output(),
+        engine_index=1,
+        num_running=2,
+        num_waiting=3,
+        kv_used_tokens=40,
+        kv_total_tokens=400,
+    )
+    arr = msgspec.msgpack.decode(msgspec.msgpack.encode(slim))
+    assert arr == [
+        "BatchTokenIDSlimOutput",
+        ["a", "b"],  # rids
+        [[10], [20, 21]],  # output_ids as plain lists
+        ["", "stop"],  # finished_reasons
+        [None, None],  # finished_messages
+        [None, 42],  # finished_matched
+        [3, 4],  # prompt_tokens
+        [1, 2],  # completion_tokens
+        [0, 1],  # cached_tokens
+        [[], [-0.5, -0.25]],  # output_token_logprobs_val
+        [[], [20, 21]],  # output_token_logprobs_idx
+        1,
+        2,
+        3,
+        40,
+        400,
+        [None, None],  # finished_status: no abort
+        [[], [[-0.5, -1.0]]],  # output_top_logprobs_val: b asked for 2
+        [[], [[21, 22]]],  # output_top_logprobs_idx
+        [0, 0],  # reasoning_tokens
+        [[], []],  # input_token_logprobs_val
+        [[], []],  # input_token_logprobs_idx
+        [[], []],  # input_top_logprobs_val
+        [[], []],  # input_top_logprobs_idx
+        [[], []],  # output_token_ids_logprobs_val
+        [[], []],  # output_token_ids_logprobs_idx
+        [None, None],  # finished_err_types: no abort
+        [None, None],  # output_hidden_states: neither request asked
+    ]
+
+
+def test_slim_output_carries_the_schedulers_abort_err_type():
+    """The scheduler's `err_type` of an abort (the plugin's grammar stamp, a
+    release's own name) rides the last appended column; a bare abort and
+    every other finish leave it None."""
+    full = _full_output()
+    full.finished_reasons = [
+        {"type": "abort", "message": "Aborted", "status_code": None, "err_type": None},
+        {
+            "type": "abort",
+            "message": "the grammar rejected a sampled token",
+            "status_code": None,
+            "err_type": "GrammarRejectedToken",
+        },
+    ]
+    slim = wire.BatchTokenIDSlimOutput.from_full(full, engine_index=1)
+    assert slim.finished_reasons == ["abort", "abort"]
+    assert slim.finished_messages == ["Aborted", "the grammar rejected a sampled token"]
+    assert slim.finished_status == [None, None]
+    assert slim.finished_err_types == [None, "GrammarRejectedToken"]
+    encoded = msgspec.msgpack.decode(msgspec.msgpack.encode(slim))
+    # 28 fields: the 27th (index 26) is finished_err_types, the 28th (index 27)
+    # output_hidden_states, None per request that asked for none.
+    assert len(encoded) == 28 and encoded[26] == [None, "GrammarRejectedToken"]
+    assert encoded[27] == [None, None]
+    # Pins for the Rust decoder (`protocol/sglang/output.rs`): PYTHON_SLIM27 is
+    # this batch as an earlier plugin encoded it (27 fields, decoded with no
+    # rows). The hex below is its 28-field form today, which no Rust constant
+    # pins; PYTHON_SLIM28 pins a different batch (hidden-state rows, not these
+    # aborts).
+    print("PIN_SLIM27_AS_28", msgspec.msgpack.encode(slim).hex())
+    # A PD decode side's grammar failure carries the name next to its 500.
+    full.finished_reasons[1] = {
+        "type": "abort",
+        "message": "Grammar accept_token failed for req b with token 7: Tokens not accepted: 7",
+        "status_code": 500,
+        "err_type": "GrammarRejectedToken",
+    }
+    slim = wire.BatchTokenIDSlimOutput.from_full(full)
+    assert slim.finished_status == [None, 500]
+    assert slim.finished_err_types == [None, "GrammarRejectedToken"]
+
+
+class _FakeSmg:
+    """Binds handshake ROUTER, input ROUTER and output PULL like the gateway."""
+
+    def __init__(self, context, tmp):
+        self.handshake = context.socket(zmq.ROUTER)
+        self.handshake.bind("tcp://127.0.0.1:0")
+        self.handshake_address = self.handshake.getsockopt_string(zmq.LAST_ENDPOINT)
+        self.input = context.socket(zmq.ROUTER)
+        self.input_address = f"ipc://{os.path.join(tmp, 'in.sock')}"
+        self.input.bind(self.input_address)
+        self.output = context.socket(zmq.PULL)
+        self.output_address = f"ipc://{os.path.join(tmp, 'out.sock')}"
+        self.output.bind(self.output_address)
+
+    def accept(self):
+        identity, hello = self.handshake.recv_multipart()
+        assert msgspec.msgpack.decode(hello)["status"] == "HELLO"
+        init = wire.WireHandshakeInitMessage(
+            addresses=wire.WireHandshakeAddresses(
+                inputs=[self.input_address], outputs=[self.output_address]
+            )
+        )
+        self.handshake.send_multipart([identity, wire.encode(init)])
+        identity2, ready = self.handshake.recv_multipart()
+        assert identity2 == identity and msgspec.msgpack.decode(ready)["status"] == "READY"
+        reg_identity, registration = self.input.recv_multipart()
+        assert reg_identity == identity
+        return identity, msgspec.msgpack.decode(registration)
+
+    def send(self, identity, type_byte, payload):
+        self.input.send_multipart([identity, type_byte, payload])
+
+    def recv_output(self, timeout_ms=5000):
+        assert self.output.poll(timeout_ms), "no output from the scheduler side"
+        return self.output.recv()
+
+    def close(self):
+        for sock in (self.handshake, self.input, self.output):
+            sock.close(linger=0)
+
+
+def test_loopback_handshake_requests_outputs_and_rejections():
+    context = zmq.Context()
+    with tempfile.TemporaryDirectory() as tmp:
+        smg = _FakeSmg(context, tmp)
+        sender = wire.MsgpackSendSocket()
+        ready = wire.WireEngineCoreReadyResponse(
+            max_model_len=4096, num_gpu_blocks=100, block_size=64, vllm_version="sglang-test"
+        )
+        result = {}
+
+        def engine_side():
+            result["recv"] = wire.connect_msgpack_engine(
+                context, smg.handshake_address, 3, ready, VOCAB, sender
+            )
+
+        thread = threading.Thread(target=engine_side)
+        thread.start()
+        identity, registration = smg.accept()
+        thread.join(timeout=10)
+        assert identity == struct.pack("<H", 3)
+        assert registration["max_model_len"] == 4096 and registration["block_size"] == 64
+        recv = result["recv"]
+        assert sender.socket is not None and sender.engine_index == 3
+
+        # A valid request reaches the scheduler, normalized and verified.
+        smg.send(identity, wire.REQ_TYPE_ADD, msgspec.msgpack.encode(_positional_request()))
+        reqs = []
+
+        def drained():
+            reqs.extend(recv.drain(16))
+            return bool(reqs)
+
+        _wait(drained, "the request never arrived")
+        (req,) = reqs
+        assert req.rid == "r1" and req.sampling_params.is_normalized
+        assert req.sampling_params.top_k != -1  # greedy collapsed top_k away from the API sentinel
+
+        # n > 1 is SMG's job: the request is answered, not dropped.
+        smg.send(
+            identity, wire.REQ_TYPE_ADD, msgspec.msgpack.encode(_positional_request(rid="r2", n=2))
+        )
+
+        def rejected():
+            assert not recv.drain(16), "an invalid request reached the scheduler"
+            return smg.output.poll(0) != 0
+
+        _wait(rejected, "no rejection was sent")
+        rejection = msgspec.msgpack.decode(smg.recv_output())
+        assert rejection[0] == "BatchTokenIDSlimOutput" and rejection[1] == ["r2"]
+        assert rejection[3] == ["abort"] and "n=2" in rejection[4][0]
+
+        # A request the scheduler cannot decode is answered too, by its rid.
+        broken = _positional_request(rid="r3")
+        broken[4] = "not-token-ids"
+        smg.send(identity, wire.REQ_TYPE_ADD, msgspec.msgpack.encode(broken))
+
+        def answered():
+            assert not recv.drain(16), "an undecodable request reached the scheduler"
+            return smg.output.poll(0) != 0
+
+        _wait(answered, "no answer for the undecodable request")
+        answer = msgspec.msgpack.decode(smg.recv_output())
+        assert answer[1] == ["r3"] and answer[3] == ["abort"] and "decode" in answer[4][0]
+
+        # Aborts fan out per rid.
+        smg.send(identity, wire.REQ_TYPE_ABORT, msgspec.msgpack.encode(["r1", "r9"]))
+        aborts = []
+
+        def aborted():
+            aborts.extend(recv.drain(16))
+            return bool(aborts)
+
+        _wait(aborted, "the aborts never arrived")
+        assert [a.rid for a in aborts] == ["r1", "r9"]
+
+        # A scheduler-side AbortReq reply becomes the request's terminal output.
+        sender.send_output(AbortReq(rid="r1", abort_message="queue full"))
+        terminal = msgspec.msgpack.decode(smg.recv_output())
+        assert terminal[1] == ["r1"] and terminal[3] == ["abort"] and terminal[4] == ["queue full"]
+
+        # A full batch goes out slimmed, with the load tail from the probe.
+        sender.attach(sender.socket, 3, lambda: _Load())
+        sender.send_output(_full_output())
+        batch = msgspec.msgpack.decode(smg.recv_output())
+        assert batch[1] == ["a", "b"] and batch[11:16] == [3, 7, 11, 500, 5000]
+
+        sender.send_engine_dead()
+        assert smg.recv_output() == wire.ENGINE_CORE_DEAD
+        recv.close()
+        sender.close()
+        smg.close()
+    context.term()
+
+
+class _Load:
+    num_running_reqs = 7
+    num_waiting_reqs = 11
+    num_used_tokens = 500
+    max_total_num_tokens = 5000
+
+
+# ----------------------------------------------------------------------------
+# Control calls, embedding requests and their outputs.
+# ----------------------------------------------------------------------------
+
+
+def _control_frame(call_id, method, args):
+    return msgspec.msgpack.encode([call_id, method, args])
+
+
+def test_control_frames_become_the_schedulers_control_requests(monkeypatch):
+    from sglang.srt.managers.io_struct import FlushCacheReqInput, ProfileReq, ProfileReqType
+
+    (flush,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_CONTROL, _control_frame(7, "flush_cache", [1.5])]
+    )
+    assert isinstance(flush, FlushCacheReqInput)
+    assert flush.rid == "smg-control-7" and flush.timeout_s == 1.5
+    assert wire.control_call_id(flush.rid) == 7
+
+    monkeypatch.setenv("SGLANG_PROFILE_WITH_STACK", "false")
+    options = {
+        "output_dir": "/tmp/t",
+        "num_steps": 3,
+        "activities": ["CPU"],
+        "profile_by_stage": False,
+        "profile_id": "p1",
+    }
+    (start,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_CONTROL, _control_frame(8, "start_profile", [options])]
+    )
+    assert isinstance(start, ProfileReq) and start.req_type == ProfileReqType.START_PROFILE
+    assert start.rid == "smg-control-8" and start.output_dir == "/tmp/t" and start.num_steps == 3
+    assert start.activities == ["CPU"] and start.profile_id == "p1"
+    # Unset options take the Python servicer's environment defaults.
+    assert start.with_stack is False and start.record_shapes is True
+
+    (stop,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_CONTROL, _control_frame(9, "stop_profile", [])]
+    )
+    assert isinstance(stop, ProfileReq) and stop.req_type == ProfileReqType.STOP_PROFILE
+
+    with pytest.raises(wire.ControlError) as refused:
+        wire.decode_request_frames([wire.REQ_TYPE_CONTROL, _control_frame(10, "reboot", [])])
+    assert refused.value.call_id == 10 and "reboot" in str(refused.value)
+    assert wire.control_call_id("r1") is None and wire.control_call_id(None) is None
+
+
+def _positional_embedding_request(rid="e1", input_ids=(1, 2, 3)):
+    sp = msgspec.msgpack.decode(msgspec.msgpack.encode(SamplingParams(max_new_tokens=0)))
+    # The prefix the Rust encoder emits: through `dimensions`.
+    return [
+        "TokenizedEmbeddingReqInput",
+        rid,
+        None,
+        "hi",
+        list(input_ids),
+        None,
+        None,
+        sp,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
+
+
+def test_embedding_requests_ride_the_add_frame():
+    from sglang.srt.managers.io_struct import TokenizedEmbeddingReqInput
+
+    (req,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(_positional_embedding_request())]
+    )
+    assert isinstance(req, TokenizedEmbeddingReqInput)
+    assert req.rid == "e1" and list(req.input_ids) == [1, 2, 3] and req.dimensions is None
+    assert req.sampling_params.max_new_tokens == 0
+    # The generate request still decodes through the same union decoder.
+    (gen,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(_positional_request())]
+    )
+    assert type(gen).__name__ == "TokenizedGenerateReqInput"
+
+
+class _Sink:
+    """A sender socket stand-in that keeps what was sent."""
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, payload, copy=False):
+        self.sent.append(msgspec.msgpack.decode(bytes(payload)))
+
+
+def test_sender_slims_embeddings_and_answers_control_replies():
+    from sglang.srt.managers.io_struct import (
+        BatchEmbeddingOutput,
+        FlushCacheReqInput,
+        FlushCacheReqOutput,
+        ProfileReqOutput,
+    )
+
+    sender = wire.MsgpackSendSocket()
+    sink = _Sink()
+    sender.attach(sink, 2, None)
+    unset = {name: None for name in BatchEmbeddingOutput.__struct_fields__}
+    sender.send_output(
+        BatchEmbeddingOutput(
+            **unset
+            | dict(
+                rids=["e1", "e2"],
+                finished_reasons=[
+                    {"type": "stop"},
+                    {"type": "abort", "message": "too long", "status_code": 400},
+                ],
+                embeddings=[[0.25, -0.5], []],
+                prompt_tokens=[3, 0],
+                cached_tokens=[0, 0],
+            )
+        )
+    )
+    (batch,) = sink.sent
+    assert batch[0] == "BatchEmbeddingSlimOutput"
+    assert batch[1] == ["e1", "e2"] and batch[2] == [[0.25, -0.5], []]
+    assert batch[3] == [3, 0] and batch[5] == ["stop", "abort"]
+    assert batch[6] == [None, "too long"] and batch[7] == [None, 400] and batch[8] == 2
+
+    # The scheduler hands the answered control request back with its reply.
+    sink.sent.clear()
+    sender.send_output(
+        FlushCacheReqOutput(success=True), FlushCacheReqInput(rid="smg-control-7", timeout_s=0)
+    )
+    sender.send_output(
+        ProfileReqOutput(success=False, message="no profiler"),
+        FlushCacheReqInput(rid="smg-control-8", timeout_s=0),
+    )
+    # A reply for a request this side did not issue has no consumer.
+    sender.send_output(
+        FlushCacheReqOutput(success=True), FlushCacheReqInput(rid="someone-else", timeout_s=0)
+    )
+    # SGLang's reply struct defaults its message to "", not None.
+    assert sink.sent == [
+        ["ControlReplySlim", 7, True, "", 2],
+        ["ControlReplySlim", 8, False, "no profiler", 2],
+    ]
+
+
+def test_sender_relays_the_schedulers_bare_health_signal_as_an_empty_batch_without_a_tail():
+    """A scheduler busy with a chunked prefill or a running batch never
+    queues the health probe and answers it with a bare ``HealthCheckOutput``;
+    SMG reads any output since its probe started as alive, so the signal
+    leaves as a token batch with no columns and, with a load probe attached,
+    still no load tail: an outputs-less batch with a tail is a stats-only
+    step report to SMG, which this scheduler never sends."""
+    from types import SimpleNamespace
+
+    from sglang.srt.managers.io_struct import HealthCheckOutput
+
+    sender = wire.MsgpackSendSocket()
+    sink = _Sink()
+    sender.attach(
+        sink,
+        3,
+        lambda: SimpleNamespace(
+            num_running_reqs=1, num_waiting_reqs=2, num_used_tokens=5, max_total_num_tokens=100
+        ),
+    )
+    sender.send_output(HealthCheckOutput())
+    (signal,) = sink.sent
+    assert signal[0] == "BatchTokenIDSlimOutput"
+    assert signal[1:11] == [[]] * 10, "no request columns"
+    assert signal[11] == 3, "the producing rank"
+    assert signal[12:16] == [0, 0, 0, 0], "no load tail"
+
+
+def test_slim_output_appends_prompt_logprobs_and_reasoning_tokens():
+    full = _full_output()
+    full.reasoning_tokens = [0, 4]
+    full.input_token_logprobs_val = [None, [None, -0.7, -1.1]]
+    full.input_token_logprobs_idx = [None, [1, 2, 3]]
+    full.input_top_logprobs_val = [None, [None, [-0.7], [-1.1]]]
+    full.input_top_logprobs_idx = [None, [None, [2], [3]]]
+    slim = wire.BatchTokenIDSlimOutput.from_full(full)
+    encoded = msgspec.msgpack.decode(msgspec.msgpack.encode(slim))
+    assert len(encoded) == 28
+    assert encoded[24:26] == [[[], []], [[], []]]
+    assert encoded[26] == [None, None]  # finished_err_types: no abort
+    assert encoded[27] == [
+        None,
+        None,
+    ]  # output_hidden_states: None per request without the relay's rows
+    assert encoded[19] == [0, 4]
+    assert encoded[20] == [[], [None, -0.7, -1.1]] and encoded[21] == [[], [1, 2, 3]]
+    assert encoded[22] == [[], [[], [-0.7], [-1.1]]] and encoded[23] == [[], [[], [2], [3]]]
+    # Pins for the Rust decoder (`protocol/sglang/output.rs`): the legacy
+    # 24-element prefix, an embedding batch and a control reply.
+    print("PIN_SLIM24", msgspec.msgpack.encode(encoded[:24]).hex())
+    print(
+        "PIN_EMBED",
+        msgspec.msgpack.encode(
+            wire.BatchEmbeddingSlimOutput(
+                rids=["e1"],
+                embeddings=[[0.25, -0.5]],
+                prompt_tokens=[3],
+                cached_tokens=[0],
+                finished_reasons=["stop"],
+                finished_messages=[None],
+                finished_status=[None],
+                engine_index=1,
+            )
+        ).hex(),
+    )
+    print(
+        "PIN_CONTROL",
+        msgspec.msgpack.encode(
+            wire.ControlReplySlim(call_id=7, success=True, message=None, engine_index=1)
+        ).hex(),
+    )
+
+
+def test_sender_handles_scalar_and_sparse_embeddings_and_never_raises():
+    from sglang.srt.managers.io_struct import BatchEmbeddingOutput, BatchTokenIDOutput
+
+    sender = wire.MsgpackSendSocket()
+    sink = _Sink()
+    sender.attach(sink, 0, None)
+    unset = {name: None for name in BatchEmbeddingOutput.__struct_fields__}
+    sender.send_output(
+        BatchEmbeddingOutput(
+            **unset
+            | dict(
+                rids=["s1", "d1"],
+                finished_reasons=[{"type": "stop"}, {"type": "stop"}],
+                embeddings=[0.75, {3: 0.5, 9: 0.25}],
+                prompt_tokens=[2, 2],
+                cached_tokens=[0, 0],
+            )
+        )
+    )
+    (batch,) = sink.sent
+    # A bare float (cross-encoder, single label) is a one-element vector; a
+    # sparse dict has no slot on the wire and ends that request with an abort.
+    assert batch[2] == [[0.75], []]
+    assert batch[5] == ["stop", "abort"] and "sparse" in batch[6][1]
+
+    # A conversion failure on the scheduler's loop never raises: the batch's
+    # requests end with a terminal abort instead.
+    sink.sent.clear()
+    broken = BatchTokenIDOutput(
+        **{name: None for name in BatchTokenIDOutput.__struct_fields__} | dict(rids=["b1"])
+    )
+    sender.send_output(broken)
+    (abort,) = sink.sent
+    assert abort[0] == "BatchTokenIDSlimOutput" and abort[1] == ["b1"] and abort[3] == ["abort"]
+    assert "could not be relayed" in abort[4][0]
+
+
+class _Idle:
+    """A request socket with nothing to read."""
+
+    def recv_multipart(self, *args, **kwargs):
+        raise zmq.Again()
+
+
+def test_relay_failures_abort_in_the_scheduler_too(caplog, monkeypatch):
+    """An output this side cannot relay ends its requests for SMG; the
+    scheduler must stop them as well, or they keep decoding (and keep failing
+    every step) for clients that already got an error."""
+    from sglang.srt.managers.io_struct import BatchTokenIDOutput
+
+    sender = wire.MsgpackSendSocket()
+    sink = _Sink()
+    sender.attach(sink, 0, None)
+    recv = wire.MsgpackRecvSocket(
+        _Idle(), VOCAB, sender.send_terminal_abort, pending_aborts=sender.pending_aborts
+    )
+
+    def broken(rids):
+        return BatchTokenIDOutput(
+            **{name: None for name in BatchTokenIDOutput.__struct_fields__} | dict(rids=rids)
+        )
+
+    with caplog.at_level(logging.WARNING, logger=wire.logger.name):
+        sender.send_output(broken(["b1", "b2"]))
+        sender.send_output(broken(["b3"]))
+    # SMG heard a terminal abort per request...
+    assert [sent[1] for sent in sink.sent] == [["b1"], ["b2"], ["b3"]]
+    # ...and the scheduler frees them on its next drains, within the poll's limit.
+    aborts = recv.drain(2)
+    assert [(type(a).__name__, a.rid) for a in aborts] == [("AbortReq", "b1"), ("AbortReq", "b2")]
+    assert [a.rid for a in recv.drain(16)] == ["b3"]
+    assert not recv.drain(16) and not sender.pending_aborts
+    # One traceback per (output type, exception type); the repeat is a single line.
+    failures = [r for r in caplog.records if "could not relay" in r.getMessage()]
+    assert len(failures) == 2 and [bool(r.exc_info) for r in failures] == [True, False]
+
+    # A different cause for the same output type gets its own traceback.
+    def missing_field(*args, **kwargs):
+        raise KeyError("num_running_reqs")
+
+    monkeypatch.setattr(wire.BatchTokenIDSlimOutput, "from_full", classmethod(missing_field))
+    with caplog.at_level(logging.WARNING, logger=wire.logger.name):
+        sender.send_output(broken(["b4"]))
+    failures = [r for r in caplog.records if "could not relay" in r.getMessage()]
+    assert len(failures) == 3 and bool(failures[-1].exc_info)
+    assert [a.rid for a in recv.drain(16)] == ["b4"]
+    monkeypatch.undo()
+    # A load probe that breaks costs the output its load tail, not the output.
+    sink.sent.clear()
+    sender.attach(sink, 0, lambda: object())
+    sender.send_output(_full_output())
+    (batch,) = sink.sent
+    assert batch[1] == ["a", "b"] and batch[11:15] == [0, 0, 0, 0] and not sender.pending_aborts
+
+
+def test_slim_output_carries_hidden_states_as_rows_per_position():
+    """A request that asked for hidden states gets the rows its output ADDED,
+    one per position a forward ran on: the engine keeps the list cumulative
+    (the prefill's block as one element, a row per prompt position computed,
+    then a decode step's rows), the relay remembers the elements it consumed
+    per request
+    and the slim wire carries the rest, flattened into rows, so the Rust
+    decoder reads the step's rows. A request that asked for none rides as
+    None; a finished request is forgotten; an older sender without the column
+    decodes as None."""
+    full = _full_output()
+    prefill_block = [[0.5, 1.5], [2.5, 3.5]]  # two prompt positions
+    full.output_hidden_states = [None, [prefill_block, [4.5, 5.5]]]
+    # The fixture's second request has finished; here it is still running, so
+    # its rows accumulate across outputs until the step that finishes it.
+    finished_at_the_end = list(full.finished_reasons)
+    full.finished_reasons = [None, None]
+    rows = wire.HiddenStateRows()
+    slim = wire.BatchTokenIDSlimOutput.from_full(
+        full, engine_index=1, hidden_rows=rows.column(full)
+    )
+    assert slim.output_hidden_states == [None, [[0.5, 1.5], [2.5, 3.5], [4.5, 5.5]]]
+    # The next output of the same request carries only the row the step added.
+    full.output_hidden_states = [None, [prefill_block, [4.5, 5.5], [6.5, 7.5]]]
+    assert rows.column(full) == [None, [[6.5, 7.5]]]
+    # The output that finishes it carries what that step added (nothing here)
+    # and the relay forgets the request: a later output under the same rid
+    # starts over from the whole list. Without the column, nothing rides.
+    full.finished_reasons = finished_at_the_end
+    assert rows.column(full) == [None, []]
+    full.finished_reasons = [None, None]
+    assert rows.column(full) == [None, [*prefill_block, [4.5, 5.5], [6.5, 7.5]]]
+    assert wire.BatchTokenIDSlimOutput.from_full(full).output_hidden_states == [None, None]
+    full.output_hidden_states = [None, [prefill_block, [4.5, 5.5]]]
+    encoded = msgspec.msgpack.encode(slim)
+    arr = msgspec.msgpack.decode(encoded)
+    assert arr[-1] == [None, [[0.5, 1.5], [2.5, 3.5], [4.5, 5.5]]]
+    decoded = msgspec.msgpack.decode(encoded, type=wire.BatchTokenIDSlimOutput)
+    assert decoded.output_hidden_states == slim.output_hidden_states
+    older = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(arr[:-1]), type=wire.BatchTokenIDSlimOutput
+    )
+    assert older.output_hidden_states is None
+
+
+# Pinned by the Rust request encoder test, including the video_token_id slot.
+RUST_VIDEO_REQUEST = (
+    "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c099919902c0c09192010301"
+    "c734020000001093920204a7666c6f61743332a3637075000000000000003f0000803f0000c03f0000004000002040000040"
+    "4000006040c0c281ae766964656f5f677269645f746877c72a020000000e93920103a5696e743634a3637075010000000000"
+    "000002000000000000000200000000000000c0c007c0c0c0c007c0dc001acc80c0c0c0cb3ff0000000000000cb3ff0000000"
+    "000000ffcb0000000000000000cb0000000000000000cb0000000000000000cb3ff00000000000000001c0c0c0c0c0c2c3c3"
+    "c2c0c0c0c0c2ff00c0c2"
+)
+
+
+def test_rust_video_tokens_are_padded_before_embedding():
+    """Use the native SGLang decoder to verify video placeholder padding."""
+    from sglang.srt.managers.mm_utils import (
+        MultiModalityDataPaddingPatternMultimodalTokens,
+    )
+    from sglang.srt.managers.schedule_batch import Modality
+
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, bytes.fromhex(RUST_VIDEO_REQUEST)])
+    media = req.mm_inputs
+    assert media.video_token_id == 7
+    (item,) = media.mm_items
+    assert item.modality is Modality.VIDEO
+    item.pad_value = 1000
+    padded = MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+        req.input_ids, media
+    )
+    assert list(padded) == [1, 1000, 1000, 1000, 2]
+    assert list(req.input_ids) == [1, 7, 7, 7, 2]
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("modality", [1, 2])
+def test_sender_cpu_hash_preserves_engine_identity_padding_and_features(
+    monkeypatch, dtype, modality
+):
+    """Rust's SHA256 wire identity replaces hashing, never feature computation."""
+    import hashlib
+
+    torch = pytest.importorskip("torch")
+    from sglang.srt.managers import mm_utils
+
+    monkeypatch.setenv("SGLANG_MM_SKIP_COMPUTE_HASH", "0")
+    feature = torch.arange(32768, dtype=torch.float32).to(getattr(torch, dtype))
+    raw = feature.view(torch.uint8).numpy().tobytes()
+    payload = msgspec.msgpack.decode(bytes.fromhex(RUST_MM_FRAMED_REQUEST))
+    item = payload[6][0][0]
+    item[0] = modality
+    item[5] = msgspec.msgpack.Ext(100, msgspec.msgpack.encode([[32768], dtype, 1]))
+    (baseline,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(payload), bytearray(raw), b"\x80"]
+    )
+    expected = baseline.mm_inputs.mm_items[0]
+    expected.set_pad_value()
+    item[1] = int.from_bytes(hashlib.sha256(raw).digest()[:8], "big")
+    (candidate,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(payload), bytearray(raw), b"\x80"]
+    )
+    actual = candidate.mm_inputs.mm_items[0]
+    monkeypatch.setattr(
+        mm_utils, "hash_feature", lambda _: pytest.fail("sender hash must be reused")
+    )
+    actual.set_pad_value()
+    assert (actual.hash, actual.pad_value) == (expected.hash, expected.pad_value)
+    assert actual.feature.dtype == expected.feature.dtype
+    assert torch.equal(actual.feature, expected.feature)
+    assert actual.offsets == expected.offsets

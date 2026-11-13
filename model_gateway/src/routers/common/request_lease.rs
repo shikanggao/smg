@@ -73,17 +73,17 @@ struct Held<T> {
 enum SerializedBody {
     None,
     Single(Bytes),
-    Legs(Bytes, Bytes),
+    Sides(Bytes, Bytes),
 }
 
 impl SerializedBody {
-    /// One upstream rendering of the request; PD legs differ only in
-    /// injected fields, so the larger leg stands for both.
+    /// One upstream rendering of the request; PD sides differ only in
+    /// injected fields, so the larger side stands for both.
     fn released_len(&self) -> usize {
         match self {
             Self::None => 0,
             Self::Single(body) => body.len(),
-            Self::Legs(prefill, decode) => prefill.len().max(decode.len()),
+            Self::Sides(prefill, decode) => prefill.len().max(decode.len()),
         }
     }
 }
@@ -127,10 +127,10 @@ impl<T> RequestLease<T> {
         Ok(body)
     }
 
-    /// Two-leg (PD) variant of [`Self::serialize_with`]: both leg bodies come
+    /// Two-side (PD) variant of [`Self::serialize_with`]: both side bodies come
     /// from one pass over the leased request, and the closure's intermediate
     /// trees die with it.
-    pub(crate) fn serialize_legs_with<E>(
+    pub(crate) fn serialize_sides_with<E>(
         &self,
         f: impl FnOnce(LeaseView<'_, T>) -> Result<(Vec<u8>, Vec<u8>), E>,
     ) -> Result<(Bytes, Bytes), E> {
@@ -138,12 +138,12 @@ impl<T> RequestLease<T> {
         let (mut prefill, mut decode) = f(Self::view(&inner))?;
         trim_serialization_slack(&mut prefill);
         trim_serialization_slack(&mut decode);
-        let legs = (Bytes::from(prefill), Bytes::from(decode));
-        inner.body = SerializedBody::Legs(legs.0.clone(), legs.1.clone());
-        Ok(legs)
+        let sides = (Bytes::from(prefill), Bytes::from(decode));
+        inner.body = SerializedBody::Sides(sides.0.clone(), sides.1.clone());
+        Ok(sides)
     }
 
-    /// Memoized upstream body from the last single-leg serialization; the
+    /// Memoized upstream body from the last single-body serialization; the
     /// handle is cheap and safe to hand to (re)dispatch attempts.
     #[cfg_attr(
         not(test),
@@ -155,7 +155,7 @@ impl<T> RequestLease<T> {
     pub(crate) fn body(&self) -> Option<Bytes> {
         match &self.lock().body {
             SerializedBody::Single(body) => Some(body.clone()),
-            SerializedBody::None | SerializedBody::Legs(..) => None,
+            SerializedBody::None | SerializedBody::Sides(..) => None,
         }
     }
 
@@ -236,13 +236,24 @@ pub(crate) mod test_probe {
     }
 
     /// Loopback POST /generate stub that answers `{}` only after every probe
-    /// clone outside the test is gone (or after a deadline, leaving
+    /// clone outside the test is gone (or after five seconds, leaving
     /// `released` false).
+    pub(crate) async fn spawn_release_gated_stub(probe: Weak<()>) -> (String, Arc<AtomicBool>) {
+        spawn_release_gated_stub_with_deadline(probe, Duration::from_secs(5)).await
+    }
+
+    /// [`spawn_release_gated_stub`] with the stub's own answer `deadline` away
+    /// instead of five seconds: far out, the stub answers only once the test
+    /// lets go of the probe, so a verdict can wait for that answer under a
+    /// hang guard instead of a clock.
     #[expect(
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    pub(crate) async fn spawn_release_gated_stub(probe: Weak<()>) -> (String, Arc<AtomicBool>) {
+    pub(crate) async fn spawn_release_gated_stub_with_deadline(
+        probe: Weak<()>,
+        deadline: Duration,
+    ) -> (String, Arc<AtomicBool>) {
         let released = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&released);
         let app = axum::Router::new().route(
@@ -251,8 +262,8 @@ pub(crate) mod test_probe {
                 let probe = probe.clone();
                 let flag = Arc::clone(&flag);
                 async move {
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                    while probe.strong_count() > 1 && tokio::time::Instant::now() < deadline {
+                    let answer_by = tokio::time::Instant::now() + deadline;
+                    while probe.strong_count() > 1 && tokio::time::Instant::now() < answer_by {
                         tokio::time::sleep(Duration::from_millis(2)).await;
                     }
                     flag.store(probe.strong_count() <= 1, Ordering::SeqCst);
@@ -347,12 +358,12 @@ mod tests {
     }
 
     #[test]
-    fn legs_serialize_from_one_view_and_release_together() {
+    fn sides_serialize_from_one_view_and_release_together() {
         let (lease, probe) = lease(ReleasePoint::AfterDispatch);
         let (prefill, decode) = lease
-            .serialize_legs_with(|_| Ok::<_, Infallible>((b"pp".to_vec(), b"dddd".to_vec())))
+            .serialize_sides_with(|_| Ok::<_, Infallible>((b"pp".to_vec(), b"dddd".to_vec())))
             .unwrap();
-        assert_eq!(lease.body(), None, "legs are not a single-body memo");
+        assert_eq!(lease.body(), None, "sides are not a single-body memo");
 
         lease.release_dispatch();
 

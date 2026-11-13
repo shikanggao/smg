@@ -15,11 +15,12 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use openai_protocol::{rl::RlCallOutcome, worker::ConnectionMode};
+use openai_protocol::rl::RlCallOutcome;
 use serde_json::Value;
 use tracing::info;
 
 use crate::{
+    calls::{route_answer, CallFailure, RlControlCalls},
     discovery::enum_str,
     error::RlError,
     metrics::{op_label, record_control_call},
@@ -76,8 +77,8 @@ impl ProxyRequest {
         })
     }
 
-    fn url_for(&self, worker: &RlWorkerInfo) -> String {
-        let base = worker.base_url.trim_end_matches('/');
+    fn url_for(&self, base: &str) -> String {
+        let base = base.trim_end_matches('/');
         match &self.query {
             Some(q) => format!("{base}/{}?{q}", self.path),
             None => format!("{base}/{}", self.path),
@@ -117,6 +118,16 @@ pub(crate) fn parse_body(
     )
 }
 
+/// The worker has nowhere to send control calls, or nothing to send them with.
+fn no_control_endpoint(worker: &RlWorkerInfo, message: &str) -> RlError {
+    RlError::NoControlEndpoint {
+        worker_id: worker.id.clone(),
+        url: worker.url.clone(),
+        connection_mode: enum_str(&worker.connection_mode),
+        message: message.to_string(),
+    }
+}
+
 /// Send `req` to `worker`. `Err` only for transport failures; an upstream
 /// 4xx/5xx is a successful proxy with that status in the outcome.
 pub async fn call_worker(
@@ -124,18 +135,25 @@ pub async fn call_worker(
     worker: &RlWorkerInfo,
     req: &ProxyRequest,
 ) -> Result<RlCallOutcome, RlError> {
-    // A worker the gateway never speaks HTTP to has no client to borrow.
-    let client = match &worker.http_client {
-        Some(client) if worker.connection_mode == ConnectionMode::Http => client,
-        _ => {
-            return Err(RlError::UnsupportedConnectionMode {
-                worker_id: worker.id.clone(),
-                url: worker.url.clone(),
-                mode: enum_str(&worker.connection_mode),
-            })
+    // Control is independent of the data transport: what matters is that the
+    // gateway knows an HTTP control endpoint and has a client to reach it, or,
+    // without one, that the worker's engine connection carries the calls.
+    let Some(base) = worker.control_url.as_deref() else {
+        if let Some(calls) = &worker.control_calls {
+            return call_over_engine_connection(state, worker, calls.as_ref(), req).await;
         }
+        return Err(no_control_endpoint(
+            worker,
+            "no `rl.control_url` label: set it at registration or through the worker update route (a TokenSpeed gRPC engine advertises it when launched with a routable --rl-control-host; a TokenSpeed engine on the direct ZMQ lane carries the calls itself)",
+        ));
     };
-    let url = req.url_for(worker);
+    let client = worker.control_client.as_ref().map_err(|e| {
+        no_control_endpoint(
+            worker,
+            &format!("no HTTP client for the control endpoint: {e}"),
+        )
+    })?;
+    let url = req.url_for(base);
     // The worker's client carries the gateway's request timeout; a refit
     // can outlive it, so the control deadline is set per request, as the
     // gateway's own flush/profile admin calls do.
@@ -231,8 +249,106 @@ pub async fn call_worker(
     );
     info!(
         target: "smg_rl",
-        worker_id = %worker.id, url = %worker.url, method = %req.method,
-        path = %req.path, status, latency_ms = outcome.latency_ms, "rl.proxy"
+        worker_id = %worker.id, url = %worker.url, control_url = %base,
+        method = %req.method, path = %req.path, status,
+        latency_ms = outcome.latency_ms, "rl.proxy"
+    );
+    Ok(outcome)
+}
+
+/// Send `req` to `worker` as a control call on its engine connection: the
+/// route is the method, its JSON body (a map, or nothing) the argument, and
+/// the ranks' replies come back in the route's own shape (see
+/// [`route_answer`]). The connection carries the engine's POST operations
+/// only: any other method, or a route below one segment, has no call.
+async fn call_over_engine_connection(
+    state: &RlState,
+    worker: &RlWorkerInfo,
+    calls: &dyn RlControlCalls,
+    req: &ProxyRequest,
+) -> Result<RlCallOutcome, RlError> {
+    if req.method != Method::POST || req.path.contains('/') {
+        return Err(no_control_endpoint(
+            worker,
+            &format!(
+                "its engine connection carries the engine's POST control operations only, not \
+                 {} /{}; label `rl.control_url` to reach the engine's own control app",
+                req.method, req.path
+            ),
+        ));
+    }
+    // An empty object is the route's defaults, as no body is (callers send
+    // `{}` to the routes whose framework requires a JSON body), so it is a
+    // call without an argument.
+    let body = if req.body.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice::<Value>(&req.body) {
+            Ok(Value::Object(fields)) if fields.is_empty() => None,
+            Ok(body @ Value::Object(_)) => Some(body),
+            Ok(other) => {
+                return Err(RlError::InvalidBody(format!(
+                    "a control call takes a JSON object, got {other}"
+                )))
+            }
+            Err(e) => return Err(RlError::InvalidBody(e.to_string())),
+        }
+    };
+    let op = op_label(&req.path);
+    let timeout = Duration::from_secs(state.config.control_timeout_secs);
+    let started = Instant::now();
+    let replies = calls.call(&req.path, body, timeout).await;
+    let elapsed = started.elapsed();
+    let replies = match replies {
+        Ok(replies) => replies,
+        Err(CallFailure::Timeout) => {
+            record_control_call(op, "timeout", elapsed);
+            return Err(RlError::UpstreamTimeout {
+                worker_id: worker.id.clone(),
+                url: worker.url.clone(),
+                timeout_secs: state.config.control_timeout_secs,
+            });
+        }
+        Err(CallFailure::Failed(message)) => {
+            record_control_call(op, "unreachable", elapsed);
+            return Err(RlError::UpstreamUnreachable {
+                worker_id: worker.id.clone(),
+                url: worker.url.clone(),
+                message,
+            });
+        }
+        // The connection cannot carry the call: the same answer as a worker
+        // without a control endpoint, with the engine's reason and the way out.
+        Err(CallFailure::Unsupported(message)) => {
+            return Err(no_control_endpoint(
+                worker,
+                &format!("{message}; label `rl.control_url` to reach the engine's own control app"),
+            ));
+        }
+    };
+    let (status, body) = route_answer(&replies);
+    let outcome = RlCallOutcome {
+        worker_id: worker.id.clone(),
+        url: worker.url.clone(),
+        status,
+        latency_ms: elapsed.as_millis() as u64,
+        body,
+        body_truncated: false,
+    };
+    record_control_call(
+        op,
+        if outcome.is_success() {
+            "ok"
+        } else {
+            "upstream_error"
+        },
+        elapsed,
+    );
+    info!(
+        target: "smg_rl",
+        worker_id = %worker.id, url = %worker.url, transport = "engine_connection",
+        path = %req.path, status, ranks = replies.len(),
+        latency_ms = outcome.latency_ms, "rl.proxy"
     );
     Ok(outcome)
 }
@@ -274,8 +390,9 @@ mod tests {
 
     use super::*;
     use crate::{
+        calls::{CallFailure, RankReply},
         config::RlConfig,
-        testing::{worker, FakeEngine, FakeView},
+        testing::{worker, zmq_worker, FakeCalls, FakeEngine, FakeView},
     };
 
     fn state(workers: Vec<RlWorkerInfo>, timeout_secs: u64) -> Arc<RlState> {
@@ -403,6 +520,7 @@ mod tests {
         let engine = FakeEngine::start(StatusCode::OK, json!({}), 0).await;
         let mut grpc = worker("g1", &engine.url, RuntimeType::Sglang);
         grpc.connection_mode = ConnectionMode::Grpc;
+        grpc.control_url = None;
         let app = crate::router::<()>(state(
             vec![worker("w1", &engine.url, RuntimeType::Sglang), grpc],
             5,
@@ -430,7 +548,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(json_body(r).await["error"], "unsupported_connection_mode");
+        assert_eq!(json_body(r).await["error"], "no_control_endpoint");
 
         let r = app
             .clone()
@@ -456,13 +574,63 @@ mod tests {
         assert!(engine.seen().is_empty());
     }
 
+    /// The transport SMG uses for data is irrelevant to control: a gRPC
+    /// worker with a control endpoint is proxied exactly like an HTTP one.
+    #[tokio::test]
+    async fn grpc_worker_with_a_control_endpoint_is_proxied() {
+        let control_app = FakeEngine::start(StatusCode::OK, json!({"success": true}), 0).await;
+        let mut w = worker("g1", "grpc://engine:30000", RuntimeType::TokenSpeed);
+        w.connection_mode = ConnectionMode::Grpc;
+        w.control_url = Some(control_app.url.clone());
+        w.api_key = Some("ts-secret".to_string());
+        let app = crate::router::<()>(state(vec![w], 5));
+
+        let resp = app
+            .oneshot(
+                Request::post("/workers/g1/engine/pause_generation")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"wait"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = control_app.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].path, "/pause_generation");
+        assert_eq!(&seen[0].body[..], br#"{"mode":"wait"}"#);
+        assert_eq!(seen[0].headers["authorization"], "Bearer ts-secret");
+    }
+
+    #[tokio::test]
+    async fn control_url_without_a_client_is_reported_not_routed() {
+        let mut w = worker("g2", "grpc://engine:30000", RuntimeType::TokenSpeed);
+        w.connection_mode = ConnectionMode::Grpc;
+        w.control_url = Some("http://ctl:1".to_string());
+        w.control_client = Err("bad CA bundle".to_string());
+        let app = crate::router::<()>(state(vec![w], 5));
+        let r = app
+            .oneshot(
+                Request::post("/workers/g2/engine/pause")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = json_body(r).await;
+        assert_eq!(body["error"], "no_control_endpoint");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("bad CA bundle"), "{message}");
+    }
+
     /// The control deadline is applied per request, so it holds even when
     /// the worker's client carries no client-level timeout of its own.
     #[tokio::test]
     async fn control_timeout_is_applied_per_request_on_the_worker_client() {
         let slow_engine = FakeEngine::start(StatusCode::OK, json!({}), 1500).await;
         let mut w = worker("slow", &slow_engine.url, RuntimeType::Sglang);
-        w.http_client = Some(Arc::new(reqwest::Client::new()));
+        w.control_client = Ok(crate::testing::test_client());
         let app = crate::router::<()>(state(vec![w], 1));
 
         let r = app
@@ -545,5 +713,160 @@ mod tests {
         let body = json_body(resp).await;
         assert_eq!(body["body_truncated"], true);
         assert!(body["body"].as_str().unwrap().len() <= BODY_CAP);
+    }
+
+    /// A worker with no control app whose engine connection carries the
+    /// calls is driven over it: the route is the call's method, its JSON body
+    /// the argument, the control deadline the wait, and the ranks' replies
+    /// come back in the route's own shape and status.
+    #[tokio::test]
+    async fn a_worker_without_a_control_app_is_driven_over_its_engine_connection() {
+        let calls = FakeCalls::succeeding(2);
+        let app = crate::router::<()>(state(vec![zmq_worker("z1", calls.clone())], 7));
+        let resp = app
+            .oneshot(
+                Request::post("/workers/z1/engine/update_weights_from_disk")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"model_path":"/ckpt","flush_cache":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["status"], 200);
+        assert_eq!(body["body"], json!({"success": true, "message": ""}));
+        let seen = calls.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "update_weights_from_disk");
+        assert_eq!(
+            seen[0].1,
+            Some(json!({"model_path": "/ckpt", "flush_cache": true}))
+        );
+        assert_eq!(seen[0].2, Duration::from_secs(7));
+
+        // A route without a body is a call without an argument; a rank's
+        // refusal is the route's 400 with the engine's words.
+        let refused = FakeCalls::answering(Ok(vec![RankReply {
+            success: false,
+            message: "a pause is already in progress".to_string(),
+        }]));
+        let app = crate::router::<()>(state(vec![zmq_worker("z2", refused.clone())], 7));
+        let resp = app
+            .oneshot(
+                Request::post("/workers/z2/engine/pause_generation")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(resp).await;
+        assert_eq!(body["body"]["message"], "a pause is already in progress");
+        assert_eq!(refused.seen()[0].1, None);
+
+        // `{}`, which callers send to bodyless routes, is no argument either.
+        let flushed = FakeCalls::succeeding(1);
+        let app = crate::router::<()>(state(vec![zmq_worker("z4", flushed.clone())], 7));
+        let resp = app
+            .oneshot(
+                Request::post("/workers/z4/engine/flush_cache")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            flushed.seen()[0],
+            ("flush_cache".to_string(), None, Duration::from_secs(7))
+        );
+    }
+
+    /// The engine connection carries POST operations named by one route
+    /// segment, with an object body; anything else is refused before any call,
+    /// and a call that times out or cannot be made maps as an HTTP one does.
+    #[tokio::test]
+    async fn what_the_engine_connection_cannot_carry_is_refused() {
+        let calls = FakeCalls::succeeding(1);
+        let app = crate::router::<()>(state(vec![zmq_worker("z1", calls.clone())], 5));
+        for (request, status, code) in [
+            (
+                Request::get("/workers/z1/engine/get_weight_version")
+                    .body(Body::empty())
+                    .unwrap(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "no_control_endpoint",
+            ),
+            (
+                Request::post("/workers/z1/engine/v1/loads")
+                    .body(Body::empty())
+                    .unwrap(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "no_control_endpoint",
+            ),
+            (
+                Request::post("/workers/z1/engine/pause_generation")
+                    .body(Body::from("[1, 2]"))
+                    .unwrap(),
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+            ),
+        ] {
+            let resp = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(resp.status(), status);
+            assert_eq!(json_body(resp).await["error"], code);
+        }
+        assert!(calls.seen().is_empty());
+
+        for (failure, status) in [
+            (CallFailure::Timeout, StatusCode::GATEWAY_TIMEOUT),
+            (
+                CallFailure::Failed("engine not connected".to_string()),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                CallFailure::Unsupported(
+                    "the engine's handshake declares no control reply".to_string(),
+                ),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            let app = crate::router::<()>(state(
+                vec![zmq_worker("z3", FakeCalls::answering(Err(failure)))],
+                5,
+            ));
+            let resp = app
+                .oneshot(
+                    Request::post("/workers/z3/engine/continue_generation")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status);
+        }
+    }
+
+    /// A control app the operator names wins over the engine connection.
+    #[tokio::test]
+    async fn a_labelled_control_app_wins_over_the_engine_connection() {
+        let control_app = FakeEngine::start(StatusCode::OK, json!({"success": true}), 0).await;
+        let calls = FakeCalls::succeeding(1);
+        let mut w = zmq_worker("z1", calls.clone());
+        w.control_url = Some(control_app.url.clone());
+        let app = crate::router::<()>(state(vec![w], 5));
+        let resp = app
+            .oneshot(
+                Request::post("/workers/z1/engine/continue_generation")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(control_app.seen().len(), 1);
+        assert!(calls.seen().is_empty());
     }
 }

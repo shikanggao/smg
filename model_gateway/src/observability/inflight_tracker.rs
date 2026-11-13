@@ -1,15 +1,20 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, LazyLock, OnceLock,
     },
     time::{Duration, Instant},
 };
 
 use dashmap::DashMap;
+use serde::Serialize;
 use tokio::sync::Notify;
+use uuid::Uuid;
 
-use super::gauge_histogram::{BucketBounds, GaugeHistogramHandle, GaugeHistogramVec};
+use super::{
+    gauge_histogram::{BucketBounds, GaugeHistogramHandle, GaugeHistogramVec},
+    metrics::Metrics,
+};
 use crate::policies::utils::PeriodicTask;
 
 static INFLIGHT_AGE_BOUNDS: BucketBounds<11> =
@@ -20,7 +25,12 @@ static INFLIGHT_AGE_HANDLE: LazyLock<GaugeHistogramHandle> =
     LazyLock::new(|| INFLIGHT_AGE_HISTOGRAM.register_no_labels());
 
 pub struct InFlightRequestTracker {
+    instance_id: Uuid,
     requests: DashMap<u64, Instant>,
+    /// Live request count. `DashMap::len()`/`is_empty()` lock every shard, and
+    /// the metrics middleware reads the count at request start and end, so it
+    /// is kept in one atomic instead.
+    count: AtomicUsize,
     next_id: AtomicU64,
     sampler: OnceLock<PeriodicTask>,
     /// Monotonic flag: false → true. Never reset.
@@ -32,7 +42,9 @@ pub struct InFlightRequestTracker {
 impl InFlightRequestTracker {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            instance_id: Uuid::now_v7(),
             requests: DashMap::new(),
+            count: AtomicUsize::new(0),
             next_id: AtomicU64::new(0),
             sampler: OnceLock::new(),
             draining: AtomicBool::new(false),
@@ -55,8 +67,16 @@ impl InFlightRequestTracker {
     }
 
     pub fn track(self: &Arc<Self>) -> InFlightGuard {
+        self.track_from(Instant::now())
+    }
+
+    /// [`Self::track`] for a request that came in at `started` (the edge's
+    /// entry stamp): its age is counted from there.
+    pub fn track_from(self: &Arc<Self>, started: Instant) -> InFlightGuard {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.requests.insert(request_id, Instant::now());
+        // Count first: a drain check must never see zero once admission began.
+        self.count.fetch_add(1, Ordering::AcqRel);
+        self.requests.insert(request_id, started);
         InFlightGuard {
             tracker: self.clone(),
             request_id,
@@ -64,11 +84,24 @@ impl InFlightRequestTracker {
     }
 
     pub fn len(&self) -> usize {
-        self.requests.len()
+        self.count.load(Ordering::Acquire)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.requests.is_empty()
+        self.len() == 0
+    }
+
+    /// Observe requests through response-body completion. To drain a worker,
+    /// first stop new routing to it, then retain this snapshot's IDs and poll
+    /// until none remain. Later arrivals do not prolong that cohort's drain.
+    /// A different instance ID invalidates a previous snapshot.
+    /// Upgraded connections outlive their HTTP response and require separate,
+    /// protocol-specific drain tracking.
+    pub fn snapshot(&self) -> InFlightSnapshot {
+        InFlightSnapshot {
+            instance_id: self.instance_id,
+            request_ids: self.requests.iter().map(|entry| *entry.key()).collect(),
+        }
     }
 
     /// Begin graceful shutdown: mark as draining. Idempotent.
@@ -86,7 +119,7 @@ impl InFlightRequestTracker {
     ///
     /// Returns `true` if all requests drained, `false` if timed out.
     pub async fn wait_for_drain(&self, max_timeout: Duration) -> bool {
-        if self.requests.is_empty() {
+        if self.is_empty() {
             return true;
         }
         tokio::time::timeout(max_timeout, async {
@@ -94,7 +127,7 @@ impl InFlightRequestTracker {
                 // Create the notified future BEFORE checking the condition
                 // to avoid TOCTOU race where a guard drops between check and wait.
                 let notified = self.drain_complete.notified();
-                if self.requests.is_empty() {
+                if self.is_empty() {
                     return;
                 }
                 notified.await;
@@ -117,10 +150,26 @@ impl InFlightRequestTracker {
             .collect()
     }
 
+    /// The sampler's tick: the in-flight age histogram from the tracked
+    /// requests, and `smg_http_connections_active` from the count. The
+    /// gauge's per-event sets (the arrival, the three releases) each load
+    /// the count and set the gauge as two steps, so two releases that
+    /// interleave as load, load, set, set leave the gauge one above the
+    /// count until the next event, and a server that goes idle right then
+    /// has no next event; the tick sets the gauge from the count, so a stale
+    /// reading lasts one sample interval at most.
     fn sample_and_record(&self) {
         let counts = self.compute_bucket_counts();
         INFLIGHT_AGE_HANDLE.set_counts(&counts);
+        Metrics::set_http_connections_active(self.len());
     }
+}
+
+/// Opaque process-local identities, unrelated to client request IDs or content.
+#[derive(Serialize)]
+pub struct InFlightSnapshot {
+    pub instance_id: Uuid,
+    pub request_ids: Vec<u64>,
 }
 
 pub struct InFlightGuard {
@@ -131,12 +180,13 @@ pub struct InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.tracker.requests.remove(&self.request_id);
+        let was = self.tracker.count.fetch_sub(1, Ordering::AcqRel);
         // Notify drain waiters when we hit zero. `wait_for_drain()` re-checks
         // the condition after waking, so spurious wakeups are harmless.
         // We unconditionally notify (without checking is_draining()) to avoid a
         // race where the last guard drops before begin_drain()'s Release store
         // is visible, which would skip the notification entirely.
-        if self.tracker.requests.is_empty() {
+        if was == 1 {
             self.tracker.drain_complete.notify_waiters();
         }
     }
@@ -147,6 +197,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::observability::metrics::test_support::render_with_recorder;
 
     impl InFlightRequestTracker {
         fn insert_with_time(&self, request_id: u64, start_time: Instant) {
@@ -245,6 +296,31 @@ mod tests {
         assert_ne!(g1.request_id, g2.request_id);
         assert_ne!(g2.request_id, g3.request_id);
         assert_eq!(tracker.len(), 3);
+        assert_ne!(
+            tracker.snapshot().instance_id,
+            InFlightRequestTracker::new().snapshot().instance_id
+        );
+    }
+
+    /// What two releases that interleave their loads and sets leave behind:
+    /// the gauge above the count, set through the recorder as the edge sets
+    /// it. One tick of the sampler reads the count and sets the gauge from
+    /// it.
+    #[test]
+    fn a_sampler_tick_sets_the_active_gauge_from_the_count_after_a_stale_set() {
+        let tracker = InFlightRequestTracker::new();
+        let _guards = [tracker.track(), tracker.track()];
+        assert_eq!(tracker.len(), 2);
+        let rendered = render_with_recorder(|| {
+            Metrics::set_http_connections_active(3);
+            tracker.sample_and_record();
+        });
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == "smg_http_connections_active 2"),
+            "{rendered}"
+        );
     }
 
     #[test]

@@ -10,23 +10,35 @@
 //! The plan is held until the retry window closes (first non-retryable
 //! response).
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
+    common::{InputIds, Usage},
     completion::CompletionRequest,
+    decisions::{DecisionUsage, DecisionsRequest},
     embedding::EmbeddingRequest,
-    generate::GenerateRequest,
+    generate::{GenerateRequest, GenerateResponse},
     messages::CreateMessageRequest,
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use smg_external_router::header_utils::insert_routed_worker_id;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::error;
+use tracing::{debug, error};
 
 use super::{
-    common::{responses::ResponsesContext, stages::*},
+    common::{
+        response_formatting::TokenCounts,
+        responses::{ResponsesContext, StreamStartupSender},
+        stages::{pd_protocol::PdProtocol, *},
+    },
     context::*,
     harmony,
     mode::Mode,
@@ -37,6 +49,10 @@ use super::{
             completion::{
                 CompletionPreparationStage, CompletionRequestBuildingStage,
                 CompletionResponseProcessingStage,
+            },
+            decisions::{
+                DecisionsPreparationStage, DecisionsRequestBuildingStage,
+                DecisionsResponseProcessingStage,
             },
             embedding::{
                 preparation::EmbeddingPreparationStage,
@@ -51,23 +67,30 @@ use super::{
             ChatGenerateResponseProcessingStage, TranscriptionPreparationStage,
             TranscriptionRequestBuildingStage, TranscriptionResponseProcessingStage,
         },
-        streaming,
+        streaming, symphony,
     },
     spec::ResponseSpec,
     utils,
-    utils::error_type_from_status,
+    utils::{error_reason_for_response, error_type_for_response},
 };
 use crate::{
-    config::types::RetryConfig,
-    middleware::TenantRequestMeta,
-    observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
+    config::{types::RetryConfig, ParserChoice},
+    middleware::{ReportedRefusal, TenantRequestMeta},
+    observability::{
+        cache_trace,
+        metrics::{bool_to_static_str, metrics_labels, Metrics},
+    },
     policies::PolicyRegistry,
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
-        common::retry::{is_retryable_response, BackoffCalculator},
+        common::{
+            json_response,
+            placement::{self, Candidates, WireConstraint},
+            retry::{is_retryable_response, BackoffCalculator},
+        },
         error,
     },
-    worker::WorkerRegistry,
+    worker::{PrefillAdmission, RoutingPool, WorkerRegistry},
 };
 
 /// Which endpoint a pipeline serves. Selects the endpoint-specific stage set
@@ -81,6 +104,7 @@ pub(crate) enum Endpoint {
     Harmony,
     Embeddings,
     Classify,
+    Decisions,
     Transcription,
 }
 
@@ -93,35 +117,52 @@ pub(crate) enum Endpoint {
 pub(crate) struct PipelineDeps {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
+    prefill_admission: Option<Arc<PrefillAdmission>>,
     tool_parser_factory: ToolParserFactory,
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
-    /// `None` when tenant rate limiting is disabled; read only by the
-    /// endpoints that insert `RateLimitReserveStage` (chat/messages/completion/harmony).
+    /// `None` when tenant rate limiting is disabled; read by the
+    /// `RateLimitReserveStage` of every endpoint.
     rate_limit_manager: Option<Arc<RateLimitManager>>,
+    /// `--queue-timeout-secs`: a request still ahead of worker selection this
+    /// long after the gateway accepted it is refused instead of dispatched.
+    queue_timeout: Duration,
+    /// `--grpc-request-timeout-secs`: the deadline of each attempt's calls to
+    /// its workers and of the streams they open, counted from the dispatch;
+    /// `None` leaves them unbounded.
+    request_timeout: Option<Duration>,
 }
 
 impl PipelineDeps {
     /// Full deps for the chat/messages/harmony endpoints, which consume the
     /// configured parser factories/overrides.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "pipeline construction wires the endpoint dependency bundle"
+    )]
     pub(crate) fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
+        prefill_admission: Option<Arc<PrefillAdmission>>,
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
+        queue_timeout: Duration,
     ) -> Self {
         Self {
             worker_registry,
             policy_registry,
+            prefill_admission,
             tool_parser_factory,
             reasoning_parser_factory,
             configured_tool_parser,
             configured_reasoning_parser,
             rate_limit_manager,
+            queue_timeout,
+            request_timeout: None,
         }
     }
 
@@ -130,17 +171,31 @@ impl PipelineDeps {
     pub(crate) fn pair(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
+        prefill_admission: Option<Arc<PrefillAdmission>>,
         rate_limit_manager: Option<Arc<RateLimitManager>>,
+        queue_timeout: Duration,
     ) -> Self {
         Self {
             worker_registry,
             policy_registry,
+            prefill_admission,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager,
+            queue_timeout,
+            request_timeout: None,
         }
+    }
+
+    /// Bound each attempt's calls to its workers, and the streams they open,
+    /// by `timeout` from the dispatch (`--grpc-request-timeout-secs`); zero
+    /// leaves them unbounded.
+    #[must_use]
+    pub(crate) fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = (!timeout.is_zero()).then_some(timeout);
+        self
     }
 
     /// Build the chat/messages response processor pair from the configured
@@ -156,12 +211,15 @@ impl PipelineDeps {
             self.worker_registry.clone(),
             self.configured_tool_parser.clone(),
             self.configured_reasoning_parser.clone(),
+            &self.tool_parser_factory,
+            &self.reasoning_parser_factory,
         );
         let processor = processor::ResponseProcessor::new(
             self.tool_parser_factory.clone(),
             self.reasoning_parser_factory.clone(),
             parser_resolver.clone(),
-        );
+        )
+        .with_backend(backend);
         let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
             self.tool_parser_factory.clone(),
             self.reasoning_parser_factory.clone(),
@@ -183,7 +241,8 @@ impl PipelineDeps {
             ToolParserFactory::default(),
             ReasoningParserFactory::default(),
             utils::ParserResolver::disabled(),
-        );
+        )
+        .with_backend(backend);
         let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
             ToolParserFactory::default(),
             ReasoningParserFactory::default(),
@@ -199,11 +258,14 @@ impl PipelineDeps {
         Self {
             worker_registry: Arc::new(WorkerRegistry::new()),
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            prefill_admission: None,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
             configured_tool_parser: None,
             configured_reasoning_parser: None,
             rate_limit_manager: None,
+            queue_timeout: Duration::from_secs(60),
+            request_timeout: None,
         }
     }
 }
@@ -213,9 +275,9 @@ impl PipelineDeps {
 /// process stage on the request-free [`DispatchContext`].
 struct PipelineStages {
     preparation: Box<dyn PipelineStage>,
-    /// `None` for endpoints that haven't opted into tenant rate limiting
-    /// (embeddings/classify).
-    rate_limit: Option<RateLimitReserveStage>,
+    /// The tenant's reservation, taken once per logical request by every
+    /// endpoint (a no-op while tenant rate limiting is off).
+    rate_limit: RateLimitReserveStage,
     worker_selection: WorkerSelectionStage,
     /// EPD-only encode planning/staging.
     encode: Option<EncodeStage>,
@@ -229,8 +291,14 @@ pub(crate) struct RequestPipeline {
     stages: Arc<PipelineStages>,
     /// Backend type for metrics labeling
     backend_type: &'static str,
-    /// Disaggregation mode, for per-leg retry metric labels.
+    /// Disaggregation mode, for per-side retry metric labels.
     mode: Mode,
+    /// The registry, read at dispatch for `--worker-overload-shed`.
+    worker_registry: Arc<WorkerRegistry>,
+    /// Shapes a forced tool call's constraint for each attempt's worker.
+    tool_parser_factory: ToolParserFactory,
+    /// The deadline of each attempt's dispatch and streams, when set.
+    request_timeout: Option<Duration>,
 }
 
 /// Outcome of one full pipeline run.
@@ -238,10 +306,14 @@ enum RunOutcome {
     /// Early response (streaming SSE) already produced by response processing.
     Early(Response),
     /// Buffered completion: the final response (or responses-iteration state)
-    /// sits on the dispatch context; the Instant is the successful attempt's
-    /// start, for duration metrics.
+    /// sits on the dispatch context; the Instant is the request's start, for
+    /// the duration record.
     Final(Box<DispatchContext>, Instant),
 }
+
+/// One full pipeline run: the one box of a run, allocated where the request
+/// context moves in (see [`RequestPipeline::run`]).
+type RunFuture<'a> = Pin<Box<dyn Future<Output = Result<RunOutcome, Response>> + Send + 'a>>;
 
 impl RequestPipeline {
     /// Build the pipeline for `endpoint` in the given disaggregation `mode`,
@@ -260,23 +332,38 @@ impl RequestPipeline {
             deps.worker_registry.clone(),
             deps.policy_registry.clone(),
             mode.worker_selection(),
-        );
-        let plan_kind = mode.plan_kind();
-        let inject_pd_metadata = mode.inject_pd_metadata();
+            deps.prefill_admission.clone(),
+        )
+        .with_queue_timeout(deps.queue_timeout);
+        let plan_settings = mode.plan_settings();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
-        let rate_limit = || RateLimitReserveStage::new(deps.rate_limit_manager.clone());
+        let rate_limit = RateLimitReserveStage::new(deps.rate_limit_manager.clone());
 
         let stages = match endpoint {
+            Endpoint::Decisions => {
+                if !matches!(mode, Mode::Regular) {
+                    return None;
+                }
+                PipelineStages {
+                    preparation: Box::new(DecisionsPreparationStage),
+                    rate_limit,
+                    worker_selection,
+                    encode: None,
+                    request_building: Box::new(DecisionsRequestBuildingStage),
+                    response_processing: Box::new(DecisionsResponseProcessingStage),
+                }
+            }
             Endpoint::Chat => {
                 let (processor, streaming_processor) = deps.configured_processors(backend);
                 PipelineStages {
-                    preparation: Box::new(ChatGeneratePreparationStage::new()),
-                    rate_limit: Some(rate_limit()),
+                    preparation: Box::new(ChatGeneratePreparationStage::new(
+                        mode.multimodal_wire_pools(),
+                    )),
+                    rate_limit,
                     worker_selection,
                     encode,
                     request_building: Box::new(ChatGenerateRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
+                        plan_settings,
                     )),
                     response_processing: Box::new(ChatGenerateResponseProcessingStage::new(
                         processor,
@@ -287,14 +374,13 @@ impl RequestPipeline {
             Endpoint::Messages => {
                 let (processor, streaming_processor) = deps.configured_processors(backend);
                 PipelineStages {
-                    preparation: Box::new(MessagePreparationStage),
-                    rate_limit: Some(rate_limit()),
+                    preparation: Box::new(MessagePreparationStage::new(
+                        mode.multimodal_wire_pools(),
+                    )),
+                    rate_limit,
                     worker_selection,
                     encode,
-                    request_building: Box::new(MessageRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )),
+                    request_building: Box::new(MessageRequestBuildingStage::new(plan_settings)),
                     response_processing: Box::new(MessageResponseProcessingStage::new(
                         processor,
                         streaming_processor,
@@ -306,13 +392,10 @@ impl RequestPipeline {
                 let (processor, streaming_processor) = PipelineDeps::default_processors(backend);
                 PipelineStages {
                     preparation: Box::new(CompletionPreparationStage),
-                    rate_limit: Some(rate_limit()),
+                    rate_limit,
                     worker_selection,
                     encode,
-                    request_building: Box::new(CompletionRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
-                    )),
+                    request_building: Box::new(CompletionRequestBuildingStage::new(plan_settings)),
                     response_processing: Box::new(CompletionResponseProcessingStage::new(
                         processor,
                         streaming_processor,
@@ -326,12 +409,11 @@ impl RequestPipeline {
                 }
                 PipelineStages {
                     preparation: Box::new(harmony::stages::HarmonyPreparationStage::new()),
-                    rate_limit: Some(rate_limit()),
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     request_building: Box::new(harmony::stages::HarmonyRequestBuildingStage::new(
-                        inject_pd_metadata,
-                        plan_kind,
+                        plan_settings,
                     )),
                     response_processing: Box::new(
                         harmony::stages::HarmonyResponseProcessingStage::new(),
@@ -345,7 +427,7 @@ impl RequestPipeline {
                 }
                 PipelineStages {
                     preparation: Box::new(EmbeddingPreparationStage::new()),
-                    rate_limit: None,
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     request_building: Box::new(EmbeddingRequestBuildingStage::new()),
@@ -359,7 +441,7 @@ impl RequestPipeline {
                 }
                 PipelineStages {
                     preparation: Box::new(EmbeddingPreparationStage::new()),
-                    rate_limit: None,
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     request_building: Box::new(EmbeddingRequestBuildingStage::new()),
@@ -375,9 +457,7 @@ impl RequestPipeline {
                 let (processor, _streaming) = PipelineDeps::default_processors(backend);
                 PipelineStages {
                     preparation: Box::new(TranscriptionPreparationStage),
-                    // Whole-file transcription was never tenant rate-limited on
-                    // the old wrapping path; keep that.
-                    rate_limit: None,
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     // Regular-only: no PD metadata, single-plan (see the stage).
@@ -393,15 +473,45 @@ impl RequestPipeline {
             stages: Arc::new(stages),
             backend_type: backend,
             mode,
+            worker_registry: deps.worker_registry.clone(),
+            tool_parser_factory: deps.tool_parser_factory.clone(),
+            request_timeout: deps.request_timeout,
         })
+    }
+
+    /// The deadline each attempt's dispatch and streams run under, when set.
+    #[cfg(test)]
+    pub(crate) fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
     }
 
     /// Ingress phase: run the request-owning stages through request building.
     async fn run_ingress(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         macro_rules! step {
             ($stage:expr, $result:expr) => {
-                $result.inspect_err(|response: &Response| {
-                    error!("Stage {} failed with status {}", $stage, response.status());
+                $result.map_err(|response: Response| {
+                    // A refusal the failing stage did not report itself (the
+                    // preparation stage's 404 for a model nobody serves)
+                    // gets its one rate-limited line here; a reported one,
+                    // and every other failure, passes through.
+                    let response = self.stages.worker_selection.report_refusal(
+                        "RequestPipeline::run_ingress",
+                        helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref()),
+                        &ctx.input.model_id,
+                        response,
+                    );
+                    if response.extensions().get::<ReportedRefusal>().is_some() {
+                        // The one line this refusal gets was written
+                        // (rate-limited, with the pool's state).
+                        debug!(
+                            "Stage {} refused the request with status {}",
+                            $stage,
+                            response.status()
+                        );
+                    } else {
+                        error!("Stage {} failed with status {}", $stage, response.status());
+                    }
+                    response
                 })
             };
         }
@@ -411,23 +521,35 @@ impl RequestPipeline {
             stages.preparation.name(),
             stages.preparation.execute(ctx).await
         )?;
-        if let Some(rate_limit) = &stages.rate_limit {
-            step!(rate_limit.name(), rate_limit.execute(ctx).await)?;
-        }
+        step!(
+            stages.rate_limit.name(),
+            stages.rate_limit.execute(ctx).await
+        )?;
         step!(
             stages.worker_selection.name(),
             stages.worker_selection.execute(ctx).await
         )?;
-        let workers = ctx.state.workers.as_ref().ok_or_else(|| {
-            error!(function = "run_ingress", "Worker selection not completed");
-            error::internal_error(
-                "worker_selection_not_completed",
-                "Worker selection not completed",
-            )
-        })?;
+        let workers = stage_output(ctx.state.workers.as_ref(), "run_ingress")?;
+        // Keep the post-selection guard for paths without pre-filtering
+        // (EPD and direct ZMQ), and for a model card updated during selection.
+        // No rejected request acquires a client or reaches an engine (#2380).
+        let prep = stage_output(ctx.state.preparation.as_ref(), "run_ingress")?;
+        step!(
+            "ContextLength",
+            enforce_context_length(prep, workers, &ctx.input.model_id)
+        )?;
+        step!(
+            "OutputBudget",
+            enforce_output_budget(&ctx.input.request_type, workers, &ctx.input.model_id)
+        )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",
-            acquire_clients(workers, &ctx.input.model_id).await
+            acquire_clients(
+                workers,
+                &ctx.input.model_id,
+                self.worker_registry.overload_shed_enabled(),
+            )
+            .await
         )?);
         if let Some(encode) = &stages.encode {
             step!(encode.name(), encode.execute(ctx).await)?;
@@ -444,61 +566,72 @@ impl RequestPipeline {
         &self,
         dctx: &mut DispatchContext,
         plan: &mut Option<ExecutionPlan>,
-        spec: &ResponseSpec,
+        spec: &mut Option<ResponseSpec>,
         stamp: &AttemptStamp,
         attempt: u32,
         last_attempt: bool,
     ) -> Result<Option<Response>, Response> {
+        dctx.attempt = attempt;
+        let consumed = || {
+            error!(function = "run_attempt", "Execution plan already consumed");
+            error::internal_error("execution_plan_consumed", "Execution plan already consumed")
+        };
         if attempt > 0 {
             // Fresh worker selection per attempt; the retained plan is
-            // re-stamped (engine ids, sampling defaults, PD rooms) for the
-            // new workers. Buffered decode state from the failed attempt is
-            // reset.
-            self.stages.worker_selection.reselect(dctx)?;
-            let workers = dctx.workers.as_ref().ok_or_else(|| {
-                error!(
-                    function = "run_attempt",
-                    "Worker re-selection not completed"
-                );
-                error::internal_error(
-                    "worker_selection_not_completed",
-                    "Worker selection not completed",
+            // re-stamped (engine ids, sampling defaults, the forced tool
+            // call's shape, PD rooms) for the new workers. Buffered decode
+            // state from the failed attempt is reset.
+            self.stages
+                .worker_selection
+                .reselect(dctx, plan.as_ref().ok_or_else(consumed)?)
+                .await?;
+            let workers = stage_output(dctx.workers.as_ref(), "run_attempt")?;
+            dctx.clients = Some(
+                acquire_clients(
+                    workers,
+                    &dctx.model_id,
+                    self.worker_registry.overload_shed_enabled(),
                 )
-            })?;
-            dctx.clients = Some(acquire_clients(workers, &dctx.model_id).await?);
-            let retained = plan.as_mut().ok_or_else(|| {
-                error!(function = "run_attempt", "Execution plan already consumed");
-                error::internal_error("execution_plan_consumed", "Execution plan already consumed")
-            })?;
-            helpers::restamp_plan_for_attempt(retained, stamp, workers)?;
+                .await?,
+            );
+            let retained = plan.as_mut().ok_or_else(consumed)?;
+            helpers::restamp_plan_for_attempt(retained, stamp, workers, &self.tool_parser_factory)?;
+            // The new workers' window, for the stop reason of a `length` finish.
+            if let Some(ResponseSpec::Messages(messages)) = spec.as_mut() {
+                messages.context_window = selection_context_length(workers, &dctx.model_id);
+            }
             if let Some(decoder) = dctx.response.stop_decoder.as_mut() {
                 decoder.reset();
             }
             dctx.response.execution_result = None;
         }
 
-        // The last allowed attempt moves the plan (no clone); earlier
-        // attempts dispatch a clone and retain the original for replay.
-        let attempt_plan = if last_attempt {
-            plan.take()
-        } else {
-            plan.clone()
+        if let Some(ResponseSpec::Decisions(spec)) = spec {
+            if let Some(workers) = dctx.workers.as_ref() {
+                enforce_decisions_context_length(spec.max_input_tokens, workers, &dctx.model_id)?;
+            }
         }
-        .ok_or_else(|| {
-            error!(function = "run_attempt", "Execution plan already consumed");
-            error::internal_error("execution_plan_consumed", "Execution plan already consumed")
-        })?;
+
+        // The last allowed attempt moves the plan and the spec (no clone);
+        // earlier attempts dispatch a clone and retain the originals for replay.
+        let (attempt_plan, attempt_spec) = if last_attempt {
+            plan.take().zip(spec.take())
+        } else {
+            plan.clone().zip(spec.clone())
+        }
+        .ok_or_else(consumed)?;
 
         dctx.dispatch = Some(prepare_dispatch_metadata(
             &attempt_plan,
             &dctx.dispatch_model,
             dctx.workers.as_ref(),
+            dctx.created,
         ));
 
-        execute_plan(dctx, attempt_plan).await?;
+        execute_plan(dctx, attempt_plan, last_attempt, self.request_timeout).await?;
         self.stages
             .response_processing
-            .process(dctx, spec.clone())
+            .process(dctx, attempt_spec)
             .await
             .inspect_err(|response| {
                 error!(
@@ -509,136 +642,275 @@ impl RequestPipeline {
             })
     }
 
-    /// Full two-phase run. `metrics_endpoint` enables per-attempt
-    /// router-request/error/duration recording (the responses-internal entry
-    /// points pass `None`, matching their historical behavior); `retry_config`
-    /// enables the dispatch-phase retry loop. Callers `Box::pin` this future:
-    /// it holds ingress + per-attempt state across awaits.
-    async fn run(
-        &self,
+    /// Full two-phase run. `metrics_endpoint` enables the request's
+    /// router-request, error and duration records, one each per request as
+    /// the HTTP routers record a route (the responses-internal entry points
+    /// pass `None`: a Responses turn runs the pipeline once per tool-loop
+    /// iteration, so the pipeline is not where that turn is counted);
+    /// `retry_config` enables the dispatch-phase retry loop.
+    ///
+    /// The run is boxed once, here, and the context moves straight into that
+    /// box: it holds ingress + per-attempt state across awaits, and an
+    /// `async fn` hop in between would keep its own copy of the 2.6 KiB
+    /// context in every caller's state machine (an argument lives in the
+    /// future as the upvar and as the rebound local).
+    fn run<'a>(
+        &'a self,
+        ctx: RequestContext,
+        metrics_endpoint: Option<&'static str>,
+        retry_config: Option<&'a RetryConfig>,
+    ) -> RunFuture<'a> {
+        let requested = cache_trace::requested(ctx.input.headers.as_ref());
+        if !cache_trace::enabled() && !requested {
+            return Box::pin(self.run_inner(ctx, metrics_endpoint, retry_config));
+        }
+        let root_id = helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref())
+            .map(str::to_owned);
+        Box::pin(cache_trace::scope(requested, async move {
+            let result = self.run_inner(ctx, metrics_endpoint, retry_config).await;
+            if let Err(response) = &result {
+                cache_trace::failure(root_id.as_deref(), response.status().as_u16());
+            }
+            result
+        }))
+    }
+
+    /// The run itself, as the future [`Self::run`] boxes: an `async move`
+    /// block over the context it was handed, so the context has one place in
+    /// that future (an `async fn` would rebind the argument into a second).
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "an async fn keeps a by-value argument twice in its state machine (the captured argument and the rebound local); the async move block holds the 2.6 KiB context once"
+    )]
+    fn run_inner<'a>(
+        &'a self,
         mut ctx: RequestContext,
         metrics_endpoint: Option<&'static str>,
-        retry_config: Option<&RetryConfig>,
-    ) -> Result<RunOutcome, Response> {
-        let mut attempt_start = Instant::now();
-        if let Some(endpoint) = metrics_endpoint {
-            Metrics::record_router_request(
-                metrics_labels::ROUTER_GRPC,
-                self.backend_type,
-                metrics_labels::CONNECTION_GRPC,
-                &ctx.input.model_id,
-                endpoint,
-                bool_to_static_str(ctx.is_streaming()),
-            );
-        }
-
-        let build = match self.run_ingress(&mut ctx).await {
-            Ok(build) => build,
-            Err(response) => {
-                self.record_error(metrics_endpoint, &ctx.input.model_id, &response);
-                return Err(response);
+        retry_config: Option<&'a RetryConfig>,
+    ) -> impl Future<Output = Result<RunOutcome, Response>> + Send + 'a {
+        async move {
+            let start = Instant::now();
+            if let Some(endpoint) = metrics_endpoint {
+                self.record_request(endpoint, &ctx.input.model_id, ctx.is_streaming());
             }
-        };
-        let BuildOutput { plan, spec, stamp } = build;
 
-        // Build boundary: the parsed request drops inside into_dispatch —
-        // the dispatch phase has no field that could carry it. The built
-        // plan's wire size stands in for the released buffers.
-        let model_id = ctx.input.model_id.clone();
-        let mut dctx = match ctx.into_dispatch() {
-            Ok(dctx) => Box::new(dctx),
-            Err(response) => {
-                self.record_error(metrics_endpoint, &model_id, &response);
-                return Err(response);
-            }
-        };
-        Metrics::record_request_buffers_released_early(plan.wire_len());
+            let build = match self.run_ingress(&mut ctx).await {
+                Ok(build) => build,
+                Err(response) => {
+                    self.record_error(metrics_endpoint, &ctx.input.model_id, &response);
+                    return Err(response);
+                }
+            };
+            let BuildOutput { plan, spec, stamp } = build;
 
-        let max_attempts = retry_config.map_or(1, |config| config.max_retries.max(1));
-        let mut plan = Some(plan);
-        let mut attempt: u32 = 0;
-        loop {
-            if attempt > 0 {
-                attempt_start = Instant::now();
-                if let Some(endpoint) = metrics_endpoint {
-                    Metrics::record_router_request(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &dctx.model_id,
-                        endpoint,
-                        bool_to_static_str(dctx.streaming),
+            // Build boundary: the parsed request drops inside into_dispatch —
+            // the dispatch phase has no field that could carry it. The built
+            // plan's wire size stands in for the released buffers.
+            let model_id = ctx.input.model_id.clone();
+            let mut dctx = match ctx.into_dispatch() {
+                Ok(dctx) => Box::new(dctx),
+                Err(response) => {
+                    self.record_error(metrics_endpoint, &model_id, &response);
+                    return Err(response);
+                }
+            };
+            Metrics::record_request_buffers_released_early(plan.wire_len());
+
+            // Keep the original failure and metrics, without sleeping for a
+            // retry that cannot safely replay an encoder's replica-bound
+            // handoff (the selected runtime's encode handoff decides).
+            let encode_handoff = PdProtocol::encode_handoff(dctx.wire.runtime);
+            let retry_config =
+                retry_config.filter(|_| !plan.replays_replica_bound_handoff(encode_handoff));
+            let max_attempts = retry_config.map_or(1, |config| config.max_retries.max(1));
+            let mut plan = Some(plan);
+            let mut spec = Some(spec);
+            let mut attempt: u32 = 0;
+            loop {
+                let last_attempt = attempt + 1 >= max_attempts;
+                let mut failure = match self
+                    .run_attempt(
+                        &mut dctx,
+                        &mut plan,
+                        &mut spec,
+                        &stamp,
+                        attempt,
+                        last_attempt,
+                    )
+                    .await
+                {
+                    Ok(Some(response)) => {
+                        if let Some(endpoint) = metrics_endpoint {
+                            self.record_duration(endpoint, &dctx.model_id, start);
+                        }
+                        return Ok(RunOutcome::Early(Self::routed_response(&dctx, response)));
+                    }
+                    Ok(None) => return Ok(RunOutcome::Final(dctx, start)),
+                    Err(response) => response,
+                };
+
+                if failure.extensions().get::<ReportedRefusal>().is_some() {
+                    // The re-selection wrote this refusal's line (rate-limited,
+                    // with the pool's state), as for the first selection.
+                    debug!(
+                        attempt,
+                        status = %failure.status(),
+                        "pipeline attempt refused"
+                    );
+                } else {
+                    error!(
+                        attempt,
+                        status = %failure.status(),
+                        "pipeline attempt failed"
                     );
                 }
-            }
+                // The failed attempt's worker load must not stay elevated through
+                // the backoff window (a fresh context dropped them here before).
+                // This releases its PD admission claim too, so the retry is not
+                // queued behind its own predecessor's bootstrap rooms.
+                dctx.load_guards = None;
+                dctx.pd_prefill_guard = None;
+                // A worker's definitive answer closes the retry window on that
+                // worker: the next attempt goes to another available worker, or
+                // the answer stands as the client's response.
+                if let Some(workers) = dctx.workers.as_ref() {
+                    // The alternative is sought where the retry would re-select,
+                    // among the workers that decide the constraint alike too.
+                    let pools = self.retry_pools(&dctx.model_id, dctx.wire);
+                    let decided_on = dctx.constraint_decided_on;
+                    dctx.ledger.settle(
+                        &mut failure,
+                        workers.workers(),
+                        pools
+                            .iter()
+                            .flat_map(|pool| pool.as_slice().iter())
+                            .filter(|worker| {
+                                decided_on
+                                    .is_none_or(|decoding| decoding.decides_alike(worker.as_ref()))
+                                    && dctx
+                                        .routing
+                                        .context_requirements
+                                        .admits(worker.as_ref(), &dctx.model_id)
+                            }),
+                    );
+                }
 
-            let last_attempt = attempt + 1 >= max_attempts;
-            let failure = match self
-                .run_attempt(&mut dctx, &mut plan, &spec, &stamp, attempt, last_attempt)
-                .await
-            {
-                Ok(Some(response)) => {
-                    if let Some(endpoint) = metrics_endpoint {
-                        Metrics::record_router_duration(
-                            metrics_labels::ROUTER_GRPC,
-                            self.backend_type,
-                            metrics_labels::CONNECTION_GRPC,
-                            &dctx.model_id,
-                            endpoint,
-                            attempt_start.elapsed(),
-                        );
+                // The attempt's failure is the request's answer unless a retry
+                // follows: counted once, here, under its class and reason, as
+                // the HTTP routers count the answer of a route; the attempts
+                // are the retry families' count.
+                let retryable = retry_config.filter(|_| is_retryable_response(&failure));
+                let Some(config) = retryable.filter(|_| !last_attempt) else {
+                    self.record_error(metrics_endpoint, &dctx.model_id, &failure);
+                    if retryable.is_some() {
+                        if let Some(endpoint) = metrics_endpoint {
+                            self.record_retries_exhausted(endpoint);
+                        }
                     }
-                    return Ok(RunOutcome::Early(response));
+                    return Err(failure);
+                };
+
+                // The retry re-selects away from the engines this attempt used,
+                // while another available worker is left to take the request.
+                let engines: Vec<String> = dctx
+                    .workers
+                    .iter()
+                    .flat_map(WorkerSelection::engines)
+                    .map(str::to_string)
+                    .collect();
+                for engine in engines {
+                    if !dctx.tried.contains(&engine) {
+                        dctx.tried.push(engine);
+                    }
                 }
-                Ok(None) => return Ok(RunOutcome::Final(dctx, attempt_start)),
-                Err(response) => response,
-            };
 
-            self.record_error(metrics_endpoint, &dctx.model_id, &failure);
-            error!(
-                attempt,
-                status = %failure.status(),
-                "pipeline attempt failed"
-            );
-            // The failed attempt's worker load must not stay elevated through
-            // the backoff window (a fresh context dropped them here before).
-            // This releases its PD admission claim too, so the retry is not
-            // queued behind its own predecessor's bootstrap rooms.
-            dctx.load_guards = None;
-
-            let Some(config) = retry_config else {
-                return Err(failure);
-            };
-            if !is_retryable_response(&failure) {
-                return Err(failure);
-            }
-            if last_attempt {
+                let next_attempt = attempt + 1;
+                let delay = BackoffCalculator::calculate_delay(config, attempt);
                 if let Some(endpoint) = metrics_endpoint {
-                    self.record_retries_exhausted(endpoint);
+                    self.record_retry(endpoint);
+                    Metrics::record_worker_retry_backoff(next_attempt, delay);
                 }
-                return Err(failure);
+                tokio::time::sleep(delay).await;
+                attempt = next_attempt;
             }
-
-            let next_attempt = attempt + 1;
-            let delay = BackoffCalculator::calculate_delay(config, attempt);
-            if let Some(endpoint) = metrics_endpoint {
-                self.record_retry(endpoint);
-                Metrics::record_worker_retry_backoff(next_attempt, delay);
-            }
-            tokio::time::sleep(delay).await;
-            attempt = next_attempt;
         }
     }
 
-    fn record_error(&self, endpoint: Option<&'static str>, model: &str, response: &Response) {
+    /// The pools a retry of `model_id` re-selects from, narrowed to the
+    /// retained wire as the re-selection itself is.
+    fn retry_pools(&self, model_id: &str, wire: WireConstraint) -> Vec<Candidates> {
+        let pools: &[RoutingPool] = match self.mode {
+            Mode::Regular => &[RoutingPool::GrpcPipelineRegular],
+            Mode::PrefillDecode | Mode::EncodePrefillDecode => {
+                &[RoutingPool::GrpcPrefill, RoutingPool::GrpcDecode]
+            }
+        };
+        pools
+            .iter()
+            .map(|pool| placement::candidates(&self.worker_registry, model_id, *pool, Some(wire)))
+            .collect()
+    }
+
+    /// Attribute a response to the worker from the successful dispatch attempt.
+    fn routed_response(ctx: &DispatchContext, mut response: Response) -> Response {
+        if let Some(trace) = ctx.cache_trace.as_ref() {
+            if let Ok(value) = http::HeaderValue::from_str(trace) {
+                response.headers_mut().insert("x-smg-cache-trace", value);
+            }
+        }
+        // Which parser read a chat completion, so a client comparing the two can tell.
+        if let Some(parser) = ctx.parser {
+            response.headers_mut().insert(
+                symphony::HEADER,
+                http::HeaderValue::from_static(parser.name()),
+            );
+        }
+        if let Some(workers) = ctx.workers.as_ref() {
+            let worker = match workers {
+                WorkerSelection::Single { worker } => worker,
+                WorkerSelection::Disaggregated { decode, .. } => decode,
+            };
+            insert_routed_worker_id(response.headers_mut(), worker.redacted_url());
+        }
+        response
+    }
+
+    /// One router request under this pipeline's labels, the count the
+    /// dashboards read: recorded once per request here, at its entry (the
+    /// attempts are the retry families' count), and by the router for an
+    /// answer it gives without the pipeline, so that traffic stays visible.
+    /// The `model` label is the served model's id, or `other` for a model no
+    /// worker serves ([`WorkerRegistry::metric_model_label`]), here and in
+    /// the error and duration records below.
+    pub(crate) fn record_request(&self, endpoint: &'static str, model: &str, streaming: bool) {
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            self.worker_registry.metric_model_label(model),
+            endpoint,
+            bool_to_static_str(streaming),
+        );
+    }
+
+    /// A refused request under this pipeline's labels, by its class (one of
+    /// the gateway's own refusals, or the response's status) and the cause
+    /// behind it (the worker's status, the refusal's code).
+    pub(crate) fn record_error(
+        &self,
+        endpoint: Option<&'static str>,
+        model: &str,
+        response: &Response,
+    ) {
         if let Some(endpoint) = endpoint {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_GRPC,
                 self.backend_type,
                 metrics_labels::CONNECTION_GRPC,
-                model,
+                self.worker_registry.metric_model_label(model),
                 endpoint,
-                error_type_from_status(response.status()),
+                error_type_for_response(response),
+                error_reason_for_response(response),
             );
         }
     }
@@ -676,7 +948,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model,
+            self.worker_registry.metric_model_label(model),
             endpoint,
             start.elapsed(),
         );
@@ -699,9 +971,10 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model,
+            self.worker_registry.metric_model_label(model),
             endpoint,
             metrics_labels::ERROR_INTERNAL,
+            metrics_labels::REASON_INTERNAL,
         );
         error::internal_error("wrong_response_type", "Internal error: wrong response type")
     }
@@ -717,32 +990,133 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model,
+            self.worker_registry.metric_model_label(model),
             endpoint,
             metrics_labels::ERROR_INTERNAL,
+            metrics_labels::REASON_INTERNAL,
         );
         error::internal_error("no_response_produced", "No response produced")
     }
 
     /// Settle a non-streaming success's reservation with real usage, if this
-    /// logical request reserved one. No-op if the cell is unset (feature
-    /// disabled or endpoint opted out) or was never admitted (e.g. prep
-    /// failed before the reserve stage ran). Idempotent -- `settle_success`
-    /// is a no-op if the handle was already resolved.
-    async fn settle_reservation(
-        cell: Option<&RateLimitCell>,
-        actual_input_tokens: u32,
-        completion_tokens: u32,
-    ) {
-        let Some(RateLimitOutcome::Admitted(handle)) = cell.and_then(RateLimitCell::peek) else {
-            return;
-        };
-        handle
-            .settle_success(UsageSettlement {
-                actual_input_tokens,
-                completion_tokens,
-            })
-            .await;
+    /// logical request reserved one ([`RateLimitCell::settle`]; no-op when
+    /// the caller set no cell).
+    async fn settle_reservation(cell: Option<&RateLimitCell>, usage: UsageSettlement) {
+        if let Some(cell) = cell {
+            cell.settle(usage).await;
+        }
+    }
+
+    /// The settlement of a non-streamed chat or messages answer: the engine's
+    /// counters the response stage recorded (see `ResponseState::engine_counts`);
+    /// all zeros, a full refund, when none were (the stage always records
+    /// them with a response).
+    fn recorded_settlement(response: &ResponseState) -> UsageSettlement {
+        response
+            .engine_counts
+            .map_or_else(UsageSettlement::default, TokenCounts::settlement)
+    }
+
+    /// The settlement of a non-streamed legacy completion: its usage object
+    /// is the engine's counters unchanged (no unbilled prompt tokens, no
+    /// parser), summed over the prompts of a batch.
+    pub(in crate::routers::grpc) fn completion_settlement(
+        usage: Option<&Usage>,
+    ) -> UsageSettlement {
+        usage.map_or_else(UsageSettlement::default, |usage| UsageSettlement {
+            actual_input_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cached_input_tokens: usage
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cached_tokens),
+            reasoning_tokens: usage
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens)
+                .unwrap_or(0),
+        })
+    }
+
+    /// The settlement of a non-streamed generate answer, one entry per
+    /// choice: the choices share one prompt, so its count and its cache hit
+    /// are taken once, the greatest any choice reports, as `TokenCounts::of`
+    /// and the streamed paths take them (the choice that prefilled the
+    /// shared prefix may report fewer hits than its siblings), and each
+    /// choice's own completion and reasoning counts sum.
+    pub(in crate::routers::grpc) fn generate_settlement(
+        responses: &[GenerateResponse],
+    ) -> UsageSettlement {
+        TokenCounts::of_generated(responses).settlement()
+    }
+
+    /// The settlement of an embeddings or classification answer: the prompt
+    /// tokens the engine counted, no completion.
+    pub(in crate::routers::grpc) fn prompt_only_settlement(prompt_tokens: u32) -> UsageSettlement {
+        UsageSettlement {
+            actual_input_tokens: prompt_tokens,
+            ..UsageSettlement::default()
+        }
+    }
+
+    /// The settlement of a decision batch: its input tokens, no completion
+    /// (label scoring generates none, as today), and the cache and reasoning
+    /// counters its usage reports, zero while the backend reports none.
+    pub(in crate::routers::grpc) fn decisions_settlement(usage: &DecisionUsage) -> UsageSettlement {
+        let count = |tokens: u64| u32::try_from(tokens).unwrap_or(u32::MAX);
+        UsageSettlement {
+            actual_input_tokens: count(usage.input_tokens),
+            completion_tokens: 0,
+            cached_input_tokens: count(usage.input_tokens_details.cached_tokens),
+            reasoning_tokens: count(usage.output_tokens_details.reasoning_tokens),
+        }
+    }
+
+    /// [`Self::run`], reporting to a Responses stream's startup barrier
+    /// whether the backend request started, with the parser header the
+    /// started stream's answer carries. A run that fails before then hands
+    /// its response to the barrier; the caller gets a placeholder the
+    /// Responses stream never forwards.
+    fn run_signalling<'a>(
+        &'a self,
+        ctx: RequestContext,
+        metrics_endpoint: Option<&'static str>,
+        retry_config: Option<&'a RetryConfig>,
+        stream_start: Option<StreamStartupSender>,
+    ) -> impl Future<Output = Result<RunOutcome, Response>> + Send + 'a {
+        let run = self.run(ctx, metrics_endpoint, retry_config);
+        async move {
+            let outcome = run.await;
+            let Some(startup) = stream_start else {
+                return outcome;
+            };
+            // A dropped receiver means the client left; nothing waits for
+            // either message.
+            match outcome {
+                Ok(outcome) => {
+                    // The parser that read the answer, as the Responses stream's
+                    // own answer names it: a stream answers early, its header
+                    // set by `routed_response`.
+                    let parser = match &outcome {
+                        RunOutcome::Early(response) => {
+                            response.headers().get(symphony::HEADER).cloned()
+                        }
+                        RunOutcome::Final(dctx, _) => dctx
+                            .parser
+                            .map(|parser| http::HeaderValue::from_static(parser.name())),
+                    };
+                    let _ = startup.send(Ok(parser));
+                    Ok(outcome)
+                }
+                Err(failure) => {
+                    let _ = startup.send(Err(failure));
+                    Err(error::internal_error(
+                        "responses_stream_startup_failed",
+                        "Streaming response failed before backend request startup",
+                    ))
+                }
+            }
+        }
     }
 
     /// Execute the complete pipeline for a chat request
@@ -756,25 +1130,28 @@ impl RequestPipeline {
         tenant_request_meta: Option<TenantRequestMeta>,
         rate_limit_cell: Option<Arc<RateLimitCell>>,
         retry_config: Option<&RetryConfig>,
+        stream_start: Option<StreamStartupSender>,
     ) -> Response {
-        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-        ctx.input.rate_limit_cell = rate_limit_cell;
-
         const ENDPOINT: &str = metrics_labels::ENDPOINT_CHAT;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+        let run = {
+            let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run_signalling(ctx, Some(ENDPOINT), retry_config, stream_start)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Chat(response)) => {
-                    let usage = response.usage.as_ref();
+                    // The engine's counts: the usage shown excludes the unbilled
+                    // stub and may carry the parser's reasoning split.
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        usage.map_or(0, |u| u.prompt_tokens),
-                        usage.map_or(0, |u| u.completion_tokens),
+                        Self::recorded_settlement(&dctx.response),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_chat",
@@ -801,27 +1178,41 @@ impl RequestPipeline {
         rate_limit_cell: Option<Arc<RateLimitCell>>,
         retry_config: Option<&RetryConfig>,
     ) -> Response {
-        let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-        ctx.input.rate_limit_cell = rate_limit_cell;
-
+        // The response needs to know the request's shape (single prompt vs.
+        // batch, and `n`) to answer like SGLang, but `into_dispatch` drops
+        // the request by construction (see the module doc) -- the dispatch
+        // phase runs with no request, on purpose. Read the two scalars off
+        // the request now, before it moves into the context, instead of
+        // retaining a handle across dispatch.
+        //
+        // `single_prompt` is false for `InputIds::Batch`, but that shape
+        // never reaches here: the preparation stage 400s it first.
+        let single_prompt =
+            request.text.is_some() || matches!(request.input_ids, Some(InputIds::Single(_)));
+        let n = request
+            .sampling_params
+            .as_ref()
+            .and_then(|sp| sp.n)
+            .unwrap_or(1);
         const ENDPOINT: &str = metrics_labels::ENDPOINT_GENERATE;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+        let run = {
+            let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), retry_config)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Generate(response)) => {
-                    let actual_input_tokens =
-                        response.first().map_or(0, |r| r.meta_info.prompt_tokens);
-                    let completion_tokens =
-                        response.iter().map(|r| r.meta_info.completion_tokens).sum();
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        actual_input_tokens,
-                        completion_tokens,
+                        Self::generate_settlement(&response),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    let body = generate_response_body(single_prompt, n, response);
+                    Self::routed_response(&dctx, json_response(&body))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_generate",
@@ -848,24 +1239,24 @@ impl RequestPipeline {
         rate_limit_cell: Option<Arc<RateLimitCell>>,
         retry_config: Option<&RetryConfig>,
     ) -> Response {
-        let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-        ctx.input.rate_limit_cell = rate_limit_cell;
-
         const ENDPOINT: &str = metrics_labels::ENDPOINT_COMPLETIONS;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+        let run = {
+            let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), retry_config)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Completion(response)) => {
-                    let usage = response.usage.as_ref();
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        usage.map_or(0, |u| u.prompt_tokens),
-                        usage.map_or(0, |u| u.completion_tokens),
+                        Self::completion_settlement(response.usage.as_ref()),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_completion",
@@ -892,23 +1283,27 @@ impl RequestPipeline {
         rate_limit_cell: Option<Arc<RateLimitCell>>,
         retry_config: Option<&RetryConfig>,
     ) -> Response {
-        let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-        ctx.input.rate_limit_cell = rate_limit_cell;
-
         const ENDPOINT: &str = metrics_labels::ENDPOINT_MESSAGES;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+        let run = {
+            let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), retry_config)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Messages(response)) => {
+                    // The engine's counts: the Messages usage reports no cache
+                    // hits and the greater of the engine's and the parser's
+                    // thinking count.
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        response.usage.input_tokens,
-                        response.usage.output_tokens,
+                        Self::recorded_settlement(&dctx.response),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_messages",
@@ -923,6 +1318,53 @@ impl RequestPipeline {
         }
     }
 
+    /// Execute a decision batch and settle its single logical reservation.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the rate-limited endpoint entry contract"
+    )]
+    pub async fn execute_decisions(
+        &self,
+        request: Arc<DecisionsRequest>,
+        headers: Option<http::HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+        tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
+        retry_config: Option<&RetryConfig>,
+    ) -> Response {
+        const ENDPOINT: &str = metrics_labels::ENDPOINT_DECISIONS;
+        let run = {
+            let mut ctx = RequestContext::for_decisions(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), retry_config)
+        };
+        match run.await {
+            Ok(RunOutcome::Early(response)) => response,
+            Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
+                Some(FinalResponse::Decisions(response)) => {
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::decisions_settlement(&response.usage),
+                    )
+                    .await;
+                    self.record_duration(ENDPOINT, &dctx.model_id, start);
+                    Self::routed_response(&dctx, json_response(&response))
+                }
+                Some(other) => self.wrong_response_type(
+                    "execute_decisions",
+                    "Decisions",
+                    &other,
+                    &dctx.model_id,
+                    ENDPOINT,
+                ),
+                None => self.no_response_produced("execute_decisions", &dctx.model_id, ENDPOINT),
+            },
+            Err(response) => response,
+        }
+    }
+
     /// Execute the complete pipeline for an embedding request
     pub async fn execute_embeddings(
         &self,
@@ -931,17 +1373,28 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
-        let mut ctx = RequestContext::for_embedding(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-
         const ENDPOINT: &str = metrics_labels::ENDPOINT_EMBEDDINGS;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), None)).await {
+        let run = {
+            let mut ctx = RequestContext::for_embedding(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), None)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Embedding(response)) => {
+                    // The prompt tokens the engine counted; an embedding has
+                    // no completion.
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::prompt_only_settlement(response.usage.prompt_tokens),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_embeddings",
@@ -957,6 +1410,10 @@ impl RequestPipeline {
     }
 
     /// Execute the complete pipeline for an audio transcription request.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the rate-limited endpoint entry contract"
+    )]
     pub async fn execute_transcription(
         &self,
         request: Arc<openai_protocol::transcription::TranscriptionRequest>,
@@ -965,20 +1422,34 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
-        let mut ctx =
-            RequestContext::for_transcription(request, audio, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-
         // Same label the HTTP layer records for /v1/audio/transcriptions, so
         // the endpoint's metrics don't split across backends.
         const ENDPOINT: &str = metrics_labels::ENDPOINT_AUDIO_TRANSCRIPTIONS;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), None)).await {
+        let run = {
+            let mut ctx =
+                RequestContext::for_transcription(request, audio, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), None)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Transcription { text, format }) => {
+                    // The engine's counts of the transcript's generation, as
+                    // the response stage recorded them.
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::recorded_settlement(&dctx.response),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    super::regular::stages::transcription::render(format, text)
+                    Self::routed_response(
+                        &dctx,
+                        super::regular::stages::transcription::render(format, text),
+                    )
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_transcription",
@@ -1003,17 +1474,28 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
-        let mut ctx = RequestContext::for_classify(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-
         const ENDPOINT: &str = metrics_labels::ENDPOINT_CLASSIFY;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), None)).await {
+        let run = {
+            let mut ctx = RequestContext::for_classify(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), None)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Classify(response)) => {
+                    // The prompt tokens the engine counted; a classification
+                    // has no completion.
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::prompt_only_settlement(response.usage.prompt_tokens),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    axum::Json(response).into_response()
+                    Self::routed_response(&dctx, json_response(&response))
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_classify",
@@ -1030,9 +1512,14 @@ impl RequestPipeline {
 
     /// Execute chat pipeline for responses endpoint
     ///
-    /// Used by ALL non-streaming /v1/responses requests.
-    /// Same stages as execute_chat(), with two differences:
-    /// 1. Returns Result<ChatCompletionResponse, Response> for tool_loop composition
+    /// Used by ALL non-streaming /v1/responses requests, once per iteration
+    /// of a tool loop. Same stages as execute_chat(), the tenant rate-limit
+    /// reservation included: every iteration is a generation of its own, so
+    /// each takes the reservation a chat request takes (reserved at ingress
+    /// under a charge id of its own, settled with the engine's counts, closed
+    /// unsettled when the iteration fails). Two differences:
+    /// 1. Returns the completion with the parser that read it (what the chat
+    ///    route answers in `x-smg-parser`), as a Result for tool_loop composition
     /// 2. Disallows streaming (responses endpoint uses different SSE format)
     pub async fn execute_chat_for_responses(
         &self,
@@ -1041,11 +1528,15 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
-    ) -> Result<ChatCompletionResponse, Response> {
-        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-
-        match Box::pin(self.run(ctx, None, None)).await {
+    ) -> Result<(ChatCompletionResponse, Option<ParserChoice>), Response> {
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
+        let run = {
+            let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
+            ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
+            self.run(ctx, None, None)
+        };
+        let result = match run.await {
             Ok(RunOutcome::Early(_)) => {
                 // Streaming not supported for responses sync mode
                 error!(
@@ -1058,7 +1549,14 @@ impl RequestPipeline {
                 ))
             }
             Ok(RunOutcome::Final(mut dctx, _)) => match dctx.response.final_response.take() {
-                Some(FinalResponse::Chat(response)) => Ok(response),
+                Some(FinalResponse::Chat(response)) => {
+                    // The engine's counts the response stage recorded, as
+                    // `execute_chat` settles them.
+                    rate_limit_cell
+                        .settle(Self::recorded_settlement(&dctx.response))
+                        .await;
+                    Ok((response, dctx.parser))
+                }
                 Some(_) => {
                     error!(
                         function = "execute_chat_for_responses",
@@ -1081,1153 +1579,188 @@ impl RequestPipeline {
                 }
             },
             Err(response) => Err(response),
+        };
+        if result.is_err() {
+            // A failed iteration keeps its reserved debit, as a failed typed
+            // request does (`GrpcRouter::execute_reserved`).
+            rate_limit_cell.close_unsettled().await;
         }
+        result
     }
 
     /// Execute one Harmony Responses API iteration through the pipeline.
     ///
     /// Returns ToolCallsFound (continue serving) or Completed (final
     /// response); called by harmony::responses::serve_harmony_responses()
-    /// per iteration.
+    /// per iteration. Each iteration takes the tenant rate-limit reservation
+    /// a chat request takes: reserved at ingress under a charge id of its own,
+    /// settled with the engine's counts the response stage recorded, closed
+    /// unsettled when the iteration fails.
     pub async fn execute_harmony_responses(
         &self,
         request: &openai_protocol::responses::ResponsesRequest,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<harmony::ResponsesIterationResult, Response> {
-        let mut ctx = RequestContext::for_responses(
-            Arc::new(request.clone()),
-            None,                  // No headers needed for internal pipeline execution
-            request.model.clone(), // Model ID from request
-            harmony_ctx.components.clone(),
-        );
-        ctx.input.tenant_request_meta = tenant_request_meta;
-
-        let mut dctx = match Box::pin(self.run(ctx, None, None)).await {
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
+        let run = {
+            let mut ctx = RequestContext::for_responses(
+                Arc::new(request.clone()),
+                None,                  // No headers needed for internal pipeline execution
+                request.model.clone(), // Model ID from request
+                harmony_ctx.components.clone(),
+            );
+            ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
+            ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
+            self.run(ctx, None, None)
+        };
+        let result = match run.await {
             Ok(RunOutcome::Early(response)) => {
                 error!(
                     function = "execute_harmony_responses",
                     "Unexpected early response during Responses iteration"
                 );
-                return Err(response);
+                Err(response)
             }
-            Ok(RunOutcome::Final(dctx, _)) => dctx,
-            Err(response) => return Err(response),
+            Ok(RunOutcome::Final(mut dctx, _)) => {
+                match dctx.response.responses_iteration_result.take() {
+                    Some(iteration_result) => {
+                        rate_limit_cell
+                            .settle(Self::recorded_settlement(&dctx.response))
+                            .await;
+                        Ok(*iteration_result)
+                    }
+                    None => {
+                        error!(
+                            function = "execute_harmony_responses",
+                            "No ResponsesIterationResult produced by pipeline"
+                        );
+                        Err(error::internal_error(
+                            "no_responses_iteration_result",
+                            "No ResponsesIterationResult produced by pipeline",
+                        ))
+                    }
+                }
+            }
+            Err(response) => Err(response),
         };
-
-        dctx.response
-            .responses_iteration_result
-            .take()
-            .ok_or_else(|| {
-                error!(
-                    function = "execute_harmony_responses",
-                    "No ResponsesIterationResult produced by pipeline"
-                );
-                error::internal_error(
-                    "no_responses_iteration_result",
-                    "No ResponsesIterationResult produced by pipeline",
-                )
-            })
+        if result.is_err() {
+            rate_limit_cell.close_unsettled().await;
+        }
+        result
     }
 
     /// Execute a Harmony Responses pipeline iteration with streaming support.
     ///
     /// Runs through dispatch and returns the raw ExecutionResult (with
-    /// stream) and LoadGuards for token-level streaming processing. The
-    /// caller keeps load_guards alive until stream processing completes.
+    /// stream) and LoadGuards for token-level streaming processing, with the
+    /// iteration's tenant rate-limit reservation (taken under a charge id of
+    /// its own) and the router's stop obligations (the string `stop`s the
+    /// engine cannot match, for the reader to scan for). The caller keeps
+    /// load_guards alive until stream processing completes, then settles the
+    /// reservation with the counts the stream brought
+    /// ([`RateLimitCell::settle`]) or closes it when the stream broke
+    /// ([`RateLimitCell::close_unsettled`]); a cell dropped before either
+    /// (the client left) abandons the reservation, its debit kept.
     pub async fn execute_harmony_responses_streaming(
         &self,
         request: &openai_protocol::responses::ResponsesRequest,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
-    ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
-        let mut ctx = RequestContext::for_responses(
-            Arc::new(request.clone()),
-            None,
-            request.model.clone(),
-            harmony_ctx.components.clone(),
-        );
-        ctx.input.tenant_request_meta = tenant_request_meta;
-
-        let mut dctx = match Box::pin(self.run(ctx, None, None)).await {
+        stream_start: Option<StreamStartupSender>,
+    ) -> Result<
+        (
+            ExecutionResult,
+            Option<LoadGuards>,
+            Arc<RateLimitCell>,
+            Vec<String>,
+        ),
+        Response,
+    > {
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
+        let run = {
+            let mut ctx = RequestContext::for_responses(
+                Arc::new(request.clone()),
+                None,
+                request.model.clone(),
+                harmony_ctx.components.clone(),
+            );
+            ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
+            ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
+            self.run_signalling(ctx, None, None, stream_start)
+        };
+        let result = match run.await {
             Ok(RunOutcome::Early(response)) => {
                 error!(
                     function = "execute_harmony_responses_streaming",
                     "Unexpected early response during streaming Responses"
                 );
-                return Err(response);
+                Err(response)
             }
-            Ok(RunOutcome::Final(dctx, _)) => dctx,
-            Err(response) => return Err(response),
-        };
-
-        let execution_result = dctx.response.execution_result.take().ok_or_else(|| {
-            error!(
-                function = "execute_harmony_responses_streaming",
-                "No ExecutionResult produced by pipeline"
-            );
-            error::internal_error(
-                "no_execution_result_produced",
-                "No ExecutionResult produced by pipeline",
-            )
-        })?;
-
-        let load_guards = dctx.load_guards.take();
-
-        Ok((execution_result, load_guards))
-    }
-}
-
-#[cfg(test)]
-impl RequestPipeline {
-    /// Mode-bearing construction descriptor for the parity test. Stage
-    /// ordering itself is structural (see `PipelineStages`), so only the
-    /// per-mode args and optional stages need freezing.
-    fn signature(&self) -> String {
-        format!(
-            "{}|rate_limit={}|encode={}|{}",
-            self.stages.worker_selection.signature(),
-            self.stages.rate_limit.is_some(),
-            self.stages.encode.is_some(),
-            self.stages.request_building.signature(),
-        )
-    }
-}
-
-#[cfg(test)]
-mod build_parity_tests {
-    use super::*;
-    use crate::routers::grpc::mode::Mode;
-
-    /// Hand-transcribed expected construction descriptor + metrics backend
-    /// label per endpoint/mode. Do not regenerate from `build()` output, or
-    /// this stops guarding anything: it exists to catch a wrong
-    /// `build`/`mode.rs` mapping (a flipped `inject_pd_metadata`, wrong
-    /// `plan_kind`, or swapped `WorkerSelectionMode`). Stage ordering is
-    /// structural in `PipelineStages` and needs no golden.
-    fn golden(endpoint: Endpoint, mode: Mode) -> (String, &'static str) {
-        const REGULAR: &str = metrics_labels::BACKEND_REGULAR;
-        const PD: &str = metrics_labels::BACKEND_PD;
-        let (selection, inject, plan, backend) = match mode {
-            Mode::Regular => ("Regular", "false", "Single", REGULAR),
-            Mode::PrefillDecode => ("PrefillDecode", "true", "PrefillDecode", PD),
-            Mode::EncodePrefillDecode => {
-                ("EncodePrefillDecode", "false", "EncodePrefillDecode", PD)
-            }
-        };
-        let encode = matches!(mode, Mode::EncodePrefillDecode);
-        let build = match endpoint {
-            Endpoint::Chat => format!(
-                "ChatGenerateRequestBuildingStage(ChatRequestBuildingStage(inject_pd_metadata={inject}, {plan}), GenerateRequestBuildingStage(inject_pd_metadata={inject}, {plan}))"
-            ),
-            Endpoint::Messages => {
-                format!("MessageRequestBuildingStage(inject_pd_metadata={inject}, {plan})")
-            }
-            Endpoint::Completion => {
-                format!("CompletionRequestBuildingStage(inject_pd_metadata={inject}, {plan})")
-            }
-            Endpoint::Harmony => {
-                format!("HarmonyRequestBuildingStage(inject_pd_metadata={inject}, {plan})")
-            }
-            Endpoint::Embeddings | Endpoint::Classify => {
-                "EmbeddingRequestBuildingStage".to_string()
-            }
-            Endpoint::Transcription => "TranscriptionRequestBuildingStage".to_string(),
-        };
-        let rate_limit = !matches!(
-            endpoint,
-            Endpoint::Embeddings | Endpoint::Classify | Endpoint::Transcription
-        );
-        // Harmony never carries the encode stage.
-        let encode = encode && !matches!(endpoint, Endpoint::Harmony);
-        (
-            format!(
-                "WorkerSelectionStage({selection})|rate_limit={rate_limit}|encode={encode}|{build}"
-            ),
-            backend,
-        )
-    }
-
-    fn assert_parity(endpoint: Endpoint, mode: Mode, deps: &PipelineDeps) {
-        let (expected_sig, expected_backend) = golden(endpoint, mode);
-        let built = RequestPipeline::build(endpoint, mode, deps)
-            .unwrap_or_else(|| panic!("build({endpoint:?}, {mode:?}) should be valid"));
-        assert_eq!(
-            built.signature(),
-            expected_sig,
-            "construction parity for {endpoint:?}/{mode:?}"
-        );
-        assert_eq!(
-            built.backend_type, expected_backend,
-            "backend_type parity for {endpoint:?}/{mode:?}"
-        );
-        assert_eq!(built.mode, mode, "mode parity for {endpoint:?}/{mode:?}");
-    }
-
-    #[test]
-    fn build_matches_frozen_goldens() {
-        let deps = PipelineDeps::test_default();
-
-        for endpoint in [Endpoint::Chat, Endpoint::Messages, Endpoint::Completion] {
-            for mode in [
-                Mode::Regular,
-                Mode::PrefillDecode,
-                Mode::EncodePrefillDecode,
-            ] {
-                assert_parity(endpoint, mode, &deps);
-            }
-        }
-
-        assert!(
-            RequestPipeline::build(Endpoint::Harmony, Mode::EncodePrefillDecode, &deps).is_none(),
-            "Harmony EPD must be invalid"
-        );
-        assert_parity(Endpoint::Harmony, Mode::Regular, &deps);
-        assert_parity(Endpoint::Harmony, Mode::PrefillDecode, &deps);
-
-        for endpoint in [
-            Endpoint::Embeddings,
-            Endpoint::Classify,
-            Endpoint::Transcription,
-        ] {
-            assert!(
-                RequestPipeline::build(endpoint, Mode::PrefillDecode, &deps).is_none(),
-                "{endpoint:?} PD must be invalid"
-            );
-            assert!(
-                RequestPipeline::build(endpoint, Mode::EncodePrefillDecode, &deps).is_none(),
-                "{endpoint:?} EPD must be invalid"
-            );
-            assert_parity(endpoint, Mode::Regular, &deps);
-        }
-    }
-}
-
-#[cfg(test)]
-mod alias_pipeline_tests {
-    use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
-    use openai_protocol::{
-        generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
-    };
-    use serde_json::json;
-
-    use super::*;
-    use crate::{
-        config::types::PolicyConfig,
-        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
-    };
-
-    const CANONICAL_MODEL: &str = "canonical-model";
-    const MODEL_ALIAS: &str = "model-alias";
-
-    fn register_pd_worker(registry: &WorkerRegistry, url: &str, worker_type: WorkerType) {
-        let worker = BasicWorkerBuilder::new(url)
-            .worker_type(worker_type)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::Sglang)
-            .model(ModelCard::new(CANONICAL_MODEL).with_alias(MODEL_ALIAS))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        registry.register(Arc::new(worker)).unwrap();
-    }
-
-    #[tokio::test]
-    async fn pd_generate_alias_is_canonical_before_preparation() {
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_pd_worker(
-            &worker_registry,
-            "grpc://prefill:30000",
-            WorkerType::Prefill,
-        );
-        register_pd_worker(&worker_registry, "grpc://decode:30000", WorkerType::Decode);
-
-        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-        let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-        tokenizer_registry
-            .load("tokenizer-id", CANONICAL_MODEL, "test", || async move {
-                Ok(tokenizer)
-            })
-            .await
-            .unwrap();
-
-        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry, None);
-        let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
-        let components = Arc::new(SharedComponents {
-            tokenizer_registry,
-            worker_registry,
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            parser_resolver: utils::ParserResolver::disabled(),
-            multimodal: None,
-        });
-        let request: GenerateRequest = serde_json::from_value(json!({
-            "model": MODEL_ALIAS,
-            "text": "Hello"
-        }))
-        .unwrap();
-        let mut ctx = RequestContext::for_generate(
-            Arc::new(request),
-            None,
-            MODEL_ALIAS.to_string(),
-            components,
-        );
-
-        assert_eq!(ctx.input.model_id, CANONICAL_MODEL);
-        assert_eq!(ctx.generate_request_arc().model, CANONICAL_MODEL);
-
-        // Ingress up to worker selection: the canonical id must already be in
-        // place when selection runs.
-        pipeline.stages.preparation.execute(&mut ctx).await.unwrap();
-        pipeline
-            .stages
-            .worker_selection
-            .execute(&mut ctx)
-            .await
-            .unwrap();
-
-        assert_eq!(ctx.input.model_id, CANONICAL_MODEL);
-        assert_eq!(ctx.generate_request_arc().model, CANONICAL_MODEL);
-        assert!(ctx.state.tokenizer.is_some());
-        match ctx.state.workers.as_ref().unwrap() {
-            WorkerSelection::Disaggregated {
-                prefill, decode, ..
-            } => {
-                assert_eq!(prefill.url(), "grpc://prefill:30000");
-                assert_eq!(decode.url(), "grpc://decode:30000");
-            }
-            WorkerSelection::Single { .. } => panic!("expected PD worker selection"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod request_release_tests {
-    use std::{
-        pin::Pin,
-        sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-            Mutex, PoisonError, Weak,
-        },
-        time::Duration,
-    };
-
-    use futures::Stream;
-    use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
-    use openai_protocol::{
-        completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
-    };
-    use portpicker::pick_unused_port;
-    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
-    use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
-    use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
-
-    use super::*;
-    use crate::{
-        config::types::PolicyConfig,
-        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
-    };
-
-    const MODEL: &str = "request-release-test-model";
-
-    type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
-    type KvEventStream = Pin<Box<dyn Stream<Item = Result<common::KvEventBatch, Status>> + Send>>;
-    type TokenizerStream =
-        Pin<Box<dyn Stream<Item = Result<common::GetTokenizerChunk, Status>> + Send>>;
-
-    /// TokenSpeed stub gated on the parsed request's drop probe: it withholds
-    /// its tokens (or, with `gate_rpc`, the generate RPC itself) until the
-    /// probe reaches zero strong references or a deadline passes, recording
-    /// the outcome in `released`. An ungated stub (no probe) answers
-    /// immediately -- used for the PD prefill leg. `fail_first` makes the
-    /// first generate call return UNAVAILABLE, for retry-replay tests;
-    /// `fail_always` fails every call, and `answer_after` stalls the generate
-    /// RPC, standing in for an engine that answers only at its own deadline.
-    /// Every call's input token ids and engine request id are recorded, as is
-    /// every aborted request id.
-    #[derive(Clone, Default)]
-    struct GatedScheduler {
-        probe: Option<Weak<CompletionRequest>>,
-        gate_rpc: bool,
-        released: Arc<AtomicBool>,
-        fail_first: bool,
-        fail_always: bool,
-        answer_after: Option<Duration>,
-        calls: Arc<AtomicUsize>,
-        seen_input_ids: Arc<Mutex<Vec<Vec<u32>>>>,
-        seen_request_ids: Arc<Mutex<Vec<String>>>,
-        aborted_request_ids: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl GatedScheduler {
-        async fn await_probe(probe: &Weak<CompletionRequest>, released: &AtomicBool) {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while probe.strong_count() > 0 && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-            released.store(probe.strong_count() == 0, Ordering::SeqCst);
-        }
-    }
-
-    fn generate_frames(request_id: &str) -> Vec<Result<ts::GenerateResponse, Status>> {
-        use ts::generate_response::Response as GenResp;
-        vec![
-            Ok(ts::GenerateResponse {
-                request_id: request_id.to_string(),
-                response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
-                    token_ids: vec![100],
-                    prompt_tokens: 2,
-                    completion_tokens: 1,
-                    cached_tokens: 0,
-                    output_logprobs: None,
-                    index: 0,
-                })),
-            }),
-            Ok(ts::GenerateResponse {
-                request_id: request_id.to_string(),
-                response: Some(GenResp::Complete(ts::GenerateComplete {
-                    output_ids: vec![100],
-                    finish_reason: "stop".to_string(),
-                    prompt_tokens: 2,
-                    completion_tokens: 1,
-                    cached_tokens: 0,
-                    output_logprobs: None,
-                    matched_stop: None,
-                    index: 0,
-                })),
-            }),
-        ]
-    }
-
-    #[tonic::async_trait]
-    impl TokenSpeedScheduler for GatedScheduler {
-        type GenerateStream = GenStream;
-        type SubscribeKvEventsStream = KvEventStream;
-        type GetTokenizerStream = TokenizerStream;
-
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test stub; the gate task ends at its deadline"
-        )]
-        async fn generate(
-            &self,
-            request: TonicRequest<ts::GenerateRequest>,
-        ) -> Result<TonicResponse<Self::GenerateStream>, Status> {
-            let request = request.into_inner();
-            self.seen_input_ids
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(request.tokenized.map(|t| t.input_ids).unwrap_or_default());
-            self.seen_request_ids
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(request.request_id.clone());
-            if self.fail_always
-                || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0)
-            {
-                return Err(Status::unavailable("release-test induced failure"));
-            }
-            if let Some(delay) = self.answer_after {
-                tokio::time::sleep(delay).await;
-            }
-            if self.gate_rpc {
-                if let Some(probe) = &self.probe {
-                    Self::await_probe(probe, &self.released).await;
+            Ok(RunOutcome::Final(mut dctx, _)) => match dctx.response.execution_result.take() {
+                Some(execution_result) => {
+                    let load_guards = dctx.load_guards.take();
+                    // The string stops the engine will never match, for the
+                    // Harmony reader to scan the channel text for, as the
+                    // response stage hands them to a non-streamed iteration.
+                    let router_stops = std::mem::take(&mut dctx.response.router_stop_obligations);
+                    Ok((
+                        execution_result,
+                        load_guards,
+                        rate_limit_cell.clone(),
+                        router_stops,
+                    ))
                 }
-            }
-            let request_id = request.request_id;
-            let (tx, rx) = mpsc::channel(8);
-            let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
-            let released = Arc::clone(&self.released);
-            tokio::spawn(async move {
-                if let Some(probe) = probe {
-                    Self::await_probe(&probe, &released).await;
+                None => {
+                    error!(
+                        function = "execute_harmony_responses_streaming",
+                        "No ExecutionResult produced by pipeline"
+                    );
+                    Err(error::internal_error(
+                        "no_execution_result_produced",
+                        "No ExecutionResult produced by pipeline",
+                    ))
                 }
-                for frame in generate_frames(&request_id) {
-                    if tx.send(frame).await.is_err() {
-                        return;
-                    }
-                }
-            });
-            Ok(TonicResponse::new(Box::pin(ReceiverStream::new(rx))))
+            },
+            Err(response) => Err(response),
+        };
+        if result.is_err() {
+            rate_limit_cell.close_unsettled().await;
         }
-
-        async fn health_check(
-            &self,
-            _request: TonicRequest<ts::HealthCheckRequest>,
-        ) -> Result<TonicResponse<ts::HealthCheckResponse>, Status> {
-            Ok(TonicResponse::new(ts::HealthCheckResponse {
-                healthy: true,
-                message: "ok".to_string(),
-            }))
-        }
-
-        async fn abort(
-            &self,
-            request: TonicRequest<ts::AbortRequest>,
-        ) -> Result<TonicResponse<ts::AbortResponse>, Status> {
-            self.aborted_request_ids
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(request.into_inner().request_id);
-            Ok(TonicResponse::new(ts::AbortResponse {
-                success: true,
-                message: String::new(),
-            }))
-        }
-
-        async fn get_model_info(
-            &self,
-            _request: TonicRequest<ts::GetModelInfoRequest>,
-        ) -> Result<TonicResponse<ts::GetModelInfoResponse>, Status> {
-            Ok(TonicResponse::new(ts::GetModelInfoResponse {
-                model_path: MODEL.to_string(),
-                tokenizer_path: MODEL.to_string(),
-                served_model_name: MODEL.to_string(),
-                model_type: "mock".to_string(),
-                architectures: vec!["MockForCausalLM".to_string()],
-                max_context_length: 32768,
-                max_req_input_len: 32768,
-                vocab_size: 32000,
-                eos_token_ids: vec![2],
-                pad_token_id: 0,
-                bos_token_id: 1,
-                weight_version: "mock".to_string(),
-                default_sampling_params_json: String::new(),
-                supports_vision: false,
-                ..Default::default()
-            }))
-        }
-
-        async fn get_server_info(
-            &self,
-            _request: TonicRequest<ts::GetServerInfoRequest>,
-        ) -> Result<TonicResponse<ts::GetServerInfoResponse>, Status> {
-            Ok(TonicResponse::new(ts::GetServerInfoResponse {
-                max_total_num_tokens: 1_000_000,
-                tokenspeed_version: "mock".to_string(),
-                ..Default::default()
-            }))
-        }
-
-        async fn get_loads(
-            &self,
-            _request: TonicRequest<ts::GetLoadsRequest>,
-        ) -> Result<TonicResponse<ts::GetLoadsResponse>, Status> {
-            Err(Status::unimplemented("release-test stub"))
-        }
-
-        async fn subscribe_kv_events(
-            &self,
-            _request: TonicRequest<common::SubscribeKvEventsRequest>,
-        ) -> Result<TonicResponse<Self::SubscribeKvEventsStream>, Status> {
-            Err(Status::unimplemented("release-test stub"))
-        }
-
-        async fn flush_cache(
-            &self,
-            _request: TonicRequest<common::FlushCacheRequest>,
-        ) -> Result<TonicResponse<common::FlushCacheResponse>, Status> {
-            Err(Status::unimplemented("release-test stub"))
-        }
-
-        async fn start_profile(
-            &self,
-            _request: TonicRequest<common::StartProfileRequest>,
-        ) -> Result<TonicResponse<common::ProfileResponse>, Status> {
-            Err(Status::unimplemented("release-test stub"))
-        }
-
-        async fn stop_profile(
-            &self,
-            _request: TonicRequest<common::StopProfileRequest>,
-        ) -> Result<TonicResponse<common::ProfileResponse>, Status> {
-            Err(Status::unimplemented("release-test stub"))
-        }
-
-        async fn get_tokenizer(
-            &self,
-            _request: TonicRequest<common::GetTokenizerRequest>,
-        ) -> Result<TonicResponse<Self::GetTokenizerStream>, Status> {
-            Err(Status::unimplemented("release-test stub"))
-        }
+        result
     }
+}
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "test helper; the stub server lives for the test process"
-    )]
-    async fn spawn_stub(scheduler: GatedScheduler) -> u16 {
-        let port = pick_unused_port().expect("no free port for release-test stub");
-        let addr = format!("127.0.0.1:{port}").parse().expect("stub addr");
-        tokio::spawn(async move {
-            Server::builder()
-                .add_service(TokenSpeedSchedulerServer::new(scheduler))
-                .serve(addr)
-                .await
-                .expect("release-test stub server");
-        });
-        for _ in 0..100 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .is_ok()
-            {
-                return port;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("release-test stub on port {port} never came up");
+/// A `/generate` response body: a bare object for a single prompt, a list
+/// otherwise. `#[serde(untagged)]` makes `One` serialize as its inner
+/// object with no wrapper, matching SGLang's shape -- see the doc comment
+/// on [`GenerateResponse`].
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum GenerateBody {
+    One(Box<GenerateResponse>),
+    Many(Vec<GenerateResponse>),
+}
+
+/// SGLang answers a single prompt with one object and a batch (or `n > 1`)
+/// with a list. Mirror that shape here so native clients that never batch
+/// (slime, verl) can index `meta_info` directly instead of unwrapping a
+/// one-element list.
+///
+/// `single_prompt` and `n` are read off the request in `execute_generate`
+/// (the only caller) before it moves into the dispatch context, which is
+/// request-free by construction -- see the module doc.
+fn generate_response_body(
+    single_prompt: bool,
+    n: u32,
+    responses: Vec<GenerateResponse>,
+) -> GenerateBody {
+    if single_prompt && n <= 1 && responses.len() == 1 {
+        let mut responses = responses;
+        return GenerateBody::One(Box::new(responses.remove(0)));
     }
-
-    fn register_worker(registry: &WorkerRegistry, port: u16, worker_type: WorkerType) {
-        let worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-            .worker_type(worker_type)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::TokenSpeed)
-            .model(ModelCard::new(MODEL))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        registry
-            .register(Arc::new(worker))
-            .expect("register release-test worker");
-    }
-
-    async fn components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
-        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-        let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-        tokenizer_registry
-            .load(
-                "tokenizer-id",
-                MODEL,
-                "test",
-                || async move { Ok(tokenizer) },
-            )
-            .await
-            .expect("load mock tokenizer");
-        Arc::new(SharedComponents {
-            tokenizer_registry,
-            worker_registry,
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            parser_resolver: utils::ParserResolver::disabled(),
-            multimodal: None,
-        })
-    }
-
-    fn completion_request(stream: bool) -> Arc<CompletionRequest> {
-        Arc::new(
-            serde_json::from_value(serde_json::json!({
-                "model": MODEL,
-                "prompt": "Hello world",
-                "stream": stream,
-            }))
-            .expect("completion request"),
-        )
-    }
-
-    fn completion_pipeline(worker_registry: &Arc<WorkerRegistry>, mode: Mode) -> RequestPipeline {
-        let deps = PipelineDeps::pair(
-            worker_registry.clone(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-            None,
-        );
-        RequestPipeline::build(Endpoint::Completion, mode, &deps).expect("completion pipeline")
-    }
-
-    fn fast_retry_config(max_retries: u32) -> RetryConfig {
-        RetryConfig {
-            max_retries,
-            initial_backoff_ms: 1,
-            max_backoff_ms: 2,
-            backoff_multiplier: 1.0,
-            jitter_factor: 0.0,
-        }
-    }
-
-    async fn run_and_drain(
-        pipeline: RequestPipeline,
-        components: Arc<SharedComponents>,
-        request: Arc<CompletionRequest>,
-    ) -> bytes::Bytes {
-        let response = pipeline
-            .execute_completion(
-                request,
-                None,
-                MODEL.to_string(),
-                components,
-                None,
-                None,
-                None,
-            )
-            .await;
-        assert_eq!(response.status(), http::StatusCode::OK);
-        axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("drain SSE body")
-    }
-
-    /// The stream task must run off the response spec: the stub refuses to
-    /// emit tokens until the parsed request has been freed, so a stream that
-    /// still pinned it would stall past the stub's deadline.
-    #[tokio::test]
-    async fn streaming_releases_parsed_request_before_first_token() {
-        let request = completion_request(true);
-        let released = Arc::new(AtomicBool::new(false));
-        let port = spawn_stub(GatedScheduler {
-            probe: Some(Arc::downgrade(&request)),
-            released: Arc::clone(&released),
-            ..Default::default()
-        })
-        .await;
-
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker(&worker_registry, port, WorkerType::Regular);
-        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
-        let components = components(worker_registry).await;
-
-        let body = run_and_drain(pipeline, components, request).await;
-
-        assert!(
-            released.load(Ordering::SeqCst),
-            "the parsed request must be freed before the first token"
-        );
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("data: [DONE]"), "stream must finish: {body}");
-    }
-
-    /// grpc_pd twin: the decode leg's stream task must not pin the parsed
-    /// request either (the prefill stub answers immediately).
-    #[tokio::test]
-    async fn pd_streaming_releases_parsed_request_before_first_token() {
-        let request = completion_request(true);
-        let released = Arc::new(AtomicBool::new(false));
-        let prefill_port = spawn_stub(GatedScheduler::default()).await;
-        let decode_port = spawn_stub(GatedScheduler {
-            probe: Some(Arc::downgrade(&request)),
-            released: Arc::clone(&released),
-            ..Default::default()
-        })
-        .await;
-
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
-        register_worker(&worker_registry, decode_port, WorkerType::Decode);
-        let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
-        let components = components(worker_registry).await;
-
-        let body = run_and_drain(pipeline, components, request).await;
-
-        assert!(
-            released.load(Ordering::SeqCst),
-            "the parsed request must be freed before the first decode token"
-        );
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("data: [DONE]"), "stream must finish: {body}");
-    }
-
-    /// The parsed request dies at the build boundary even with the retry
-    /// window open: only the execution plan is retained for replay. The stub
-    /// refuses to answer the generate RPC until the probe frees.
-    #[tokio::test]
-    async fn buffered_dispatch_releases_parsed_request_even_with_retries_enabled() {
-        let request = completion_request(false);
-        let released = Arc::new(AtomicBool::new(false));
-        let port = spawn_stub(GatedScheduler {
-            probe: Some(Arc::downgrade(&request)),
-            gate_rpc: true,
-            released: Arc::clone(&released),
-            ..Default::default()
-        })
-        .await;
-
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker(&worker_registry, port, WorkerType::Regular);
-        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
-        let components = components(worker_registry).await;
-
-        let retry = fast_retry_config(3);
-        let response = pipeline
-            .execute_completion(
-                request,
-                None,
-                MODEL.to_string(),
-                components,
-                None,
-                None,
-                Some(&retry),
-            )
-            .await;
-
-        assert_eq!(response.status(), http::StatusCode::OK);
-        assert!(
-            released.load(Ordering::SeqCst),
-            "the parsed request must be freed before the upstream answers"
-        );
-    }
-
-    /// grpc_pd twin of the dispatch-release probe: the gated decode leg
-    /// answers only after the parsed request is freed.
-    #[tokio::test]
-    async fn pd_buffered_dispatch_releases_parsed_request_before_upstream_responds() {
-        let request = completion_request(false);
-        let released = Arc::new(AtomicBool::new(false));
-        let prefill_port = spawn_stub(GatedScheduler::default()).await;
-        let decode_port = spawn_stub(GatedScheduler {
-            probe: Some(Arc::downgrade(&request)),
-            gate_rpc: true,
-            released: Arc::clone(&released),
-            ..Default::default()
-        })
-        .await;
-
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
-        register_worker(&worker_registry, decode_port, WorkerType::Decode);
-        let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
-        let components = components(worker_registry).await;
-
-        let response = pipeline
-            .execute_completion(
-                request,
-                None,
-                MODEL.to_string(),
-                components,
-                None,
-                None,
-                None,
-            )
-            .await;
-
-        assert_eq!(response.status(), http::StatusCode::OK);
-        assert!(
-            released.load(Ordering::SeqCst),
-            "the parsed request must be freed before the decode leg answers"
-        );
-    }
-
-    /// A failed first dispatch retries from the retained plan: the second
-    /// attempt must send identical token ids without re-tokenizing, under a
-    /// fresh per-attempt engine id, and the parsed request must already be
-    /// gone when the first attempt is sent.
-    #[tokio::test]
-    async fn retry_replays_identical_token_ids_from_the_retained_plan() {
-        let request = completion_request(false);
-        let probe = Arc::downgrade(&request);
-        let seen_ids = Arc::new(Mutex::new(Vec::new()));
-        let seen_request_ids = Arc::new(Mutex::new(Vec::new()));
-        let port = spawn_stub(GatedScheduler {
-            fail_first: true,
-            seen_input_ids: Arc::clone(&seen_ids),
-            seen_request_ids: Arc::clone(&seen_request_ids),
-            ..Default::default()
-        })
-        .await;
-
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker(&worker_registry, port, WorkerType::Regular);
-        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
-        let components = components(worker_registry).await;
-
-        let retry = fast_retry_config(2);
-        let response = pipeline
-            .execute_completion(
-                request,
-                None,
-                MODEL.to_string(),
-                components,
-                None,
-                None,
-                Some(&retry),
-            )
-            .await;
-        assert_eq!(response.status(), http::StatusCode::OK);
-        assert_eq!(
-            probe.strong_count(),
-            0,
-            "request freed at the build boundary"
-        );
-
-        {
-            let seen = seen_ids.lock().unwrap_or_else(PoisonError::into_inner);
-            assert_eq!(seen.len(), 2, "503 then 200 must mean two attempts");
-            assert_eq!(
-                seen[0], seen[1],
-                "the retry must replay identical input ids"
-            );
-            assert!(
-                !seen[0].is_empty(),
-                "attempts must carry the tokenized prompt"
-            );
-        }
-        {
-            let ids = seen_request_ids
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            assert_eq!(ids.len(), 2);
-            assert!(ids[0].starts_with("cmpl_") && ids[1].starts_with("cmpl_"));
-            assert_ne!(ids[0], ids[1], "each attempt gets a fresh engine id");
-        }
-    }
-
-    /// A prefill leg that cannot start must answer the client immediately
-    /// rather than waiting out the decode leg's own deadline, and the decode
-    /// room it stranded must be aborted rather than left for the engine to
-    /// time out. The decode stub here answers only after `DECODE_DELAY`,
-    /// standing in for an engine whose transfer deadline is what the client
-    /// used to wait on.
-    #[tokio::test]
-    async fn a_failed_prefill_answers_now_and_aborts_the_decode_room() {
-        const DECODE_DELAY: Duration = Duration::from_secs(2);
-
-        let prefill_port = spawn_stub(GatedScheduler {
-            fail_always: true,
-            ..Default::default()
-        })
-        .await;
-        let aborted = Arc::new(Mutex::new(Vec::new()));
-        let decode_request_ids = Arc::new(Mutex::new(Vec::new()));
-        let decode_port = spawn_stub(GatedScheduler {
-            answer_after: Some(DECODE_DELAY),
-            aborted_request_ids: Arc::clone(&aborted),
-            seen_request_ids: Arc::clone(&decode_request_ids),
-            ..Default::default()
-        })
-        .await;
-
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
-        register_worker(&worker_registry, decode_port, WorkerType::Decode);
-        let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
-        let components = components(worker_registry).await;
-
-        let started = Instant::now();
-        let response = pipeline
-            .execute_completion(
-                completion_request(false),
-                None,
-                MODEL.to_string(),
-                components,
-                None,
-                None,
-                None,
-            )
-            .await;
-        let answered_in = started.elapsed();
-
-        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            error::extract_error_code_from_response(&response),
-            "prefill_worker_failed_to_start"
-        );
-        assert!(
-            answered_in < DECODE_DELAY,
-            "the prefill failure must not wait for the decode leg, took {answered_in:?}"
-        );
-
-        // The decode leg is retired off the request path: once its dispatch
-        // lands, its stream drops and that is what sends the abort.
-        let deadline = Instant::now() + DECODE_DELAY + Duration::from_secs(8);
-        loop {
-            if !aborted
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_empty()
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the stranded decode room was never aborted"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let aborted = aborted.lock().unwrap_or_else(PoisonError::into_inner);
-        let dispatched = decode_request_ids
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        assert_eq!(
-            aborted.as_slice(),
-            dispatched.as_slice(),
-            "the abort must name the decode leg's own request id"
-        );
-    }
+    GenerateBody::Many(responses)
 }
 
 #[cfg(test)]
-mod rate_limit_reserve_tests {
-    use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
-    use openai_protocol::generate::GenerateRequest;
-    use serde_json::json;
-
-    use super::*;
-    use crate::{
-        config::types::RouterConfig,
-        rate_limit::{RateLimitManager, Reservation, ReserveRequest},
-        tenant::TenantKey,
-    };
-
-    const MODEL: &str = "reserve-test-model";
-
-    async fn test_components() -> Arc<SharedComponents> {
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-        let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-        tokenizer_registry
-            .load(
-                "tokenizer-id",
-                MODEL,
-                "test",
-                || async move { Ok(tokenizer) },
-            )
-            .await
-            .unwrap();
-        Arc::new(SharedComponents {
-            tokenizer_registry,
-            worker_registry,
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            parser_resolver: utils::ParserResolver::disabled(),
-            multimodal: None,
-        })
-    }
-
-    /// Real `RateLimitManager` backed by a tiny in-memory budget --
-    /// `RateLimitManager::new` is private to the `rate_limit` module, so
-    /// `from_config` (with a temp YAML) is the only way to build one from
-    /// here. The YAML is read synchronously inside `from_config`, before the
-    /// tempdir is dropped at the end of this function, so no leak is needed.
-    fn manager_with_tokens_per_minute(tpm: u32) -> Arc<RateLimitManager> {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rate_limit.yaml");
-        std::fs::write(
-            &path,
-            format!("default_policy:\n  tokens_per_minute: {tpm}\n  requests_per_minute: 1000\n"),
-        )
-        .unwrap();
-        let rc = RouterConfig::builder()
-            .worker_startup_timeout_secs(1)
-            .tenant_rate_limit_enabled(true)
-            .tenant_rate_limit_config(Some(path.to_str().unwrap().to_string()))
-            .build_unchecked();
-        RateLimitManager::from_config(&rc).unwrap().unwrap()
-    }
-
-    fn ctx_with_tokens(components: Arc<SharedComponents>, num_tokens: usize) -> RequestContext {
-        let request: GenerateRequest = serde_json::from_value(json!({
-            "model": MODEL,
-            "text": "Hello"
-        }))
-        .unwrap();
-        let mut ctx =
-            RequestContext::for_generate(Arc::new(request), None, MODEL.to_string(), components);
-        ctx.state.preparation = Some(PreparationOutput::Generate {
-            original_text: None,
-            token_ids: vec![0; num_tokens],
-        });
-        ctx.input.tenant_request_meta = Some(TenantRequestMeta::new(TenantKey::new("test-tenant")));
-        ctx
-    }
-
-    #[tokio::test]
-    async fn reserve_is_admitted_once_and_cached_on_the_cell() {
-        // Admits one 5-token reservation but not two (5 + 5 > 6).
-        let manager = manager_with_tokens_per_minute(6);
-        let components = test_components().await;
-        let mut ctx = ctx_with_tokens(components, 5);
-        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
-
-        let stage = RateLimitReserveStage::new(Some(manager));
-
-        assert!(stage.execute(&mut ctx).await.is_ok());
-        // A second pass (defensive; ingress runs once) sees the cached
-        // Admitted outcome and does not reserve again.
-        assert!(stage.execute(&mut ctx).await.is_ok());
-
-        assert!(matches!(
-            ctx.input.rate_limit_cell.as_ref().unwrap().peek(),
-            Some(RateLimitOutcome::Admitted(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn denial_is_cached_on_the_cell() {
-        // Too small for even one 5-token reservation.
-        let manager = manager_with_tokens_per_minute(3);
-        let components = test_components().await;
-        let mut ctx = ctx_with_tokens(components, 5);
-        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
-
-        let stage = RateLimitReserveStage::new(Some(manager));
-
-        let response = stage.execute(&mut ctx).await.expect_err("should be denied");
-        assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
-
-        assert!(matches!(
-            ctx.input.rate_limit_cell.as_ref().unwrap().peek(),
-            Some(RateLimitOutcome::Denied)
-        ));
-    }
-
-    #[tokio::test]
-    async fn disabled_manager_is_a_no_op() {
-        let components = test_components().await;
-        let mut ctx = ctx_with_tokens(components, 5);
-        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
-
-        let stage = RateLimitReserveStage::new(None);
-        assert!(stage.execute(&mut ctx).await.is_ok());
-        assert!(ctx.input.rate_limit_cell.as_ref().unwrap().peek().is_none());
-    }
-
-    #[tokio::test]
-    async fn endpoint_without_a_cell_is_a_no_op() {
-        // Responses/embeddings/classify don't set rate_limit_cell today.
-        let manager = manager_with_tokens_per_minute(6);
-        let components = test_components().await;
-        let mut ctx = ctx_with_tokens(components, 5);
-
-        let stage = RateLimitReserveStage::new(Some(manager));
-        assert!(stage.execute(&mut ctx).await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn settle_reservation_with_zero_usage_refunds_the_full_estimate() {
-        // Budget 6; reserve 5 leaves 1. A response with no `usage` settles
-        // with 0/0 (see the `usage.map_or(0, ...)` call sites in
-        // execute_chat/execute_generate/etc.) -- that must refund the full
-        // 5-token debit back to the tenant, not silently keep it (nothing
-        // was actually consumed) and not leave the reservation stuck open
-        // (which would leak budget forever).
-        let manager = manager_with_tokens_per_minute(6);
-        let components = test_components().await;
-        let mut ctx = ctx_with_tokens(components, 5);
-        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
-
-        let stage = RateLimitReserveStage::new(Some(manager.clone()));
-        assert!(stage.execute(&mut ctx).await.is_ok());
-
-        RequestPipeline::settle_reservation(ctx.input.rate_limit_cell.as_deref(), 0, 0).await;
-
-        // The full 6-token budget must be available again -- would be
-        // denied if settle had kept the original 5-token debit instead of
-        // truing it up to the real (zero) usage.
-        let check = ReserveRequest {
-            request_charge_id: uuid::Uuid::now_v7(),
-            tenant_key: TenantKey::new("test-tenant"),
-            model_id: Some(MODEL.to_string()),
-            estimated_input_tokens: 6,
-        };
-        assert!(matches!(
-            manager.reserve(check).await,
-            Reservation::Admitted(_)
-        ));
-    }
-}
+mod tests;

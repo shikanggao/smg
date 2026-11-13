@@ -68,6 +68,171 @@ Service account name
 {{- end }}
 
 {{/*
+Discovery provider -- the worker discovery provider the router runs:
+router.discovery.provider, or "kubernetes" for router.serviceDiscovery.enabled,
+its legacy spelling. Empty when workers are not discovered (mesh router
+discovery is not worker discovery; see smg.meshRouterDiscovery).
+*/}}
+{{- define "smg.discoveryProvider" -}}
+{{- if .Values.router.serviceDiscovery.enabled -}}
+kubernetes
+{{- else -}}
+{{- .Values.router.discovery.provider | default "" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Mesh router discovery -- "true" when mesh is on without peerUrls, so the
+routers find each other among the release's router pods through the
+Kubernetes API. The gateway runs that only inside Kubernetes discovery.
+*/}}
+{{- define "smg.meshRouterDiscovery" -}}
+{{- if and .Values.router.mesh.enabled (not .Values.router.mesh.peerUrls) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Kubernetes API -- "true" when the router reads pods through the Kubernetes
+API: Kubernetes worker discovery, by either spelling, or mesh router
+discovery. The Role and RoleBinding are created for it; the file, Slurm and
+Consul providers never call the API, so they get none unless rbac.create.
+*/}}
+{{- define "smg.usesKubernetesApi" -}}
+{{- if or (eq (include "smg.discoveryProvider" .) "kubernetes") (include "smg.meshRouterDiscovery" .) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Discovery cluster-wide -- "true" when Kubernetes discovery watches every
+namespace, so its RBAC is a ClusterRole and ClusterRoleBinding.
+router.serviceDiscovery.clusterWide counts on its own, as it always has.
+*/}}
+{{- define "smg.discoveryClusterWide" -}}
+{{- $discovery := .Values.router.discovery -}}
+{{- if or .Values.router.serviceDiscovery.clusterWide (and (eq ($discovery.provider | default "") "kubernetes") $discovery.kubernetes.clusterWide) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Discovery namespace -- the namespace Kubernetes discovery watches when it is
+not cluster-wide: router.discovery.kubernetes.namespace under the provider,
+router.serviceDiscovery.namespace under the legacy spelling, the release's
+otherwise (mesh router discovery alone watches the release's). The Role and
+RoleBinding are created there, so they cover the pods the router reads.
+*/}}
+{{- define "smg.discoveryNamespace" -}}
+{{- if eq (.Values.router.discovery.provider | default "") "kubernetes" -}}
+{{- .Values.router.discovery.kubernetes.namespace | default .Release.Namespace -}}
+{{- else if .Values.router.serviceDiscovery.enabled -}}
+{{- .Values.router.serviceDiscovery.namespace | default .Release.Namespace -}}
+{{- else -}}
+{{- .Release.Namespace -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Discovery file path -- the manifest the file provider reads: file.path, else
+the ConfigMap's key under /etc/smg/discovery, where the router pod mounts it.
+*/}}
+{{- define "smg.discoveryFilePath" -}}
+{{- with .Values.router.discovery.file -}}
+{{- .path | default (printf "/etc/smg/discovery/%s" (.configMap.key | default "workers.json")) -}}
+{{- end -}}
+{{- end }}
+
+{{- /*
+Admission config validation -- the values the gateway would refuse at
+start-up or ignore with a warning: the tenant rate limit enabled without its
+YAML (the gateway requires --tenant-rate-limit-config with the flag), and a
+rate-limit or scheduler ConfigMap without its feature enabled (the gateway
+ignores --tenant-rate-limit-config and --priority-scheduler-config without
+their enabled flags). Renders nothing.
+*/}}
+{{- define "smg.validateAdmission" -}}
+{{- if and .Values.router.tenantRateLimit.enabled (not .Values.router.tenantRateLimit.configMap.name) -}}
+{{- fail "router.tenantRateLimit.enabled needs router.tenantRateLimit.configMap.name: the gateway requires --tenant-rate-limit-config with --tenant-rate-limit-enabled" -}}
+{{- end -}}
+{{- if and .Values.router.priorityScheduler.configMap.name (not .Values.router.priorityScheduler.enabled) -}}
+{{- fail "router.priorityScheduler.configMap.name without router.priorityScheduler.enabled: the gateway ignores --priority-scheduler-config without --priority-scheduler-enabled" -}}
+{{- end -}}
+{{- if and .Values.router.tenantRateLimit.configMap.name (not .Values.router.tenantRateLimit.enabled) -}}
+{{- fail "router.tenantRateLimit.configMap.name without router.tenantRateLimit.enabled: the gateway ignores --tenant-rate-limit-config without --tenant-rate-limit-enabled" -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Discovery validation -- refuses at render time what the gateway would refuse
+at start-up, or run without telling: two spellings of the worker provider,
+mesh router discovery the provider cannot carry, and a provider without what
+it cannot start without. Renders nothing.
+*/}}
+{{- define "smg.validateDiscovery" -}}
+{{- $discovery := .Values.router.discovery -}}
+{{- $provider := $discovery.provider | default "" -}}
+{{- if and .Values.router.serviceDiscovery.enabled $provider -}}
+{{- fail (printf "router.serviceDiscovery.enabled is the legacy spelling of router.discovery.provider=kubernetes and cannot be combined with router.discovery.provider=%s: set one or the other (router.discovery.kubernetes takes the serviceDiscovery settings)" $provider) -}}
+{{- end -}}
+{{- if include "smg.meshRouterDiscovery" . -}}
+{{- if and $provider (ne $provider "kubernetes") -}}
+{{- fail (printf "router.mesh without router.mesh.peerUrls finds its peers through Kubernetes discovery, which the gateway runs only under the kubernetes worker provider: with router.discovery.provider=%s, set router.mesh.peerUrls" $provider) -}}
+{{- end -}}
+{{- /* Router discovery watches the namespace worker discovery watches, and
+     the router pods are in the release's: another namespace finds no peer,
+     and every namespace finds the routers of other releases. */}}
+{{- if and (eq $provider "kubernetes") (or $discovery.kubernetes.clusterWide (ne ($discovery.kubernetes.namespace | default .Release.Namespace) .Release.Namespace)) -}}
+{{- fail (printf "router.mesh without router.mesh.peerUrls finds its peers in the namespace Kubernetes discovery watches, so router.discovery.kubernetes must watch the release namespace %s (no clusterWide, no other namespace): otherwise set router.mesh.peerUrls" .Release.Namespace) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $provider "file" -}}
+{{- if not (or $discovery.file.configMap.name $discovery.file.path) -}}
+{{- fail "router.discovery.provider=file needs its manifest: router.discovery.file.configMap.name (an existing ConfigMap) or router.discovery.file.path" -}}
+{{- end -}}
+{{- else if eq $provider "slurm" -}}
+{{- with $discovery.slurm -}}
+{{- if not .port -}}
+{{- fail "router.discovery.provider=slurm needs router.discovery.slurm.port, the inference server's port on every node" -}}
+{{- end -}}
+{{- if not (or .jobNames .encodeJobNames .prefillJobNames .decodeJobNames) -}}
+{{- fail "router.discovery.provider=slurm needs at least one job name: router.discovery.slurm.jobNames, encodeJobNames, prefillJobNames or decodeJobNames" -}}
+{{- end -}}
+{{- end -}}
+{{- else if eq $provider "consul" -}}
+{{- with $discovery.consul -}}
+{{- if not .service -}}
+{{- fail "router.discovery.provider=consul needs router.discovery.consul.service, the Consul service whose instances are the workers" -}}
+{{- end -}}
+{{- if .tls.existingSecret -}}
+{{- $keys := .tls.secretKeys | default dict -}}
+{{- if ne (empty $keys.clientCert) (empty $keys.clientKey) -}}
+{{- fail "router.discovery.consul.tls.secretKeys.clientCert and clientKey go together: set both or neither" -}}
+{{- end -}}
+{{- if not (or $keys.caCert $keys.clientCert) -}}
+{{- fail "router.discovery.consul.tls.existingSecret is mounted for no file: set secretKeys.caCert, or clientCert and clientKey" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Consul TLS files -- the files of router.discovery.consul.tls.existingSecret
+the router pod mounts under /etc/smg/consul-tls, as a JSON list for
+fromJsonArray: each with its key within the Secret (key), its file name in
+the mount (path) and the Consul variable naming it (env). Empty unless the
+consul provider has a TLS Secret.
+*/}}
+{{- define "smg.consulTlsFiles" -}}
+{{- $files := list -}}
+{{- $consul := .Values.router.discovery.consul -}}
+{{- if and (eq (.Values.router.discovery.provider | default "") "consul") $consul.tls.existingSecret -}}
+{{- $keys := $consul.tls.secretKeys | default dict -}}
+{{- range $file := list (dict "key" $keys.caCert "path" "ca.crt" "env" "CONSUL_CACERT") (dict "key" $keys.clientCert "path" "client.crt" "env" "CONSUL_CLIENT_CERT") (dict "key" $keys.clientKey "path" "client.key" "env" "CONSUL_CLIENT_KEY") -}}
+{{- if $file.key -}}
+{{- $files = append $files $file -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $files -}}
+{{- end }}
+
+{{/*
 Router CLI arguments -- builds the full args list from values.
 Called from the router Deployment template.
 */}}
@@ -76,8 +241,82 @@ Called from the router Deployment template.
 - "0.0.0.0"
 - "--port"
 - {{ .Values.router.port | quote }}
+{{- /* The admin listener's values the gateway would refuse at start are
+     refused here: a host without the port, and a port another rendered
+     listener holds (the data and metrics ports; the mesh port when the
+     mesh is on). */}}
+{{- if and .Values.router.adminHost (not .Values.router.adminPort) -}}
+{{- fail "router.adminHost without router.adminPort: the gateway refuses --admin-host without --admin-port" -}}
+{{- end -}}
+{{- if .Values.router.adminPort }}
+{{- $admin := int .Values.router.adminPort -}}
+{{- $taken := "" -}}
+{{- if eq $admin (int .Values.router.port) -}}
+{{- $taken = "router.port" -}}
+{{- else if eq $admin (int .Values.router.metrics.port) -}}
+{{- $taken = "router.metrics.port" -}}
+{{- else if and .Values.router.mesh.enabled (eq $admin (int .Values.router.mesh.port)) -}}
+{{- $taken = "router.mesh.port" -}}
+{{- end -}}
+{{- if $taken -}}
+{{- fail (printf "router.adminPort %d equals %s: the gateway refuses two listeners on one port" $admin $taken) -}}
+{{- end }}
+- "--admin-port"
+- {{ .Values.router.adminPort | quote }}
+{{- with .Values.router.adminHost }}
+- "--admin-host"
+- {{ . | quote }}
+{{- end }}
+{{- end }}
 - "--policy"
 - {{ .Values.router.policy | quote }}
+{{- with .Values.router.disaggregation }}
+{{- $mode := .mode | default "" }}
+{{- /* The role flags of disaggregated serving, typed: a role given without
+     its mode would be ignored by the gateway with a warning, so the chart
+     refuses it at render; the encode role exists only under epd. */}}
+{{- if and (not $mode) (or .prefillPolicy .decodePolicy .encodePolicy .prefill .decode .encode) -}}
+{{- fail "router.disaggregation names a role (a policy or workers) without router.disaggregation.mode: set mode to pd or epd" -}}
+{{- end }}
+{{- if and (ne $mode "epd") (or .encodePolicy .encode) -}}
+{{- fail (printf "router.disaggregation.encodePolicy and router.disaggregation.encode need router.disaggregation.mode=epd (mode is %q)" $mode) -}}
+{{- end }}
+{{- if eq $mode "pd" }}
+- "--pd-disaggregation"
+{{- else if eq $mode "epd" }}
+- "--epd-disaggregation"
+{{- end }}
+{{- if .prefillPolicy }}
+- "--prefill-policy"
+- {{ .prefillPolicy | quote }}
+{{- end }}
+{{- if .decodePolicy }}
+- "--decode-policy"
+- {{ .decodePolicy | quote }}
+{{- end }}
+{{- if .encodePolicy }}
+- "--encode-policy"
+- {{ .encodePolicy | quote }}
+{{- end }}
+{{- range .prefill }}
+- "--prefill"
+- {{ .url | quote }}
+{{- if .bootstrapPort }}
+- {{ .bootstrapPort | quote }}
+{{- end }}
+{{- end }}
+{{- range .decode }}
+- "--decode"
+- {{ .url | quote }}
+{{- end }}
+{{- range .encode }}
+- "--encode"
+- {{ .url | quote }}
+{{- if .bootstrapPort }}
+- {{ .bootstrapPort | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if .Values.router.enableIgw }}
 - "--enable-igw"
 {{- end }}
@@ -94,6 +333,15 @@ Called from the router Deployment template.
 - "--mesh-peer-urls"
 - {{ . | quote }}
 {{- end }}
+{{- else if eq (.Values.router.discovery.provider | default "") "kubernetes" }}
+{{- /* The Kubernetes worker provider is on (below) and router discovery runs
+     inside it, in its namespace (the release's, smg.validateDiscovery), so
+     only the router selector is added; --service-discovery would conflict
+     with --discovery-provider. The selector names the release, so another
+     release's routers in the namespace are not taken for peers. */}}
+- "--router-selector"
+- "app.kubernetes.io/component=router"
+- "app.kubernetes.io/instance={{ .Release.Name }}"
 {{- else }}
 {{/* Use K8s service discovery to find other router pods by label.
      Each router pod is annotated with the mesh port so peers can connect.
@@ -115,12 +363,25 @@ Called from the router Deployment template.
 {{- end }}
 {{- end }}
 {{- end }}
+{{- $disaggregationMode := .Values.router.disaggregation.mode | default "" }}
+{{- $roleWorkers := or .Values.router.disaggregation.prefill .Values.router.disaggregation.decode .Values.router.disaggregation.encode }}
+{{- $chartWorkersAreRegular := and .Values.workers (not (include "smg.discoveryProvider" .)) (not (include "smg.meshRouterDiscovery" .)) }}
+{{- /* A disaggregated gateway reads only its role workers and drops regular
+     worker URLs without a word, so the chart refuses them under a mode and
+     passes its own workers only when the roles or a discovery provider
+     address them. */}}
+{{- if and $disaggregationMode .Values.router.workerUrls -}}
+{{- fail "router.workerUrls names regular workers under router.disaggregation.mode: a disaggregated gateway reads only its role workers (router.disaggregation.prefill, decode and encode, or the discovery role selectors)" -}}
+{{- end }}
+{{- if and $disaggregationMode $chartWorkersAreRegular (not $roleWorkers) -}}
+{{- fail "workers deploys engines that router.disaggregation.mode gives no role: list their services under router.disaggregation.prefill, decode or encode, or find them by a discovery role selector" -}}
+{{- end }}
 {{- if .Values.router.workerUrls }}
 - "--worker-urls"
 {{- range .Values.router.workerUrls }}
 - {{ . | quote }}
 {{- end }}
-{{- else if and .Values.workers (not .Values.router.serviceDiscovery.enabled) (not (and .Values.router.mesh.enabled (not .Values.router.mesh.peerUrls))) }}
+{{- else if and $chartWorkersAreRegular (not $disaggregationMode) }}
 - "--worker-urls"
 {{- range $i, $worker := .Values.workers }}
 {{- $defaults := index $.Values.engineDefaults $worker.engine }}
@@ -150,6 +411,119 @@ Called from the router Deployment template.
 - {{ .Values.router.serviceDiscovery.modelIdFrom | quote }}
 {{- end }}
 {{- end }}
+{{- with .Values.router.discovery }}
+{{- if .provider }}
+- "--discovery-provider"
+- {{ .provider | quote }}
+{{- if eq .provider "kubernetes" }}
+{{- with .kubernetes }}
+{{- if .selector }}
+- "--selector"
+- {{ .selector | quote }}
+{{- end }}
+{{- $mode := $.Values.router.disaggregation.mode | default "" }}
+{{- if and (not $mode) (or .prefillSelector .decodeSelector .encodeSelector) -}}
+{{- fail "router.discovery.kubernetes names a role selector (prefillSelector, decodeSelector or encodeSelector) without router.disaggregation.mode: set mode to pd or epd" -}}
+{{- end }}
+{{- if and (ne $mode "epd") .encodeSelector -}}
+{{- fail (printf "router.discovery.kubernetes.encodeSelector needs router.disaggregation.mode=epd (mode is %q)" $mode) -}}
+{{- end }}
+{{- if .prefillSelector }}
+- "--prefill-selector"
+- {{ .prefillSelector | quote }}
+{{- end }}
+{{- if .decodeSelector }}
+- "--decode-selector"
+- {{ .decodeSelector | quote }}
+{{- end }}
+{{- if .encodeSelector }}
+- "--encode-selector"
+- {{ .encodeSelector | quote }}
+{{- end }}
+- "--service-discovery-port"
+- {{ .port | quote }}
+{{- if not .clusterWide }}
+- "--service-discovery-namespace"
+- {{ .namespace | default $.Release.Namespace | quote }}
+{{- end }}
+{{- if .modelIdFrom }}
+- "--model-id-from"
+- {{ .modelIdFrom | quote }}
+{{- end }}
+{{- end }}
+{{- else if eq .provider "file" }}
+- "--discovery-file"
+- {{ include "smg.discoveryFilePath" $ | quote }}
+{{- else if eq .provider "slurm" }}
+{{- with .slurm }}
+{{- $mode := $.Values.router.disaggregation.mode | default "" }}
+{{- if and (not $mode) (or .prefillJobNames .decodeJobNames .encodeJobNames) -}}
+{{- fail "router.discovery.slurm names a role job (prefillJobNames, decodeJobNames or encodeJobNames) without router.disaggregation.mode: set mode to pd or epd" -}}
+{{- end }}
+{{- if and (ne $mode "epd") .encodeJobNames -}}
+{{- fail (printf "router.discovery.slurm.encodeJobNames needs router.disaggregation.mode=epd (mode is %q)" $mode) -}}
+{{- end }}
+{{- if and $mode .jobNames -}}
+{{- fail (printf "router.discovery.slurm.jobNames names regular jobs under router.disaggregation.mode=%s: a disaggregated gateway reads only its role jobs (prefillJobNames, decodeJobNames and, under epd, encodeJobNames)" $mode) -}}
+{{- end }}
+{{- range .jobNames }}
+- "--slurm-job-name"
+- {{ . | quote }}
+{{- end }}
+{{- range .encodeJobNames }}
+- "--slurm-encode-job-name"
+- {{ . | quote }}
+{{- end }}
+{{- range .prefillJobNames }}
+- "--slurm-prefill-job-name"
+- {{ . | quote }}
+{{- end }}
+{{- range .decodeJobNames }}
+- "--slurm-decode-job-name"
+- {{ . | quote }}
+{{- end }}
+- "--slurm-port"
+- {{ .port | quote }}
+{{- if .bootstrapPort }}
+- "--slurm-bootstrap-port"
+- {{ .bootstrapPort | quote }}
+{{- end }}
+{{- if .user }}
+- "--slurm-user"
+- {{ .user | quote }}
+{{- end }}
+{{- if .account }}
+- "--slurm-account"
+- {{ .account | quote }}
+{{- end }}
+{{- if .partition }}
+- "--slurm-partition"
+- {{ .partition | quote }}
+{{- end }}
+{{- end }}
+{{- else if eq .provider "consul" }}
+{{- /* The ACL token and the TLS files are Consul's environment variables,
+     set on the router container from Secrets, never flags. */}}
+{{- with .consul }}
+- "--consul-service"
+- {{ .service | quote }}
+{{- if .address }}
+- "--consul-address"
+- {{ .address | quote }}
+{{- end }}
+{{- if .datacenter }}
+- "--consul-datacenter"
+- {{ .datacenter | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- /* Under either spelling of Kubernetes discovery, as under any provider. */}}
+{{- if and (include "smg.discoveryProvider" .) .Values.router.discovery.checkIntervalSecs }}
+- "--discovery-check-interval-secs"
+- {{ int .Values.router.discovery.checkIntervalSecs | quote }}
+{{- end }}
 {{- if .Values.router.model }}
 - "--model-path"
 - {{ .Values.router.model | quote }}
@@ -168,7 +542,7 @@ Called from the router Deployment template.
 - {{ .Values.router.balanceAbsThreshold | quote }}
 - "--balance-rel-threshold"
 - {{ .Values.router.balanceRelThreshold | quote }}
-- "--eviction-interval"
+- "--eviction-interval-secs"
 - {{ .Values.router.evictionIntervalSecs | quote }}
 - "--max-tree-size"
 - {{ int .Values.router.maxTreeSize | quote }}
@@ -178,6 +552,18 @@ Called from the router Deployment template.
 - {{ int .Values.router.maxPayloadSize | quote }}
 - "--request-timeout-secs"
 - {{ .Values.router.requestTimeoutSecs | quote }}
+- "--mm-turbojpeg"
+- {{ .Values.router.mmTurbojpeg | quote }}
+{{- if .Values.router.grpcRequestTimeoutSecs }}
+- "--grpc-request-timeout-secs"
+- {{ .Values.router.grpcRequestTimeoutSecs | quote }}
+{{- end }}
+- "--shutdown-grace-period-secs"
+- {{ .Values.router.shutdownGracePeriodSeconds | quote }}
+{{- if ne .Values.router.shutdownSettleSeconds nil }}
+- "--shutdown-settle-secs"
+- {{ .Values.router.shutdownSettleSeconds | quote }}
+{{- end }}
 - "--max-concurrent-requests"
 - {{ .Values.router.maxConcurrentRequests | quote }}
 - "--queue-size"
@@ -245,36 +631,16 @@ Called from the router Deployment template.
 - {{ .Values.history.backend | quote }}
 {{- end }}
 {{- if eq .Values.history.backend "postgres" }}
-{{- if .Values.history.postgres.url }}
-- "--postgres-db-url"
-- {{ .Values.history.postgres.url | quote }}
-{{- end }}
-- "--postgres-pool-max-size"
+- "--postgres-pool-max"
 - {{ .Values.history.postgres.poolMax | quote }}
 {{- end }}
 {{- if eq .Values.history.backend "redis" }}
-{{- if .Values.history.redis.url }}
-- "--redis-url"
-- {{ .Values.history.redis.url | quote }}
-{{- end }}
-- "--redis-pool-max-size"
+- "--redis-pool-max"
 - {{ .Values.history.redis.poolMax | quote }}
 {{- end }}
 {{- if eq .Values.history.backend "oracle" }}
-{{- if .Values.history.oracle.dsn }}
-- "--oracle-dsn"
-- {{ .Values.history.oracle.dsn | quote }}
-{{- end }}
 - "--oracle-pool-max"
 - {{ .Values.history.oracle.poolMax | quote }}
-{{- if .Values.history.oracle.user }}
-- "--oracle-user"
-- {{ .Values.history.oracle.user | quote }}
-{{- end }}
-{{- if .Values.history.oracle.password }}
-- "--oracle-password"
-- {{ .Values.history.oracle.password | quote }}
-{{- end }}
 {{- end }}
 {{- if ge (int .Values.auth.rateLimitTokensPerSecond) 0 }}
 - "--rate-limit-tokens-per-second"
@@ -299,13 +665,203 @@ Called from the router Deployment template.
 - "--tool-call-parser"
 - {{ .Values.router.toolCallParser | quote }}
 {{- end }}
-{{- if .Values.auth.apiKey }}
-- "--api-key"
-- {{ .Values.auth.apiKey | quote }}
+{{- if .Values.router.parser }}
+- "--parser"
+- {{ .Values.router.parser | quote }}
+{{- end }}
+{{- if include "smg.authSecretName" . }}
+- "--api-key-file"
+- {{ printf "/etc/smg/auth/%s" (include "smg.authSecretKey" .) | quote }}
+{{- end }}
+{{- if include "smg.controlPlaneSecretName" . }}
+- "--control-plane-api-keys-file"
+- {{ printf "/etc/smg/control-plane/%s" (include "smg.controlPlaneSecretKey" .) | quote }}
+{{- end }}
+{{- if .Values.router.tenantRateLimit.enabled }}
+- "--tenant-rate-limit-enabled"
+{{- end }}
+{{- if .Values.router.tenantRateLimit.configMap.name }}
+- "--tenant-rate-limit-config"
+- {{ printf "/etc/smg/rate-limit/%s" .Values.router.tenantRateLimit.configMap.key | quote }}
+{{- end }}
+{{- if .Values.router.priorityScheduler.enabled }}
+- "--priority-scheduler-enabled"
+{{- end }}
+{{- if .Values.router.priorityScheduler.configMap.name }}
+- "--priority-scheduler-config"
+- {{ printf "/etc/smg/scheduler/%s" .Values.router.priorityScheduler.configMap.key | quote }}
 {{- end }}
 {{- range .Values.router.extraArgs }}
 - {{ . | quote }}
 {{- end }}
+{{- end }}
+
+{{/*
+Auth secret -- the Secret holding the shared API key, mounted into the router
+pod as a file the gateway reads with --api-key-file; the key itself is never
+in the pod's arguments. `auth.existingSecret` names a Secret the operator
+manages; otherwise `auth.apiKey`, when set, is written into a chart-managed
+Secret. Empty when no key is configured.
+*/}}
+{{- define "smg.authSecretName" -}}
+{{- if .Values.auth.existingSecret -}}
+{{- .Values.auth.existingSecret -}}
+{{- else if .Values.auth.apiKey -}}
+{{- printf "%s-auth" (include "smg.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Auth secret key -- the key within the auth Secret that holds the API key.
+*/}}
+{{- define "smg.authSecretKey" -}}
+{{- .Values.auth.apiKeySecretKey | default "api-key" -}}
+{{- end }}
+
+{{/*
+Control-plane secret -- the Secret holding the control-plane API keys file,
+mounted into the router pod and read with --control-plane-api-keys-file;
+the keys are never in the pod's arguments. `auth.controlPlane.existingSecret`
+names a Secret the operator manages; otherwise `auth.controlPlane.apiKeys`,
+when set, is written into a chart-managed Secret. Empty when neither is set.
+*/}}
+{{- define "smg.controlPlaneSecretName" -}}
+{{- if .Values.auth.controlPlane.existingSecret -}}
+{{- .Values.auth.controlPlane.existingSecret -}}
+{{- else if .Values.auth.controlPlane.apiKeys -}}
+{{- printf "%s-control-plane" (include "smg.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Control-plane secret key -- the key within that Secret holding the file.
+*/}}
+{{- define "smg.controlPlaneSecretKey" -}}
+{{- .Values.auth.controlPlane.secretKey | default "control-plane-api-keys" -}}
+{{- end }}
+
+{{/*
+History store -- the store the history backend uses, postgres or redis (its
+values are .Values.history.<store>); empty for the other backends.
+*/}}
+{{- define "smg.historyStore" -}}
+{{- if or (eq .Values.history.backend "postgres") (eq .Values.history.backend "redis") -}}
+{{- .Values.history.backend -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History secret -- the Secret holding the history store's connection URL,
+which carries the database password. The URL reaches the router pod as the
+environment variable the gateway reads (SMG_POSTGRES_DB_URL or
+SMG_REDIS_URL); it is never in the pod's arguments. The store's
+`existingSecret` names a Secret the operator manages; otherwise its `url`,
+when set, is written into the chart-managed Secret <fullname>-history.
+Empty when no URL is configured or the backend has no store.
+*/}}
+{{- define "smg.historySecretName" -}}
+{{- with include "smg.historyStore" . -}}
+{{- $store := index $.Values.history . -}}
+{{- if $store.existingSecret -}}
+{{- $store.existingSecret -}}
+{{- else if $store.url -}}
+{{- printf "%s-history" (include "smg.fullname" $) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History secret key -- the key within the history Secret that holds the URL:
+the store's `secretKey`, else "<store>-url".
+*/}}
+{{- define "smg.historySecretKey" -}}
+{{- with include "smg.historyStore" . -}}
+{{- (index $.Values.history .).secretKey | default (printf "%s-url" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History URL variable -- the environment variable the gateway reads the
+history store's connection URL from.
+*/}}
+{{- define "smg.historyUrlEnv" -}}
+{{- with include "smg.historyStore" . -}}
+{{- if eq . "postgres" }}SMG_POSTGRES_DB_URL{{ else }}SMG_REDIS_URL{{ end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History secret managed -- "true" when the chart writes the history Secret
+itself (the store's `url` is set and no `existingSecret` replaces it). The
+router pod template carries a checksum of that Secret, so a changed URL
+rolls the pods.
+*/}}
+{{- define "smg.historySecretManaged" -}}
+{{- with include "smg.historyStore" . -}}
+{{- $store := index $.Values.history . -}}
+{{- if and $store.url (not $store.existingSecret) -}}true{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Oracle secret -- the Secret holding the Oracle connect descriptor, database
+user and password. Each reaches the router pod as the environment variable
+the gateway reads (ATP_DSN, ATP_USER, ATP_PASSWORD); none is in the pod's
+arguments. `history.oracle.existingSecret` names a Secret the operator
+manages; otherwise the credentials set under history.oracle are written into
+the chart-managed Secret <fullname>-secrets, the Secret earlier chart
+versions wrote without reading it (same name, same keys). Empty when the
+backend is not oracle or no credential is configured.
+*/}}
+{{- define "smg.oracleSecretName" -}}
+{{- if eq .Values.history.backend "oracle" -}}
+{{- with .Values.history.oracle -}}
+{{- if .existingSecret -}}
+{{- .existingSecret -}}
+{{- else if or .dsn .user .password -}}
+{{- printf "%s-secrets" (include "smg.fullname" $) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Oracle secret managed -- "true" when the chart writes the Oracle Secret
+itself (a credential is set under history.oracle and no `existingSecret`
+replaces them). The router pod template carries a checksum of that Secret,
+so a changed credential rolls the pods.
+*/}}
+{{- define "smg.oracleSecretManaged" -}}
+{{- if eq .Values.history.backend "oracle" -}}
+{{- with .Values.history.oracle -}}
+{{- if and (not .existingSecret) (or .dsn .user .password) -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Oracle credentials -- the credentials the router pod is wired to, as a JSON
+list for fromJsonArray: each with the environment variable the gateway reads
+it from (env), its key within the Oracle Secret (key) and its value from the
+values (value, used by the chart-managed Secret alone). With `existingSecret`
+all three are wired and that Secret holds their keys; otherwise the ones set
+under history.oracle. Empty when there is no Oracle Secret.
+*/}}
+{{- define "smg.oracleCredentials" -}}
+{{- $credentials := list -}}
+{{- if include "smg.oracleSecretName" . -}}
+{{- $oracle := .Values.history.oracle -}}
+{{- $keys := $oracle.secretKeys | default dict -}}
+{{- $dsn := dict "env" "ATP_DSN" "key" ($keys.dsn | default "oracle-dsn") "value" $oracle.dsn -}}
+{{- $user := dict "env" "ATP_USER" "key" ($keys.user | default "oracle-user") "value" $oracle.user -}}
+{{- $password := dict "env" "ATP_PASSWORD" "key" ($keys.password | default "oracle-password") "value" $oracle.password -}}
+{{- range $credential := list $dsn $user $password -}}
+{{- if or $oracle.existingSecret $credential.value -}}
+{{- $credentials = append $credentials $credential -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $credentials -}}
 {{- end }}
 
 {{/*
@@ -321,9 +877,9 @@ Expects a dict with keys: worker, global, chart, defaults
 {{- $workerRepository = .worker.image.repository | default "" -}}
 {{- $workerTag = .worker.image.tag | default "" -}}
 {{- end -}}
-{{/* Engine images default to ghcr.io (gateway image is on docker.io) */}}
+{{/* Engine images are published under ghcr.io/smg-project/smg (the gateway image is on docker.io) */}}
 {{- $registry := $workerRegistry | default "ghcr.io" -}}
-{{- $repository := $workerRepository | default .global.image.repository -}}
+{{- $repository := $workerRepository | default "smg-project/smg" -}}
 {{- $tag := $workerTag | default (.global.image.tag | default .chart.AppVersion) -}}
 {{- printf "%s/%s:%s" $registry $repository $tag -}}
 {{- end }}
@@ -386,6 +942,24 @@ Expects a dict with keys: worker, defaults
 - {{ . | quote }}
 {{- end }}
 {{- end }}
+{{- end }}
+
+{{/*
+Worker metrics port -- the port the engine pod serves Prometheus metrics on,
+or empty when it serves none. A gRPC worker with `metrics.enabled` runs the
+engine behind the Rust servicer, whose own listener answers `GET /metrics`
+with the `smg_servicer_*` families (requests by finish reason, refusals,
+errors, in-flight requests, token totals, the first-token / inter-token /
+end-to-end latency histograms, the servicer's lifecycle state); the Python
+servicer has no endpoint. An HTTP worker runs the engine's own server, which
+the chart leaves as it is.
+Expects a dict with keys: worker
+*/}}
+{{- define "smg.workerMetricsPort" -}}
+{{- $mode := .worker.connectionMode | default "http" -}}
+{{- if and (eq $mode "grpc") (.worker.metrics).enabled -}}
+{{- (.worker.metrics).port | default 29100 -}}
+{{- end -}}
 {{- end }}
 
 {{/*

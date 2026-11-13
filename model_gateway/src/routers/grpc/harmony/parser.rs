@@ -348,9 +348,6 @@ impl HarmonyParserAdapter {
         let mut commentary_delta = None;
         let mut final_delta: Option<String> = None;
 
-        // Track message count before processing
-        let prev_message_count = self.parser.messages().len();
-
         // Accumulate delta text for commentary channel
         let mut accumulated_delta = String::new();
 
@@ -442,10 +439,6 @@ impl HarmonyParserAdapter {
             }
         }
 
-        // Check if new messages were completed
-        let current_message_count = self.parser.messages().len();
-        let is_final = current_message_count > prev_message_count;
-
         // Only emit a delta if at least one channel produced output
         let has_delta =
             analysis_delta.is_some() || commentary_delta.is_some() || final_delta.is_some();
@@ -455,7 +448,6 @@ impl HarmonyParserAdapter {
                 analysis_delta,
                 commentary_delta,
                 final_delta,
-                is_final,
             }))
         } else {
             Ok(None)
@@ -497,19 +489,5 @@ impl HarmonyParserAdapter {
             finish_reason: final_finish_reason,
             reasoning_token_count: self.reasoning_token_count,
         }
-    }
-
-    /// Reset parser state
-    ///
-    /// Resets the parser to initial state for reuse
-    #[expect(dead_code)]
-    pub fn reset(&mut self) -> Result<(), String> {
-        // Create a new parser instance (StreamableParser doesn't have a reset method)
-        let encoding = try_harmony_encoding()?;
-        self.parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
-            .map_err(|e| format!("Failed to reset parser: {e}"))?;
-        self.prev_recipient = None;
-        self.reasoning_token_count = 0;
-        Ok(())
     }
 }
