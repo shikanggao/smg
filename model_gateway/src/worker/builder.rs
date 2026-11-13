@@ -608,6 +608,7 @@ mod tests {
             .overload(OverloadUpdate {
                 waiting_requests: None,
                 token_usage: Some(0.5),
+                ..Default::default()
             })
             .overload_defaults(OverloadThresholds {
                 waiting_requests: Some(16),

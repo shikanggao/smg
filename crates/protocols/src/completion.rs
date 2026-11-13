@@ -283,6 +283,22 @@ impl GenerationRequest for CompletionRequest {
         Some(&self.model)
     }
 
+    fn prompt_work_hint(&self) -> PromptWorkHint {
+        if self.n.is_some_and(|n| n != 1)
+            || self.best_of.is_some_and(|n| n > 1)
+            || self.suffix.is_some()
+        {
+            return PromptWorkHint::Unknown;
+        }
+        match &self.prompt {
+            CompletionPrompt::Text(text) => PromptWorkHint::TextBytes(text.len()),
+            CompletionPrompt::TokenIds(ids) => PromptWorkHint::BodyTokenIds(ids.len()),
+            CompletionPrompt::Texts(_) | CompletionPrompt::TokenIdBatches(_) => {
+                PromptWorkHint::Unknown
+            }
+        }
+    }
+
     fn extract_text_for_routing(&self) -> String {
         match &self.prompt {
             CompletionPrompt::Text(s) => s.clone(),
