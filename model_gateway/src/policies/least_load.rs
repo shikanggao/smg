@@ -727,11 +727,20 @@ impl LeastLoadPolicy {
     /// from the same mean prefill the in-flight term uses, so a queued request
     /// and a just-dispatched one weigh the same.
     fn queued_tokens(&self, load: &WorkerLoadResponse) -> f64 {
-        let reported = load.total_waiting_uncached_tokens();
-        if reported > 0 {
-            return reported as f64;
-        }
-        load.total_waiting_reqs().max(0) as f64 * self.mean_prefill_tokens as f64
+        load.loads
+            .iter()
+            .map(|rank| {
+                let reported = rank.num_waiting_uncached_tokens.max(0) as f64;
+                match rank.num_waiting_uncached_tokens_available {
+                    Some(true) => reported,
+                    Some(false) => {
+                        rank.num_waiting_reqs.max(0) as f64 * self.mean_prefill_tokens as f64
+                    }
+                    None if reported > 0.0 => reported,
+                    None => rank.num_waiting_reqs.max(0) as f64 * self.mean_prefill_tokens as f64,
+                }
+            })
+            .sum()
     }
 
     /// Load snapshots do not report remaining running token-work. Keep running
@@ -1118,6 +1127,31 @@ mod tests {
     };
 
     /// Invalid or incomplete rank capacity falls back to the fleet input rate.
+    #[test]
+    fn queue_availability_is_per_rank_and_explicit_zero_is_measured() {
+        let policy = LeastLoadPolicy::with_params(0.15, 100, 1000.0);
+        let mut load = WorkerLoadResponse {
+            loads: vec![
+                SchedulerLoadSnapshot {
+                    num_waiting_reqs: 2,
+                    num_waiting_uncached_tokens_available: Some(true),
+                    ..Default::default()
+                },
+                SchedulerLoadSnapshot {
+                    num_waiting_reqs: 3,
+                    num_waiting_uncached_tokens_available: Some(false),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(policy.queued_tokens(&load), 300.0);
+        load.loads[0].num_waiting_uncached_tokens_available = None;
+        assert_eq!(policy.queued_tokens(&load), 500.0);
+        load.loads[0].num_waiting_uncached_tokens = 50;
+        assert_eq!(policy.queued_tokens(&load), 350.0);
+    }
+
     #[test]
     fn prefill_uses_only_valid_complete_input_capacity() {
         let prefill: Arc<dyn Worker> = Arc::new(

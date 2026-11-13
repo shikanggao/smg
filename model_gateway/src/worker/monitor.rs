@@ -48,7 +48,7 @@
 //!    channel and merge in the fresh loads.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt::Debug,
     sync::{Arc, Weak},
     time::{Duration, Instant},
@@ -57,7 +57,8 @@ use std::{
 use dashmap::DashMap;
 use futures::future;
 use openai_protocol::worker::{
-    RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey, WorkerLoadResponse, WorkerStatus,
+    PrefillMetricProvenance, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
+    WorkerLoadResponse, WorkerStatus,
 };
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
@@ -75,6 +76,7 @@ use crate::{
         event::WorkerEvent,
         liveness,
         load_state::{LoadReceiver, LoadSnapshot, LoadState},
+        native_engine_work_capture::{self, Capture as NativeEngineWorkCapture},
         ConnectionMode, Worker, WorkerRegistry,
     },
 };
@@ -88,11 +90,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// summary buckets are simply never queried by name.
 struct PromScrape {
     samples: HashMap<String, Vec<f64>>,
+    histogram_buckets: HashMap<String, Vec<(f64, f64)>>,
+    local_compute_tokens: Option<f64>,
+    request_count_series: Vec<String>,
+    kv_usage_series: Vec<String>,
 }
 
 impl PromScrape {
     fn parse(text: &str) -> Self {
         let mut samples: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut histogram_buckets: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
+        let mut local_compute_tokens = None;
+        let mut request_count_series = Vec::new();
+        let mut kv_usage_series = Vec::new();
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -108,19 +118,79 @@ impl PromScrape {
                 Some(close) => (&line[..=close], &line[close + 1..]),
                 None => match line.split_once(char::is_whitespace) {
                     Some(split) => split,
-                    None => continue,
+                    None => (line, ""),
                 },
             };
-            let Some(value) = tail.split_whitespace().next() else {
-                continue;
-            };
-            let Ok(value) = value.parse::<f64>() else {
-                continue;
-            };
             let name = head.split('{').next().unwrap_or(head).trim();
+            // Preserve malformed native-count presence, even a head with no
+            // numeric token. Otherwise one missing rank silently lowers P.
+            let value = tail.split_whitespace().next().unwrap_or("");
+            if [
+                "vllm:gpu_cache_usage_perc",
+                "vllm:kv_cache_usage_perc",
+                "sglang:token_usage",
+                "sglang_token_usage",
+            ]
+            .contains(&name)
+            {
+                // Keep malformed series presence separately without changing
+                // the legacy policy's numeric aggregation behavior.
+                kv_usage_series.push(head.to_owned());
+            }
+            if [
+                "vllm:num_requests_waiting",
+                "vllm:num_requests_running",
+                "sglang:num_queue_reqs",
+                "sglang:num_running_reqs",
+                "sglang_num_queue_reqs",
+                "sglang_num_running_reqs",
+            ]
+            .contains(&name)
+            {
+                request_count_series.push(head.to_owned());
+            }
+            if name == "vllm:prompt_tokens_by_source_total" && local_compute_source(head) {
+                // Retain invalid presence: it must not silently select cached
+                // prompt totals or completion-time counters as capacity.
+                let computed = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .unwrap_or(f64::NAN);
+                local_compute_tokens = Some(local_compute_tokens.unwrap_or(0.0) + computed);
+            }
+            let Ok(value) = value.parse::<f64>() else {
+                if request_count_series
+                    .last()
+                    .is_some_and(|series| series == head)
+                {
+                    samples.entry(name.to_owned()).or_default().push(f64::NAN);
+                }
+                continue;
+            };
             samples.entry(name.to_string()).or_default().push(value);
+            if name == "vllm:request_prefill_kv_computed_tokens_bucket" {
+                let bound = histogram_bound(head);
+                if let Some(bound) = bound {
+                    let buckets = histogram_buckets.entry(name.to_string()).or_default();
+                    if let Some((_, total)) = buckets.iter_mut().find(|(seen, _)| *seen == bound) {
+                        *total += value;
+                    } else {
+                        buckets.push((bound, value));
+                    }
+                }
+            }
         }
-        Self { samples }
+        for buckets in histogram_buckets.values_mut() {
+            buckets.sort_by(|(a, _), (b, _)| a.total_cmp(b));
+        }
+        Self {
+            samples,
+            histogram_buckets,
+            local_compute_tokens,
+            request_count_series,
+            kv_usage_series,
+        }
     }
 
     /// Sum across all label-set samples for `name` (0.0 if absent). Right for
@@ -141,10 +211,691 @@ impl PromScrape {
         }
     }
 
+    fn max(&self, name: &str) -> f64 {
+        self.samples
+            .get(name)
+            .map(|v| {
+                v.iter().copied().fold(0.0_f64, |a, b| {
+                    if a.is_finite() && b.is_finite() {
+                        a.max(b)
+                    } else {
+                        f64::NAN
+                    }
+                })
+            })
+            .unwrap_or(0.0)
+    }
+
     /// True when at least one sample exists for `name`.
     fn has(&self, name: &str) -> bool {
         self.samples.get(name).is_some_and(|v| !v.is_empty())
     }
+
+    fn first_sum(&self, names: &[&str]) -> Option<f64> {
+        names
+            .iter()
+            .find(|name| self.has(name))
+            .map(|name| self.sum(name))
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    }
+
+    fn histogram(&self, name: &str) -> Option<Vec<(f64, f64)>> {
+        self.histogram_buckets.get(name).cloned()
+    }
+
+    fn valid_request_counts(&self, names: &[&str]) -> bool {
+        let mut expected_labels = None;
+        for name in names {
+            let Some(values) = self.samples.get(*name) else {
+                return false;
+            };
+            let mut labels: Vec<_> = self
+                .request_count_series
+                .iter()
+                .filter(|head| head.split('{').next() == Some(*name))
+                .map(|head| &head[name.len()..])
+                .collect();
+            labels.sort_unstable();
+            if labels.is_empty()
+                || labels.len() != values.len()
+                || labels.windows(2).any(|pair| pair[0] == pair[1])
+                || values
+                    .iter()
+                    .any(|value| !value.is_finite() || *value < 0.0 || value.fract() != 0.0)
+                || self.sum(name) > f64::from(i32::MAX)
+                || expected_labels
+                    .as_ref()
+                    .is_some_and(|expected| expected != &labels)
+            {
+                return false;
+            }
+            expected_labels = Some(labels);
+        }
+        true
+    }
+
+    fn request_counts_profile(&self, epoch: u64) -> u64 {
+        use std::{
+            collections::hash_map::DefaultHasher,
+            hash::{Hash, Hasher},
+        };
+        let mut series = self.request_count_series.clone();
+        series.sort_unstable();
+        let mut hasher = DefaultHasher::new();
+        series.hash(&mut hasher);
+        epoch.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn valid_kv_usage(&self, name: &str) -> bool {
+        let Some(values) = self.samples.get(name) else {
+            return false;
+        };
+        let mut series: Vec<_> = self
+            .kv_usage_series
+            .iter()
+            .filter(|head| head.split('{').next() == Some(name))
+            .collect();
+        series.sort_unstable();
+        !series.is_empty()
+            && series.len() == values.len()
+            && !series.windows(2).any(|pair| pair[0] == pair[1])
+            && values
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+    }
+
+    fn kv_usage_profile(&self, name: &str, aggregation: &str) -> u64 {
+        use std::{
+            collections::hash_map::DefaultHasher,
+            hash::{Hash, Hasher},
+        };
+        let mut series: Vec<_> = self
+            .kv_usage_series
+            .iter()
+            .filter(|head| head.split('{').next() == Some(name))
+            .collect();
+        series.sort_unstable();
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        aggregation.hash(&mut hasher);
+        series.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct EngineCounterSample {
+    observed: Option<Instant>,
+    local_compute_tokens: Option<f64>,
+    prompt_tokens: Option<f64>,
+    generation_tokens: Option<f64>,
+    prefill_kv_sum: Option<f64>,
+    prefill_kv_count: Option<f64>,
+    prefix_cache_hits: Option<f64>,
+    prefix_cache_queries: Option<f64>,
+    prefill_kv_buckets: Option<Vec<(f64, f64)>>,
+    waiting: f64,
+    running: f64,
+    ttft_sum: Option<f64>,
+    ttft_count: Option<f64>,
+    prefill_started_count: Option<f64>,
+    queue_delay_sum: Option<f64>,
+    queue_delay_count: Option<f64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrefillCounter {
+    LocalCompute,
+    StartedRequests,
+    CompletedUncached,
+    Prompt,
+}
+
+impl EngineCounterSample {
+    fn prefill_counter(&self) -> (PrefillCounter, Option<f64>) {
+        if self.local_compute_tokens.is_some() {
+            (PrefillCounter::LocalCompute, self.local_compute_tokens)
+        } else if self.prefill_started_count.is_some() {
+            (PrefillCounter::StartedRequests, self.prefill_started_count)
+        } else if self.prefill_kv_sum.is_some() {
+            (PrefillCounter::CompletedUncached, self.prefill_kv_sum)
+        } else {
+            (PrefillCounter::Prompt, self.prompt_tokens)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct EngineMetricsHistory {
+    recovery_counter_epoch: u64,
+    sample: EngineCounterSample,
+    avg_request_prefill_kv_computed_tokens: Option<f64>,
+    cache_hit_rate: Option<f64>,
+    prefill_histogram_deltas: VecDeque<Vec<(f64, f64)>>,
+    saturated_prefill_rates: VecDeque<f64>,
+    prefill_size_deltas: VecDeque<(f64, f64)>,
+    low_load_ttft_samples: VecDeque<f64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EngineDerivedMetrics {
+    prefill_metric_provenance: PrefillMetricProvenance,
+    recovery_counter_epoch: u64,
+    prefill_throughput: Option<f64>,
+    timely_prefill_progress: Option<f64>,
+    timely_prefill_progress_source: Option<&'static str>,
+    timely_prefill_progress_interval: Option<f64>,
+    gen_throughput: f64,
+    avg_request_prefill_kv_computed_tokens: Option<f64>,
+    median_request_prefill_kv_computed_tokens: Option<f64>,
+    prefill_size_sample_count: Option<u64>,
+    learned_prefill_capacity: Option<f64>,
+    prefill_capacity_sample_count: Option<u32>,
+    prefill_capacity_learning_active: Option<bool>,
+    cache_hit_rate: f64,
+    low_load_ttft_seconds: Option<f64>,
+    recent_queue_delay_seconds: Option<f64>,
+    recent_queue_delay_sample_count: Option<u64>,
+}
+
+const PREFILL_SIZE_WINDOW_INTERVALS: usize = 64;
+const PREFILL_CAPACITY_WINDOW_INTERVALS: usize = 32;
+const PREFILL_CAPACITY_MIN_SAMPLES: usize = 8;
+// Both Prometheus backends use the same learning windows and eligibility rules.
+const LOW_LOAD_TTFT_WINDOW: usize = 32;
+const LOW_LOAD_TTFT_MIN_SAMPLES: usize = 4;
+
+fn counter_rate(current: Option<f64>, previous: Option<f64>, elapsed: f64) -> Option<f64> {
+    let (current, previous) = (current?, previous?);
+    (elapsed > 0.0 && current >= previous).then_some((current - previous) / elapsed)
+}
+
+fn counter_delta_mean(
+    current_numerator: Option<f64>,
+    previous_numerator: Option<f64>,
+    current_denominator: Option<f64>,
+    previous_denominator: Option<f64>,
+) -> Option<f64> {
+    let numerator = current_numerator? - previous_numerator?;
+    let denominator = current_denominator? - previous_denominator?;
+    (numerator >= 0.0 && denominator > 0.0).then_some(numerator / denominator)
+}
+
+fn counter_delta_ratio(
+    current_numerator: Option<f64>,
+    previous_numerator: Option<f64>,
+    current_denominator: Option<f64>,
+    previous_denominator: Option<f64>,
+) -> Option<f64> {
+    counter_delta_mean(
+        current_numerator,
+        previous_numerator,
+        current_denominator,
+        previous_denominator,
+    )
+    .map(|ratio| ratio.clamp(0.0, 1.0))
+}
+
+fn counter_reset(current: Option<f64>, previous: Option<f64>) -> bool {
+    matches!((current, previous), (Some(current), Some(previous)) if current < previous)
+}
+
+enum HistogramDelta {
+    Valid(Vec<(f64, f64)>),
+    Reset,
+    Unavailable,
+}
+
+fn histogram_delta(
+    current: Option<&[(f64, f64)]>,
+    previous: Option<&[(f64, f64)]>,
+) -> HistogramDelta {
+    let (Some(current), Some(previous)) = (current, previous) else {
+        return HistogramDelta::Unavailable;
+    };
+    if current.len() != previous.len() || current.is_empty() {
+        return HistogramDelta::Unavailable;
+    }
+    let mut delta = Vec::with_capacity(current.len());
+    let mut last = 0.0;
+    for ((bound, value), (previous_bound, previous_value)) in current.iter().zip(previous.iter()) {
+        if bound != previous_bound
+            || !value.is_finite()
+            || !previous_value.is_finite()
+            || *value < 0.0
+            || *previous_value < 0.0
+        {
+            return HistogramDelta::Unavailable;
+        }
+        if value < previous_value {
+            return HistogramDelta::Reset;
+        }
+        let count = value - previous_value;
+        if count < last {
+            return HistogramDelta::Unavailable;
+        }
+        last = count;
+        delta.push((*bound, count));
+    }
+    HistogramDelta::Valid(delta)
+}
+
+fn rolling_histogram_quantile(
+    windows: &VecDeque<Vec<(f64, f64)>>,
+    quantile: f64,
+) -> Option<(f64, u64)> {
+    let first = windows.front()?;
+    if first.is_empty() {
+        return None;
+    }
+    let mut cumulative = vec![0.0; first.len()];
+    for window in windows {
+        if window.len() != first.len()
+            || window
+                .iter()
+                .zip(first)
+                .any(|((bound, _), (first_bound, _))| bound != first_bound)
+        {
+            return None;
+        }
+        for (total, (_, count)) in cumulative.iter_mut().zip(window) {
+            *total += count;
+        }
+    }
+    let sample_count = cumulative.last().copied()?;
+    if !sample_count.is_finite() || sample_count <= 0.0 {
+        return None;
+    }
+    let target = sample_count * quantile.clamp(0.0, 1.0);
+    let value = first
+        .iter()
+        .zip(cumulative)
+        .find_map(|((bound, _), count)| (count >= target && bound.is_finite()).then_some(*bound))?;
+    Some((value, sample_count.round().max(0.0) as u64))
+}
+
+fn conservative_capacity(samples: &VecDeque<f64>) -> Option<f64> {
+    if samples.len() < PREFILL_CAPACITY_MIN_SAMPLES {
+        return None;
+    }
+    let mut sorted: Vec<_> = samples.iter().copied().collect();
+    sorted.sort_by(f64::total_cmp);
+    let index = (sorted.len() - 1) / 4;
+    sorted.get(index).copied()
+}
+
+fn vllm_counter_sample(metrics: &PromScrape, observed: Instant) -> EngineCounterSample {
+    EngineCounterSample {
+        observed: Some(observed),
+        local_compute_tokens: metrics.local_compute_tokens,
+        prompt_tokens: metrics.first_sum(&["vllm:prompt_tokens_total", "vllm:prompt_tokens"]),
+        generation_tokens: metrics
+            .first_sum(&["vllm:generation_tokens_total", "vllm:generation_tokens"]),
+        prefill_kv_sum: metrics.first_sum(&["vllm:request_prefill_kv_computed_tokens_sum"]),
+        prefill_kv_count: metrics.first_sum(&["vllm:request_prefill_kv_computed_tokens_count"]),
+        prefix_cache_hits: metrics.first_sum(&[
+            "vllm:prefix_cache_hits_total",
+            "vllm:prefix_cache_hits",
+            "vllm:gpu_prefix_cache_hits_total",
+        ]),
+        prefix_cache_queries: metrics.first_sum(&[
+            "vllm:prefix_cache_queries_total",
+            "vllm:prefix_cache_queries",
+            "vllm:gpu_prefix_cache_queries_total",
+        ]),
+        prefill_kv_buckets: metrics.histogram("vllm:request_prefill_kv_computed_tokens_bucket"),
+        waiting: metrics.sum("vllm:num_requests_waiting"),
+        running: metrics.sum("vllm:num_requests_running"),
+        ttft_sum: metrics.first_sum(&["vllm:time_to_first_token_seconds_sum"]),
+        ttft_count: metrics.first_sum(&["vllm:time_to_first_token_seconds_count"]),
+        prefill_started_count: None,
+        queue_delay_sum: metrics.first_sum(&["vllm:request_queue_time_seconds_sum"]),
+        queue_delay_count: metrics.first_sum(&["vllm:request_queue_time_seconds_count"]),
+    }
+}
+
+fn derive_engine_metrics(
+    metrics: &PromScrape,
+    current: EngineCounterSample,
+    previous: Option<EngineMetricsHistory>,
+) -> (EngineDerivedMetrics, EngineMetricsHistory) {
+    let elapsed = previous
+        .as_ref()
+        .and_then(|history| history.sample.observed)
+        .and_then(|observed| current.observed.map(|now| now.duration_since(observed)))
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0);
+
+    let (prefill_source, prefill_counter) = current.prefill_counter();
+    let capacity_counter_changed = previous.as_ref().is_some_and(|history| {
+        let (previous_source, previous_counter) = history.sample.prefill_counter();
+        prefill_source != previous_source || counter_reset(prefill_counter, previous_counter)
+    }) || prefill_counter
+        .is_some_and(|value| !value.is_finite() || value < 0.0);
+    let prefill_counter_reset = previous.as_ref().is_some_and(|history| {
+        counter_reset(current.prefill_kv_sum, history.sample.prefill_kv_sum)
+            || counter_reset(current.prefill_kv_count, history.sample.prefill_kv_count)
+            || counter_reset(current.prompt_tokens, history.sample.prompt_tokens)
+    });
+    // Keep recovery count history separate from a native restart/counter reset,
+    // including when capacity learning has not accumulated any samples yet.
+    let recovery_reset = capacity_counter_changed
+        || prefill_counter_reset
+        || previous.as_ref().is_some_and(|history| {
+            counter_reset(current.generation_tokens, history.sample.generation_tokens)
+                || counter_reset(current.ttft_count, history.sample.ttft_count)
+                || counter_reset(current.queue_delay_count, history.sample.queue_delay_count)
+        });
+    let recovery_counter_epoch = previous
+        .as_ref()
+        .map_or(0, |h| h.recovery_counter_epoch)
+        .wrapping_add(u64::from(recovery_reset));
+    let prefill_throughput = previous.as_ref().and_then(|history| {
+        if capacity_counter_changed {
+            return None;
+        }
+        // vLLM's source="local_compute" counter is published with prefill
+        // outputs, before decode completes. The request histogram remains a
+        // prompt-size signal and a compatibility rate for older versions.
+        // Zero local compute must not fall back to cache-inclusive totals.
+        let rate = counter_rate(prefill_counter, history.sample.prefill_counter().1, elapsed)?;
+        // Some engines publish prompt tokens only at generation completion.
+        // Their prefill-admission count is timely; convert that request rate
+        // to token work with the same observed mean used by the queue proxy.
+        let rate = if prefill_source == PrefillCounter::StartedRequests {
+            rate * history.avg_request_prefill_kv_computed_tokens?
+        } else {
+            rate
+        };
+        (rate.is_finite() && rate > 0.0).then_some(rate)
+    });
+    // Keep zero as evidence, and exclude counters published at request completion.
+    // This is an independent shadow signal; capacity learning above is unchanged.
+    let timely_prefill_progress_source = match prefill_source {
+        PrefillCounter::LocalCompute => Some("local_compute_tokens"),
+        PrefillCounter::StartedRequests => Some("prefill_started_requests"),
+        _ => None,
+    };
+    let timely_prefill_progress = timely_prefill_progress_source.and_then(|_| {
+        let history = previous.as_ref()?;
+        if capacity_counter_changed || recovery_reset {
+            return None;
+        }
+        let rate = counter_rate(prefill_counter, history.sample.prefill_counter().1, elapsed)?;
+        let rate = if prefill_source == PrefillCounter::StartedRequests {
+            rate * history.avg_request_prefill_kv_computed_tokens?
+        } else {
+            rate
+        };
+        (rate.is_finite() && rate >= 0.0).then_some(rate)
+    });
+    let timely_prefill_progress_interval = timely_prefill_progress.map(|_| elapsed);
+    let gen_throughput = previous
+        .as_ref()
+        .and_then(|history| {
+            counter_rate(
+                current.generation_tokens,
+                history.sample.generation_tokens,
+                elapsed,
+            )
+        })
+        .filter(|rate| rate.is_finite() && *rate >= 0.0)
+        .unwrap_or(0.0);
+
+    let recent_prefill = previous.as_ref().and_then(|history| {
+        counter_delta_mean(
+            current.prefill_kv_sum,
+            history.sample.prefill_kv_sum,
+            current.prefill_kv_count,
+            history.sample.prefill_kv_count,
+        )
+    });
+    let cumulative_prefill = match (current.prefill_kv_sum, current.prefill_kv_count) {
+        (Some(sum), Some(count)) if count > 0.0 => Some(sum / count),
+        _ => None,
+    };
+    let mut prefill_size_deltas = previous
+        .as_ref()
+        .map(|history| history.prefill_size_deltas.clone())
+        .unwrap_or_default();
+    if prefill_counter_reset {
+        prefill_size_deltas.clear();
+    }
+    if let (Some(mean), Some(history)) = (recent_prefill, previous.as_ref()) {
+        let count = current.prefill_kv_count.unwrap_or(0.0)
+            - history.sample.prefill_kv_count.unwrap_or(0.0);
+        if mean.is_finite() && mean >= 0.0 && count.is_finite() && count > 0.0 {
+            prefill_size_deltas.push_back((mean * count, count));
+            while prefill_size_deltas.len() > PREFILL_SIZE_WINDOW_INTERVALS {
+                prefill_size_deltas.pop_front();
+            }
+        }
+    }
+    let recent_size_count: f64 = prefill_size_deltas.iter().map(|(_, count)| count).sum();
+    let rolling_mean = (recent_size_count > 0.0).then(|| {
+        prefill_size_deltas
+            .iter()
+            .map(|(tokens, _)| tokens)
+            .sum::<f64>()
+            / recent_size_count
+    });
+    let avg_request_prefill_kv_computed_tokens = rolling_mean
+        .or(recent_prefill)
+        .or_else(|| {
+            previous
+                .as_ref()
+                .and_then(|history| history.avg_request_prefill_kv_computed_tokens)
+        })
+        .or(cumulative_prefill)
+        .filter(|value| value.is_finite() && *value >= 0.0);
+
+    let direct_cache_hit_rate = [
+        "vllm:gpu_prefix_cache_hit_rate",
+        "vllm:prefix_cache_hit_rate",
+    ]
+    .into_iter()
+    .find(|name| metrics.has(name))
+    .map(|name| metrics.mean(name))
+    .filter(|rate| rate.is_finite())
+    .map(|rate| rate.clamp(0.0, 1.0));
+    let recent_cache_hit_rate = previous.as_ref().and_then(|history| {
+        counter_delta_ratio(
+            current.prefix_cache_hits,
+            history.sample.prefix_cache_hits,
+            current.prefix_cache_queries,
+            history.sample.prefix_cache_queries,
+        )
+    });
+    let cumulative_cache_hit_rate = match (current.prefix_cache_hits, current.prefix_cache_queries)
+    {
+        (Some(hits), Some(queries)) if queries > 0.0 => Some((hits / queries).clamp(0.0, 1.0)),
+        _ => None,
+    };
+    let cache_hit_rate = direct_cache_hit_rate
+        .or(recent_cache_hit_rate)
+        .or_else(|| previous.as_ref().and_then(|history| history.cache_hit_rate))
+        .or(cumulative_cache_hit_rate);
+
+    let mut prefill_histogram_deltas = previous
+        .as_ref()
+        .map(|history| history.prefill_histogram_deltas.clone())
+        .unwrap_or_default();
+    let histogram = previous.as_ref().map(|history| {
+        histogram_delta(
+            current.prefill_kv_buckets.as_deref(),
+            history.sample.prefill_kv_buckets.as_deref(),
+        )
+    });
+    match histogram {
+        Some(HistogramDelta::Valid(delta)) => {
+            if delta.last().is_some_and(|(_, count)| *count > 0.0) {
+                prefill_histogram_deltas.push_back(delta);
+                while prefill_histogram_deltas.len() > PREFILL_SIZE_WINDOW_INTERVALS {
+                    prefill_histogram_deltas.pop_front();
+                }
+            }
+        }
+        Some(HistogramDelta::Reset) => prefill_histogram_deltas.clear(),
+        Some(HistogramDelta::Unavailable) | None => {}
+    }
+    if prefill_counter_reset {
+        prefill_histogram_deltas.clear();
+    }
+    let (median_request_prefill_kv_computed_tokens, histogram_size_sample_count) =
+        rolling_histogram_quantile(&prefill_histogram_deltas, 0.5)
+            .map(|(median, count)| (Some(median), Some(count)))
+            .unwrap_or((None, None));
+    let prefill_size_sample_count = (recent_size_count > 0.0)
+        .then_some(recent_size_count.round() as u64)
+        .or(histogram_size_sample_count);
+
+    let mut saturated_prefill_rates = previous
+        .as_ref()
+        .map(|history| history.saturated_prefill_rates.clone())
+        .unwrap_or_default();
+    if prefill_counter_reset || capacity_counter_changed {
+        saturated_prefill_rates.clear();
+    }
+    let waiting = current
+        .waiting
+        .max(previous.as_ref().map(|h| h.sample.waiting).unwrap_or(0.0));
+    let prefill_capacity_learning_active = waiting > 0.0 && prefill_throughput.is_some();
+    if waiting > 0.0 {
+        if let Some(rate) = prefill_throughput {
+            saturated_prefill_rates.push_back(rate);
+            while saturated_prefill_rates.len() > PREFILL_CAPACITY_WINDOW_INTERVALS {
+                saturated_prefill_rates.pop_front();
+            }
+        }
+    }
+    let learned_prefill_capacity = conservative_capacity(&saturated_prefill_rates);
+    let prefill_capacity_sample_count = u32::try_from(saturated_prefill_rates.len()).ok();
+
+    let mut low_load_ttft_samples = previous
+        .as_ref()
+        .map(|history| history.low_load_ttft_samples.clone())
+        .unwrap_or_default();
+    if let Some(history) = previous.as_ref() {
+        if counter_reset(current.ttft_sum, history.sample.ttft_sum)
+            || counter_reset(current.ttft_count, history.sample.ttft_count)
+        {
+            low_load_ttft_samples.clear();
+        } else if current.waiting == 0.0
+            && history.sample.waiting == 0.0
+            && (0.0..=1.0).contains(&current.running)
+            && (0.0..=1.0).contains(&history.sample.running)
+        {
+            if let Some(mean) = counter_delta_mean(
+                current.ttft_sum,
+                history.sample.ttft_sum,
+                current.ttft_count,
+                history.sample.ttft_count,
+            )
+            .filter(|mean| mean.is_finite() && *mean > 0.0)
+            {
+                low_load_ttft_samples.push_back(mean);
+                while low_load_ttft_samples.len() > LOW_LOAD_TTFT_WINDOW {
+                    low_load_ttft_samples.pop_front();
+                }
+            }
+        }
+    }
+    let low_load_ttft_seconds =
+        (low_load_ttft_samples.len() >= LOW_LOAD_TTFT_MIN_SAMPLES).then(|| {
+            let mut values: Vec<_> = low_load_ttft_samples.iter().copied().collect();
+            values.sort_by(f64::total_cmp);
+            let middle = values.len() / 2;
+            if values.len() % 2 == 0 {
+                (values[middle - 1] + values[middle]) / 2.0
+            } else {
+                values[middle]
+            }
+        });
+
+    let recent_queue_delay_seconds = previous.as_ref().and_then(|history| {
+        counter_delta_mean(
+            current.queue_delay_sum,
+            history.sample.queue_delay_sum,
+            current.queue_delay_count,
+            history.sample.queue_delay_count,
+        )
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    });
+    let recent_queue_delay_sample_count = recent_queue_delay_seconds.and_then(|_| {
+        let delta = current.queue_delay_count? - previous.as_ref()?.sample.queue_delay_count?;
+        (delta.is_finite() && delta > 0.0).then_some(delta.round() as u64)
+    });
+
+    let provenance_source = match prefill_source {
+        PrefillCounter::LocalCompute => "local_compute_tokens",
+        PrefillCounter::StartedRequests => "prefill_started_requests",
+        PrefillCounter::CompletedUncached => "completed_uncached_tokens",
+        PrefillCounter::Prompt => "completion_prompt_tokens",
+    };
+    let previous_raw_counter = previous
+        .as_ref()
+        .and_then(|history| history.sample.prefill_counter().1);
+    let size_count = prefill_size_sample_count.or_else(|| {
+        current
+            .prefill_kv_count
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|_| 0)
+    });
+    let prefill_metric_provenance = PrefillMetricProvenance {
+        schema_version: 1,
+        counter_epoch: recovery_counter_epoch,
+        progress_source: Some(provenance_source.to_owned()),
+        raw_counter: prefill_counter.filter(|value| value.is_finite() && *value >= 0.0),
+        previous_raw_counter,
+        interval_seconds: (elapsed > 0.0).then_some(elapsed),
+        interval_started_time_seconds: previous
+            .as_ref()
+            .and_then(|history| history.sample.observed)
+            .map(super::estimated_wait::diagnostic_time),
+        interval_ended_time_seconds: current.observed.map(super::estimated_wait::diagnostic_time),
+        raw_rate: (!capacity_counter_changed && !recovery_reset)
+            .then(|| counter_rate(prefill_counter, previous_raw_counter, elapsed))
+            .flatten(),
+        previous_conversion_size_mean: previous
+            .as_ref()
+            .and_then(|history| history.avg_request_prefill_kv_computed_tokens),
+        current_unshrunk_size_mean: avg_request_prefill_kv_computed_tokens,
+        queue_size_observed_sample_count: size_count,
+        native_size_counter_count: current.prefill_kv_count,
+        capacity_interval_eligible: prefill_capacity_learning_active,
+        counter_reset: recovery_reset,
+    };
+    let derived = EngineDerivedMetrics {
+        prefill_metric_provenance,
+        recovery_counter_epoch,
+        prefill_throughput,
+        timely_prefill_progress,
+        timely_prefill_progress_source,
+        timely_prefill_progress_interval,
+        gen_throughput,
+        avg_request_prefill_kv_computed_tokens,
+        median_request_prefill_kv_computed_tokens,
+        prefill_size_sample_count,
+        learned_prefill_capacity,
+        prefill_capacity_sample_count,
+        prefill_capacity_learning_active: Some(prefill_capacity_learning_active),
+        cache_hit_rate: cache_hit_rate.unwrap_or(0.0),
+        low_load_ttft_seconds,
+        recent_queue_delay_seconds,
+        recent_queue_delay_sample_count,
+    };
+    let history = EngineMetricsHistory {
+        recovery_counter_epoch,
+        sample: current,
+        avg_request_prefill_kv_computed_tokens,
+        cache_hit_rate,
+        prefill_histogram_deltas,
+        saturated_prefill_rates,
+        prefill_size_deltas,
+        low_load_ttft_samples,
+    };
+    (derived, history)
 }
 
 /// DP rank load cache used by load-aware routing policies.
@@ -372,6 +1123,8 @@ pub struct WorkerMonitor {
     /// in-place image upgrade that adds or removes an endpoint is
     /// re-discovered.
     native_loads_memo: Arc<DashMap<String, NativeLoadsMemo>>,
+    engine_metrics_history: Arc<DashMap<String, EngineMetricsHistory>>,
+    native_deadline_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     group_handles: Mutex<HashMap<WorkerGroupKey, GroupState>>,
     event_task: Mutex<Option<JoinHandle<()>>>,
     eviction_flush_task: Mutex<Option<JoinHandle<()>>>,
@@ -533,6 +1286,8 @@ impl WorkerMonitor {
             conditional_polling,
             load_state,
             native_loads_memo: Arc::new(DashMap::new()),
+            engine_metrics_history: Arc::new(DashMap::new()),
+            native_deadline_tasks: Mutex::new(HashMap::new()),
             group_handles: Mutex::new(HashMap::new()),
             event_task: Mutex::new(None),
             eviction_flush_task: Mutex::new(None),
@@ -888,7 +1643,12 @@ impl WorkerMonitor {
         let routing_needs_load = self.policy_registry.needs_backend_loads()
             || self.policy_registry.get_dp_rank_policy().is_some();
         let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
-        routing_needs_load || self.engine_metrics || overload_needs_load
+        routing_needs_load
+            || self.engine_metrics
+            || overload_needs_load
+            || workers
+                .iter()
+                .any(|w| self.worker_registry.estimated_wait().needs_load(w))
     }
 
     /// The poll decision for `url` at `now` from the receipt times of its
@@ -1258,6 +2018,9 @@ impl WorkerMonitor {
     /// inherit stale per-rank loads from a previous incarnation.
     /// Idempotent.
     pub fn stop_all_groups(&self) {
+        for (_, task) in self.native_deadline_tasks.lock().drain() {
+            task.abort();
+        }
         let drained: Vec<(WorkerGroupKey, GroupState)> = {
             let mut handles = self.group_handles.lock();
             handles.drain().collect()
@@ -1283,6 +2046,8 @@ impl WorkerMonitor {
         self.load_state.clear();
         self.worker_load_manager.clear();
         self.native_loads_memo.clear();
+        self.engine_metrics_history.clear();
+        self.worker_registry.estimated_wait().clear();
         // The rank instants go with the loads they describe: a worker whose
         // removal event the lag skipped would otherwise keep its lock and
         // instants for good.
@@ -1406,6 +2171,8 @@ impl WorkerMonitor {
         self.worker_registry.set_worker_overloaded(worker, false);
         self.worker_load_manager.remove_worker(url);
         self.native_loads_memo.remove(url);
+        self.engine_metrics_history.remove(url);
+        self.worker_registry.estimated_wait().evict(worker);
         // The pushed-record state goes with the worker: a replacement is
         // polled until its own stream pushes.
         self.pushed_reports.lock().remove(url);
@@ -1474,15 +2241,12 @@ impl WorkerMonitor {
     ///
     /// `native_loads_memo` is the shared probe memo, or `None` for callers
     /// with no monitor to borrow it from (they simply always discover).
+    #[cfg(test)]
     pub(crate) async fn fetch_http_load(
         worker: &Arc<dyn Worker>,
-        native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
+        memo: Option<&DashMap<String, NativeLoadsMemo>>,
     ) -> Option<WorkerLoadResponse> {
-        if let Some((path, load)) = Self::fetch_native_loads(worker, native_loads_memo).await {
-            liveness::on_contact(worker);
-            return Some(Self::scoped_native_load(path, load, worker.dp_rank()));
-        }
-        Self::fetch_http_gauges(worker).await
+        Self::fetch_http_load_with_history(worker, memo, None).await
     }
 
     /// The whole answer of the first native load route that has one (an
@@ -1538,14 +2302,22 @@ impl WorkerMonitor {
 
     /// The backend-wide gauges of a worker with no native load route.
     async fn fetch_http_gauges(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
+        Self::fetch_http_gauges_with_history(worker, None).await
+    }
+    async fn fetch_http_gauges_with_history(
+        worker: &Arc<dyn Worker>,
+        engine_metrics_history: Option<&DashMap<String, EngineMetricsHistory>>,
+    ) -> Option<WorkerLoadResponse> {
         // Backend-wide gauges cannot be attributed to a virtual DP worker.
         if worker.dp_rank().is_some() {
             return None;
         }
 
         match worker.metadata().spec.runtime_type {
-            RuntimeType::Vllm => Self::fetch_http_load_vllm(worker).await,
-            RuntimeType::Sglang => Self::fetch_http_load_sglang(worker).await,
+            RuntimeType::Vllm => Self::fetch_http_load_vllm(worker, engine_metrics_history).await,
+            RuntimeType::Sglang => {
+                Self::fetch_http_load_sglang(worker, engine_metrics_history).await
+            }
             // Custom engines expose no gauge schema we can parse; the native
             // routes above were their only path.
             _ => None,
@@ -1578,29 +2350,13 @@ impl WorkerMonitor {
             return NativeLoads::Inconclusive;
         }
 
-        // WorkerLoadResponse defaults missing fields for compatibility. Native
-        // route discovery must require an explicit loads array so an unrelated
-        // JSON response is not mistaken for an authoritative empty snapshot.
-        #[derive(serde::Deserialize)]
-        struct NativeResponse {
-            loads: Vec<SchedulerLoadSnapshot>,
-            #[serde(flatten)]
-            response: WorkerLoadResponse,
-        }
-
-        match resp.json::<NativeResponse>().await {
-            // An empty native snapshot is still authoritative: no rank has
-            // telemetry yet. Do not turn it into an aggregate fallback.
-            Ok(NativeResponse {
-                loads,
-                mut response,
-            }) => {
-                response.loads = loads;
-                NativeLoads::Available(response)
+        match resp.json::<serde_json::Value>().await {
+            Ok(value) if value.get("loads").is_some_and(serde_json::Value::is_array) => {
+                Self::decode_native_loads(value)
+                    .map(NativeLoads::Available)
+                    .unwrap_or(NativeLoads::Absent)
             }
-            // A 200 that is not a load response means something else is
-            // mounted here; that is as definitive as a 404.
-            Err(_) => NativeLoads::Absent,
+            _ => NativeLoads::Absent,
         }
     }
 
@@ -1608,7 +2364,10 @@ impl WorkerMonitor {
     /// The KV-cache usage ratio (0.0–1.0) maps onto `token_usage`; it is
     /// exposed as `vllm:gpu_cache_usage_perc` in vLLM v0 and renamed to
     /// `vllm:kv_cache_usage_perc` in vLLM v1, so accept either.
-    async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
+    async fn fetch_http_load_vllm(
+        worker: &Arc<dyn Worker>,
+        history: Option<&DashMap<String, EngineMetricsHistory>>,
+    ) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.base_url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         let m = PromScrape::parse(&body);
@@ -1620,11 +2379,49 @@ impl WorkerMonitor {
             .into_iter()
             .find(|name| m.has(name))?;
 
+        let waiting = m.sum("vllm:num_requests_waiting");
+        if !m.has("vllm:num_requests_waiting") || !waiting.is_finite() || waiting < 0.0 {
+            return None;
+        }
+        let current = vllm_counter_sample(&m, Instant::now());
+        let previous =
+            history.and_then(|store| store.get(worker.url()).map(|sample| sample.value().clone()));
+        let (derived, next) = derive_engine_metrics(&m, current, previous);
+        if let Some(store) = history {
+            store.insert(worker.url().to_string(), next);
+        }
         Some(Self::single_rank(SchedulerLoadSnapshot {
             num_running_reqs: m.sum("vllm:num_requests_running") as i32,
             num_waiting_reqs: m.sum("vllm:num_requests_waiting") as i32,
-            token_usage: m.mean(kv_usage),
-            cache_hit_rate: m.mean("vllm:gpu_prefix_cache_hit_rate"),
+            native_request_counts_available: Some(
+                m.valid_request_counts(&["vllm:num_requests_waiting", "vllm:num_requests_running"]),
+            ),
+            native_request_counts_profile: Some(
+                m.request_counts_profile(derived.recovery_counter_epoch),
+            ),
+            num_waiting_uncached_tokens_available: Some(false),
+            token_usage: m.max(kv_usage),
+            native_kv_usage_available: Some(m.valid_kv_usage(kv_usage)),
+            native_kv_usage_profile: Some(m.kv_usage_profile(kv_usage, "max")),
+            prefill_metric_provenance: Some(derived.prefill_metric_provenance),
+            prefill_throughput: derived.prefill_throughput,
+            timely_prefill_progress: derived.timely_prefill_progress,
+            timely_prefill_progress_source: derived
+                .timely_prefill_progress_source
+                .map(str::to_owned),
+            timely_prefill_progress_interval: derived.timely_prefill_progress_interval,
+            gen_throughput: derived.gen_throughput,
+            avg_request_prefill_kv_computed_tokens: derived.avg_request_prefill_kv_computed_tokens,
+            median_request_prefill_kv_computed_tokens: derived
+                .median_request_prefill_kv_computed_tokens,
+            prefill_size_sample_count: derived.prefill_size_sample_count,
+            learned_prefill_capacity: derived.learned_prefill_capacity,
+            prefill_capacity_sample_count: derived.prefill_capacity_sample_count,
+            prefill_capacity_learning_active: derived.prefill_capacity_learning_active,
+            cache_hit_rate: derived.cache_hit_rate,
+            low_load_ttft_seconds: derived.low_load_ttft_seconds,
+            recent_queue_delay_seconds: derived.recent_queue_delay_seconds,
+            recent_queue_delay_sample_count: derived.recent_queue_delay_sample_count,
             ..Default::default()
         }))
     }
@@ -1634,27 +2431,19 @@ impl WorkerMonitor {
     /// KV-usage ratio (0.0–1.0) is `<prefix>token_usage`, where SGLang used
     /// the `sglang:` metric prefix through v0.5.3 and switched to `sglang_`
     /// in v0.5.4+, so detect whichever is present and use it throughout.
-    async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
+    async fn fetch_http_load_sglang(
+        worker: &Arc<dyn Worker>,
+        history: Option<&DashMap<String, EngineMetricsHistory>>,
+    ) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.base_url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
-        let m = PromScrape::parse(&body);
-
-        // Require the KV-usage gauge — the load signal routing acts on.
-        // Without it `token_usage` would default to 0.0 and hide real KV
-        // pressure, so report unavailable instead. Pick the prefix off it.
-        let prefix = ["sglang:", "sglang_"]
-            .into_iter()
-            .find(|p| m.has(&format!("{p}token_usage")))?;
-
-        Some(Self::single_rank(SchedulerLoadSnapshot {
-            num_running_reqs: m.sum(&format!("{prefix}num_running_reqs")) as i32,
-            num_waiting_reqs: m.sum(&format!("{prefix}num_queue_reqs")) as i32,
-            token_usage: m.mean(&format!("{prefix}token_usage")),
-            gen_throughput: m.mean(&format!("{prefix}gen_throughput")),
-            cache_hit_rate: m.mean(&format!("{prefix}cache_hit_rate")),
-            utilization: m.mean(&format!("{prefix}utilization")),
-            ..Default::default()
-        }))
+        let previous = history.and_then(|store| store.get(worker.url()).map(|v| v.value().clone()));
+        let (snapshot, next) =
+            Self::decode_sglang_metrics_with_history(&body, Instant::now(), previous)?;
+        if let Some(store) = history {
+            store.insert(worker.url().to_owned(), next);
+        }
+        Some(Self::single_rank(snapshot))
     }
 
     /// Shared authenticated GET builder with the standard timeout.
@@ -1754,16 +2543,24 @@ impl WorkerMonitor {
     /// share it. The engine answers once; each member's report is that
     /// answer scoped to its own rank, as its own poll would have had it (a
     /// rank the answer omits is an empty report).
-    async fn fetch_engine_loads(
+    async fn fetch_engine_loads_with_history(
         members: Vec<Arc<dyn Worker>>,
         connection_mode: ConnectionMode,
         native_loads_memo: &DashMap<String, NativeLoadsMemo>,
+        history: Option<&DashMap<String, EngineMetricsHistory>>,
     ) -> Vec<(Arc<dyn Worker>, Option<WorkerLoadResponse>)> {
         let mut reports = Vec::with_capacity(members.len());
         match connection_mode {
             ConnectionMode::Http => {
                 if let [worker] = members.as_slice() {
-                    reports.push(Self::fetch_http_load(worker, Some(native_loads_memo)).await);
+                    reports.push(
+                        Self::fetch_http_load_with_history(
+                            worker,
+                            Some(native_loads_memo),
+                            history,
+                        )
+                        .await,
+                    );
                 } else {
                     match Self::fetch_native_loads(&members[0], Some(native_loads_memo)).await {
                         Some((path, load)) => {
@@ -1797,6 +2594,343 @@ impl WorkerMonitor {
         }
         members.into_iter().zip(reports).collect()
     }
+
+    fn decode_sglang_metrics_with_history(
+        body: &str,
+        observed: Instant,
+        previous: Option<EngineMetricsHistory>,
+    ) -> Option<(SchedulerLoadSnapshot, EngineMetricsHistory)> {
+        let m = PromScrape::parse(body);
+
+        // Require the KV-usage gauge — the load signal routing acts on.
+        // Without it `token_usage` would default to 0.0 and hide real KV
+        // pressure, so report unavailable instead. Pick the prefix off it.
+        let prefix = ["sglang:", "sglang_"]
+            .into_iter()
+            .find(|p| m.has(&format!("{p}token_usage")))?;
+
+        let waiting_name = format!("{prefix}num_queue_reqs");
+        let waiting = m.sum(&waiting_name);
+        if !m.has(&waiting_name) || !waiting.is_finite() || waiting < 0.0 {
+            return None;
+        }
+        // These counters are published together for completed requests. Use
+        // uncached prompt tokens for both size and capacity, never output tokens.
+        let prompt = m.first_sum(&[&format!("{prefix}prompt_tokens_total")]);
+        let cached = m.first_sum(&[&format!("{prefix}cached_tokens_total")]);
+        let uncached = prompt
+            .zip(cached)
+            .and_then(|(prompt, cached)| (prompt >= cached).then_some(prompt - cached));
+        let current = EngineCounterSample {
+            observed: Some(observed),
+            prompt_tokens: uncached,
+            generation_tokens: m.first_sum(&[&format!("{prefix}generation_tokens_total")]),
+            prefill_kv_sum: uncached,
+            prefill_kv_count: m.first_sum(&[&format!("{prefix}num_requests_total")]),
+            waiting,
+            running: m.sum(&format!("{prefix}num_running_reqs")),
+            ttft_sum: m.first_sum(&[&format!("{prefix}time_to_first_token_seconds_sum")]),
+            ttft_count: m.first_sum(&[&format!("{prefix}time_to_first_token_seconds_count")]),
+            prefill_started_count: m.first_sum(&[&format!("{prefix}queue_time_seconds_count")]),
+            queue_delay_sum: m.first_sum(&[&format!("{prefix}queue_time_seconds_sum")]),
+            queue_delay_count: m.first_sum(&[&format!("{prefix}queue_time_seconds_count")]),
+            ..Default::default()
+        };
+        let (derived, next) = derive_engine_metrics(&m, current, previous);
+        Some((
+            SchedulerLoadSnapshot {
+                num_running_reqs: m.sum(&format!("{prefix}num_running_reqs")) as i32,
+                num_waiting_reqs: m.sum(&format!("{prefix}num_queue_reqs")) as i32,
+                native_request_counts_available: Some(m.valid_request_counts(&[
+                    &format!("{prefix}num_queue_reqs"),
+                    &format!("{prefix}num_running_reqs"),
+                ])),
+                native_request_counts_profile: Some(
+                    m.request_counts_profile(derived.recovery_counter_epoch),
+                ),
+                num_waiting_uncached_tokens_available: Some(false),
+                token_usage: m.mean(&format!("{prefix}token_usage")),
+                native_kv_usage_available: Some(m.valid_kv_usage(&format!("{prefix}token_usage"))),
+                native_kv_usage_profile: Some(
+                    m.kv_usage_profile(&format!("{prefix}token_usage"), "mean"),
+                ),
+                // Preserve the reported generation rate; estimated-wait admission
+                // applies its configured floor to demand-starved samples.
+                gen_throughput: m
+                    .first_sum(&[&format!("{prefix}gen_throughput")])
+                    .unwrap_or(-1.0),
+                cache_hit_rate: m.mean(&format!("{prefix}cache_hit_rate")),
+                utilization: m.mean(&format!("{prefix}utilization")),
+                prefill_metric_provenance: Some(derived.prefill_metric_provenance),
+                prefill_throughput: derived.prefill_throughput,
+                timely_prefill_progress: derived.timely_prefill_progress,
+                timely_prefill_progress_source: derived
+                    .timely_prefill_progress_source
+                    .map(str::to_owned),
+                timely_prefill_progress_interval: derived.timely_prefill_progress_interval,
+                avg_request_prefill_kv_computed_tokens: derived
+                    .avg_request_prefill_kv_computed_tokens,
+                prefill_size_sample_count: derived.prefill_size_sample_count,
+                learned_prefill_capacity: derived.learned_prefill_capacity,
+                prefill_capacity_sample_count: derived.prefill_capacity_sample_count,
+                prefill_capacity_learning_active: derived.prefill_capacity_learning_active,
+                low_load_ttft_seconds: derived.low_load_ttft_seconds,
+                recent_queue_delay_seconds: derived.recent_queue_delay_seconds,
+                recent_queue_delay_sample_count: derived.recent_queue_delay_sample_count,
+                ..Default::default()
+            },
+            next,
+        ))
+    }
+
+    #[cfg(test)]
+    fn decode_sglang_metrics(body: &str) -> Option<SchedulerLoadSnapshot> {
+        Self::decode_sglang_metrics_with_history(body, Instant::now(), None)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    fn schedule_native_deadline(
+        self: &Arc<Self>,
+        worker: Arc<dyn Worker>,
+        watermark: Option<super::estimated_wait::PollWatermark>,
+        raw_started: Instant,
+    ) {
+        if !self
+            .worker_registry
+            .estimated_wait()
+            .native_deadline_enabled()
+            || watermark.is_none()
+        {
+            return;
+        }
+        let mut tasks = self.native_deadline_tasks.lock();
+        tasks.retain(|_, task| !task.is_finished());
+        if tasks.len() >= MAX_NATIVE_DEADLINE_POLLS || tasks.contains_key(worker.url()) {
+            return;
+        }
+        let monitor = Arc::downgrade(self);
+        let url = worker.url().to_owned();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "Native side polls are bounded globally, deduplicated per worker, timed out, tracked and aborted on monitor drop/reset"
+        )]
+        let task = tokio::spawn(async move {
+            let native_started = Instant::now();
+            let capture_enabled = native_engine_work_capture::enabled();
+            let mut terminal = capture_enabled.then(|| NativeCaptureTerminalGuard {
+                worker_url: worker.url().to_owned(),
+                raw_started,
+                native_started,
+                completed: false,
+            });
+            let response = Self::fetch_http_native_deadline(&worker, capture_enabled).await;
+            Self::finish_native_deadline_fetch(
+                monitor.upgrade(),
+                &worker,
+                watermark,
+                raw_started,
+                native_started,
+                response,
+            );
+            if let Some(terminal) = terminal.as_mut() {
+                terminal.completed = true;
+            }
+        });
+        tasks.insert(url, task);
+    }
+
+    fn finish_native_deadline_fetch(
+        monitor: Option<Arc<Self>>,
+        worker: &Arc<dyn Worker>,
+        watermark: Option<super::estimated_wait::PollWatermark>,
+        raw_started: Instant,
+        native_started: Instant,
+        response: Result<NativeDeadlineFetch, NativeDeadlineFetchError>,
+    ) {
+        let (native, capture) = match response.as_ref() {
+            Ok(response) => (response.native.as_ref(), response.capture.as_ref()),
+            Err(error) => (None, error.capture.as_ref()),
+        };
+        let transport_timeout = response
+            .as_ref()
+            .is_err_and(NativeDeadlineFetchError::is_timeout);
+        let reason = match monitor.as_ref() {
+            None => Some("monitor_disappeared"),
+            Some(monitor) if !monitor.worker_registry.is_current_ready(worker) => {
+                Some("worker_retired_or_not_ready")
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = reason {
+            if let Some(capture) = capture {
+                let encoded = serde_json::to_string(capture).unwrap_or_else(|_| {
+                    r#"{"available":false,"unavailable_reason":"diagnostic_serialization_failed"}"#.to_owned()
+                });
+                Self::log_native_capture_drop_json(
+                    worker.url(),
+                    raw_started,
+                    native_started,
+                    &encoded,
+                    native.is_some(),
+                    reason,
+                    Some(transport_timeout),
+                );
+            }
+            return;
+        }
+        let monitor = monitor.unwrap(); // The existing readiness fence above remains authoritative.
+        if transport_timeout {
+            monitor
+                .worker_registry
+                .estimated_wait()
+                .publish_native_deadline_timeout(
+                    worker,
+                    watermark,
+                    raw_started,
+                    native_started,
+                    capture,
+                );
+        } else {
+            monitor
+                .worker_registry
+                .estimated_wait()
+                .publish_native_deadline(
+                    worker,
+                    native,
+                    watermark,
+                    raw_started,
+                    native_started,
+                    capture,
+                );
+        }
+    }
+
+    fn log_native_capture_drop_json(
+        worker_url: &str,
+        raw_started: Instant,
+        native_started: Instant,
+        capture: &str,
+        typed_response_present: bool,
+        publication_reason: &'static str,
+        native_transport_timeout: Option<bool>,
+    ) {
+        use super::estimated_wait::diagnostic_time;
+        let received = Instant::now();
+        tracing::debug!(target: "smg::estimated_wait::observation",
+            event="native_engine_work_capture",worker=worker_url,
+            native_engine_work_method="router_native_response_counts_v1",diagnostic_only=true,
+            diagnostic_time_seconds=diagnostic_time(Instant::now()),
+            native_poll_started_time_seconds=diagnostic_time(native_started),
+            native_receipt_time_seconds=diagnostic_time(received),
+            raw_poll_started_time_seconds=diagnostic_time(raw_started),
+            publication_reason,native_contract_reason="not_observed",accepted_by_adapter=false,
+            typed_response_present,native_transport_timeout,native_engine_work_json=capture);
+    }
+
+    async fn fetch_http_native_deadline(
+        worker: &Arc<dyn Worker>,
+        capture_enabled: bool,
+    ) -> Result<NativeDeadlineFetch, NativeDeadlineFetchError> {
+        let url = format!("{}/v1/native_deadline_snapshot", worker.url());
+        let mut response = Self::authed_request(worker, &url)
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .map_err(|error| NativeDeadlineFetchError::new(error, capture_enabled, None, 0))?;
+        if !response.status().is_success() {
+            return Ok(NativeDeadlineFetch::unavailable(
+                capture_enabled,
+                "native_http_status_unavailable",
+                Some(response.status().as_u16()),
+                0,
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_NATIVE_DEADLINE_RESPONSE_BYTES as u64)
+        {
+            return Ok(NativeDeadlineFetch::unavailable(
+                capture_enabled,
+                "native_response_size_limit",
+                Some(response.status().as_u16()),
+                0,
+            ));
+        }
+        let mut body = Vec::new();
+        let status = response.status().as_u16();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            NativeDeadlineFetchError::new(error, capture_enabled, Some(status), body.len())
+        })? {
+            if chunk.len() > MAX_NATIVE_DEADLINE_RESPONSE_BYTES.saturating_sub(body.len()) {
+                return Ok(NativeDeadlineFetch::unavailable(
+                    capture_enabled,
+                    "native_response_size_limit",
+                    Some(response.status().as_u16()),
+                    body.len().saturating_add(chunk.len()),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        // The existing typed parse remains authoritative for native capability.
+        // Diagnostics are separately bounded and never feed that typed value.
+        let native = serde_json::from_slice::<WorkerLoadResponse>(&body).ok();
+        let capture = capture_enabled
+            .then(|| NativeEngineWorkCapture::from_body(&body, response.status().as_u16()));
+        Ok(NativeDeadlineFetch { native, capture })
+    }
+
+    /// Preserve missing queue-token signals before the wire schema fills defaults.
+    pub(crate) fn decode_native_loads(mut value: serde_json::Value) -> Option<WorkerLoadResponse> {
+        if let Some(loads) = value
+            .get_mut("loads")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for load in loads {
+                if let Some(rank) = load.as_object_mut() {
+                    let kv_available = rank
+                        .get("native_kv_usage_available")
+                        .is_none_or(|flag| flag.as_bool() == Some(true))
+                        && rank
+                            .get("token_usage")
+                            .and_then(serde_json::Value::as_f64)
+                            .is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value));
+                    rank.insert("native_kv_usage_available".to_owned(), kv_available.into());
+                    let counts_available = rank
+                        .get("native_request_counts_available")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(false)
+                        && ["num_waiting_reqs", "num_running_reqs"].iter().all(|key| {
+                            rank.get(*key)
+                                .and_then(serde_json::Value::as_i64)
+                                .is_some_and(|n| n >= 0 && n <= i64::from(i32::MAX))
+                        });
+                    rank.insert(
+                        "native_request_counts_available".to_owned(),
+                        counts_available.into(),
+                    );
+                    if !rank.contains_key("num_waiting_uncached_tokens") {
+                        rank.insert(
+                            "num_waiting_uncached_tokens_available".to_owned(),
+                            false.into(),
+                        );
+                    }
+                }
+            }
+        }
+        serde_json::from_value(value).ok()
+    }
+
+    async fn fetch_http_load_with_history(
+        worker: &Arc<dyn Worker>,
+        native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
+        engine_metrics_history: Option<&DashMap<String, EngineMetricsHistory>>,
+    ) -> Option<WorkerLoadResponse> {
+        if let Some((path, load)) = Self::fetch_native_loads(worker, native_loads_memo).await {
+            liveness::on_contact(worker);
+            return Some(Self::scoped_native_load(path, load, worker.dp_rank()));
+        }
+        Self::fetch_http_gauges_with_history(worker, engine_metrics_history).await
+    }
 }
 
 impl Drop for WorkerMonitor {
@@ -1812,6 +2946,9 @@ impl Drop for WorkerMonitor {
         }
         for (_, state) in self.group_handles.get_mut().drain() {
             state.handle.abort();
+        }
+        for (_, task) in self.native_deadline_tasks.get_mut().drain() {
+            task.abort();
         }
     }
 }
@@ -2080,11 +3217,28 @@ async fn poll_group_once(
     for worker in &workers {
         let mode = monitor.poll_mode(worker.url(), now, interval);
         Metrics::record_engine_load_poll(worker.url(), mode.as_str());
-        if mode != PollMode::Suppressed {
+        if mode != PollMode::Suppressed
+            || monitor.worker_registry.estimated_wait().needs_load(worker)
+        {
             polled.push(Arc::clone(worker));
         }
     }
 
+    let mut admission_polls: HashMap<_, _> = polled
+        .iter()
+        .map(|worker| {
+            (
+                worker.url().to_owned(),
+                (
+                    monitor
+                        .worker_registry
+                        .estimated_wait()
+                        .poll_started(worker),
+                    Instant::now(),
+                ),
+            )
+        })
+        .collect();
     let results = if polled.is_empty() {
         debug!("Every worker in group {group_key} pushed its load within {interval:?}; no poll");
         Vec::new()
@@ -2094,9 +3248,15 @@ async fn poll_group_once(
             .map(|members| {
                 let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
                 let connection_mode = group_key.connection_mode;
+                let history = Arc::clone(&monitor.engine_metrics_history);
                 async move {
-                    WorkerMonitor::fetch_engine_loads(members, connection_mode, &native_loads_memo)
-                        .await
+                    WorkerMonitor::fetch_engine_loads_with_history(
+                        members,
+                        connection_mode,
+                        &native_loads_memo,
+                        Some(&history),
+                    )
+                    .await
                 }
             })
             .collect();
@@ -2112,6 +3272,29 @@ async fn poll_group_once(
     let mut dp_evict: Vec<String> = Vec::new();
     for (worker, response) in results {
         let url = worker.url().to_string();
+        if monitor.worker_registry.is_current_ready(&worker) {
+            if let Some((watermark, started)) = admission_polls.remove(&url) {
+                let mut native_watermark = watermark.clone();
+                let raw = monitor
+                    .worker_registry
+                    .estimated_wait()
+                    .publish_with_sg_raw(&worker, response.as_ref(), watermark, started);
+                if let Some(watermark) = native_watermark.as_mut() {
+                    watermark.sg_raw_evidence = raw;
+                    watermark.coherent_raw = monitor
+                        .worker_registry
+                        .estimated_wait()
+                        .coherent_raw_context(&worker, started);
+                }
+                if group_key.connection_mode == ConnectionMode::Http {
+                    monitor.schedule_native_deadline(
+                        Arc::clone(&worker),
+                        native_watermark,
+                        started,
+                    );
+                }
+            }
+        }
         // The overload predicate runs exactly here, once per report, never
         // on a request path, against the worker's effective thresholds
         // (resolved at registration). A failed fetch means no fresh
@@ -2238,6 +3421,88 @@ mod tests;
 
 #[cfg(test)]
 mod native_loads_tests {
+    #[test]
+    fn size_basis_progress_provenance_keeps_explicit_zero_and_previous_conversion_mean() {
+        use super::{derive_engine_metrics, EngineCounterSample, PromScrape};
+        let start = Instant::now();
+        let sample = EngineCounterSample {
+            observed: Some(start),
+            prefill_started_count: Some(10.0),
+            prefill_kv_sum: Some(1000.0),
+            prefill_kv_count: Some(10.0),
+            waiting: 2.0,
+            ..Default::default()
+        };
+        let (first, history) = derive_engine_metrics(&PromScrape::parse(""), sample.clone(), None);
+        assert_eq!(
+            first
+                .prefill_metric_provenance
+                .queue_size_observed_sample_count,
+            Some(0)
+        );
+        assert_eq!(
+            first.prefill_metric_provenance.native_size_counter_count,
+            Some(10.0)
+        );
+        assert_eq!(first.prefill_size_sample_count, None);
+        assert_eq!(first.avg_request_prefill_kv_computed_tokens, Some(100.0));
+        let mut next = sample;
+        next.observed = Some(start + Duration::from_secs(1));
+        next.prefill_started_count = Some(12.0);
+        next.prefill_kv_sum = Some(3000.0);
+        next.prefill_kv_count = Some(11.0);
+        let (derived, history) =
+            derive_engine_metrics(&PromScrape::parse(""), next.clone(), Some(history));
+        let p = &derived.prefill_metric_provenance;
+        assert_eq!(p.raw_counter, Some(12.0));
+        assert_eq!(p.previous_raw_counter, Some(10.0));
+        assert_eq!(p.raw_rate, Some(2.0));
+        assert_eq!(p.previous_conversion_size_mean, Some(100.0));
+        assert_eq!(p.current_unshrunk_size_mean, Some(2000.0));
+        assert_eq!(p.queue_size_observed_sample_count, Some(1));
+        assert_eq!(derived.timely_prefill_progress, Some(200.0));
+        assert!(p.capacity_interval_eligible);
+        next.observed = Some(start + Duration::from_secs(2));
+        next.prefill_started_count = Some(1.0);
+        let (reset, _) = derive_engine_metrics(&PromScrape::parse(""), next, Some(history));
+        assert!(reset.prefill_metric_provenance.counter_reset);
+        assert_eq!(reset.prefill_metric_provenance.raw_rate, None);
+        assert_eq!(reset.timely_prefill_progress, None);
+    }
+
+    #[test]
+    fn recent_queue_delay_uses_counter_deltas_and_rejects_resets_or_no_progress() {
+        use super::{derive_engine_metrics, EngineCounterSample, PromScrape};
+        let metrics = PromScrape::parse("");
+        let before = EngineCounterSample {
+            queue_delay_sum: Some(10.0),
+            queue_delay_count: Some(2.0),
+            ..Default::default()
+        };
+        let (_, history) = derive_engine_metrics(&metrics, before, None);
+        let current = EngineCounterSample {
+            queue_delay_sum: Some(30.0),
+            queue_delay_count: Some(6.0),
+            ..Default::default()
+        };
+        let (derived, history) = derive_engine_metrics(&metrics, current.clone(), Some(history));
+        assert_eq!(derived.recent_queue_delay_seconds, Some(5.0));
+        assert_eq!(derived.recent_queue_delay_sample_count, Some(4));
+        let (same, history) = derive_engine_metrics(&metrics, current, Some(history));
+        assert_eq!(same.recent_queue_delay_seconds, None);
+        let reset = EngineCounterSample {
+            queue_delay_sum: Some(0.0),
+            queue_delay_count: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_engine_metrics(&metrics, reset, Some(history))
+                .0
+                .recent_queue_delay_seconds,
+            None
+        );
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use openai_protocol::{
@@ -2525,7 +3790,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(4),
                 token_usage: None,
-                ..Default::default()
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2551,7 +3816,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(5),
                 token_usage: None,
-                ..Default::default()
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2577,6 +3842,40 @@ mod native_loads_tests {
     /// `--disable-load-monitoring`: without it the feature would silently
     /// never engage under a load-blind policy.
     #[tokio::test]
+    async fn estimated_wait_override_alone_polls_and_sheds_with_monitoring_disabled() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
+        registry
+            .estimated_wait()
+            .configure(crate::worker::estimated_wait::EstimatedWaitConfig {
+                estimated_wait_shadow: false,
+                estimated_wait_provisional_baseline_secs: Some(0.001),
+                ..Default::default()
+            });
+        let worker = vllm_worker_with_overload(
+            &stub.url,
+            OverloadUpdate {
+                max_estimated_wait_secs: Some(0.01),
+                ..Default::default()
+            },
+        );
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(worker.clone()).unwrap();
+        monitor.start_event_loop();
+        wait_until("estimated-wait ingestion to shed", || {
+            registry
+                .estimated_wait()
+                .begin()
+                .unwrap()
+                .check(std::slice::from_ref(&worker), "a")
+                .is_err()
+        })
+        .await;
+        assert!(stub.probes.load(Ordering::SeqCst) > 0);
+        assert!(!worker.is_overloaded());
+    }
+
+    #[tokio::test]
     async fn overload_thresholds_alone_start_load_polling() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
         let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
@@ -2585,7 +3884,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: None,
                 token_usage: Some(0.2),
-                ..Default::default()
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2643,7 +3942,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(1),
                 token_usage: None,
-                ..Default::default()
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2695,7 +3994,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(1),
                 token_usage: None,
-                ..Default::default()
+                max_estimated_wait_secs: None,
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2912,6 +4211,8 @@ mod native_loads_tests {
                 .expect("metrics fallback");
             assert_eq!(resp.loads[0].num_running_reqs, 7);
             assert_eq!(resp.loads[0].num_waiting_reqs, 11);
+            assert_eq!(resp.loads[0].native_kv_usage_available, Some(true));
+            assert!(resp.loads[0].native_kv_usage_profile.is_some());
         }
 
         let hit = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
@@ -3553,5 +4854,752 @@ mod native_loads_tests {
             cached.get(worker.url()).and_then(|ranks| ranks.get(&0)),
             Some(&2048)
         );
+    }
+
+    #[tokio::test]
+    async fn native_deadline_side_poll_never_delays_or_changes_raw_metrics_and_is_default_off() {
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+        for mode in ["off", "slow", "malformed", "unavailable"] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let unauthorized = Arc::new(AtomicUsize::new(0));
+            let gate = Arc::new(Notify::new());
+            let counter = Arc::clone(&hits);
+            let wrong_auth = Arc::clone(&unauthorized);
+            let endpoint_gate = Arc::clone(&gate);
+            let app = axum::Router::new()
+                .route("/metrics", axum::routing::get(|| async { VLLM_METRICS }))
+                .route("/v1/native_deadline_snapshot", axum::routing::get(move |headers: http::HeaderMap| {
+                    let counter = Arc::clone(&counter); let wrong_auth = Arc::clone(&wrong_auth); let endpoint_gate = Arc::clone(&endpoint_gate);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        if headers.get("authorization").and_then(|h| h.to_str().ok()) != Some("Bearer native-test-key") {
+                            wrong_auth.fetch_add(1, Ordering::SeqCst);
+                            return (StatusCode::UNAUTHORIZED, "unauthorized");
+                        }
+                        if mode == "slow" { endpoint_gate.notified().await; }
+                        if mode == "unavailable" { (StatusCode::NOT_FOUND, "absent") }
+                        else { (StatusCode::OK, "{\"loads\":[{\"dp_rank\":0,\"deadline_recovery\":\"malformed\"}]}") }
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Loopback contract-test server is aborted after the assertion"
+            )]
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+            registry.estimated_wait().configure(EstimatedWaitConfig {
+                max_estimated_wait_secs: Some(300.0),
+                estimated_wait_calibration_shadow: true,
+                estimated_wait_feature_shadow: mode != "off",
+                ..Default::default()
+            });
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(&url)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Http)
+                    .runtime_type(RuntimeType::Vllm)
+                    .model(ModelCard::new("a"))
+                    .api_key("native-test-key")
+                    .status(WorkerStatus::Ready)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            );
+            let mut expected = WorkerMonitor::fetch_http_load(&worker, None).await.unwrap();
+            registry.register(Arc::clone(&worker)).unwrap();
+            let mut rx = monitor.subscribe();
+            monitor.start_event_loop();
+            let mut actual = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if let Some(load) = rx.borrow().get(&url) {
+                        break load.clone();
+                    }
+                    rx.changed().await.unwrap();
+                }
+            })
+            .await
+            .expect("raw publication must not wait for 2s native side timeout");
+            // These independent scrapes record different diagnostic endpoints.
+            // Every original raw field and all other provenance still match.
+            for rank in actual.loads.iter_mut().chain(expected.loads.iter_mut()) {
+                if let Some(p) = &mut rank.prefill_metric_provenance {
+                    p.interval_started_time_seconds = None;
+                    p.interval_ended_time_seconds = None;
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "{mode}"
+            );
+            if mode == "off" {
+                assert_eq!(hits.load(Ordering::SeqCst), 0);
+                assert!(monitor.native_deadline_tasks.lock().is_empty());
+            } else {
+                wait_until("native side probe", || hits.load(Ordering::SeqCst) == 1).await;
+                assert_eq!(unauthorized.load(Ordering::SeqCst), 0);
+                if mode == "slow" {
+                    monitor.schedule_native_deadline(
+                        Arc::clone(&worker),
+                        registry.estimated_wait().poll_started(&worker),
+                        Instant::now(),
+                    );
+                    assert_eq!(monitor.native_deadline_tasks.lock().len(), 1);
+                    assert_eq!(hits.load(Ordering::SeqCst), 1);
+                }
+            }
+            gate.notify_waiters();
+            monitor.stop_all_groups();
+            server.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_engine_work_capture_retirement_monitor_drop_and_task_abort_are_terminal() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter(Arc::clone(&bytes));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let mut expected = Vec::new();
+        for mode in ["retired", "monitor_gone", "retired_timeout", "aborted"] {
+            let seen = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let hits = Arc::new(AtomicUsize::new(0));
+            let handler_seen = Arc::clone(&seen);
+            let handler_release = Arc::clone(&release);
+            let handler_hits = Arc::clone(&hits);
+            let app = axum::Router::new().route(
+                "/v1/native_deadline_snapshot",
+                axum::routing::get(move || {
+                    let seen = Arc::clone(&handler_seen);
+                    let release = Arc::clone(&handler_release);
+                    let hits = Arc::clone(&handler_hits);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        seen.notify_one();
+                        release.notified().await;
+                        include_str!(concat!(
+                            env!("CARGO_MANIFEST_DIR"),
+                            "/tests/fixtures/native_deadline/vllm_active.json"
+                        ))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded loopback held-response server aborted after fetch"
+            )]
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let registry = Arc::new(WorkerRegistry::new());
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(&url)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Http)
+                    .runtime_type(RuntimeType::Vllm)
+                    .model(ModelCard::new("a"))
+                    .status(WorkerStatus::Ready)
+                    .build(),
+            );
+            let id = registry.register(Arc::clone(&worker)).unwrap();
+            let monitor = Arc::new(WorkerMonitor::new(
+                Arc::clone(&registry),
+                Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+                1,
+                false,
+                false,
+            ));
+            let weak = Arc::downgrade(&monitor);
+            let original_worker = Arc::clone(&worker);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded held fetch tests terminal/drop behavior without monitor task ownership"
+            )]
+            let fetch = tokio::spawn(async move {
+                let raw_started = Instant::now();
+                let native_started = Instant::now();
+                let mut terminal = NativeCaptureTerminalGuard {
+                    worker_url: original_worker.url().to_owned(),
+                    raw_started,
+                    native_started,
+                    completed: false,
+                };
+                let response =
+                    WorkerMonitor::fetch_http_native_deadline(&original_worker, true).await;
+                WorkerMonitor::finish_native_deadline_fetch(
+                    weak.upgrade(),
+                    &original_worker,
+                    None,
+                    raw_started,
+                    native_started,
+                    response,
+                );
+                terminal.completed = true;
+            });
+            seen.notified().await;
+            match mode {
+                "monitor_gone" => {
+                    drop(monitor);
+                    release.notify_one();
+                    expected.push(("monitor_disappeared", false));
+                }
+                "aborted" => {
+                    fetch.abort();
+                    expected.push(("poll_task_dropped_before_terminal_observation", false));
+                }
+                _ => {
+                    registry.remove(&id);
+                    if mode != "retired_timeout" {
+                        release.notify_one();
+                    }
+                    expected.push(("worker_retired_or_not_ready", mode == "retired_timeout"));
+                }
+            }
+            if mode == "aborted" {
+                assert!(fetch.await.unwrap_err().is_cancelled());
+            } else {
+                fetch.await.unwrap();
+            }
+            server.abort();
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes.lock())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(events
+            .iter()
+            .all(|e| e["fields"]["event"] != "native_deadline_poll"));
+        let captures: Vec<_> = events
+            .iter()
+            .map(|e| &e["fields"])
+            .filter(|e| e["event"] == "native_engine_work_capture")
+            .collect();
+        assert_eq!(captures.len(), 4);
+        for (event, (reason, timeout)) in captures.iter().zip(expected) {
+            assert_eq!(event["publication_reason"], reason);
+            assert_eq!(event["accepted_by_adapter"], false);
+            if reason == "poll_task_dropped_before_terminal_observation" {
+                assert!(event
+                    .get("native_transport_timeout")
+                    .is_none_or(serde_json::Value::is_null));
+            } else {
+                assert_eq!(event["native_transport_timeout"], timeout);
+            }
+            let capture: serde_json::Value =
+                serde_json::from_str(event["native_engine_work_json"].as_str().unwrap()).unwrap();
+            if reason == "poll_task_dropped_before_terminal_observation" {
+                assert_eq!(capture["bytes_observed"], serde_json::Value::Null);
+                assert_eq!(capture["response_sha256"], serde_json::Value::Null);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_engine_work_capture_partial_body_error_and_timeout_preserve_prefix_metadata() {
+        const PREFIX: &[u8] = b"{\"loads\":";
+        for timeout in [false, true] {
+            let prefix_sent = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let handler_seen = Arc::clone(&prefix_sent);
+            let handler_release = Arc::clone(&release);
+            let app = axum::Router::new().route(
+                "/v1/native_deadline_snapshot",
+                axum::routing::get(move || {
+                    let seen = Arc::clone(&handler_seen);
+                    let release = Arc::clone(&handler_release);
+                    async move {
+                        let stream = futures::stream::unfold(0, move |step| {
+                            let seen = Arc::clone(&seen);
+                            let release = Arc::clone(&release);
+                            async move {
+                                match step {
+                                    0 => Some((
+                                        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                                            PREFIX,
+                                        )),
+                                        1,
+                                    )),
+                                    1 => {
+                                        seen.notify_one();
+                                        if timeout {
+                                            std::future::pending::<()>().await;
+                                        }
+                                        release.notified().await;
+                                        Some((Err(std::io::Error::other("SECRET_BODY_ERROR")), 2))
+                                    }
+                                    _ => None,
+                                }
+                            }
+                        });
+                        axum::response::Response::builder()
+                            .status(200)
+                            .body(axum::body::Body::from_stream(stream))
+                            .unwrap()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker = vllm_worker(&format!("http://{}", listener.local_addr().unwrap()));
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded loopback body-error server aborted after test"
+            )]
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded local fetch awaited by this test"
+            )]
+            let fetch = tokio::spawn(async move {
+                WorkerMonitor::fetch_http_native_deadline(&worker, true).await
+            });
+            prefix_sent.notified().await;
+            tokio::task::yield_now().await;
+            if !timeout {
+                release.notify_one();
+            }
+            let error = fetch.await.unwrap().unwrap_err();
+            server.abort();
+            assert_eq!(error.is_timeout(), timeout);
+            let value = serde_json::to_value(error.capture.unwrap()).unwrap();
+            assert_eq!(value["http_status"], 200);
+            assert_eq!(value["bytes_observed"], PREFIX.len());
+            assert_eq!(value["response_complete"], false);
+            assert_eq!(value["response_bytes"], serde_json::Value::Null);
+            assert_eq!(value["response_sha256"], serde_json::Value::Null);
+            let reason = if timeout {
+                "native_body_read_timeout"
+            } else {
+                "native_body_read_error"
+            };
+            assert_eq!(value["unavailable_reason"], reason);
+            assert_eq!(value["failure_reason_counts"][reason], 1);
+            assert!(!value.to_string().contains("SECRET_BODY_ERROR"));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_engine_work_capture_http_and_size_failures_have_no_full_response_hash() {
+        for (status, body) in [
+            (StatusCode::UNAUTHORIZED, "rejected".to_owned()),
+            (
+                StatusCode::OK,
+                "x".repeat(MAX_NATIVE_DEADLINE_RESPONSE_BYTES + 1),
+            ),
+        ] {
+            let app = axum::Router::new().route(
+                "/v1/native_deadline_snapshot",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { (status, body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker = vllm_worker(&format!("http://{}", listener.local_addr().unwrap()));
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded loopback failure test server aborted after fetch"
+            )]
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let response = WorkerMonitor::fetch_http_native_deadline(&worker, true)
+                .await
+                .unwrap();
+            server.abort();
+            assert!(response.native.is_none());
+            let capture = serde_json::to_value(response.capture.unwrap()).unwrap();
+            assert_eq!(capture["response_complete"], false);
+            assert_eq!(capture["response_sha256"], serde_json::Value::Null);
+            assert_eq!(capture["response_bytes"], serde_json::Value::Null);
+            assert_eq!(capture["available"], false);
+            assert_eq!(capture["http_status"], status.as_u16());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_engine_work_capture_fetch_is_opt_in_and_cannot_change_typed_base() {
+        use sha2::{Digest, Sha256};
+
+        let mut wire: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/native_deadline/vllm_active.json"
+        )))
+        .unwrap();
+        // The diagnostic can be malformed while the authoritative native
+        // inventory remains valid. Unknown response content is never retained.
+        wire["loads"][0]["deadline_recovery"]["engine_work_progress"] = serde_json::Value::Null;
+        wire["prompt"] = "SECRET_PROMPT_MUST_NOT_BE_CAPTURED".into();
+        let body = serde_json::to_string(&wire).unwrap();
+        let expected: WorkerLoadResponse = serde_json::from_str(&body).unwrap();
+        let expected_sha = Sha256::digest(body.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        for enabled in [false, true] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let handler_hits = Arc::clone(&hits);
+            let response_body = body.clone();
+            let app = axum::Router::new().route(
+                "/v1/native_deadline_snapshot",
+                axum::routing::get(move || {
+                    let body = response_body.clone();
+                    handler_hits.fetch_add(1, Ordering::SeqCst);
+                    async move { body }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let worker = vllm_worker(&format!("http://{}", listener.local_addr().unwrap()));
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded loopback diagnostic test server aborted after fetch"
+            )]
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let response = WorkerMonitor::fetch_http_native_deadline(&worker, enabled)
+                .await
+                .unwrap();
+            server.abort();
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                serde_json::to_value(response.native.unwrap()).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+            assert_eq!(response.capture.is_some(), enabled);
+            if let Some(capture) = response.capture {
+                let value = serde_json::to_value(&capture).unwrap();
+                assert_eq!(value["response_sha256"], expected_sha);
+                assert_eq!(value["response_complete"], true);
+                assert_eq!(value["available"], false);
+                assert!(!serde_json::to_string(&capture)
+                    .unwrap()
+                    .contains("SECRET_PROMPT_MUST_NOT_BE_CAPTURED"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_deadline_fetch_classifies_timeout_without_excusing_rejected_or_malformed_data()
+    {
+        for mode in ["timeout", "rejected", "malformed"] {
+            let app = axum::Router::new().route(
+                "/v1/native_deadline_snapshot",
+                axum::routing::get(move || async move {
+                    if mode == "timeout" {
+                        tokio::time::sleep(Duration::from_secs(4)).await;
+                    }
+                    if mode == "rejected" {
+                        (StatusCode::UNAUTHORIZED, "rejected")
+                    } else {
+                        (StatusCode::OK, "not a native inventory")
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "Bounded loopback test server aborted after fetch"
+            )]
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(&url)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Http)
+                    .runtime_type(RuntimeType::Vllm)
+                    .model(ModelCard::new("a"))
+                    .status(WorkerStatus::Ready)
+                    .build(),
+            );
+            let result = WorkerMonitor::fetch_http_native_deadline(&worker, false).await;
+            server.abort();
+            if mode == "timeout" {
+                assert!(result.unwrap_err().is_timeout());
+            } else {
+                let response = result.unwrap();
+                assert!(response.native.is_none());
+                assert!(response.capture.is_none());
+            }
+        }
+    }
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+}
+
+fn histogram_bound(head: &str) -> Option<f64> {
+    head.match_indices("le=\"").find_map(|(index, _)| {
+        matches!(
+            head[..index].trim_end().chars().next_back(),
+            Some('{') | Some(',')
+        )
+        .then(|| &head[index + 4..])
+        .and_then(|tail| tail.split_once('"'))
+        .and_then(|(bound, _)| bound.parse::<f64>().ok())
+    })
+}
+
+fn local_compute_source(head: &str) -> bool {
+    const LABEL: &str = "source=\"local_compute\"";
+    head.match_indices(LABEL).any(|(index, _)| {
+        matches!(
+            head[..index].trim_end().chars().next_back(),
+            Some('{') | Some(',')
+        ) && matches!(
+            head[index + LABEL.len()..].trim_start().chars().next(),
+            Some(',') | Some('}')
+        )
+    })
+}
+
+impl NativeDeadlineFetch {
+    fn unavailable(
+        capture_enabled: bool,
+        reason: &'static str,
+        status: Option<u16>,
+        bytes_observed: usize,
+    ) -> Self {
+        Self {
+            native: None,
+            capture: capture_enabled
+                .then(|| NativeEngineWorkCapture::unavailable(reason, status, bytes_observed)),
+        }
+    }
+}
+
+impl Drop for NativeCaptureTerminalGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let capture = NativeEngineWorkCapture::unavailable("native_poll_task_dropped", None, 0);
+            let mut value = serde_json::to_value(capture).unwrap_or(serde_json::Value::Null);
+            // Cancellation/panic can drop the fetch at an arbitrary await.
+            // Its unreturned prefix is unknown here; never claim zero bytes.
+            if let Some(value) = value.as_object_mut() {
+                value.insert("bytes_observed".into(), serde_json::Value::Null);
+            }
+            WorkerMonitor::log_native_capture_drop_json(
+                &self.worker_url,
+                self.raw_started,
+                self.native_started,
+                &value.to_string(),
+                false,
+                "poll_task_dropped_before_terminal_observation",
+                None,
+            );
+        }
+    }
+}
+
+struct NativeCaptureTerminalGuard {
+    worker_url: String,
+    raw_started: Instant,
+    native_started: Instant,
+    completed: bool,
+}
+
+impl NativeDeadlineFetchError {
+    fn new(error: reqwest::Error, enabled: bool, status: Option<u16>, observed: usize) -> Self {
+        let reason = match (status.is_some(), error.is_timeout()) {
+            (true, true) => "native_body_read_timeout",
+            (true, false) => "native_body_read_error",
+            (false, true) => "native_transport_timeout",
+            (false, false) => "native_transport_error",
+        };
+        Self {
+            error,
+            capture: enabled
+                .then(|| NativeEngineWorkCapture::unavailable(reason, status, observed)),
+        }
+    }
+
+    fn is_timeout(&self) -> bool {
+        self.error.is_timeout()
+    }
+}
+
+#[derive(Debug)]
+struct NativeDeadlineFetchError {
+    error: reqwest::Error,
+    capture: Option<NativeEngineWorkCapture>,
+}
+
+#[derive(Debug)]
+struct NativeDeadlineFetch {
+    native: Option<WorkerLoadResponse>,
+    capture: Option<NativeEngineWorkCapture>,
+}
+
+const MAX_NATIVE_DEADLINE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+const MAX_NATIVE_DEADLINE_POLLS: usize = 32;
+
+#[cfg(test)]
+mod estimated_wait_metrics_tests {
+    use super::PromScrape;
+
+    #[test]
+    fn feature_kv_requires_every_reported_series_to_be_valid() {
+        for name in [
+            "vllm:gpu_cache_usage_perc",
+            "vllm:kv_cache_usage_perc",
+            "sglang:token_usage",
+            "sglang_token_usage",
+        ] {
+            let good = format!("{name}{{rank=\"0\"}} 0\n{name}{{rank=\"1\"}} 1");
+            assert!(PromScrape::parse(&good).valid_kv_usage(name));
+            assert!(!PromScrape::parse("").valid_kv_usage(name));
+            for bad in ["bad", "NaN", "+Inf", "-0.01", "1.01", ""] {
+                let body = format!("{name}{{rank=\"0\"}} 0.5\n{name}{{rank=\"1\"}} {bad}");
+                assert!(!PromScrape::parse(&body).valid_kv_usage(name), "{body}");
+                assert!(!PromScrape::parse(&format!("{name} {bad}")).valid_kv_usage(name));
+            }
+            let duplicate = format!("{name}{{rank=\"0\"}} 0.1\n{name}{{rank=\"0\"}} 0.2");
+            assert!(!PromScrape::parse(&duplicate).valid_kv_usage(name));
+        }
+    }
+
+    #[test]
+    fn feature_kv_profile_tracks_source_not_value_or_series_order() {
+        let name = "vllm:kv_cache_usage_perc";
+        let first = PromScrape::parse(&format!(
+            "{name}{{rank=\"0\"}} 0.1\n{name}{{rank=\"1\"}} 0.2"
+        ));
+        let reordered = PromScrape::parse(&format!(
+            "{name}{{rank=\"1\"}} 0.9\n{name}{{rank=\"0\"}} 0.8"
+        ));
+        assert_eq!(
+            first.kv_usage_profile(name, "max"),
+            reordered.kv_usage_profile(name, "max")
+        );
+        let fewer = PromScrape::parse(&format!("{name}{{rank=\"0\"}} 0.1"));
+        assert_ne!(
+            first.kv_usage_profile(name, "max"),
+            fewer.kv_usage_profile(name, "max")
+        );
+        assert_ne!(
+            first.kv_usage_profile(name, "max"),
+            first.kv_usage_profile(name, "mean")
+        );
+    }
+
+    #[test]
+    fn feature_kv_native_json_distinguishes_measured_zero_from_missing() {
+        use serde_json::json;
+        for (rank, expected) in [
+            (json!({}), false),
+            (json!({"token_usage": 0.0}), true),
+            (json!({"token_usage": 1.0}), true),
+            (json!({"token_usage": -0.01}), false),
+            (json!({"token_usage": 1.01}), false),
+            (json!({"native_kv_usage_available": true}), false),
+            (
+                json!({"token_usage": 0.2, "native_kv_usage_available": false}),
+                false,
+            ),
+            (
+                json!({"token_usage": 0.2, "native_kv_usage_available": "true"}),
+                false,
+            ),
+            (
+                json!({"token_usage": 0.2, "native_kv_usage_available": null}),
+                false,
+            ),
+        ] {
+            let response = super::WorkerMonitor::decode_native_loads(json!({"loads": [rank]}))
+                .expect("valid native load envelope");
+            assert_eq!(response.loads[0].native_kv_usage_available, Some(expected));
+        }
+        let legacy: openai_protocol::worker::SchedulerLoadSnapshot =
+            serde_json::from_value(json!({"token_usage": 0.0})).unwrap();
+        assert_eq!(legacy.native_kv_usage_available, None);
+    }
+
+    #[test]
+    fn feature_kv_sglang_metadata_does_not_change_legacy_aggregation() {
+        for prefix in ["sglang:", "sglang_"] {
+            let base = format!("{prefix}num_queue_reqs 1\n{prefix}num_running_reqs 2\n");
+            let valid = format!("{base}{prefix}token_usage{{rank=\"0\"}} 0.2\n{prefix}token_usage{{rank=\"1\"}} 0.8");
+            let snapshot = super::WorkerMonitor::decode_sglang_metrics(&valid).unwrap();
+            assert_eq!(snapshot.token_usage, 0.5);
+            assert_eq!(snapshot.native_kv_usage_available, Some(true));
+            let malformed = valid.replace(" 0.8", " bad");
+            let invalid = super::WorkerMonitor::decode_sglang_metrics(&malformed).unwrap();
+            assert_eq!(invalid.token_usage, 0.2); // Existing aggregation is unchanged.
+            assert_eq!(invalid.native_kv_usage_available, Some(false));
+            assert_eq!(
+                snapshot.native_kv_usage_profile,
+                invalid.native_kv_usage_profile
+            );
+            assert!(snapshot.native_kv_usage_profile.is_some());
+        }
+    }
+
+    #[test]
+    fn recovery_counts_reject_missing_malformed_mixed_rank_gauges_and_change_profile() {
+        let valid="vllm:num_requests_waiting{rank=\"0\"} 10\nvllm:num_requests_running{rank=\"0\"} 2\nvllm:num_requests_waiting{rank=\"1\"} 5\nvllm:num_requests_running{rank=\"1\"} 2";
+        let names = ["vllm:num_requests_waiting", "vllm:num_requests_running"];
+        let good = PromScrape::parse(valid);
+        assert!(good.valid_request_counts(&names));
+        for bad in ["bad", "NaN", "+Inf", "-1", "0.5"] {
+            let mixed = PromScrape::parse(&valid.replace(
+                "running{rank=\"1\"} 2",
+                &format!("running{{rank=\"1\"}} {bad}"),
+            ));
+            assert!(!mixed.valid_request_counts(&names), "{bad}");
+            assert_eq!(
+                good.request_counts_profile(0),
+                mixed.request_counts_profile(0)
+            );
+        }
+        let missing_rank =
+            PromScrape::parse(&valid.replace("vllm:num_requests_waiting{rank=\"1\"} 5\n", ""));
+        assert!(!missing_rank.valid_request_counts(&names));
+        let missing_token =
+            PromScrape::parse(&valid.replace("waiting{rank=\"1\"} 5", "waiting{rank=\"1\"}"));
+        assert!(!missing_token.valid_request_counts(&names));
+        let duplicate = PromScrape::parse(&format!(
+            "{valid}\nvllm:num_requests_waiting{{rank=\"1\"}} 5"
+        ));
+        assert!(!duplicate.valid_request_counts(&names));
+        let missing = PromScrape::parse("vllm:num_requests_waiting 10");
+        assert!(!missing.valid_request_counts(&names));
+        assert_ne!(
+            good.request_counts_profile(0),
+            good.request_counts_profile(1)
+        );
+        assert_ne!(
+            good.request_counts_profile(0),
+            PromScrape::parse(&valid.replace("rank=\"1\"", "rank=\"2\"")).request_counts_profile(0)
+        );
+    }
+
+    #[test]
+    fn maximum_kv_sample_preserves_saturation_and_invalid_data() {
+        let scrape = PromScrape::parse(
+            "vllm:kv_cache_usage_perc{rank=\"0\"} 0.99\nvllm:kv_cache_usage_perc{rank=\"1\"} 0.1",
+        );
+        assert_eq!(scrape.max("vllm:kv_cache_usage_perc"), 0.99);
+        let scrape = PromScrape::parse("kv 0.5\nkv NaN");
+        assert!(scrape.max("kv").is_nan());
     }
 }

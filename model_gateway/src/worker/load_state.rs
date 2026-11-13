@@ -38,7 +38,7 @@ use std::{
     time::Instant,
 };
 
-use openai_protocol::worker::{WorkerLoadResponse, WorkerStatus};
+use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::Mutex;
 use tokio::sync::{watch, Notify};
 
@@ -269,11 +269,7 @@ impl LoadState {
     }
 
     fn is_current_incarnation(&self, worker: &Arc<dyn Worker>) -> bool {
-        self.registry
-            .get_by_url(worker.url())
-            .is_some_and(|current| {
-                Arc::ptr_eq(&current, worker) && current.status() == WorkerStatus::Ready
-            })
+        self.registry.is_current_ready(worker)
     }
 
     /// Queue a worker's eviction and wake the flusher. The snapshot changes
@@ -480,7 +476,7 @@ mod tests {
         let worker = ready_worker("http://w1:8080", "m");
         registry.register(Arc::clone(&worker)).unwrap();
 
-        worker.set_status(WorkerStatus::NotReady);
+        worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
         state.publish_group(&[], vec![(Arc::clone(&worker), load(1))]);
 
         assert!(state.snapshot().is_empty());

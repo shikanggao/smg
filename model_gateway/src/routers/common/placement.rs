@@ -18,6 +18,7 @@ use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
 };
+use parking_lot::Mutex;
 use rand::RngExt;
 use smg_policy_controller::{Decision, LeaseId, Phase, Side, Target, WorkerId, MAX_TARGETS};
 use tracing::{debug, warn};
@@ -38,6 +39,7 @@ use crate::{
         error,
     },
     worker::{
+        estimated_wait::CalibrationForecast,
         overload::{BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION},
         ConnectionMode, ConnectionModeExt, PdPairIndex, PrefillCandidateError,
         PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerRegistry, WorkerType,
@@ -112,6 +114,9 @@ pub(crate) type CandidateFilter<'a> = &'a (dyn Fn(&dyn Worker) -> bool + Sync);
 /// Everything a single-worker placement reads from the request.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PlacementInputs<'a> {
+    pub calibration: Option<&'a Mutex<Option<CalibrationForecast>>>,
+    pub feature_context_supported: bool,
+    pub request_started: Option<std::time::Instant>,
     /// Request text for cache-aware routing.
     pub text: Option<&'a str>,
     /// Tokenized request, or a valid routing-tokens hint, for prefix hashing.
@@ -246,7 +251,7 @@ pub(crate) fn select_single(
     pool: RoutingPool,
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
-) -> Option<Arc<dyn Worker>> {
+) -> Result<Option<Arc<dyn Worker>>, Response> {
     // The request's sequence comes before the pool read: a worker retired
     // from here on is booked by no commit of this request, however the
     // retirement interleaves with the capture and the decision.
@@ -271,23 +276,148 @@ pub(crate) fn select_from(
     model_id: &str,
     candidates: &[Arc<dyn Worker>],
     inputs: PlacementInputs<'_>,
+) -> Result<Option<Arc<dyn Worker>>, Response> {
+    // Narrow before admission as well as selection: rejected wire/candidate
+    // entries cannot make a qualified cohort look available.
+    let filtered;
+    let candidates = if let Some(accepts) = inputs.candidate_filter {
+        filtered = candidates
+            .iter()
+            .filter(|w| accepts(w.as_ref()))
+            .cloned()
+            .collect::<Vec<_>>();
+        filtered.as_slice()
+    } else {
+        candidates
+    };
+    let mut admission = registry.estimated_wait().begin();
+    if admission.is_none() {
+        return Ok(select_from_policy(
+            registry, policies, model_id, candidates, inputs,
+        ));
+    }
+    let request_id = inputs
+        .headers
+        .and_then(|h| h.get("opc-request-id"))
+        .and_then(|v| v.to_str().ok());
+    let feature_worker = crate::worker::estimated_wait::AdmissionGuard::feature_scope(
+        candidates,
+        inputs.feature_context_supported,
+    );
+    let policy = policies.get_policy_or_default(model_id);
+    let eligibility_info = SelectWorkerInfo {
+        headers: inputs.headers,
+        routing_key: policies.sticky_header_key(inputs.headers),
+        rid_key: inputs.rid_key,
+        ..Default::default()
+    };
+    let lifted = !registry.overload_shed_enabled()
+        && policy.routes_by_session_key(&eligibility_info)
+        && candidates
+            .iter()
+            .all(|w| *w.worker_type() == WorkerType::Regular);
+    let mut admission_candidates: Vec<_> = candidates
+        .iter()
+        .filter(|w| w.is_available() || (lifted && overload::vetoed_by_overload_alone(w.as_ref())))
+        .cloned()
+        .collect();
+    // Admission sees the same soft retry exclusion as placement, without
+    // changing the slice indexed by an explicit target.
+    if !inputs.tried.is_empty() && !strict_target(policy.as_ref(), inputs.headers) {
+        let untried: Vec<_> = admission_candidates
+            .iter()
+            .filter(|w| !inputs.tried.iter().any(|engine| engine == w.base_url()))
+            .cloned()
+            .collect();
+        if !untried.is_empty() {
+            admission_candidates = untried;
+        }
+    }
+    if admission_candidates.is_empty() && overload::all_vetoed(candidates) {
+        admission_candidates = candidates
+            .iter()
+            .filter(|w| {
+                w.is_healthy()
+                    && w.circuit_breaker_can_execute()
+                    && (!registry.overload_shed_enabled() || !w.is_overloaded())
+            })
+            .cloned()
+            .collect();
+    }
+    let mut frozen_forecast = None;
+    if let Some(guard) = &mut admission {
+        guard.record_forecast(
+            candidates,
+            inputs
+                .headers
+                .and_then(|headers| headers.get("opc-request-id"))
+                .and_then(|value| value.to_str().ok()),
+            feature_worker,
+        );
+        let reject = if let Some(worker) = feature_worker {
+            frozen_forecast = guard.capture_calibration(worker, request_id);
+            guard.attach_feature_context(worker, &mut frozen_forecast);
+            let prediction = frozen_forecast
+                .as_ref()
+                .and_then(|f| f.selected_prediction())
+                .map(|p| {
+                    p.with_router_elapsed(
+                        inputs
+                            .request_started
+                            .map_or(0.0, |s| s.elapsed().as_secs_f64()),
+                    )
+                });
+            let threshold = guard.threshold(worker);
+
+            !registry.estimated_wait().is_shadow()
+                && prediction.is_some_and(|p| p.exceeds(threshold))
+        } else {
+            guard.check_cohort(&admission_candidates, model_id)
+        };
+        if reject {
+            if let Some(worker) = feature_worker {
+                guard.record_feature_decision(worker, request_id, true, false);
+            }
+            return Err(crate::worker::estimated_wait::AdmissionGuard::shed(
+                model_id,
+            ));
+        }
+    }
+    let Some(selected) = select_from_policy(registry, policies, model_id, candidates, inputs)
+    else {
+        return Ok(None);
+    };
+    if let Some(guard) = &mut admission {
+        let in_scope = feature_worker.is_some_and(|worker| Arc::ptr_eq(worker, &selected));
+        if let Some(capture) = inputs.calibration {
+            *capture.lock() = if in_scope {
+                frozen_forecast.take()
+            } else {
+                guard.capture_calibration(&selected, request_id)
+            };
+        }
+        if in_scope {
+            let tracked = inputs
+                .calibration
+                .is_some_and(|capture| capture.lock().is_some());
+            guard.record_feature_decision(&selected, request_id, false, tracked);
+        }
+        guard.credit(&selected, inputs.tokens);
+        if let Some(capture) = inputs.calibration {
+            guard.register_deadline_dispatch(&selected, &mut capture.lock());
+        }
+    }
+    Ok(Some(selected))
+}
+
+fn select_from_policy(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    candidates: &[Arc<dyn Worker>],
+    inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
     let policy = policies.get_policy_or_default(model_id);
-
-    // The per-request predicate applies to every entry point, so a caller
-    // that sets it can never dispatch to a worker it rejects.
-    let accepted;
-    let candidates: &[Arc<dyn Worker>] = match inputs.candidate_filter {
-        Some(accepts) => {
-            accepted = candidates
-                .iter()
-                .filter(|w| accepts(w.as_ref()))
-                .cloned()
-                .collect::<Vec<_>>();
-            &accepted
-        }
-        None => candidates,
-    };
 
     let mut info = SelectWorkerInfo {
         request_text: inputs.text,
@@ -435,7 +565,7 @@ struct RegularDecision<'a> {
 }
 
 /// [`select_from`] through the policy engine: one decision over the view of
-/// the candidates, outside any lock of this host; the commit walks the
+/// the candidates, outside the policy host’s registry and lease locks; the commit walks the
 /// ordered targets and takes the first one the eligibility re-validates.
 /// When every target misses, one re-decision with the misses excluded, then
 /// the host's own all-vetoed fallback, as the legacy path falls back.
@@ -1057,6 +1187,50 @@ pub(crate) fn select_pair(
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: PlacementInputs<'_>,
 ) -> Result<Pair, Box<PairFailure>> {
+    let mut admission = registry.estimated_wait().begin();
+    let pair = select_pair_uncredited(
+        registry,
+        policies,
+        model_id,
+        pairs,
+        wire,
+        homogeneous_runtime,
+        prefill_capacity,
+        inputs,
+        admission.as_ref(),
+    )?;
+    if let Some(guard) = &mut admission {
+        for (role, worker) in [
+            (WorkerRole::Prefill, &pair.prefill),
+            (WorkerRole::Decode, &pair.decode),
+        ] {
+            guard
+                .check(std::slice::from_ref(worker), model_id)
+                .map_err(|shed| {
+                    Box::new(PairFailure {
+                        role,
+                        verdict: PlacementFailure::AllOverloaded(shed),
+                    })
+                })?;
+        }
+        guard.credit(&pair.prefill, inputs.tokens);
+        guard.credit(&pair.decode, inputs.tokens);
+    }
+    Ok(pair)
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(crate) fn select_pair_uncredited(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    pairs: &PdPairIndex,
+    wire: Option<WireConstraint>,
+    homogeneous_runtime: bool,
+    prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+    inputs: PlacementInputs<'_>,
+    admission: Option<&crate::worker::estimated_wait::AdmissionGuard<'_>>,
+) -> Result<Pair, Box<PairFailure>> {
     let admitted = |w: &Arc<dyn Worker>| {
         WireConstraint::admits(wire, w.as_ref())
             && inputs
@@ -1244,10 +1418,33 @@ pub(crate) fn select_pair(
             ));
         }
     }
+    if let Some(guard) = admission {
+        open.retain(|&i| {
+            let decode = pairs.partners[i]
+                .iter()
+                .filter(|d| partner_open(d, pair_runtime))
+                .cloned()
+                .collect::<Vec<_>>();
+            !guard.check_cohort(&decode, model_id)
+        });
+        if open.is_empty() {
+            return Err(fail(
+                WorkerRole::Decode,
+                PlacementFailure::AllOverloaded(
+                    crate::worker::estimated_wait::AdmissionGuard::shed(model_id),
+                ),
+            ));
+        }
+    }
     let prefill: Vec<Arc<dyn Worker>> = open
         .iter()
         .map(|&i| Arc::clone(&pairs.prefill[i]))
         .collect();
+    if let Some(guard) = admission {
+        guard
+            .check(&prefill, model_id)
+            .map_err(|shed| fail(WorkerRole::Prefill, PlacementFailure::AllOverloaded(shed)))?;
+    }
     let hash_ring = policies
         .hash_ring_wanted()
         .then(|| registry.get_hash_ring(model_id))
@@ -1315,6 +1512,11 @@ pub(crate) fn select_pair(
         return Err(fail(WorkerRole::Decode, PlacementFailure::Unavailable));
     }
     retain_decodes_with_a_room(decode_policy.as_ref(), inputs.headers, &mut decode);
+    if let Some(guard) = admission {
+        guard
+            .check(&decode, model_id)
+            .map_err(|shed| fail(WorkerRole::Decode, PlacementFailure::AllOverloaded(shed)))?;
+    }
     // A decode pool all over the thresholds pairs by load, as the default
     // paired it: the least-loaded of the pick's partners, counted as a veto
     // fallback and not as a selection of the decode policy. Any other keeps
@@ -1559,6 +1761,76 @@ mod tests {
     /// A decode partner whose window is full, or whose free room a place
     /// waiting at its gate is in line for, is left out of the pick while its
     /// sibling has a room; with both full the policy chooses as before.
+    #[test]
+    fn estimated_wait_enforces_static_fallback_and_actual_retry_cohort() {
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+        for shadow in [false, true] {
+            let registry = registry_with(&[
+                ("http://h:1", ConnectionMode::Http, RuntimeType::Sglang),
+                ("http://h:2", ConnectionMode::Http, RuntimeType::Sglang),
+            ]);
+            registry.estimated_wait().configure(EstimatedWaitConfig {
+                max_estimated_wait_secs: Some(1.0),
+                estimated_wait_shadow: shadow,
+                estimated_wait_provisional_baseline_secs: Some(0.001),
+                estimated_wait_fallback_prefill_throughput: 100.0,
+                ..Default::default()
+            });
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            let idle = registry.get_by_url("http://h:1").unwrap();
+            let busy = registry.get_by_url("http://h:2").unwrap();
+            let stamp = registry.estimated_wait().poll_started(&busy);
+            registry.estimated_wait().publish(
+                &busy,
+                Some(&WorkerLoadResponse {
+                    loads: vec![SchedulerLoadSnapshot {
+                        num_waiting_uncached_tokens: 200,
+                        gen_throughput: 100.0,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                stamp,
+                std::time::Instant::now(),
+            );
+            let tried = vec![idle.base_url().to_string()];
+            let result = select_from(
+                &registry,
+                &policies,
+                MODEL,
+                &[idle, busy.clone()],
+                PlacementInputs {
+                    tried: &tried,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                result.is_err(),
+                !shadow,
+                "a tried permissive worker cannot mask the retry target"
+            );
+            registry.set_worker_overloaded(&busy, true);
+            assert!(!registry.overload_shed_enabled());
+            let result = select_from(
+                &registry,
+                &policies,
+                MODEL,
+                &[busy],
+                PlacementInputs::default(),
+            );
+            assert_eq!(
+                result.is_err(),
+                !shadow,
+                "static fallback cannot bypass TTFT enforcement"
+            );
+            if shadow {
+                assert!(result.unwrap().is_some());
+            }
+        }
+    }
+
     #[test]
     fn a_full_decode_window_sends_the_pick_to_the_partner_with_a_room() {
         let registry = gated_pd_registry(2);
@@ -2169,6 +2441,7 @@ mod tests {
             &only_second,
             PlacementInputs::default(),
         )
+        .unwrap()
         .expect("the narrowed slice still has a worker");
         assert_eq!(selected.url(), "http://h:2");
         assert!(matches!(
@@ -2351,6 +2624,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .unwrap()
         .expect("steered to the admitted worker");
         assert_eq!(selected.url(), "http://h:1");
     }
@@ -2368,6 +2642,7 @@ mod tests {
             None,
             PlacementInputs::default(),
         )
+        .unwrap()
         .expect("the HTTP worker is selectable from its own pool");
         assert_eq!(selected.url(), "http://h:1");
 
@@ -2381,6 +2656,7 @@ mod tests {
             None,
             PlacementInputs::default(),
         )
+        .unwrap()
         .is_none());
         assert!(matches!(
             single_failure(&registry, MODEL, RoutingPool::GrpcPipelineRegular, None),
@@ -2413,6 +2689,7 @@ mod tests {
             None,
             inputs,
         )
+        .unwrap()
         .expect("a worker is selectable")
     }
 
@@ -2527,6 +2804,7 @@ mod tests {
                 ..inputs
             },
         )
+        .unwrap()
         .is_some());
     }
 
@@ -2586,6 +2864,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .unwrap()
         };
         let by_index: Vec<Arc<dyn Worker>> = (0..3)
             .map(|index| target(index).expect("a healthy pool answers every index"))
@@ -3633,6 +3912,7 @@ mod tests {
                 None,
                 inputs,
             )
+            .unwrap()
             .expect("a prefill worker")
         };
         let owner = place();
@@ -3692,6 +3972,7 @@ mod tests {
                     &candidates,
                     PlacementInputs::default(),
                 )
+                .unwrap()
                 .expect("a worker is picked");
                 *picks.entry(worker.url().to_string()).or_insert(0) += 1;
             }
@@ -4131,5 +4412,219 @@ mod tests {
             "no fallback outside the host's veto"
         );
         assert_eq!(decider.decisions(), 5, "one re-decision, never a second");
+    }
+
+    #[test]
+    fn estimated_wait_uses_another_pd_cohort_when_one_decode_is_saturated() {
+        use std::time::Instant;
+
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+
+        let registry = pd_registry(&[
+            ("grpc://p:a", WorkerType::Prefill, Some("NixlConnector")),
+            ("grpc://p:b", WorkerType::Prefill, Some("MooncakeConnector")),
+            ("grpc://d:a", WorkerType::Decode, Some("NixlConnector")),
+            ("grpc://d:b", WorkerType::Decode, Some("MooncakeConnector")),
+        ]);
+        registry.estimated_wait().configure(EstimatedWaitConfig {
+            estimated_wait_provisional_baseline_secs: Some(0.001),
+            estimated_wait_shadow: false,
+            max_estimated_wait_secs: Some(1.0),
+            estimated_wait_mean_prefill_tokens: 100,
+            estimated_wait_fallback_prefill_throughput: 100.0,
+            ..Default::default()
+        });
+        let policies = cohort_policies();
+        let pairs = pairs_of(&registry, &policies);
+        for worker in pairs.prefill_pool.iter().chain(pairs.decode_pool.iter()) {
+            let queued = if worker.url() == "grpc://d:a" { 100 } else { 0 };
+            let stamp = registry.estimated_wait().poll_started(worker);
+            registry.estimated_wait().publish(
+                worker,
+                Some(&WorkerLoadResponse {
+                    loads: vec![SchedulerLoadSnapshot {
+                        num_waiting_uncached_tokens: queued,
+                        gen_throughput: 100.0,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                stamp,
+                Instant::now(),
+            );
+        }
+
+        let pair = match pair_from(&registry, &policies) {
+            Ok(pair) => pair,
+            Err(_) => panic!("the healthy cohort is selected"),
+        };
+        assert_eq!(pair.prefill.url(), "grpc://p:b");
+        assert_eq!(pair.decode.url(), "grpc://d:b");
+    }
+
+    #[test]
+    fn estimated_wait_successful_cohort_fallback_does_not_record_shed() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            estimated_wait_uses_another_pd_cohort_when_one_decode_is_saturated();
+        });
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("smg_estimated_wait_rejections_total"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_worker_overload_shed_total"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn estimated_wait_multiple_blocked_cohorts_record_one_shed() {
+        use std::time::Instant;
+
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let registry = pd_registry(&[
+                ("grpc://p:a", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://p:b", WorkerType::Prefill, Some("MooncakeConnector")),
+                ("grpc://d:a", WorkerType::Decode, Some("NixlConnector")),
+                ("grpc://d:b", WorkerType::Decode, Some("MooncakeConnector")),
+            ]);
+            registry.estimated_wait().configure(EstimatedWaitConfig {
+                estimated_wait_provisional_baseline_secs: Some(0.001),
+                estimated_wait_shadow: false,
+                max_estimated_wait_secs: Some(1.0),
+                estimated_wait_fallback_prefill_throughput: 100.0,
+                ..Default::default()
+            });
+            for worker in registry.get_all() {
+                let stamp = registry.estimated_wait().poll_started(&worker);
+                registry.estimated_wait().publish(
+                    &worker,
+                    Some(&WorkerLoadResponse {
+                        loads: vec![SchedulerLoadSnapshot {
+                            num_waiting_uncached_tokens: 200,
+                            gen_throughput: 100.0,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    stamp,
+                    Instant::now(),
+                );
+            }
+            assert!(pair_from(&registry, &cohort_policies()).is_err());
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("smg_estimated_wait_rejections_total{model=\"m\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("smg_worker_overload_shed_total{stage=\"selection\"} 1"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn estimated_wait_checks_compatible_partners_and_credits_only_admitted_pairs() {
+        use std::time::Instant;
+
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+
+        for shadow in [false, true] {
+            let registry = pd_registry(&[
+                ("grpc://p:a", WorkerType::Prefill, Some("NixlConnector")),
+                ("grpc://d:a", WorkerType::Decode, Some("NixlConnector")),
+                ("grpc://d:b", WorkerType::Decode, Some("MooncakeConnector")),
+            ]);
+            registry.estimated_wait().configure(EstimatedWaitConfig {
+                estimated_wait_provisional_baseline_secs: Some(0.001),
+                max_estimated_wait_secs: Some(1.0),
+                estimated_wait_shadow: shadow,
+                estimated_wait_mean_prefill_tokens: 100,
+                estimated_wait_fallback_prefill_throughput: 100.0,
+                // This test exercises full dispatch-credit accounting; the
+                // production default intentionally discounts it.
+                estimated_wait_dispatch_blocking_factor: 1.0,
+                ..Default::default()
+            });
+            let policies = cohort_policies();
+            let pairs = pairs_of(&registry, &policies);
+            let publish = |worker: &Arc<dyn Worker>, queued| {
+                let stamp = registry.estimated_wait().poll_started(worker);
+                registry.estimated_wait().publish(
+                    worker,
+                    Some(&WorkerLoadResponse {
+                        loads: vec![SchedulerLoadSnapshot {
+                            num_waiting_uncached_tokens: queued,
+                            gen_throughput: 100.0,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    stamp,
+                    Instant::now(),
+                );
+            };
+            for worker in pairs.prefill_pool.iter() {
+                publish(worker, 0);
+            }
+            for worker in pairs.decode_pool.iter() {
+                publish(worker, if worker.url() == "grpc://d:a" { 100 } else { 0 });
+            }
+            if shadow {
+                // Continue placement even after both legs accrue over-budget credit.
+                for _ in 0..3 {
+                    assert!(pair_from(&registry, &policies).is_ok());
+                }
+                continue;
+            }
+            // The idle decode speaks another transport and cannot bypass shedding.
+            let failure = pair_from(&registry, &policies).err().expect("decode shed");
+            assert!(matches!(failure.role, WorkerRole::Decode));
+            assert!(matches!(
+                failure.verdict,
+                PlacementFailure::AllOverloaded(_)
+            ));
+
+            let decode = pairs
+                .decode_pool
+                .iter()
+                .find(|w| w.url() == "grpc://d:a")
+                .unwrap();
+            publish(decode, 0);
+            // A rejected placement must not have consumed the prefill's budget.
+            assert!(pair_from(&registry, &policies).is_ok());
+            // Cohort pruning checks decode credit before the prefill pool.
+            let failure = pair_from(&registry, &policies)
+                .err()
+                .expect("decode credited");
+            assert!(matches!(failure.role, WorkerRole::Decode));
+            assert!(matches!(
+                failure.verdict,
+                PlacementFailure::AllOverloaded(_)
+            ));
+            publish(decode, 0);
+            let failure = pair_from(&registry, &policies)
+                .err()
+                .expect("prefill credited");
+            assert!(matches!(failure.role, WorkerRole::Prefill));
+            assert!(matches!(
+                failure.verdict,
+                PlacementFailure::AllOverloaded(_)
+            ));
+        }
     }
 }
