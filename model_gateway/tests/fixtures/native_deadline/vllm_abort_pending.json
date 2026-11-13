@@ -1,0 +1,46 @@
+{
+  "version": "0.19.0",
+  "dp_rank_count": 1,
+  "loads": [
+    {
+      "dp_rank": 0,
+      "num_running_reqs": 1,
+      "num_waiting_reqs": 0,
+      "deadline_recovery": {
+        "schema_version": 1,
+        "engine_epoch": "84ceacd9-758a-42cf-9908-ff22d7bcd349",
+        "profile_id": "75ed2c25459044c27d03f41e47d971094e7b9280b8f21004b1ad1fbf996a84ac",
+        "dp_rank": 0,
+        "snapshot_seq": 4,
+        "captured_at_monotonic_secs": 1118983.472443166,
+        "snapshot_age_seconds": 0.0018704170361161232,
+        "active_inventory_complete": true,
+        "native_population": 1,
+        "scheduler_semantics": "continuous_batching",
+        "deadline_boundary": "first_nonempty_text",
+        "deadline_origin": "engine_http_receive_monotonic",
+        "remaining_work_source": "uncached_uncomputed_prompt_tokens",
+        "effective_capacity_tokens_per_sec": null,
+        "capacity_source": null,
+        "hard_ttft_deadline_supported": true,
+        "abort_enforcement_enabled": true,
+        "abort_max_lag_seconds": null,
+        "cancellation_ack_supported": true,
+        "ack_floor_seq": 0,
+        "active_requests": [
+          {
+            "attempt_id": "00000000-0000-4000-8000-000000000061",
+            "native_request_id": "chatcmpl-upstream-exact-0-12345678",
+            "state_seq": 4,
+            "remaining_prefill_work_tokens": 50.0,
+            "hard_ttft_deadline_monotonic_secs": 1118993.458358166,
+            "queue_position": null,
+            "state": "unknown",
+            "first_text_emitted": false
+          }
+        ],
+        "cancellation_acks": []
+      }
+    }
+  ]
+}
