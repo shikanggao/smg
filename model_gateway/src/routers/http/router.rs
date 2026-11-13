@@ -701,7 +701,25 @@ impl Router {
         attempt: &TypedAttempt<'_, T>,
     ) -> Response {
         let calibration = Mutex::new(None);
-        let worker = match self.select_worker_for_attempt(attempt, &calibration) {
+        let ttft_observation = (self.worker_registry.estimated_wait().enabled()
+            && attempt.is_stream
+            && matches!(attempt.route, "/v1/chat/completions" | "/v1/completions"))
+        .then(|| {
+            crate::observability::ttft::Observation::new(
+                attempt.model_id,
+                if self.worker_registry.estimated_wait().is_shadow() {
+                    crate::observability::ttft::Mode::Shadow
+                } else {
+                    crate::observability::ttft::Mode::Enforce
+                },
+                attempt.request_started,
+            )
+        });
+        let worker = match self.select_worker_for_attempt(
+            attempt,
+            &calibration,
+            ttft_observation.as_ref(),
+        ) {
             Ok(worker) => worker,
             Err(refusal) => return refusal,
         };
@@ -741,6 +759,7 @@ impl Router {
                 &worker,
                 &mut decision_adapter,
                 calibration.into_inner(),
+                ttft_observation.clone(),
             )
             .await;
 
@@ -771,6 +790,7 @@ impl Router {
         &self,
         attempt: &TypedAttempt<'_, T>,
         calibration: &Mutex<Option<CalibrationForecast>>,
+        ttft_observation: Option<&crate::observability::ttft::Observation>,
     ) -> Result<Arc<dyn Worker>, Response> {
         let model_id = attempt.model_id;
         let ledger = attempt.ledger;
@@ -795,6 +815,7 @@ impl Router {
                     candidate_filter: Some(&admits),
                     tried: &tried,
                     calibration: attempt.is_stream.then_some(calibration),
+                    ttft_observation,
                     feature_context_supported: attempt.is_stream
                         && matches!(attempt.route, "/v1/chat/completions" | "/v1/completions"),
                     request_started: Some(attempt.request_started),
@@ -867,6 +888,7 @@ impl Router {
         worker: &Arc<dyn Worker>,
         decision_adapter: &mut Option<SglangDecisionAdapter>,
         calibration: Option<CalibrationForecast>,
+        ttft_observation: Option<crate::observability::ttft::Observation>,
     ) -> Response {
         let headers = attempt.headers;
         let lease = attempt.lease;
@@ -918,6 +940,7 @@ impl Router {
                     load_guard,
                     calibration,
                     attempt.request_started,
+                    ttft_observation,
                 )
                 .await
             }
@@ -1463,6 +1486,7 @@ impl Router {
         load_guard: WorkerLoadGuard,
         calibration: Option<CalibrationForecast>,
         request_started: Instant,
+        ttft_observation: Option<crate::observability::ttft::Observation>,
     ) -> Response {
         let started = Instant::now();
         let is_stream = mode.is_stream;
@@ -1525,6 +1549,7 @@ impl Router {
                         .and_then(|value| value.to_str().ok()),
                 )
                 .with_calibration(calibration)
+                .with_metric_observation(ttft_observation)
         });
         if let Some(observer) = &ttft_observer {
             observer.transport_event("upstream_send_started");

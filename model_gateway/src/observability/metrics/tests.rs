@@ -1870,3 +1870,29 @@ fn the_multimodal_harness_repeats_the_malloc_conf() {
         "crates/multimodal/examples/mm_baseline.rs no longer carries SERVER_MALLOC_CONF ({conf})"
     );
 }
+
+#[test]
+fn ttft_overestimate_uses_fixed_histogram_edges_with_custom_duration_buckets() {
+    let mut builder = PrometheusBuilder::new();
+    for (matcher, buckets) in histogram_bucket_overrides(Some(vec![0.1, 0.2, 0.3])) {
+        builder = builder.set_buckets_for_metric(matcher, &buckets).unwrap();
+    }
+    let recorder = builder.build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        metrics::histogram!(crate::observability::ttft::ERROR_METRIC).record(2.0);
+    });
+    let rendered = handle.render();
+    assert!(
+        rendered.contains("smg_ttft_overestimate_seconds_bucket{le=\"1\"} 0"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("smg_ttft_overestimate_seconds_bucket{le=\"5\"} 1"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("smg_ttft_overestimate_seconds{quantile="),
+        "{rendered}"
+    );
+}
