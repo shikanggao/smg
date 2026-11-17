@@ -1,0 +1,45 @@
+{
+  "timestamp": "",
+  "version": "sglang-c9e5799-native-deadline-v1",
+  "dp_rank_count": 1,
+  "loads": [
+    {
+      "dp_rank": 0,
+      "num_waiting_reqs": 0,
+      "num_running_reqs": 0,
+      "num_total_reqs": 0,
+      "deadline_recovery": {
+        "schema_version": 1,
+        "engine_epoch": "da05da92-4ab9-4467-8bbf-7bc4491de811",
+        "profile_id": "sglang-c9e5799:02f860d2f7a6f7b75ee534deb9aa879de9a44edc9c62cc6f2d9ae1d86082b162",
+        "dp_rank": 0,
+        "snapshot_seq": 5,
+        "captured_at_monotonic_secs": 1118917.714674208,
+        "snapshot_age_seconds": 0.0,
+        "active_inventory_complete": true,
+        "native_population": 0,
+        "scheduler_semantics": "continuous_batching",
+        "remaining_work_source": "uncached_uncomputed_prompt_tokens",
+        "effective_capacity_tokens_per_sec": null,
+        "capacity_source": null,
+        "cancellation_ack_supported": true,
+        "hard_ttft_deadline_supported": true,
+        "abort_enforcement_enabled": true,
+        "abort_max_lag_seconds": null,
+        "deadline_boundary": "first_nonempty_text",
+        "deadline_origin": "engine_http_receive_monotonic",
+        "ack_floor_seq": 0,
+        "active_requests": [],
+        "cancellation_acks": [
+          {
+            "attempt_id": "sglang-component-attempt-0001",
+            "native_request_id": "native-engine-id-0001",
+            "event_seq": 4,
+            "ack_monotonic_secs": 1118917.714581291,
+            "reason": "client_abort"
+          }
+        ]
+      }
+    }
+  ]
+}
