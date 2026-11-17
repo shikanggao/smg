@@ -3,6 +3,7 @@ use engine_zmq_client::{
     protocol::vllm::{
         logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
         output::{EngineCoreOutputs, RequestBatchOutputs},
+        stats::SchedulerStats,
     },
 };
 use openai_protocol::worker::RuntimeType;
@@ -1680,4 +1681,56 @@ async fn usage_prompt_count_is_the_requests_until_the_engine_reports_one() {
             "the complete with prefill stats {reported:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn vllm_zmq_load_marks_queued_tokens_unavailable() {
+    let (client, engine, _dir) = connected_pair(RuntimeType::Vllm).await;
+    let (mut input, mut output) = engine.split();
+
+    let mut stream = client
+        .generate_vllm(vllm::GenerateRequest {
+            request_id: "load".into(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    input_ids: vec![1],
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        })
+        .await
+        .expect("generate");
+    input.recv().await.expect("request reaches engine");
+    output
+        .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 0,
+            outputs: vec![EngineCoreOutput {
+                request_id: "load".into(),
+                new_token_ids: vec![2],
+                ..Default::default()
+            }],
+            scheduler_stats: Some(SchedulerStats {
+                num_running_reqs: 3,
+                num_waiting_reqs: 5,
+                kv_cache_usage: 0.25,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("load output");
+    stream
+        .next()
+        .await
+        .expect("load chunk")
+        .expect("load chunk succeeds");
+
+    let response = client.get_loads();
+    let load = response.loads.first().expect("load snapshot");
+    assert_eq!(load.num_running_reqs, 3);
+    assert_eq!(load.num_waiting_reqs, 5);
+    assert_eq!(load.num_waiting_uncached_tokens, 0);
+    assert_eq!(load.num_waiting_uncached_tokens_available, Some(false));
+    assert_eq!(load.token_usage, 0.25);
 }
