@@ -19,6 +19,15 @@ from smg.smg_rs import Router as _Router
 class TestRouterConfigValidation:
     """Test router configuration validation logic."""
 
+    def test_legacy_waiting_limit_does_not_hide_native_ttft_configuration(self):
+        Router.from_args(
+            RouterArgs(worker_urls=["http://worker:8000"], max_estimated_wait_secs=2.0)
+        )
+        with pytest.raises(ValueError, match="use worker_overload_waiting_requests"):
+            Router.from_args(
+                RouterArgs(worker_urls=["http://worker:8000"], least_load_max_waiting_requests=3)
+            )
+
     def test_valid_basic_config(self):
         """Test that a valid basic configuration passes validation."""
         args = RouterArgs(

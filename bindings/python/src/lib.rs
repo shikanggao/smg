@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
+use smg::worker::estimated_wait::EstimatedWaitConfig;
 
 // Jemalloc for all Rust-side allocations in the extension. Prefixed symbols
 // leave CPython's allocators untouched; disable_initial_exec_tls is required
@@ -579,6 +580,18 @@ struct Router {
     encode_urls: Option<Vec<(String, Option<u16>)>>,
     engine_metrics: bool,
     epd_disaggregation: bool,
+    estimated_wait_default_throughput: f64,
+    estimated_wait_dispatch_blocking_factor: f64,
+    estimated_wait_fallback_prefill_throughput: Option<f64>,
+    estimated_wait_kv_pressure_weight: f64,
+    estimated_wait_max_snapshot_age_secs: f64,
+    estimated_wait_mean_prefill_tokens: u32,
+    estimated_wait_min_prefill_throughput: Option<f64>,
+    estimated_wait_native_hard_ttft_timeout_secs: Option<f64>,
+    estimated_wait_prompt_size_prior_samples: u32,
+    estimated_wait_provisional_baseline_secs: Option<f64>,
+    estimated_wait_queue_tokens_per_request: u32,
+    estimated_wait_shadow: bool,
     eviction_interval_secs: u64,
     grpc_request_timeout_secs: u64,
     header_read_timeout_secs: u64,
@@ -610,6 +623,7 @@ struct Router {
     max_buffered_request_bytes: u64,
     max_concurrent_requests: i32,
     max_connections: usize,
+    max_estimated_wait_secs: Option<f64>,
     max_idle_secs: u64,
     max_payload_size: usize,
     max_tree_size: usize,
@@ -1414,6 +1428,28 @@ impl Router {
             .job_queue_concurrency(self.job_queue_concurrency)
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
             .worker_overload_token_usage(self.worker_overload_token_usage)
+            .estimated_wait(EstimatedWaitConfig {
+                max_estimated_wait_secs: self.max_estimated_wait_secs,
+                estimated_wait_shadow: self.estimated_wait_shadow,
+                estimated_wait_native_hard_ttft_timeout_secs: self
+                    .estimated_wait_native_hard_ttft_timeout_secs,
+                estimated_wait_provisional_baseline_secs: self
+                    .estimated_wait_provisional_baseline_secs,
+                estimated_wait_kv_pressure_weight: self.estimated_wait_kv_pressure_weight,
+                estimated_wait_dispatch_blocking_factor: self
+                    .estimated_wait_dispatch_blocking_factor,
+                estimated_wait_mean_prefill_tokens: self.estimated_wait_mean_prefill_tokens,
+                estimated_wait_fallback_prefill_throughput: self
+                    .estimated_wait_fallback_prefill_throughput
+                    .or(self.estimated_wait_min_prefill_throughput)
+                    .unwrap_or(self.estimated_wait_default_throughput),
+                estimated_wait_prompt_size_prior_samples: self
+                    .estimated_wait_prompt_size_prior_samples,
+                estimated_wait_queue_tokens_per_request: self
+                    .estimated_wait_queue_tokens_per_request,
+                estimated_wait_max_snapshot_age_secs: self.estimated_wait_max_snapshot_age_secs,
+                ..EstimatedWaitConfig::default()
+            })
             .worker_overload_protection(self.worker_overload_protection)
             .worker_overload_shed(self.worker_overload_shed)
             .worker_stall_secs(self.worker_stall_secs)
@@ -1648,6 +1684,18 @@ impl Router {
         encode_urls = None,
         engine_metrics = false,
         epd_disaggregation = false,
+        estimated_wait_default_throughput = 2000.0,
+        estimated_wait_dispatch_blocking_factor = 0.05,
+        estimated_wait_fallback_prefill_throughput = None,
+        estimated_wait_kv_pressure_weight = 0.0,
+        estimated_wait_max_snapshot_age_secs = 30.0,
+        estimated_wait_mean_prefill_tokens = 1024,
+        estimated_wait_min_prefill_throughput = None,
+        estimated_wait_native_hard_ttft_timeout_secs = None,
+        estimated_wait_prompt_size_prior_samples = 32,
+        estimated_wait_provisional_baseline_secs = None,
+        estimated_wait_queue_tokens_per_request = 0,
+        estimated_wait_shadow = true,
         eviction_interval_secs = 120,
         grpc_request_timeout_secs = 0,
         header_read_timeout_secs = 30,
@@ -1679,6 +1727,7 @@ impl Router {
         max_buffered_request_bytes = 1_048_576,
         max_concurrent_requests = -1,
         max_connections = 0,
+        max_estimated_wait_secs = None,
         max_idle_secs = 14400,
         max_payload_size = 512 * 1024 * 1024,
         max_tree_size = 2usize.pow(26),
@@ -1875,6 +1924,18 @@ impl Router {
         encode_urls: Option<Vec<(String, Option<u16>)>>,
         engine_metrics: bool,
         epd_disaggregation: bool,
+        estimated_wait_default_throughput: f64,
+        estimated_wait_dispatch_blocking_factor: f64,
+        estimated_wait_fallback_prefill_throughput: Option<f64>,
+        estimated_wait_kv_pressure_weight: f64,
+        estimated_wait_max_snapshot_age_secs: f64,
+        estimated_wait_mean_prefill_tokens: u32,
+        estimated_wait_min_prefill_throughput: Option<f64>,
+        estimated_wait_native_hard_ttft_timeout_secs: Option<f64>,
+        estimated_wait_prompt_size_prior_samples: u32,
+        estimated_wait_provisional_baseline_secs: Option<f64>,
+        estimated_wait_queue_tokens_per_request: u32,
+        estimated_wait_shadow: bool,
         eviction_interval_secs: u64,
         grpc_request_timeout_secs: u64,
         header_read_timeout_secs: u64,
@@ -1906,6 +1967,7 @@ impl Router {
         max_buffered_request_bytes: u64,
         max_concurrent_requests: i32,
         max_connections: usize,
+        max_estimated_wait_secs: Option<f64>,
         max_idle_secs: u64,
         max_payload_size: usize,
         max_tree_size: usize,
@@ -2153,6 +2215,18 @@ impl Router {
             encode_urls,
             engine_metrics,
             epd_disaggregation,
+            estimated_wait_default_throughput,
+            estimated_wait_dispatch_blocking_factor,
+            estimated_wait_fallback_prefill_throughput,
+            estimated_wait_kv_pressure_weight,
+            estimated_wait_max_snapshot_age_secs,
+            estimated_wait_mean_prefill_tokens,
+            estimated_wait_min_prefill_throughput,
+            estimated_wait_native_hard_ttft_timeout_secs,
+            estimated_wait_prompt_size_prior_samples,
+            estimated_wait_provisional_baseline_secs,
+            estimated_wait_queue_tokens_per_request,
+            estimated_wait_shadow,
             eviction_interval_secs,
             grpc_request_timeout_secs,
             header_read_timeout_secs,
@@ -2184,6 +2258,7 @@ impl Router {
             max_buffered_request_bytes,
             max_concurrent_requests,
             max_connections,
+            max_estimated_wait_secs,
             max_idle_secs,
             max_payload_size,
             max_tree_size,
