@@ -69,6 +69,7 @@ const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 /// media references, or a failure judged per role afterwards by
 /// [`WorkerSelectionStage::selection_failure`].
 enum EpdSelectionFailure {
+    Admission(Response),
     Unavailable,
     Placement(Box<PairFailure>),
     EcIncompatible,
@@ -476,6 +477,8 @@ impl<'a> SelectionInputs<'a> {
             candidate_filter,
             tried: &[],
             sequence: None,
+
+            ..Default::default()
         }
     }
 }
@@ -590,8 +593,9 @@ impl WorkerSelectionStage {
                     wire,
                     media_filter,
                 ) {
-                    Some(w) => Ok((WorkerSelection::Single { worker: w }, None)),
-                    None => Err(self.context_selection_failure(
+                    Err(shed) => Err(shed),
+                    Ok(Some(w)) => Ok((WorkerSelection::Single { worker: w }, None)),
+                    Ok(None) => Err(self.context_selection_failure(
                         model_id,
                         wire,
                         media,
@@ -774,8 +778,9 @@ impl WorkerSelectionStage {
                     Some(&admits_media),
                     &ctx.tried,
                 ) {
-                    Some(w) => WorkerSelection::Single { worker: w },
-                    None => {
+                    Err(shed) => return Err(shed),
+                    Ok(Some(w)) => WorkerSelection::Single { worker: w },
+                    Ok(None) => {
                         return Err(self.context_selection_failure(
                             model_id,
                             wire,
@@ -796,6 +801,8 @@ impl WorkerSelectionStage {
                     candidate_filter: Some(&pinned),
                     tried: &[],
                     sequence: None,
+
+                    ..Default::default()
                 };
                 let (pair, guard) = self
                     .admit_pd_pair(
@@ -910,6 +917,7 @@ impl WorkerSelectionStage {
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
                 match failure {
+                    EpdSelectionFailure::Admission(response) => return response,
                     EpdSelectionFailure::EncodeNotSupported => {
                         return multimodal::MmRefsError::EncodeNotSupported.into_response()
                     }
@@ -1702,7 +1710,7 @@ impl WorkerSelectionStage {
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
         candidate_filter: Option<CandidateFilter<'_>>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Result<Option<Arc<dyn Worker>>, Response> {
         self.select_single_worker_for_attempt(
             model_id,
             text,
@@ -1734,7 +1742,7 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Result<Option<Arc<dyn Worker>>, Response> {
         // A retry pins the retained wire, and with it the media pin and the
         // pipeline pin, on top of whatever the caller excludes.
         let pipeline = wire.map_or(PipelinePin::Any, |w| w.pipeline);
@@ -1783,6 +1791,8 @@ impl WorkerSelectionStage {
                 candidate_filter,
                 tried,
                 sequence,
+
+                ..Default::default()
             },
         )
     }
@@ -1995,6 +2005,7 @@ impl WorkerSelectionStage {
     ) -> Result<EncodePrefillDecodeWorkerSelection, EpdSelectionFailure> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
+        let mut admission = self.worker_registry.estimated_wait().begin();
         let mut available_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
         // An encoder serves the request by its runtime's encode handoff: a
         // push encoder must advertise the producer role of a connector and
@@ -2079,7 +2090,7 @@ impl WorkerSelectionStage {
             (!prefer_vision || decode_vision(worker))
                 && (!needs_encode || available_encode.iter().any(|e| compatible(e, worker)))
         };
-        let pair = placement::select_pair(
+        let pair = placement::select_pair_uncredited(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
@@ -2091,6 +2102,7 @@ impl WorkerSelectionStage {
                 candidate_filter: Some(&eligible),
                 ..inputs
             },
+            admission.as_ref(),
         )
         .map_err(EpdSelectionFailure::Placement)?;
         let handoff = PdProtocol::encode_handoff(pair.runtime);
@@ -2120,6 +2132,18 @@ impl WorkerSelectionStage {
         // The seam: under `--policy-engine engine` the items are the engine's
         // decisions over the capable encoders; the legacy policy decides
         // them per item over the encoders that pair with the prefill.
+        if let Some(guard) = &admission {
+            let compatible = available_encode
+                .iter()
+                .filter(|w| pairs_with_prefill(w))
+                .cloned()
+                .collect::<Vec<_>>();
+            if needs_encode {
+                guard
+                    .check(&compatible, model_id)
+                    .map_err(EpdSelectionFailure::Admission)?;
+            }
+        }
         let assignments = match self.policy_registry.encode_engine_for() {
             Some(decider) => assign_encode_workers_decided(
                 decider,
@@ -2145,6 +2169,26 @@ impl WorkerSelectionStage {
             }
         }
         .ok_or(EpdSelectionFailure::Unavailable)?;
+        if let Some(guard) = &mut admission {
+            for (role, worker) in [
+                (WorkerRole::Prefill, &pair.prefill),
+                (WorkerRole::Decode, &pair.decode),
+            ] {
+                guard
+                    .check(std::slice::from_ref(worker), model_id)
+                    .map_err(|shed| {
+                        EpdSelectionFailure::Placement(Box::new(PairFailure {
+                            role,
+                            verdict: PlacementFailure::AllOverloaded(shed),
+                        }))
+                    })?;
+            }
+            guard.credit(&pair.prefill, inputs.tokens);
+            guard.credit(&pair.decode, inputs.tokens);
+            for assignment in &assignments {
+                guard.credit(&assignment.worker, None);
+            }
+        }
         Ok((assignments, pair.prefill, pair.decode, pair.runtime))
     }
 }
@@ -3142,6 +3186,7 @@ mod tests {
                 None,
                 None,
             )
+            .unwrap()
             .unwrap();
         for rid in ["request-2", "request-3", "request-4"] {
             let again = stage
@@ -3155,6 +3200,7 @@ mod tests {
                     None,
                     None,
                 )
+                .unwrap()
                 .unwrap();
             assert_eq!(again.url(), first.url(), "follow-up must pin by header key");
         }
@@ -3164,6 +3210,64 @@ mod tests {
     /// distinct overload 503 the HTTP router uses. Its usual empty-pool answer
     /// is a 404, which would both misreport pressure as model absence and skip
     /// the retry path (404 is not retryable).
+
+    #[test]
+    fn estimated_wait_grpc_selection_propagates_503_and_credits_tokenized_input() {
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.estimated_wait().configure(EstimatedWaitConfig {
+            estimated_wait_provisional_baseline_secs: Some(0.001),
+            estimated_wait_shadow: false,
+            max_estimated_wait_secs: Some(1.0),
+            estimated_wait_fallback_prefill_throughput: 100.0,
+            // Make one 100-token dispatch reach the one-second threshold.
+            estimated_wait_dispatch_blocking_factor: 1.0,
+            ..Default::default()
+        });
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:8400")
+                .model(ModelCard::new("m"))
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        registry.register(worker.clone()).unwrap();
+        let stamp = registry.estimated_wait().poll_started(&worker);
+        let load = WorkerLoadResponse {
+            loads: vec![SchedulerLoadSnapshot {
+                num_waiting_uncached_tokens: 0,
+                gen_throughput: 100.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        registry
+            .estimated_wait()
+            .publish(&worker, Some(&load), stamp, Instant::now());
+        let stage = WorkerSelectionStage::new(
+            registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        assert!(stage
+            .select_single_worker("m", None, Some(&[0; 100]), None, None, None, None, None)
+            .unwrap()
+            .is_some());
+        let shed = stage
+            .select_single_worker("m", None, None, None, None, None, None, None)
+            .unwrap_err();
+        assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            shed.headers().get(error::HEADER_X_SMG_ERROR_CODE).unwrap(),
+            "worker_overload_protection_shed"
+        );
+        assert!(shed.headers().contains_key(http::header::RETRY_AFTER));
+        assert!(!is_retryable_response(&shed));
+    }
+
     #[test]
     fn grpc_all_overloaded_sheds_503_instead_of_404() {
         use crate::routers::error::extract_error_code_from_response;
@@ -3194,12 +3298,14 @@ mod tests {
 
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, None, None)
+            .unwrap()
             .is_some());
 
         worker_registry.set_worker_overloaded(&workers[0], true);
         assert!(
             stage
                 .select_single_worker(model_id, None, None, None, None, None, None, None)
+                .unwrap()
                 .is_some(),
             "one eligible worker left still serves"
         );
@@ -3208,6 +3314,7 @@ mod tests {
         assert!(
             stage
                 .select_single_worker(model_id, None, None, None, None, None, None, None)
+                .unwrap()
                 .is_none(),
             "the veto empties the candidate pool"
         );
@@ -3224,6 +3331,7 @@ mod tests {
         worker_registry.set_worker_overloaded(&workers[0], false);
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, None, None)
+            .unwrap()
             .is_some());
         assert_eq!(
             stage
@@ -3262,6 +3370,7 @@ mod tests {
         worker.set_status(WorkerStatus::NotReady);
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, None, None)
+            .unwrap()
             .is_none());
 
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, TEXT);
@@ -4386,6 +4495,110 @@ mod tests {
     }
 
     #[test]
+    fn estimated_wait_epd_encoder_rejection_does_not_credit_prefill_or_decode() {
+        use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+
+        use crate::worker::estimated_wait::EstimatedWaitConfig;
+        for engine in [false, true] {
+            let registry = Arc::new(WorkerRegistry::new());
+            registry.estimated_wait().configure(EstimatedWaitConfig {
+                max_estimated_wait_secs: Some(1.0),
+                estimated_wait_shadow: false,
+                estimated_wait_provisional_baseline_secs: Some(0.001),
+                estimated_wait_fallback_prefill_throughput: 100.0,
+                estimated_wait_dispatch_blocking_factor: 1.0,
+                ..Default::default()
+            });
+            for (port, role) in [
+                (8901, WorkerType::Encode),
+                (8902, WorkerType::Prefill),
+                (8903, WorkerType::Decode),
+            ] {
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                        .model(ModelCard::new("epd-credit"))
+                        .worker_type(role)
+                        .runtime_type(RuntimeType::Vllm)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .label("supports_ec_transfer", "true")
+                        .label("ec_connector", "ECCPUConnector")
+                        .label(
+                            "ec_role",
+                            if role == WorkerType::Encode {
+                                "ec_producer"
+                            } else {
+                                "ec_consumer"
+                            },
+                        )
+                        .label("kv_connector", "NixlConnector")
+                        .build(),
+                );
+                registry.register(worker).unwrap();
+            }
+            let publish = |worker: &Arc<dyn Worker>, queued| {
+                let stamp = registry.estimated_wait().poll_started(worker);
+                registry.estimated_wait().publish(
+                    worker,
+                    Some(&WorkerLoadResponse {
+                        loads: vec![SchedulerLoadSnapshot {
+                            num_waiting_uncached_tokens: queued,
+                            gen_throughput: 100.0,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    stamp,
+                    Instant::now(),
+                );
+            };
+            for worker in registry.get_all() {
+                publish(
+                    &worker,
+                    if *worker.worker_type() == WorkerType::Encode {
+                        200
+                    } else {
+                        0
+                    },
+                );
+            }
+            let stage = WorkerSelectionStage::new(
+                registry.clone(),
+                epd_policies(engine),
+                WorkerSelectionMode::EncodePrefillDecode,
+                None,
+            );
+            let pick = || {
+                stage.select_encode_prefill_decode_workers(
+                    "epd-credit",
+                    PlacementInputs {
+                        tokens: Some(&[0; 100]),
+                        ..Default::default()
+                    },
+                    &[vec![1]],
+                    EpdDemands {
+                        encode: MediaDemands::NONE,
+                        decode_vision: false,
+                        image_fanout: false,
+                    },
+                    None,
+                )
+            };
+            assert!(matches!(pick(), Err(EpdSelectionFailure::Admission(_))));
+            let encoder = registry.get_by_url("grpc://127.0.0.1:8901").unwrap();
+            publish(&encoder, 0);
+            assert!(
+                pick().is_ok(),
+                "failed EPD placement must leave both P/D budgets untouched"
+            );
+            assert!(
+                pick().is_err(),
+                "successful EPD placement must charge P/D exactly once"
+            );
+        }
+    }
+
+    #[test]
     fn epd_enforces_ec_roles_connectors_and_media_demands() {
         epd_enforces_ec_roles_connectors_and_demands(false);
     }
@@ -4903,6 +5116,7 @@ mod tests {
                     None,
                     Some(ACCEPTS_MEDIA_REFS),
                 )
+                .unwrap()
                 .expect("advertising worker is selectable");
             assert_eq!(worker.url(), capable_url);
         }
@@ -4913,6 +5127,7 @@ mod tests {
         };
         let worker = stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
+            .unwrap()
             .expect("retry re-selection stays on advertising workers");
         assert_eq!(worker.url(), capable_url);
 
@@ -4920,6 +5135,7 @@ mod tests {
         for _ in 0..4 {
             let worker = stage
                 .select_single_worker(model_id, None, None, None, None, None, None, None)
+                .unwrap()
                 .expect("any worker without refs");
             *seen.entry(worker.url().to_string()).or_insert(0) += 1;
         }
@@ -4957,6 +5173,7 @@ mod tests {
                 None,
                 Some(ACCEPTS_MEDIA_REFS),
             )
+            .unwrap()
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, REFS);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -4975,6 +5192,7 @@ mod tests {
         };
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
+            .unwrap()
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], Some(wire), TEXT);
         assert_eq!(
@@ -5026,6 +5244,7 @@ mod tests {
         for _ in 0..6 {
             let worker = stage
                 .select_single_worker(model_id, None, None, None, None, None, None, filter)
+                .unwrap()
                 .expect("a worker is selectable");
             *seen.entry(worker.url().to_string()).or_insert(0) += 1;
         }
@@ -5223,6 +5442,7 @@ mod tests {
                 None,
                 Some(&vision_capable),
             )
+            .unwrap()
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, VISION);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -5277,6 +5497,7 @@ mod tests {
                 None,
                 Some(&vision_capable),
             )
+            .unwrap()
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, VISION);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -5507,6 +5728,7 @@ mod tests {
         }
         let selected = stage
             .select_single_worker(model_id, None, None, None, None, None, None, None)
+            .unwrap()
             .expect("the all-overloaded pool is steered, not refused");
         assert_eq!(
             selected.url(),
@@ -5580,6 +5802,7 @@ mod tests {
                 None,
                 Some(ACCEPTS_MEDIA_REFS),
             )
+            .unwrap()
             .is_none());
         let response = stage.selection_failure(model_id, &[WorkerType::Regular], None, REFS);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

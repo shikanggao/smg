@@ -1,13 +1,11 @@
 # Completed input-work diagnostics
 
-For opt-in retention at the router's actual native poll, see
-[router_engine_work_capture.md](router_engine_work_capture.md).
-
 Set `SMG_NATIVE_ENGINE_WORK_DIAGNOSTICS=1` in an already enabled native
 deadline-signals process. It is off by default. The authenticated raw native
-snapshot adds `deadline_recovery.engine_work_progress`; no predictor, admission
-threshold, native deadline, cancellation ACK, or first-nonempty-text rule changes.
-The raw capture must preserve this dictionary even if a typed consumer ignores it.
+snapshot adds `deadline_recovery.engine_work_progress`. The router uses compatible
+cumulative uncached-prefill work deltas to estimate prefill service capacity.
+This does not change native deadlines, cancellation ACKs, or the first-nonempty-text
+rule. Router-side research capture and response hashing are not required.
 
 This diagnostic counts completed **scheduled input work** at a host completion
 witness. It does not count accepted output tokens or unique useful progress,
