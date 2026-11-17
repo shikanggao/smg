@@ -10,6 +10,7 @@ pub mod circuit_breaker;
 pub mod endpoint;
 mod engine_admin;
 pub mod error;
+pub mod estimated_wait;
 pub mod event;
 pub mod expected_wait;
 pub mod hash_ring;

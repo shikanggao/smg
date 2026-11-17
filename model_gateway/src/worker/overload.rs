@@ -28,6 +28,9 @@ pub const DEFAULT_WAITING_REQUESTS: usize = 8;
 /// so the request is shed immediately instead of queued.
 pub const BRANCH_ALL_OVERLOADED_SHED: &str = "all_overloaded_shed";
 
+/// Every eligible worker meets or exceeds the estimated-wait budget.
+pub const BRANCH_ESTIMATED_WAIT_SHED: &str = "estimated_wait_shed";
+
 /// Decision-log branch: the single worker already chosen crossed the threshold
 /// between selection and dispatch. Distinct from the fleet-wide shed above —
 /// here every other worker may well be idle.
@@ -64,8 +67,8 @@ pub const STAGE_PD_ADMISSION: &str = "pd_admission";
 
 /// Absolute thresholds above which a worker is vetoed from routing.
 ///
-/// Both fields unset disables the feature entirely: the flag is never written,
-/// so every routing path behaves exactly as it did before.
+/// Static thresholds drive the overload flag. The estimated-wait budget uses
+/// the same resolution path but is evaluated separately with dispatch credit.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct OverloadThresholds {
     /// Queued (waiting) requests summed across DP ranks, `>= 1` when set.
@@ -74,11 +77,14 @@ pub struct OverloadThresholds {
     /// `f64` to match the reported signal exactly: widening an `f32` threshold
     /// would put `0.8` just above the `0.8` an engine reports.
     pub token_usage: Option<f64>,
+    /// Estimated-wait admission budget, resolved with the static thresholds.
+    /// Its dynamic verdict is maintained by the dispatch-credit ledger.
+    pub max_estimated_wait_secs: Option<f64>,
 }
 
 impl OverloadThresholds {
-    /// Whether any signal is configured. Gates both the monitor's polling
-    /// requirement and every write to the flag.
+    /// Whether a static signal is configured. Gates writes to the overload
+    /// flag; estimated-wait admission separately requests polling.
     pub const fn is_enabled(&self) -> bool {
         self.waiting_requests.is_some() || self.token_usage.is_some()
     }
@@ -90,9 +96,13 @@ impl OverloadThresholds {
     /// thresholds say; per-worker `overload` blocks still apply on top.
     pub fn from_gateway_config(config: &RouterConfig) -> Self {
         if !config.worker_overload_protection {
-            return Self::default();
+            return Self {
+                max_estimated_wait_secs: config.estimated_wait.max_estimated_wait_secs,
+                ..Self::default()
+            };
         }
         Self {
+            max_estimated_wait_secs: config.estimated_wait.max_estimated_wait_secs,
             waiting_requests: config.worker_overload_waiting_requests,
             token_usage: config.worker_overload_token_usage,
         }
@@ -103,6 +113,9 @@ impl OverloadThresholds {
     /// monitor's ingestion predicate reads the result per report.
     pub fn resolve(overrides: &OverloadUpdate, gateway: Self) -> Self {
         Self {
+            max_estimated_wait_secs: overrides
+                .max_estimated_wait_secs
+                .or(gateway.max_estimated_wait_secs),
             waiting_requests: overrides.waiting_requests.or(gateway.waiting_requests),
             token_usage: overrides.token_usage.or(gateway.token_usage),
         }
@@ -146,6 +159,29 @@ mod tests {
     }
 
     #[test]
+    fn estimated_wait_resolves_with_other_worker_overload_overrides() {
+        let mut config = RouterConfig::default();
+        config.worker_overload_protection = false;
+        config.estimated_wait.max_estimated_wait_secs = Some(2.0);
+        let gateway = OverloadThresholds::from_gateway_config(&config);
+        assert_eq!(gateway.max_estimated_wait_secs, Some(2.0));
+        let inherited = OverloadThresholds::resolve(&OverloadUpdate::default(), gateway);
+        assert_eq!(inherited.max_estimated_wait_secs, Some(2.0));
+        let overridden = OverloadThresholds::resolve(
+            &OverloadUpdate {
+                max_estimated_wait_secs: Some(4.0),
+                ..Default::default()
+            },
+            gateway,
+        );
+        assert_eq!(overridden.max_estimated_wait_secs, Some(4.0));
+        assert!(
+            !overridden.is_enabled(),
+            "a wait budget does not enable static vetoes"
+        );
+    }
+
+    #[test]
     fn unset_thresholds_never_veto() {
         let thresholds = OverloadThresholds::default();
         assert!(!thresholds.is_enabled());
@@ -157,6 +193,7 @@ mod tests {
         let thresholds = OverloadThresholds {
             waiting_requests: Some(8),
             token_usage: None,
+            max_estimated_wait_secs: None,
         };
         assert!(!thresholds.is_overloaded(&response(7, 0.0)));
         assert!(thresholds.is_overloaded(&response(8, 0.0)));
@@ -168,6 +205,7 @@ mod tests {
         let thresholds = OverloadThresholds {
             waiting_requests: None,
             token_usage: Some(0.9),
+            max_estimated_wait_secs: None,
         };
         assert!(!thresholds.is_overloaded(&response(0, 0.89)));
         assert!(thresholds.is_overloaded(&response(0, 0.9)));
@@ -179,6 +217,7 @@ mod tests {
         let thresholds = OverloadThresholds {
             waiting_requests: Some(4),
             token_usage: Some(0.8),
+            max_estimated_wait_secs: None,
         };
         assert!(!thresholds.is_overloaded(&response(3, 0.7)));
         assert!(thresholds.is_overloaded(&response(4, 0.1)));
@@ -207,6 +246,7 @@ mod tests {
             OverloadThresholds {
                 waiting_requests: Some(DEFAULT_WAITING_REQUESTS),
                 token_usage: Some(DEFAULT_TOKEN_USAGE_CEILING),
+                max_estimated_wait_secs: None,
             }
         );
         assert!(thresholds.is_enabled());
@@ -229,6 +269,7 @@ mod tests {
             OverloadThresholds {
                 waiting_requests: None,
                 token_usage: Some(0.5),
+                max_estimated_wait_secs: None,
             }
         );
 
@@ -244,12 +285,13 @@ mod tests {
         let gateway = OverloadThresholds {
             waiting_requests: Some(16),
             token_usage: Some(DEFAULT_TOKEN_USAGE_CEILING),
+            max_estimated_wait_secs: None,
         };
         let resolved = OverloadThresholds::resolve(
             &OverloadUpdate {
                 waiting_requests: None,
                 token_usage: Some(0.5),
-                ..Default::default()
+                max_estimated_wait_secs: None,
             },
             gateway,
         );
@@ -258,6 +300,7 @@ mod tests {
             OverloadThresholds {
                 waiting_requests: Some(16),
                 token_usage: Some(0.5),
+                max_estimated_wait_secs: None,
             }
         );
 
@@ -266,7 +309,7 @@ mod tests {
             &OverloadUpdate {
                 waiting_requests: Some(4),
                 token_usage: None,
-                ..Default::default()
+                max_estimated_wait_secs: None,
             },
             OverloadThresholds::default(),
         );
@@ -287,6 +330,7 @@ mod tests {
         let thresholds = OverloadThresholds {
             waiting_requests: None,
             token_usage: Some(0.9),
+            max_estimated_wait_secs: None,
         };
         let load = WorkerLoadResponse {
             loads: vec![

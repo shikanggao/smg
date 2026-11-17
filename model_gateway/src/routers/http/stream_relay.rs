@@ -130,6 +130,17 @@ pub(crate) fn relay_streaming_body<S>(stream: S, relay: Relay) -> Response
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
 {
+    relay_streaming_body_observed(stream, relay, None)
+}
+
+pub(crate) fn relay_streaming_body_observed<S>(
+    stream: S,
+    relay: Relay,
+    mut observer: Option<crate::worker::estimated_wait::StreamTtftObserver>,
+) -> Response
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
     let Relay {
         status,
         upstream_sse,
@@ -138,6 +149,11 @@ where
         mut headers,
         mut mode,
     } = relay;
+    if !status.is_success() {
+        if let Some(observer) = &mut observer {
+            observer.cancel();
+        }
+    }
     // The relay may change an SSE body's length: re-chunking re-slices it,
     // a decode-side hook re-encodes it, and a cut after a successful head
     // appends the error event and the stream's end. So a streamed SSE body
@@ -171,7 +187,7 @@ where
     )]
     tokio::spawn(
         async move {
-            let mut stream = std::pin::pin!(stream);
+            let mut stream = Box::pin(stream);
             // What the client has been sent, for the record of a cut, and
             // its last bytes, so the event that ends a cut SSE body is
             // written on a frame boundary.
@@ -197,6 +213,10 @@ where
                             // h2 DATA frame toward the client.
                             Some(Ok(bytes)) if bytes.is_empty() => {}
                             Some(Ok(bytes)) => {
+                                if let Some(observer) = &mut observer {
+                                    if tx.capacity() == 0 { observer.cancel(); }
+                                    if status.is_success() { observer.push(&bytes); }
+                                }
                                 let (bytes, last) = match &mut mode {
                                     ChunkMode::Plain => (bytes, false),
                                     ChunkMode::Rechunk(rechunker) => (rechunker.feed(bytes), false),
@@ -209,6 +229,7 @@ where
                                     relayed += bytes.len() as u64;
                                     note_sent(&mut sent_tail, &bytes);
                                     if tx.send(Ok(bytes)).await.is_err() {
+                                        if let Some(observer) = &mut observer { observer.downstream_disconnected(); observer.transport_event("downstream_receiver_closed"); }
                                         break;
                                     }
                                 }
@@ -221,6 +242,7 @@ where
                                 }
                             }
                             Some(Err(e)) => {
+                                if let Some(observer) = &mut observer { if e.is_timeout() { observer.upstream_timeout(); } observer.transport_event("upstream_stream_error"); }
                                 let tail = mode.finish();
                                 if !tail.is_empty() {
                                     note_sent(&mut sent_tail, &tail);
@@ -257,6 +279,7 @@ where
                                 break;
                             }
                             None => {
+                                if let Some(observer) = &observer { observer.transport_event("upstream_eof"); }
                                 let tail = mode.finish();
                                 if !tail.is_empty() {
                                     let _ = tx.send(Ok(tail)).await;
@@ -281,9 +304,11 @@ where
                     // stalled upstream): break so the upstream stream drops,
                     // closing the upstream connection and letting the
                     // engine abort generation.
-                    () = &mut client_gone => break,
+                    () = &mut client_gone => { if let Some(observer) = &mut observer { observer.downstream_disconnected(); observer.transport_event("downstream_receiver_closed"); } break; },
                 }
             }
+            drop(stream);
+            if let Some(observer) = &observer { observer.transport_event("upstream_stream_released"); }
         }
         .instrument(span),
     );
