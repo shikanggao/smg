@@ -29,7 +29,7 @@ use smg::{
     },
     service_discovery::RuntimeDiscoveryConfig,
     version,
-    worker::{ConnectionMode, RuntimeType},
+    worker::{estimated_wait::EstimatedWaitConfig, ConnectionMode, RuntimeType},
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
@@ -1183,6 +1183,34 @@ impl CliArgs {
             )
             .pd_admission_wait_secs(self.workers.pd_admission_wait_secs)
             .disable_load_monitoring(self.workers.disable_load_monitoring)
+            .estimated_wait(EstimatedWaitConfig {
+                max_estimated_wait_secs: self.routing.max_estimated_wait_secs,
+                estimated_wait_shadow: self.routing.estimated_wait_shadow,
+                estimated_wait_native_hard_ttft_timeout_secs: self
+                    .routing
+                    .estimated_wait_native_hard_ttft_timeout_secs,
+                estimated_wait_provisional_baseline_secs: self
+                    .routing
+                    .estimated_wait_provisional_baseline_secs,
+                estimated_wait_kv_pressure_weight: self.routing.estimated_wait_kv_pressure_weight,
+                estimated_wait_dispatch_blocking_factor: self
+                    .routing
+                    .estimated_wait_dispatch_blocking_factor,
+                estimated_wait_mean_prefill_tokens: self.routing.estimated_wait_mean_prefill_tokens,
+                estimated_wait_fallback_prefill_throughput: self
+                    .routing
+                    .estimated_wait_fallback_prefill_throughput,
+                estimated_wait_prompt_size_prior_samples: self
+                    .routing
+                    .estimated_wait_prompt_size_prior_samples,
+                estimated_wait_queue_tokens_per_request: self
+                    .routing
+                    .estimated_wait_queue_tokens_per_request,
+                estimated_wait_max_snapshot_age_secs: self
+                    .routing
+                    .estimated_wait_max_snapshot_age_secs,
+                ..EstimatedWaitConfig::default()
+            })
             .worker_overload_protection(
                 self.routing.worker_overload_protection
                     && !self.routing.disable_worker_overload_protection,
