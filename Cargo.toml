@@ -266,15 +266,12 @@ strip = true
 
 [profile.dev]
 opt-level = 0
-# Line tables only: what a panic location or a backtrace needs to name a
-# file and line, and all that anything in this repository reads from a
-# debug build. The `limited` level adds per-function scope records that
-# nothing consumes; with split debuginfo they land in the `.dwo` files and
-# the rlibs, not the executables. `cargo test` builds with the test profile,
-# which inherits this.
-debug = "line-tables-only"
+# Keep routine builds small; the test profile inherits these settings.
+# Set CARGO_PROFILE_DEV_DEBUG or CARGO_PROFILE_TEST_DEBUG to
+# "line-tables-only" when file/line backtraces are needed.
+debug = false
 split-debuginfo = "unpacked"
-incremental = true
+incremental = false
 codegen-units = 256
 
 [profile.dev.package."*"]
