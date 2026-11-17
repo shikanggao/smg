@@ -405,6 +405,18 @@ class RouterArgs:
     # policy (--engine-metrics)
     engine_metrics: bool = False
     epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
+    estimated_wait_default_throughput: float = 2000.0
+    estimated_wait_dispatch_blocking_factor: float = 0.05
+    estimated_wait_fallback_prefill_throughput: float | None = None
+    estimated_wait_kv_pressure_weight: float = 0.0
+    estimated_wait_max_snapshot_age_secs: float = 30.0
+    estimated_wait_mean_prefill_tokens: int = 1024
+    estimated_wait_min_prefill_throughput: float | None = None
+    estimated_wait_native_hard_ttft_timeout_secs: float | None = None
+    estimated_wait_prompt_size_prior_samples: int = 32
+    estimated_wait_provisional_baseline_secs: float | None = None
+    estimated_wait_queue_tokens_per_request: int = 0
+    estimated_wait_shadow: bool = True
     eviction_interval_secs: int = 120
     # Seconds a request to a gRPC worker may take from its dispatch to its last
     # message; 0 (the default) arms no deadline
@@ -449,6 +461,7 @@ class RouterArgs:
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
     least_load_default_throughput: float = 2000.0
     least_load_kv_pressure_weight: float = 0.15
+    least_load_max_waiting_requests: int = 0
     least_load_mean_prefill_tokens: int = 1024
     load_monitor_interval: int = 10
     log_dir: str | None = None
@@ -467,6 +480,7 @@ class RouterArgs:
     max_concurrent_requests: int = -1
     # Most client connections the data listener holds open at once (0 = no bound)
     max_connections: int = 0
+    max_estimated_wait_secs: float | None = None
     max_idle_secs: int = 4 * 3600
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     max_tree_size: int = 2**26
@@ -1203,6 +1217,89 @@ class RouterArgs:
                 " de-ranks the hottest backend within cache-aware affinity; this"
                 " flag removes the worker from routing entirely."
             ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-shadow",
+            action=argparse.BooleanOptionalAction,
+            default=RouterArgs.estimated_wait_shadow,
+            help="Record would-reject decisions without enforcing estimated-wait budgets; "
+            "requires a gateway or worker wait budget; static protection is unchanged",
+        )
+        routing_group.add_argument(
+            f"--{prefix}max-estimated-wait-secs",
+            type=float,
+            default=RouterArgs.max_estimated_wait_secs,
+            help="Total TTFT budget in seconds; unset disables admission",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-kv-pressure-weight",
+            type=float,
+            default=RouterArgs.estimated_wait_kv_pressure_weight,
+            help="Deprecated compatibility option; only zero is accepted. Admission has no KV term",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-mean-prefill-tokens",
+            type=int,
+            default=RouterArgs.estimated_wait_mean_prefill_tokens,
+            help="Dispatch tokens when input tokens are unavailable",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-default-throughput",
+            type=float,
+            default=RouterArgs.estimated_wait_default_throughput,
+            help="Legacy alias for fallback prefill capacity in tokens/s",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-min-prefill-throughput",
+            type=float,
+            default=RouterArgs.estimated_wait_min_prefill_throughput,
+            help="Legacy alias for fallback prefill capacity in tokens/s",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-fallback-prefill-throughput",
+            type=float,
+            default=RouterArgs.estimated_wait_fallback_prefill_throughput,
+            help="Cold-start prefill capacity until saturated capacity is learned",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-provisional-baseline-secs",
+            type=float,
+            default=RouterArgs.estimated_wait_provisional_baseline_secs,
+            help="Same-model TTFT baseline for diagnostic calibration; measured baseline takes precedence",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-native-hard-ttft-timeout-secs",
+            type=float,
+            default=RouterArgs.estimated_wait_native_hard_ttft_timeout_secs,
+            help=(
+                "Opt-in remaining native first-output budget for regular HTTP feature streams; "
+                "requires enforcing engine; independent of admission threshold"
+            ),
+        )
+
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-prompt-size-prior-samples",
+            type=int,
+            default=RouterArgs.estimated_wait_prompt_size_prior_samples,
+            help="Effective samples assigned to the configured prompt-size prior",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-queue-tokens-per-request",
+            type=int,
+            default=RouterArgs.estimated_wait_queue_tokens_per_request,
+            help="Queued tokens per waiting request; zero disables proxy",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-max-snapshot-age-secs",
+            type=float,
+            default=RouterArgs.estimated_wait_max_snapshot_age_secs,
+            help="Maximum snapshot age in seconds; older data fails open",
+        )
+        routing_group.add_argument(
+            f"--{prefix}estimated-wait-dispatch-blocking-factor",
+            type=float,
+            default=RouterArgs.estimated_wait_dispatch_blocking_factor,
+            help="Fraction of newly dispatched prompt tokens that still block admission",
         )
         routing_group.add_argument(
             f"--{prefix}worker-overload-protection",
