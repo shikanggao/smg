@@ -15,7 +15,7 @@
 # benchmark jobs' env blocks among them: `grep -rn RUSTFLAGS .github/workflows`),
 # so a flag added here is added to each of them as well.
 rustflags = ["-C", "llvm-args=-enable-machine-outliner=never"]
-incremental = false
+incremental = true
 
 [env]
 # Linux aarch64 distributions must run on 4 KiB, 16 KiB, and 64 KiB page
