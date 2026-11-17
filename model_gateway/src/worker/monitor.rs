@@ -2525,6 +2525,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(4),
                 token_usage: None,
+                ..Default::default()
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2550,6 +2551,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(5),
                 token_usage: None,
+                ..Default::default()
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2583,6 +2585,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: None,
                 token_usage: Some(0.2),
+                ..Default::default()
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2640,6 +2643,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(1),
                 token_usage: None,
+                ..Default::default()
             },
         );
         worker.set_status(WorkerStatus::Ready);
@@ -2691,6 +2695,7 @@ mod native_loads_tests {
             OverloadUpdate {
                 waiting_requests: Some(1),
                 token_usage: None,
+                ..Default::default()
             },
         );
         worker.set_status(WorkerStatus::Ready);

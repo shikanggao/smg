@@ -149,6 +149,15 @@ impl CachePartition<'_> {
     }
 }
 
+/// Body-derived size evidence, never a routing-header hint or uncached-work claim.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum PromptWorkHint {
+    #[default]
+    Unknown,
+    TextBytes(usize),
+    BodyTokenIds(usize),
+}
+
 /// Trait for unified access to generation request properties
 /// Implemented by ChatCompletionRequest, CompletionRequest, GenerateRequest,
 /// EmbeddingRequest, RerankRequest, and ResponsesRequest
@@ -167,6 +176,12 @@ pub trait GenerationRequest: Send + Sync {
     /// rendering of the same IDs.
     fn routing_tokens(&self) -> Option<&[i32]> {
         None
+    }
+
+    /// Optional full-prompt size evidence for diagnostic pending-work accounting.
+    /// Unsupported/batched/multimodal requests retain the historical fallback.
+    fn prompt_work_hint(&self) -> PromptWorkHint {
+        PromptWorkHint::Unknown
     }
 
     /// Client-provided request id, when the protocol carries one. Routing may
@@ -3288,5 +3303,63 @@ mod tests {
         assert_eq!(json_type_name(&json!("x")), "a string");
         assert_eq!(json_type_name(&json!([])), "an array");
         assert_eq!(json_type_name(&json!({})), "an object");
+    }
+}
+
+#[cfg(test)]
+mod prompt_work_tests {
+    use serde_json::json;
+
+    use super::{GenerationRequest, PromptWorkHint};
+    use crate::{chat::ChatCompletionRequest, completion::CompletionRequest};
+
+    #[test]
+    fn completion_work_preserves_single_prompt_evidence_and_rejects_batches() {
+        for (prompt, expected) in [
+            (json!(""), Some(0)),
+            (json!("hello"), Some(5)),
+            (json!(["hello"]), None),
+            (json!([[1, 2]]), None),
+        ] {
+            let request: CompletionRequest =
+                serde_json::from_value(json!({"model": "m", "prompt": prompt})).unwrap();
+            match (request.prompt_work_hint(), expected) {
+                (PromptWorkHint::TextBytes(actual), Some(expected)) => assert_eq!(actual, expected),
+                (PromptWorkHint::Unknown, None) => {}
+                other => panic!("unexpected work evidence: {other:?}"),
+            }
+        }
+        let request: CompletionRequest =
+            serde_json::from_value(json!({"model": "m", "prompt": [1, 2, 3]})).unwrap();
+        assert!(matches!(
+            request.prompt_work_hint(),
+            PromptWorkHint::BodyTokenIds(3)
+        ));
+    }
+
+    #[test]
+    fn chat_work_does_not_omit_reasoning_or_tool_schema_inputs() {
+        for message in [
+            json!({"role": "assistant", "content": "hello", "reasoning_content": "think"}),
+            json!({"role": "assistant", "content": "hello", "reasoning": "think"}),
+            json!({"role": "developer", "content": "hello", "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]}),
+        ] {
+            let request: ChatCompletionRequest =
+                serde_json::from_value(json!({"model": "m", "messages": [message]})).unwrap();
+            assert!(matches!(
+                request.prompt_work_hint(),
+                PromptWorkHint::Unknown
+            ));
+        }
+        for role in ["developer", "assistant"] {
+            let request: ChatCompletionRequest = serde_json::from_value(
+                json!({"model": "m", "messages": [{"role": role, "content": ""}]}),
+            )
+            .unwrap();
+            assert!(matches!(
+                request.prompt_work_hint(),
+                PromptWorkHint::TextBytes(0)
+            ));
+        }
     }
 }

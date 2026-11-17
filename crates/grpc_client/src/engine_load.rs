@@ -48,6 +48,7 @@ impl From<&vllm_proto::SchedulerLoad> for common::EngineLoad {
     fn from(load: &vllm_proto::SchedulerLoad) -> Self {
         Self {
             prefill_throughput: load.prefill_throughput,
+            waiting_uncached_tokens: Some(unsigned(load.num_waiting_uncached_tokens)),
             cache_hit_rate: Some(load.cache_hit_rate),
             num_used_tokens: Some(load.num_used_tokens),
             max_total_num_tokens: Some(load.max_total_num_tokens),
@@ -67,6 +68,7 @@ impl From<&trtllm_proto::SchedulerLoad> for common::EngineLoad {
     fn from(load: &trtllm_proto::SchedulerLoad) -> Self {
         Self {
             prefill_throughput: load.prefill_throughput,
+            waiting_uncached_tokens: Some(unsigned(load.num_waiting_uncached_tokens)),
             cache_hit_rate: Some(load.cache_hit_rate),
             num_used_tokens: Some(load.num_used_tokens),
             max_total_num_tokens: Some(load.max_total_num_tokens),
@@ -87,6 +89,7 @@ impl From<&sglang_proto::SchedulerLoad> for common::EngineLoad {
     fn from(load: &sglang_proto::SchedulerLoad) -> Self {
         Self {
             prefill_throughput: load.prefill_throughput,
+            waiting_uncached_tokens: Some(unsigned(load.num_waiting_uncached_tokens)),
             cache_hit_rate: Some(load.cache_hit_rate),
             num_used_tokens: Some(load.num_used_tokens),
             max_total_num_tokens: Some(load.max_total_num_tokens),
@@ -143,6 +146,7 @@ impl From<&tokenspeed_proto::SchedulerLoad> for common::EngineLoad {
     fn from(load: &tokenspeed_proto::SchedulerLoad) -> Self {
         Self {
             prefill_throughput: load.prefill_throughput,
+            waiting_uncached_tokens: Some(unsigned(load.num_waiting_uncached_tokens)),
             active_token_usage: load.active_token_usage,
             num_resident_tokens: load
                 .num_resident_tokens
@@ -194,6 +198,7 @@ impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
             num_running_reqs: signed(record.running_requests),
             num_waiting_reqs: signed(record.waiting_requests),
             num_waiting_uncached_tokens: record.waiting_uncached_tokens.map_or(0, signed),
+            num_waiting_uncached_tokens_available: Some(record.waiting_uncached_tokens.is_some()),
             num_total_reqs: signed(
                 record
                     .running_requests
@@ -291,6 +296,25 @@ mod tests {
             assert_eq!(
                 SchedulerLoadSnapshot::from(tokenspeed).prefill_throughput,
                 rate
+            );
+        }
+    }
+
+    #[test]
+    fn pushed_queued_work_distinguishes_absent_from_measured_zero() {
+        for work in [None, Some(0), Some(123)] {
+            let record = common::EngineLoad {
+                waiting_uncached_tokens: work,
+                ..Default::default()
+            };
+            let snapshot = SchedulerLoadSnapshot::from(&record);
+            assert_eq!(
+                snapshot.num_waiting_uncached_tokens_available,
+                Some(work.is_some())
+            );
+            assert_eq!(
+                snapshot.num_waiting_uncached_tokens,
+                work.unwrap_or(0) as i32
             );
         }
     }
