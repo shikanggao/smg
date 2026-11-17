@@ -1,7 +1,7 @@
-//! Local activity and first-text deadline observations for the C2 shadow candidate.
-//! Counts describe resolved local observations, not native cancellation acknowledgements.
+//! Bounded first-text deadline observations for exact and censored fit labels.
+//! A local deadline is not a native cancellation acknowledgement.
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     sync::{
         atomic::{AtomicU8, Ordering},
         Arc,
@@ -9,32 +9,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
-
-pub const METHOD: &str = "local_ttft_activity_v1";
-
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct Context {
-    pub counts: Counts,
-    pub bucket_second: u64,
-    pub activity_origin_time_seconds: f64,
-    pub deadline_untracked_pending: u64,
-}
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct Counts {
-    pub first_text: u64,
-    pub upstream_timeout: u64,
-    pub native_deadline_cutoff: u64,
-    pub pretext_downstream_disconnect: u64,
-    pub unknown_pretext_end: u64,
-    pub admitted: u64,
-    pub actual_rejected: u64,
-    pub untracked_admitted: u64,
-    pub deadline_timely_first_text: u64,
-    pub deadline_breach: u64,
-    pub deadline_or_cutoff_adverse: u64,
-    pub deadline_or_cutoff_unknown: u64,
-}
 #[derive(Clone, Copy, Debug)]
 pub enum Outcome {
     FirstText,
@@ -42,9 +16,6 @@ pub enum Outcome {
     NativeDeadline,
     Disconnect,
     Unknown,
-    Admitted,
-    Rejected,
-    UntrackedAdmitted,
     DeadlineTimely,
     DeadlineBreach,
     ActualCutoff,
@@ -58,8 +29,6 @@ impl Outcome {
             Self::NativeDeadline => "native_hard_ttft_deadline",
             Self::Disconnect => "pretext_downstream_disconnect",
             Self::Unknown => "unknown_pretext_end",
-            Self::Admitted | Self::UntrackedAdmitted => "admitted",
-            Self::Rejected => "actual_rejected",
             Self::DeadlineTimely => "timely_first_text",
             Self::DeadlineBreach => "deadline_breach",
             Self::ActualCutoff => "actual_cutoff",
@@ -67,108 +36,6 @@ impl Outcome {
         }
     }
 }
-impl Counts {
-    fn add(&mut self, other: Self) {
-        self.first_text = self.first_text.saturating_add(other.first_text);
-        self.upstream_timeout = self.upstream_timeout.saturating_add(other.upstream_timeout);
-        self.native_deadline_cutoff = self
-            .native_deadline_cutoff
-            .saturating_add(other.native_deadline_cutoff);
-        self.pretext_downstream_disconnect = self
-            .pretext_downstream_disconnect
-            .saturating_add(other.pretext_downstream_disconnect);
-        self.unknown_pretext_end = self
-            .unknown_pretext_end
-            .saturating_add(other.unknown_pretext_end);
-        self.deadline_timely_first_text = self
-            .deadline_timely_first_text
-            .saturating_add(other.deadline_timely_first_text);
-        self.deadline_breach = self.deadline_breach.saturating_add(other.deadline_breach);
-        self.deadline_or_cutoff_adverse = self
-            .deadline_or_cutoff_adverse
-            .saturating_add(other.deadline_or_cutoff_adverse);
-        self.deadline_or_cutoff_unknown = self
-            .deadline_or_cutoff_unknown
-            .saturating_add(other.deadline_or_cutoff_unknown);
-        self.admitted = self.admitted.saturating_add(other.admitted);
-        self.actual_rejected = self.actual_rejected.saturating_add(other.actual_rejected);
-        self.untracked_admitted = self
-            .untracked_admitted
-            .saturating_add(other.untracked_admitted);
-    }
-    fn record(&mut self, outcome: Outcome) {
-        if matches!(outcome, Outcome::UntrackedAdmitted) {
-            self.untracked_admitted = self.untracked_admitted.saturating_add(1);
-        }
-        if matches!(outcome, Outcome::DeadlineBreach) {
-            self.deadline_breach = self.deadline_breach.saturating_add(1);
-        }
-        let value = match outcome {
-            Outcome::FirstText => &mut self.first_text,
-            Outcome::Timeout => &mut self.upstream_timeout,
-            Outcome::NativeDeadline => &mut self.native_deadline_cutoff,
-            Outcome::Disconnect => &mut self.pretext_downstream_disconnect,
-            Outcome::Unknown => &mut self.unknown_pretext_end,
-            Outcome::Admitted | Outcome::UntrackedAdmitted => &mut self.admitted,
-            Outcome::Rejected => &mut self.actual_rejected,
-            Outcome::DeadlineTimely => &mut self.deadline_timely_first_text,
-            Outcome::DeadlineBreach | Outcome::ActualCutoff => &mut self.deadline_or_cutoff_adverse,
-            Outcome::DeadlineUnknown => &mut self.deadline_or_cutoff_unknown,
-        };
-        *value = value.saturating_add(1);
-    }
-}
-#[derive(Debug)]
-pub struct Activity {
-    origin: Instant,
-    buckets: VecDeque<(u64, Counts)>,
-}
-impl Activity {
-    pub fn new(now: Instant) -> Self {
-        Self {
-            origin: now,
-            buckets: VecDeque::new(),
-        }
-    }
-    pub fn record(&mut self, now: Instant, outcome: Outcome) {
-        let second = now.saturating_duration_since(self.origin).as_secs();
-        // Callbacks are serialized by the ledger lock. Never insert an older bucket.
-        if self.buckets.back().is_some_and(|(time, _)| *time > second) {
-            return;
-        }
-        while self
-            .buckets
-            .front()
-            .is_some_and(|(time, _)| time.saturating_add(60) <= second)
-        {
-            self.buckets.pop_front();
-        }
-        if self.buckets.back().is_none_or(|(time, _)| *time != second) {
-            self.buckets.push_back((second, Counts::default()));
-        }
-        #[expect(
-            clippy::unwrap_used,
-            reason = "the current bucket is inserted immediately above when absent"
-        )]
-        self.buckets.back_mut().unwrap().1.record(outcome);
-    }
-    pub fn context(&self, now: Instant) -> Context {
-        let second = now.saturating_duration_since(self.origin).as_secs();
-        let mut counts = Counts::default();
-        for (time, bucket) in &self.buckets {
-            if *time <= second && time.saturating_add(60) > second {
-                counts.add(*bucket);
-            }
-        }
-        Context {
-            bucket_second: second,
-            deadline_untracked_pending: 0,
-            activity_origin_time_seconds: super::diagnostic_time(self.origin),
-            counts,
-        }
-    }
-}
-
 /// A bounded local first-text observation, independent of upstream cancellation.
 pub const TTFT_DEADLINE: Duration = Duration::from_secs(300);
 const MAX_PENDING_DEADLINES: usize = 8192;
@@ -417,73 +284,5 @@ mod tests {
         assert_eq!(d.pending_count(), 0);
         d.next = u64::MAX;
         assert!(matches!(d.register(start, None), DeadlineHandle::Untracked));
-    }
-    #[test]
-    fn deadline_union_keeps_actual_cutoff_diagnostics_separate() {
-        let start = Instant::now();
-        let mut a = Activity::new(start);
-        for _ in 0..15 {
-            a.record(start, Outcome::DeadlineTimely);
-        }
-        a.record(start, Outcome::DeadlineBreach);
-        a.record(start, Outcome::Timeout); // Later terminal is diagnostic only.
-        a.record(start, Outcome::Unknown); // Already-breached unknown isn't union unknown.
-        let c = a.context(start);
-        assert_eq!(c.counts.deadline_or_cutoff_adverse, 1);
-        assert_eq!(c.counts.deadline_breach, 1);
-        assert_eq!(c.counts.upstream_timeout, 1);
-        assert_eq!(c.counts.deadline_or_cutoff_unknown, 0);
-        assert_eq!(
-            a.context(start + Duration::from_secs(60))
-                .counts
-                .deadline_or_cutoff_adverse,
-            0
-        );
-    }
-
-    #[test]
-    fn causal_buckets_and_unknown_coverage() {
-        let now = Instant::now();
-        let mut a = Activity::new(now);
-        for _ in 0..16 {
-            a.record(now, Outcome::FirstText);
-            a.record(now, Outcome::DeadlineTimely);
-            a.record(now, Outcome::Admitted);
-        }
-        a.record(now + Duration::from_secs(1), Outcome::Timeout);
-        a.record(now + Duration::from_secs(1), Outcome::ActualCutoff);
-        assert_eq!(a.context(now).counts.deadline_or_cutoff_adverse, 0);
-        assert_eq!(
-            a.context(now + Duration::from_secs(60))
-                .counts
-                .deadline_timely_first_text,
-            0
-        );
-        for _ in 0..3 {
-            a.record(now + Duration::from_secs(1), Outcome::Unknown);
-            a.record(now + Duration::from_secs(1), Outcome::DeadlineUnknown);
-        }
-        assert_eq!(
-            a.context(now + Duration::from_secs(1))
-                .counts
-                .deadline_or_cutoff_unknown,
-            3
-        );
-    }
-    #[test]
-    fn untracked_admission_does_not_invent_terminal_outcome() {
-        let now = Instant::now();
-        let mut activity = Activity::new(now);
-        for _ in 0..16 {
-            activity.record(now, Outcome::FirstText);
-            activity.record(now, Outcome::DeadlineTimely);
-            activity.record(now, Outcome::Admitted);
-        }
-        activity.record(now, Outcome::UntrackedAdmitted);
-        let context = activity.context(now);
-        assert_eq!(context.counts.admitted, 17);
-        assert_eq!(context.counts.untracked_admitted, 1);
-        assert_eq!(context.counts.unknown_pretext_end, 0);
-        assert_eq!(context.counts.upstream_timeout, 0);
     }
 }

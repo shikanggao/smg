@@ -297,10 +297,6 @@ pub(crate) fn select_from(
             registry, policies, model_id, candidates, inputs,
         ));
     }
-    let request_id = inputs
-        .headers
-        .and_then(|h| h.get("opc-request-id"))
-        .and_then(|v| v.to_str().ok());
     let feature_worker = crate::worker::estimated_wait::AdmissionGuard::feature_scope(
         candidates,
         inputs.feature_context_supported,
@@ -347,16 +343,8 @@ pub(crate) fn select_from(
     }
     let mut frozen_forecast = None;
     if let Some(guard) = &mut admission {
-        guard.record_forecast(
-            candidates,
-            inputs
-                .headers
-                .and_then(|headers| headers.get("opc-request-id"))
-                .and_then(|value| value.to_str().ok()),
-            feature_worker,
-        );
         let reject = if let Some(worker) = feature_worker {
-            frozen_forecast = guard.capture_calibration(worker, request_id);
+            frozen_forecast = guard.capture_calibration(worker);
             guard.attach_feature_context(worker, &mut frozen_forecast);
             let prediction = frozen_forecast
                 .as_ref()
@@ -393,7 +381,7 @@ pub(crate) fn select_from(
                 );
             }
             if let Some(worker) = feature_worker {
-                guard.record_feature_decision(worker, request_id, true, false);
+                guard.record_feature_decision(worker, true, false);
             }
             return Err(crate::worker::estimated_wait::AdmissionGuard::shed(
                 model_id,
@@ -410,14 +398,14 @@ pub(crate) fn select_from(
             *capture.lock() = if in_scope {
                 frozen_forecast.take()
             } else {
-                guard.capture_calibration(&selected, request_id)
+                guard.capture_calibration(&selected)
             };
         }
         if in_scope {
             let tracked = inputs
                 .calibration
                 .is_some_and(|capture| capture.lock().is_some());
-            guard.record_feature_decision(&selected, request_id, false, tracked);
+            guard.record_feature_decision(&selected, false, tracked);
         }
         guard.credit(&selected, inputs.tokens);
         if let Some(capture) = inputs.calibration {

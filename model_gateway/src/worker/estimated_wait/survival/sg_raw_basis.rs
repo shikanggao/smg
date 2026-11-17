@@ -832,9 +832,7 @@ mod tests {
             wire["raw_evidence"]["positive_evidence_for_zero_interval"]["raw_expiry"],
             38.0
         );
-        if let Ok(path) = std::env::var("SMG_SG_ZERO_SELECTION_FIXTURE_PATH") {
-            std::fs::write(path, serde_json::to_vec_pretty(selected).unwrap()).unwrap();
-        }
+
         a.sg_raw_basis_deadline = None;
         assert_eq!(serde_json::to_value(&a).unwrap(), before);
     }
@@ -1446,23 +1444,5 @@ mod tests {
             selected["guarded_cutoff_gateway_seconds"],
             value["training_snapshot"]["at"]
         );
-        if let Ok(path) = std::env::var("SMG_SG_E_FIXTURE_PATH") {
-            let mut unavailable = a.clone();
-            state.native.invalidate_sg_raw();
-            state.native.select_sg_raw_basis(&mut unavailable, 1);
-            assert!(unavailable.sg_raw_basis_deadline.is_none());
-            let unavailable_path = std::path::Path::new(&path)
-                .with_file_name("emitted-sg-admission-unavailable-fixture.json");
-            std::fs::write(
-                unavailable_path,
-                serde_json::to_vec_pretty(&serde_json::json!({"admission":unavailable})).unwrap(),
-            )
-            .unwrap();
-            std::fs::write(
-                path,
-                serde_json::to_vec_pretty(&serde_json::json!({"admission":a})).unwrap(),
-            )
-            .unwrap();
-        }
     }
 }

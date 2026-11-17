@@ -1,32 +1,18 @@
-//! Censored-loss queue/context fits for the C2 shadow candidate and paired control.
-//! These predictions never affect admission.
-//! Exact labels and right-censored lower bounds share a slope-regularized objective;
-//! a lower bound is never treated as a measured TTFT or rounded to a deadline.
+//! Censored-loss service calibration and causal pending-request context.
+//! Exact TTFT labels and timeout lower bounds share a slope-regularized objective;
+//! a lower bound is never treated as a measured TTFT.
 //!
-//! X = uncalibrated live N (original N fallback), independent of legacy scalar.
-//! The ideal single-layer expression is T = B + X*max(0, q+a·z); the deployed
-//! expression is B + X*max(0, q+clamp(a·z, -0.5, 0.5)). q is bounded to [0,4]
-//! and each feature coefficient to [-2,2], with the existing L1 trajectory cap.
-//! Only contextual slopes receive ridge regularization. Penalizing q toward1
-//! biases even an exact, noiseless queue-only fit away from its observed gain.
-//! z contains pending growth over30s, oldest pending age/300, and timely native
-//! progress deficit. Early predictions require selected features inside their
-//! retained fit ranges; otherwise they use the matching independent queue fit.
-//! The convex fit uses an unclipped linear response. Prediction retains the
-//! contextual ±0.5 cap; both objectives and clipping are exported explicitly.
-//! This is not an exact optimizer of the capped, time-slewed prediction.
-//! Fits run on poll only when labels/retention change. Fresh polls after a gap
-//! may reuse age-valid rows, but restart the trajectory and growth history.
-//! All history is shadow-only and independently reset with the worker epoch.
-//! Unsupported/unavailable models retain the legacy scalar*X fallback. Its
-//! exported coefficients are effective output weights, not learned weights;
-//! the scalar can exceed the fitted q cap and fallback transitions are not
-//! constrained by the learned trajectory. Learned vectors remain in diagnostics.
-//! Supported mask changes preserve q and shared applied slopes, initializing new
-//! slopes and removing dropped slopes at zero. Removing a slope changes the
-//! prediction basis immediately; it and source fallback switches are not covered
-//! by the coefficient slew bound. Compatible coefficients remain continuous,
-//! but total prediction continuity is not guaranteed across these transitions.
+//! T = B + X * max(0, q + clamp(a·z, -0.5, 0.5)). q is bounded to [0,4]
+//! and feature coefficients to [-2,2], with an L1 trajectory cap. Context uses
+//! pending growth, oldest pending age and timely native progress deficit.
+//! Contextual predictions outside the supported fit ranges use the queue-only
+//! fit. Both are internal parts of the selected predictor, not operator options.
+//! The fit uses an unclipped linear response and regularizes contextual slopes;
+//! output clipping and time slew mean it is not an exact optimizer of final loss.
+//! Only the selected normalized service model is fitted. Admission/basis trackers
+//! use track_poll to retain causal labels and expire/reset state without fitting.
+//! Fresh polls after a gap restart trajectory/growth history. Worker or source
+//! changes isolate histories; source fallback changes can still change predictions.
 use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
@@ -99,9 +85,13 @@ pub struct Fit {
     pub minimum: [f64; 3],
     pub maximum: [f64; 3],
     pub supported: bool,
+    #[cfg(test)]
     pub objective: f64,
+    #[cfg(test)]
     pub projected_gradient: f64,
+    #[cfg(test)]
     pub bounded_training_objective: f64,
+    #[cfg(test)]
     pub training_clipped_count: usize,
 }
 impl Default for Fit {
@@ -116,9 +106,13 @@ impl Default for Fit {
             minimum: [0.0; 3],
             maximum: [0.0; 3],
             supported: false,
+            #[cfg(test)]
             objective: 0.0,
+            #[cfg(test)]
             projected_gradient: 0.0,
+            #[cfg(test)]
             bounded_training_objective: 0.0,
+            #[cfg(test)]
             training_clipped_count: 0,
         }
     }
@@ -240,49 +234,58 @@ impl Fit {
                 let grad = gradient(coefficients);
                 coefficients = project(std::array::from_fn(|j| coefficients[j] - step * grad[j]));
             }
-            let grad = gradient(coefficients);
-            let next = project(std::array::from_fn(|j| coefficients[j] - step * grad[j]));
-            let projected_gradient = (0..4)
-                .map(|j| ((coefficients[j] - next[j]) / step).abs())
-                .fold(0.0, f64::max);
-            let objective = 0.5
-                * RIDGE
-                * (1..4)
-                    .map(|j| (coefficients[j] - PRIOR[j]).powi(2))
-                    .sum::<f64>()
-                + 0.5
+            #[cfg(test)]
+            let (objective, projected_gradient, bounded_training_objective, training_clipped_count) = {
+                let grad = gradient(coefficients);
+                let next = project(std::array::from_fn(|j| coefficients[j] - step * grad[j]));
+                let projected_gradient = (0..4)
+                    .map(|j| ((coefficients[j] - next[j]) / step).abs())
+                    .fold(0.0, f64::max);
+                let objective = 0.5
+                    * RIDGE
+                    * (1..4)
+                        .map(|j| (coefficients[j] - PRIOR[j]).powi(2))
+                        .sum::<f64>()
+                    + 0.5
+                        * selected
+                            .iter()
+                            .zip(&weights)
+                            .map(|((r, z), w)| {
+                                let e = dot(coefficients, *z)
+                                    - (r.elapsed - r.snapshot.baseline).max(0.0) / r.snapshot.x;
+                                w / sum * if r.exact { e * e } else { e.min(0.0).powi(2) }
+                            })
+                            .sum::<f64>();
+                let bounded_training_objective = 0.5
                     * selected
                         .iter()
                         .zip(&weights)
                         .map(|((r, z), w)| {
-                            let e = dot(coefficients, *z)
-                                - (r.elapsed - r.snapshot.baseline).max(0.0) / r.snapshot.x;
+                            let shift = dot(coefficients, *z) - coefficients[0];
+                            let y = coefficients[0] + shift.clamp(-0.5, 0.5).max(-coefficients[0]);
+                            let e = y - (r.elapsed - r.snapshot.baseline).max(0.0) / r.snapshot.x;
                             w / sum * if r.exact { e * e } else { e.min(0.0).powi(2) }
                         })
-                        .sum::<f64>();
-            let bounded_training_objective = 0.5
-                * selected
+                        .sum::<f64>()
+                    + 0.5
+                        * RIDGE
+                        * (1..4)
+                            .map(|j| (coefficients[j] - PRIOR[j]).powi(2))
+                            .sum::<f64>();
+                let training_clipped_count = selected
                     .iter()
-                    .zip(&weights)
-                    .map(|((r, z), w)| {
+                    .filter(|(_, z)| {
                         let shift = dot(coefficients, *z) - coefficients[0];
-                        let y = coefficients[0] + shift.clamp(-0.5, 0.5).max(-coefficients[0]);
-                        let e = y - (r.elapsed - r.snapshot.baseline).max(0.0) / r.snapshot.x;
-                        w / sum * if r.exact { e * e } else { e.min(0.0).powi(2) }
+                        shift != shift.clamp(-0.5, 0.5).max(-coefficients[0])
                     })
-                    .sum::<f64>()
-                + 0.5
-                    * RIDGE
-                    * (1..4)
-                        .map(|j| (coefficients[j] - PRIOR[j]).powi(2))
-                        .sum::<f64>();
-            let training_clipped_count = selected
-                .iter()
-                .filter(|(_, z)| {
-                    let shift = dot(coefficients, *z) - coefficients[0];
-                    shift != shift.clamp(-0.5, 0.5).max(-coefficients[0])
-                })
-                .count();
+                    .count();
+                (
+                    objective,
+                    projected_gradient,
+                    bounded_training_objective,
+                    training_clipped_count,
+                )
+            };
             return Self {
                 coefficients,
                 mask,
@@ -293,9 +296,13 @@ impl Fit {
                 minimum,
                 maximum,
                 supported: true,
+                #[cfg(test)]
                 objective,
+                #[cfg(test)]
                 projected_gradient,
+                #[cfg(test)]
                 bounded_training_objective,
+                #[cfg(test)]
                 training_clipped_count,
             };
         }
@@ -545,6 +552,17 @@ impl State {
         }
     }
     pub fn poll(&mut self, now: f64, profile: Option<u64>, fresh: bool, max_gap: f64) {
+        self.track_poll(now, profile, fresh, max_gap);
+        if fresh && self.fitted_revision != Some(self.revision) {
+            for i in 0..2 {
+                self.models[i].update(Fit::learn(&self.rows, i == 1, true), now);
+            }
+            self.fitted_revision = Some(self.revision);
+        }
+    }
+
+    /// Maintain admission context and causal labels without fitting comparison models.
+    pub fn track_poll(&mut self, now: f64, profile: Option<u64>, fresh: bool, max_gap: f64) {
         if profile != self.profile {
             self.rows.clear();
             self.models = Default::default();
@@ -570,12 +588,6 @@ impl State {
         while self.points.front().is_some_and(|(at, _)| now - at > 60.0) || self.points.len() > 256
         {
             self.points.pop_front();
-        }
-        if self.fitted_revision != Some(self.revision) {
-            for i in 0..2 {
-                self.models[i].update(Fit::learn(&self.rows, i == 1, true), now);
-            }
-            self.fitted_revision = Some(self.revision);
         }
     }
     pub fn predictions(&self, snapshot: Snapshot, now: f64, available: bool) -> [Prediction; 2] {
@@ -648,6 +660,12 @@ impl State {
             }
         })
     }
+    #[cfg(test)]
+    pub fn labels_for_test(&self) -> &VecDeque<Label> {
+        &self.rows
+    }
+
+    #[cfg(test)]
     pub fn diagnostics(&self) -> serde_json::Value {
         serde_json::json!({"arms":ARMS,"models":self.models,"rows":self.rows.len(),"origin":self.origin,"profile":self.profile,
             "revision":self.revision,"fitted_revision":self.fitted_revision,"pending":self.pending.len(),"complete":!self.incomplete,"ridge":RIDGE,"min_x_seconds":MIN_X,
@@ -657,10 +675,6 @@ impl State {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::print_stdout,
-    reason = "tests export deterministic fixtures for independent offline parity checks"
-)]
 mod tests {
     use super::*;
     fn snapshot(at: f64, values: [Option<f64>; 3]) -> Snapshot {
@@ -717,10 +731,6 @@ mod tests {
         assert!(fit.coefficients[1] > 0.0);
         assert!(fit.coefficients[2] < 0.0);
         assert!(fit.projected_gradient < 1e-7);
-        println!(
-            "DECISION_FIXTURE={}",
-            serde_json::json!({"rows":rows,"fit":fit})
-        );
     }
     #[test]
     fn neutral_prior_and_one_sided_bound() {
@@ -741,7 +751,6 @@ mod tests {
     }
     #[test]
     fn noiseless_queue_gain_has_no_shrinkage_above_or_below_one() {
-        let mut fixtures = Vec::new();
         for gain in [0.5, 2.0] {
             let mut rows = labels();
             for row in &mut rows {
@@ -754,16 +763,10 @@ mod tests {
             assert_eq!(&fit.coefficients[1..], &[0.0; 3]);
             assert!(fit.objective < 1e-20);
             assert!(fit.projected_gradient < 1e-12);
-            fixtures.push(serde_json::json!({"name":"exact_queue","gain":gain,"rows":rows,"early":false,"censored":false,"fit":fit}));
         }
-        println!(
-            "UNPENALIZED_QUEUE_FIXTURE={}",
-            serde_json::json!({"cases":fixtures})
-        );
     }
     #[test]
     fn bound_only_queue_fit_respects_one_sided_identifiability_and_cap() {
-        let mut fixtures = Vec::new();
         for (bound, expected_gain) in [(0.5, 1.0), (2.0, 2.0), (5.0, 4.0)] {
             let mut rows = labels();
             for row in &mut rows {
@@ -784,14 +787,9 @@ mod tests {
             }
             // A lower bound below the prior does not identify a smaller point
             // prediction. Feasible q>=bound has zero loss, so initialization1 stays.
-            fixtures.push(serde_json::json!({"name":"bound_queue","bound":bound,"rows":rows,"early":false,"censored":true,"fit":fit}));
             rows.truncate(11);
             assert!(!Fit::learn(&rows, false, true).supported);
         }
-        println!(
-            "BOUND_QUEUE_FIXTURE={}",
-            serde_json::json!({"cases":fixtures})
-        );
     }
     #[test]
     fn contextual_slopes_still_have_ridge_and_intercept_has_zero_mean_residual() {
@@ -1091,7 +1089,6 @@ mod tests {
             ..Fit::default()
         };
         model.update(initial.clone(), 0.0);
-        let before_model = model.clone();
         let before = model.applied(1.0);
         assert!(before[0] > 1.0 && before[0] < 2.8);
         assert!(before[1] < 0.0 && before[3] > 0.0);
@@ -1111,12 +1108,6 @@ mod tests {
                 .sum::<f64>()
                 <= 0.100000001
         );
-        println!(
-            "QWEN_MASK_FIXTURE={}",
-            serde_json::json!({"initial_fit":initial,"initial_at":0.0,"before_model":before_model,
-                "update_fit":next,"update_at":1.0,"before_applied":before,"after_model":model,
-                "later_at":1.2,"later_applied":later})
-        );
     }
     #[test]
     fn dropped_slope_is_an_explicit_basis_change_not_a_hidden_queue_gain_reset() {
@@ -1131,7 +1122,6 @@ mod tests {
         s.models[1].update(fit.clone(), 0.0);
         let snap = snapshot(10.0, [None, Some(1.0), None]);
         let before = s.predictions(snap, 10.0, true)[1].clone();
-        let prior_model = s.models[1].clone();
         let next = Fit {
             mask: 0,
             coefficients: [2.5, 0.0, 0.0, 0.0],
@@ -1148,12 +1138,6 @@ mod tests {
         // movement resumes the original cap and cannot resurrect the old slope.
         let later = s.predictions(snap, 10.4, true)[1].clone();
         assert!((later.coefficients[0] - 2.2).abs() < 1e-10);
-        println!(
-            "MODEL_CONTINUITY_FIXTURE={}",
-            serde_json::json!({"initial_fit":fit,"initial_at":0.0,"before_model":prior_model,
-                "update_fit":next,"update_at":10.0,"after_model":s.models[1],
-                "snapshot":snap,"before":before,"after":after,"later_at":10.4,"later":later})
-        );
     }
     #[test]
     fn retained_range_boundaries_and_unselected_values_do_not_trigger_fallback() {
@@ -1223,6 +1207,25 @@ mod tests {
         }
     }
     #[test]
+    fn tracking_poll_preserves_labels_without_training_comparison_models() {
+        let mut s = state();
+        let fitted_before = s.fitted_revision;
+        s.rows = labels();
+        s.origin = Some(20.0);
+        s.revision += 1;
+        s.track_poll(1.0, Some(7), true, 5.0);
+        assert_eq!(s.rows.len(), 32);
+        assert!(s.models.iter().all(|m| !m.fit.supported));
+        assert_eq!(s.fitted_revision, fitted_before);
+        // The selected service learner still fits the same eligible observations.
+        s.poll(2.0, Some(7), true, 5.0);
+        assert!(s.models[0].fit.supported);
+        assert_eq!(s.fitted_revision, Some(s.revision));
+        s.track_poll(603.0, Some(7), true, 5.0);
+        assert!(s.rows.is_empty());
+        assert!(s.models.iter().all(|m| !m.fit.supported));
+    }
+    #[test]
     fn no_feedback_poll_does_not_refit_or_restart_movement() {
         let mut s = state();
         s.rows = labels();
@@ -1233,58 +1236,5 @@ mod tests {
         assert_eq!(s.models[1].at, before);
         s.poll(3.0, Some(7), false, 5.0);
         assert_eq!(s.models[1].target, PRIOR);
-    }
-    #[test]
-    fn deterministic_state_fixture() {
-        let mut s = State::default();
-        let mut actions = Vec::new();
-        s.poll(0.0, Some(7), true, 5.0);
-        actions.push(serde_json::json!({"op":"poll","now":0.0,"profile":7,"fresh":true,"max_gap":5.0,"state":s.diagnostics()}));
-        let mut outcomes = Vec::new();
-        for i in 0..32 {
-            let g = (i % 4) as f64 / 3.0;
-            let a = (i / 4) as f64 / 7.0;
-            let mut snap = snapshot(0.0, [Some(g * 0.5), Some(a), None]);
-            snap.scalar_gain = if i % 2 == 0 { 0.2 } else { 6.0 };
-            s.register(Some(i), 0.0, Some(snap));
-            actions.push(serde_json::json!({"op":"register","id":i,"started":0.0,"snapshot":snap}));
-            outcomes.push((102.0 + 100.0 * (0.8 * g - 0.4 * a), i));
-        }
-        outcomes.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for (at, id) in outcomes {
-            let exact = id % 3 != 0;
-            let label = s.label(id, at, at, exact, exact, None);
-            actions.push(serde_json::json!({"op":"label","id":id,"observed_at":at,"now":at,"exact":exact,"terminal":exact,"bound":null,"label":label}));
-        }
-        for now in [200.0, 200.4, 230.0] {
-            if now != 200.4 {
-                s.poll(now, Some(7), true, 40.0);
-            }
-            let mut snap = snapshot(now, [Some(1.0), Some(0.5), None]);
-            snap.scalar_gain = 2.0;
-            snap.context = s.context(now, Some(0.0), Some(100.0), true);
-            actions.push(serde_json::json!({"op":if now==200.4{"predict"}else{"poll"},"now":now,"profile":7,"fresh":true,"max_gap":40.0,
-                "snapshot":snap,"predictions":s.predictions(snap,now,true),"state":s.diagnostics()}));
-        }
-        let label = s.label(0, 240.0, 240.0, true, true, None);
-        actions.push(serde_json::json!({"op":"label","id":0,"observed_at":240.0,"now":240.0,"exact":true,"terminal":true,"bound":null,"label":label}));
-        for (now, profile, fresh) in [
-            (241.0, 7, true),
-            (250.0, 7, false),
-            (251.0, 7, true),
-            (599.0, 7, true),
-            (600.0, 7, true),
-            (601.0, 8, true),
-        ] {
-            s.poll(now, Some(profile), fresh, 40.0);
-            let mut snap = snapshot(now, [Some(1.0), Some(0.5), None]);
-            snap.scalar_gain = 6.0;
-            actions.push(serde_json::json!({"op":"poll","now":now,"profile":profile,"fresh":fresh,"max_gap":40.0,"snapshot":snap,
-                "predictions":s.predictions(snap,now,fresh),"state":s.diagnostics()}));
-        }
-        println!(
-            "DECISION_STATE_FIXTURE={}",
-            serde_json::json!({"actions":actions})
-        );
     }
 }

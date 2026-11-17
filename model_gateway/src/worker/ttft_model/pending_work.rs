@@ -230,8 +230,6 @@ pub struct Admission {
     pub original_raw_total: f64,
     pub control_raw_total: f64,
     pub candidate_raw_total: f64,
-    pub original_predictions: [decision::Prediction; 2],
-    pub control_predictions: [decision::Prediction; 2],
     pub predictions: [decision::Prediction; 2],
     pub available: bool,
 }

@@ -127,7 +127,7 @@ mod tests {
             snapshot: s,
             predictions: decision::State::default().predictions(s, 1.0, false),
         };
-        let candidate = state.admission(&original, &original, "control", 1.0, false);
+        let candidate = state.admission(&original, &original, 1.0, false);
         assert!(candidate.paired_fallback_to_original);
         assert_eq!(
             serde_json::to_value(&candidate.predictions).unwrap(),
@@ -151,11 +151,10 @@ mod tests {
         let mut selected = original.clone();
         selected.snapshot.x = 80.0;
         selected.predictions = decision::State::default().predictions(selected.snapshot, 1.0, true);
-        let candidate = state.admission(&original, &selected, "selected_v3", 1.0, true);
+        let candidate = state.admission(&original, &selected, 1.0, true);
         assert!(!candidate.paired_fallback_to_original);
         assert_eq!(candidate.training_snapshot.x, 100.0);
         assert_eq!(candidate.prediction_snapshot.x, 80.0);
-        assert_eq!(candidate.paired_control_predictions[1].total, 321.0);
         assert_eq!(candidate.predictions[1].total, 81.0);
         assert!(candidate.predictions[1].available);
         assert!(candidate.predictions[1].scalar_fallback);
@@ -276,8 +275,6 @@ pub struct Admission {
     pub paired_fallback_to_original: bool,
     pub training_snapshot: decision::Snapshot,
     pub prediction_snapshot: decision::Snapshot,
-    pub paired_control_method: &'static str,
-    pub paired_control_predictions: [decision::Prediction; 2],
     pub predictions: [decision::Prediction; 2],
 }
 
@@ -344,7 +341,7 @@ impl State {
             self.reason = "basis_provenance_missing_or_stale";
         }
         self.inner
-            .poll(now, profile, self.usable && !self.exhausted, max_gap);
+            .track_poll(now, profile, self.usable && !self.exhausted, max_gap);
     }
 
     pub fn stamp(&self, provenance: Option<Provenance>) -> Option<Stamp> {
@@ -399,7 +396,6 @@ impl State {
         &self,
         original: &decision::Admission,
         control: &decision::Admission,
-        control_method: &'static str,
         now: f64,
         available: bool,
     ) -> Admission {
@@ -421,8 +417,6 @@ impl State {
             } else {
                 snapshot
             },
-            paired_control_method: control_method,
-            paired_control_predictions: control.predictions.clone(),
             predictions: if paired_fallback_to_original {
                 control.predictions.clone()
             } else {
@@ -431,6 +425,7 @@ impl State {
         }
     }
 
+    #[cfg(test)]
     pub fn diagnostics(&self) -> serde_json::Value {
         serde_json::json!({"basis_epoch":self.epoch,"basis":self.known,"usable":self.usable,
             "reason":self.reason,"state":self.inner.diagnostics()})

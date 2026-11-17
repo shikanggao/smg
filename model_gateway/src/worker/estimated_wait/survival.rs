@@ -1782,72 +1782,7 @@ mod tests {
         n.project(at, poll, 2.0, 10.0, 10.0, &mut p)?;
         Ok(p)
     }
-    fn assert_actual_goldens(input: &str) {
-        let fixture: serde_json::Value = serde_json::from_str(input).unwrap();
-        assert!(fixture["samples"].as_array().unwrap().len() >= 10);
-        for s in fixture["samples"].as_array().unwrap() {
-            let service = &s["service"];
-            let k = service["gain"].as_f64().unwrap();
-            let capacity = service["capacity_reference"].as_f64().unwrap() / k;
-            near(
-                capacity,
-                service["effective_capacity_tokens_per_second"]
-                    .as_f64()
-                    .unwrap(),
-            );
-            let rows = s["predecessors"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|r| (r[0].as_f64().unwrap(), r[1].as_f64()));
-            let mut out = Projection::default();
-            project_rows(
-                rows,
-                capacity,
-                service["baseline"].as_f64().unwrap(),
-                s["lag"].as_f64().unwrap(),
-                &mut out,
-            )
-            .unwrap();
-            let expected = &s["expected"];
-            if let Some(binding) = s["structural_binding_expiry"].as_bool() {
-                assert_eq!(out.structural_binding_expiry_at_admission, binding);
-            }
-            near(
-                out.total_ttft_seconds.unwrap(),
-                expected["total_ttft_seconds"].as_f64().unwrap(),
-            );
-            near(
-                out.input_work_tokens,
-                expected["input_remaining_tokens"].as_f64().unwrap(),
-            );
-            near(
-                out.served_tokens,
-                expected["served_tokens"].as_f64().unwrap(),
-            );
-            near(
-                out.statistically_forecast_removed_tokens,
-                expected["statistically_forecast_removed_tokens"]
-                    .as_f64()
-                    .unwrap(),
-            );
-            assert_eq!(
-                out.overdue_retained_rows as u64,
-                expected["overdue_retained_rows"].as_u64().unwrap()
-            );
-            near(
-                out.overdue_retained_work_tokens,
-                expected["overdue_retained_estimated_work_tokens"]
-                    .as_f64()
-                    .unwrap(),
-            );
-        }
-    }
-    #[test]
-    fn actual_qwen_c2_and_guarded_prediction_input_goldens() {
-        assert_actual_goldens(include_str!("fixtures/survival_c2_qwen.json"));
-        assert_actual_goldens(include_str!("fixtures/survival_c2_guarded_qwen.json"));
-    }
+
     #[test]
     fn capacity_gain_applies_before_expiry_and_overdue_work_is_retained() {
         let mut out = Projection::default();
@@ -2056,8 +1991,6 @@ mod tests {
             paired_fallback_to_original: false,
             training_snapshot: decision::Snapshot { x: 1000.0, ..s },
             prediction_snapshot: s,
-            paired_control_method: "control",
-            paired_control_predictions: predictions.clone(),
             predictions: predictions.clone(),
         };
         let queue = pending_work::Queue::new(
@@ -2088,8 +2021,6 @@ mod tests {
             original_raw_total: 1002.0,
             control_raw_total: 2.0 + x,
             candidate_raw_total: 2.0 + x,
-            original_predictions: predictions.clone(),
-            control_predictions: predictions.clone(),
             predictions,
             available: true,
         };

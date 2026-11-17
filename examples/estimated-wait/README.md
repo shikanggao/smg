@@ -37,14 +37,14 @@ fails open when its baseline, capacity, or freshness is unavailable.
 ## Lifecycle and evidence
 
 Polls capture dispatch watermarks before I/O. Request work admitted during a poll
-survives its publication. Request IDs join lifecycle traces; they are never metric
+survives its publication. Request IDs match native lifecycle acknowledgements; they are never metric
 labels. Metadata-only SSE chunks are not first text. Nonempty content or reasoning
 text supplies TTFT. Native cancellation intent is not a release acknowledgement.
 Stale admissions cannot train a new worker generation; operational outcome metrics
 remain attached to the immutable request prediction across a learning reset.
 
 Source identity, rank, profile, original expiry, and coherent publication are part
-of the estimator. A later diagnostic publication cannot renew old evidence.
+of the estimator. A later publication cannot renew old evidence.
 Known rebound and original-expiry protections ship with the estimator itself.
 
 ## Rollout and validation
@@ -73,3 +73,10 @@ duplicate per-request debug records are excluded. The engine flag
 but on SGLang now enables only the required original-prefill witness. The reduced
 SGLang profile changes identity, causing the existing profile reset on rollout.
 Manual capture, replay, benchmark and plot scripts are not shipped.
+
+Only the selected native service learner is fitted. The legacy scalar learner,
+independently fitted comparison arms, rolling research activity counters, and
+per-request research JSON dumps are excluded. Pending/context trackers remain
+because they supply causal labels and inputs to that learner; the learner's
+queue-only fallback remains necessary when contextual features lack support.
+Captured experiment fixtures and their exporters stay outside the source tree.

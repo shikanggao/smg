@@ -229,7 +229,7 @@ where
                                     relayed += bytes.len() as u64;
                                     note_sent(&mut sent_tail, &bytes);
                                     if tx.send(Ok(bytes)).await.is_err() {
-                                        if let Some(observer) = &mut observer { observer.downstream_disconnected(); observer.transport_event("downstream_receiver_closed"); }
+                                        if let Some(observer) = &mut observer { observer.downstream_disconnected(); }
                                         break;
                                     }
                                 }
@@ -242,7 +242,7 @@ where
                                 }
                             }
                             Some(Err(e)) => {
-                                if let Some(observer) = &mut observer { if e.is_timeout() { observer.upstream_timeout(); } observer.transport_event("upstream_stream_error"); }
+                                if let Some(observer) = &mut observer { if e.is_timeout() { observer.upstream_timeout(); } }
                                 let tail = mode.finish();
                                 if !tail.is_empty() {
                                     note_sent(&mut sent_tail, &tail);
@@ -279,7 +279,6 @@ where
                                 break;
                             }
                             None => {
-                                if let Some(observer) = &observer { observer.transport_event("upstream_eof"); }
                                 let tail = mode.finish();
                                 if !tail.is_empty() {
                                     let _ = tx.send(Ok(tail)).await;
@@ -304,11 +303,10 @@ where
                     // stalled upstream): break so the upstream stream drops,
                     // closing the upstream connection and letting the
                     // engine abort generation.
-                    () = &mut client_gone => { if let Some(observer) = &mut observer { observer.downstream_disconnected(); observer.transport_event("downstream_receiver_closed"); } break; },
+                    () = &mut client_gone => { if let Some(observer) = &mut observer { observer.downstream_disconnected(); } break; },
                 }
             }
             drop(stream);
-            if let Some(observer) = &observer { observer.transport_event("upstream_stream_released"); }
         }
         .instrument(span),
     );

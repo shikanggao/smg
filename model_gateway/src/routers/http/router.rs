@@ -1555,21 +1555,15 @@ impl Router {
                     .with_metric_observation(ttft_observation)
             });
         if let Some(observer) = &ttft_observer {
-            observer.transport_event("upstream_send_started");
+            observer.upstream_send_started();
         }
         let res = match send_with_stale_conn_retry(request_builder).await {
-            Ok(res) => {
-                if let Some(observer) = &ttft_observer {
-                    observer.transport_event("upstream_headers_received");
-                }
-                res
-            }
+            Ok(res) => res,
             Err(e) => {
                 if let Some(observer) = &mut ttft_observer {
                     if e.is_timeout() {
                         observer.upstream_timeout();
                     }
-                    observer.transport_event("upstream_send_failed");
                 }
                 error!(
                     "Failed to send typed request worker_url={} route={} error={}",

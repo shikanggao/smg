@@ -71,7 +71,6 @@ pub(super) struct Diagnostic {
     pub sg_raw_basis_deadline: Option<survival::SgProjection>,
     pub training_snapshot: Option<decision::Snapshot>,
     pub normalization: Option<survival::Normalization>,
-    pub original_projection: Option<survival::Projection>,
     pub raw_safety: Option<RawSafety>,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -117,7 +116,6 @@ fn diagnostic(entry: &Entry, at: f64) -> Diagnostic {
         sg_raw_basis_deadline: None,
         training_snapshot: None,
         normalization: None,
-        original_projection: None,
         raw_safety: state.last_safety.clone(),
     }
 }
@@ -276,6 +274,7 @@ pub(super) fn raw_publication(
 mod tests {
     use openai_protocol::worker::WorkerStatus;
     use serde_json::json;
+    use std::time::Duration;
 
     use super::*;
     use crate::worker::{BasicWorkerBuilder, ConnectionMode, WorkerType};
@@ -406,50 +405,17 @@ mod tests {
     }
     fn admission(registry: &WorkerRegistry, worker: &Arc<dyn Worker>) -> survival::Admission {
         let mut guard = registry.estimated_wait().begin().unwrap();
-        let mut forecast = guard.capture_calibration(worker, None);
+        let mut forecast = guard.capture_calibration(worker);
         assert!(guard.attach_feature_context(worker, &mut forecast));
         *forecast.unwrap().survival_admission.unwrap()
     }
 
-    fn emit_fixture(
-        label: &str,
-        runtime: RuntimeType,
-        configured_floor: f64,
-        value: &survival::Admission,
-    ) {
-        if let Some(folder) = std::env::var_os("SMG_COHERENT_FIXTURE_DIR") {
-            let folder = std::path::PathBuf::from(folder);
-            std::fs::create_dir_all(&folder).unwrap();
-            let backend = if runtime == RuntimeType::Sglang {
-                "sglang"
-            } else {
-                "qwen"
-            };
-            std::fs::write(
-                folder.join(format!("{backend}-{label}.json")),
-                serde_json::to_vec_pretty(
-                    &json!({"backend":backend,"configured_floor":configured_floor,
-                    "admission":value}),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        }
-    }
     #[test]
     fn current_pair_exact_parity_and_zero_mismatch_both_backends() {
         for runtime in [RuntimeType::Sglang, RuntimeType::Vllm] {
             let (registry, worker) = ready(runtime);
             let original = admission(&registry, &worker);
-            emit_fixture(
-                "selected-current",
-                runtime,
-                registry
-                    .estimated_wait()
-                    .config()
-                    .estimated_wait_fallback_prefill_throughput,
-                &original,
-            );
+
             let selected = original.paired_native_candidate.as_ref().unwrap();
             assert!(selected.selected, "{}", selected.reason);
             let expected = if runtime == RuntimeType::Sglang {
@@ -464,15 +430,7 @@ mod tests {
             assert_eq!(selected.total_ttft_seconds, Some(expected));
             publish(&registry, &worker, Some(&raw(10, true, runtime)));
             let held_admission = admission(&registry, &worker);
-            emit_fixture(
-                "selected-held",
-                runtime,
-                registry
-                    .estimated_wait()
-                    .config()
-                    .estimated_wait_fallback_prefill_throughput,
-                &held_admission,
-            );
+
             let held = held_admission.paired_native_candidate.unwrap();
             assert!(held.selected, "{}", held.reason);
             assert_eq!(held.reason, "coherent_held_pair_live_ledger_projection");
@@ -544,15 +502,6 @@ mod tests {
                 "coherent_native_timeout"
             );
             drop(entries);
-            emit_fixture(
-                "unavailable",
-                runtime,
-                registry
-                    .estimated_wait()
-                    .config()
-                    .estimated_wait_fallback_prefill_throughput,
-                &admission(&registry, &worker),
-            );
         }
     }
     #[test]
@@ -871,7 +820,7 @@ mod tests {
                 .lock()
                 .get_mut(worker.url())
                 .unwrap()
-                .reset_calibration(Instant::now(), "coherent_test_reset");
+                .reset_calibration("coherent_test_reset");
             publish(&registry, &worker, Some(&raw(11, false, runtime)));
             registry.estimated_wait().publish_native_deadline(
                 &worker,
@@ -1115,7 +1064,6 @@ pub(super) fn select(
             d.sg_raw_basis_deadline = sg_projection;
             d.training_snapshot = Some(original.training_snapshot);
             d.normalization = original.normalization;
-            d.original_projection = Some(original.projection.clone());
         } else {
             d.reason = original
                 .sg_raw_basis_rejection_reason
@@ -1174,10 +1122,9 @@ pub(super) fn select(
         snapshot: control_snapshot,
         predictions: pending.predictions.clone(),
     };
-    let basis =
-        entry
-            .basis_decision
-            .admission(&original_query, &control, pending_work::METHOD, at, true);
+    let basis = entry
+        .basis_decision
+        .admission(&original_query, &control, at, true);
     let native = entry
         .survival
         .native
@@ -1235,7 +1182,6 @@ pub(super) fn select(
         d.capacity_basis = Some(work);
         d.training_snapshot = Some(candidate.training_snapshot);
         d.normalization = candidate.normalization;
-        d.original_projection = Some(candidate.projection.clone());
     } else {
         d.reason = candidate
             .sg_raw_basis_rejection_reason

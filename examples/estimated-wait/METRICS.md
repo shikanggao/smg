@@ -46,5 +46,5 @@ ratio is not FPR and late/admitted ratio is not FNR. No probing bypass is introd
 Three per-worker operational gauges remain: `smg_estimated_wait_data_usable`,
 `smg_estimated_wait_capacity_ready`, and `smg_estimated_wait_snapshot_age_seconds`.
 Existing rejection/unknown counters and unrelated SMG service metrics are retained.
-Scalar-fit, duplicate raw-estimate, and derived prefill-research gauges are removed;
-bounded structured traces retain diagnostic detail without permanent metric series.
+Scalar-fit, duplicate raw-estimate, derived prefill-research gauges, and research
+JSON trace dumps are excluded.
