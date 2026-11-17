@@ -117,6 +117,7 @@ pub(crate) struct PlacementInputs<'a> {
     pub calibration: Option<&'a Mutex<Option<CalibrationForecast>>>,
     pub feature_context_supported: bool,
     pub request_started: Option<std::time::Instant>,
+    pub ttft_observation: Option<&'a crate::observability::ttft::Observation>,
     /// Request text for cache-aware routing.
     pub text: Option<&'a str>,
     /// Tokenized request, or a valid routing-tokens hint, for prefix hashing.
@@ -368,13 +369,29 @@ pub(crate) fn select_from(
                     )
                 });
             let threshold = guard.threshold(worker);
-
+            if let Some(observation) = inputs.ttft_observation {
+                observation.freeze(
+                    prediction,
+                    threshold,
+                    match worker.metadata().spec.runtime_type {
+                        RuntimeType::Vllm => "vllm",
+                        RuntimeType::Sglang => "sglang",
+                        _ => "other",
+                    },
+                );
+            }
             !registry.estimated_wait().is_shadow()
                 && prediction.is_some_and(|p| p.exceeds(threshold))
         } else {
             guard.check_cohort(&admission_candidates, model_id)
         };
         if reject {
+            if let Some(observation) = inputs.ttft_observation {
+                observation.resolve(
+                    crate::observability::ttft::Outcome::Rejected,
+                    std::time::Instant::now(),
+                );
+            }
             if let Some(worker) = feature_worker {
                 guard.record_feature_decision(worker, request_id, true, false);
             }

@@ -1007,6 +1007,7 @@ pub(crate) struct StreamTtftObserver {
     feature_resolved: bool,
     feature_deadline: Option<DeadlineHandle>,
     native_deadline_pending: bool,
+    metric_observation: Option<crate::observability::ttft::Observation>,
 }
 
 impl StreamTtftObserver {
@@ -1086,7 +1087,16 @@ impl StreamTtftObserver {
             feature_resolved: false,
             feature_deadline: None,
             native_deadline_pending: false,
+            metric_observation: None,
         }
+    }
+
+    pub(crate) fn with_metric_observation(
+        mut self,
+        observation: Option<crate::observability::ttft::Observation>,
+    ) -> Self {
+        self.metric_observation = observation;
+        self
     }
 
     pub(crate) fn with_request_id(mut self, request_id: Option<&str>) -> Self {
@@ -1124,7 +1134,10 @@ impl StreamTtftObserver {
     }
 
     pub(crate) fn push(&mut self, bytes: &[u8]) {
-        if self.probe.is_none() && (self.feature_identity.is_none() || self.feature_resolved) {
+        if self.metric_observation.is_none()
+            && self.probe.is_none()
+            && (self.feature_identity.is_none() || self.feature_resolved)
+        {
             return;
         }
         let _observation_claim = self
@@ -1163,7 +1176,19 @@ impl StreamTtftObserver {
             return;
         }
         self.feature_resolved = true;
-
+        if let Some(observation) = &self.metric_observation {
+            use crate::observability::ttft::Outcome;
+            observation.resolve(
+                match outcome {
+                    FeatureOutcome::FirstText => Outcome::FirstText,
+                    FeatureOutcome::Timeout
+                    | FeatureOutcome::Disconnect
+                    | FeatureOutcome::NativeDeadline => Outcome::Interrupted,
+                    _ => Outcome::Unknown,
+                },
+                observed_at,
+            );
+        }
         if let Some(deadline) = &self.feature_deadline {
             deadline.claim_terminal();
         }
@@ -3873,6 +3898,64 @@ mod tests {
             .iter()
             .all(|e| e["request_id"] == "diagnostic-request"
                 && e["engine_cancellation_acknowledgement"] == "unavailable"));
+    }
+
+    #[test]
+    fn metric_outcome_survives_missing_learning_probe_and_metadata_events() {
+        use crate::observability::ttft::{Mode, Observation};
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let registry = Arc::new(WorkerRegistry::new());
+            let start = Instant::now();
+            let observation = Observation::new("test", Mode::Shadow, start);
+            observation.freeze(None, Some(300.0), "vllm");
+            let mut observer = StreamTtftObserver::new(&registry, "http://missing", start)
+                .with_metric_observation(Some(observation));
+            observer.push(b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n");
+            assert!(!handle.render().contains("smg_ttft_outcomes_total"));
+            observer
+                .push(b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hello\"}}]}\n\n");
+            observer.downstream_disconnected();
+            drop(observer);
+            let metrics = handle.render();
+            assert!(metrics.contains("outcome=\"exact\"} 1"), "{metrics}");
+            assert!(!metrics.contains("outcome=\"unknown\""), "{metrics}");
+            assert!(
+                !metrics.contains("smg_ttft_classifications_total"),
+                "{metrics}"
+            );
+        });
+    }
+
+    #[test]
+    fn lost_observation_is_unknown_even_after_the_budget() {
+        use crate::observability::ttft::{Mode, Observation, Prediction};
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let registry = Arc::new(WorkerRegistry::new());
+            let start = Instant::now() - Duration::from_secs(301);
+            let observation = Observation::new("test", Mode::Shadow, start);
+            observation.freeze(
+                Some(Prediction {
+                    total: 400.0,
+                    evidence_valid: true,
+                }),
+                Some(300.0),
+                "vllm",
+            );
+            let mut observer = StreamTtftObserver::new(&registry, "http://missing", start)
+                .with_metric_observation(Some(observation));
+            observer.cancel();
+            drop(observer);
+            let metrics = handle.render();
+            assert!(metrics.contains("outcome=\"unknown\"} 1"), "{metrics}");
+            assert!(
+                !metrics.contains("smg_ttft_classifications_total"),
+                "{metrics}"
+            );
+        });
     }
 
     fn config() -> EstimatedWaitConfig {
@@ -7226,6 +7309,7 @@ mod tests {
             feature_resolved: false,
             feature_deadline: None,
             native_deadline_pending: false,
+            metric_observation: None,
         };
         assert_eq!(
             observer.scan(
@@ -7270,6 +7354,7 @@ mod tests {
             feature_resolved: false,
             feature_deadline: None,
             native_deadline_pending: false,
+            metric_observation: None,
         };
         observer.cancel();
         assert_eq!(
