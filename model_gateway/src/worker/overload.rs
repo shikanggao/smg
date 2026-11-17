@@ -249,6 +249,7 @@ mod tests {
             &OverloadUpdate {
                 waiting_requests: None,
                 token_usage: Some(0.5),
+                ..Default::default()
             },
             gateway,
         );
@@ -265,6 +266,7 @@ mod tests {
             &OverloadUpdate {
                 waiting_requests: Some(4),
                 token_usage: None,
+                ..Default::default()
             },
             OverloadThresholds::default(),
         );
