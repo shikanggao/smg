@@ -24,6 +24,7 @@ pub mod model_card;
 pub mod model_type;
 pub mod models;
 pub mod multipart;
+pub mod native_deadline;
 pub mod parser;
 pub mod profile;
 pub mod realtime_conversation;

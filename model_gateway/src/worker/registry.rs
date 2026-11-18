@@ -314,6 +314,7 @@ struct TransitionTestHooks {
 /// Worker registry with model-based indexing
 #[derive(Debug)]
 pub struct WorkerRegistry {
+    estimated_wait: super::estimated_wait::EstimatedWaitAdmission,
     /// All workers indexed by ID
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
 
@@ -440,6 +441,11 @@ pub struct WorkerRegistry {
 }
 
 impl WorkerRegistry {
+    /// Shared estimated-wait admission state for the router and load monitor.
+    pub(crate) fn estimated_wait(&self) -> &super::estimated_wait::EstimatedWaitAdmission {
+        &self.estimated_wait
+    }
+
     // ───────────────────────────────────────────────────────────────────
     // 1. Construction & subscription
     // ───────────────────────────────────────────────────────────────────
@@ -454,6 +460,7 @@ impl WorkerRegistry {
         // cannot grow without bound in practice.
         let (connect_signal_tx, connect_signal_rx) = mpsc::unbounded_channel();
         Self {
+            estimated_wait: Default::default(),
             workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
@@ -849,12 +856,14 @@ impl WorkerRegistry {
         true
     }
 
-    /// Whether `worker` is the `Arc` the registry currently holds for its URL.
-    ///
-    /// The identity check is by pointer, not by URL: a `replace()` keeps the URL
-    /// and the shared runtime but installs a new worker object with a possibly
-    /// different model card, and the replaced handle must not be allowed to
-    /// attribute a counter move to the model set it used to carry.
+    /// Common publication fence for report consumers: same worker incarnation
+    /// and still Ready after I/O. Consumers also fence their own generations.
+    pub(crate) fn is_current_ready(&self, worker: &Arc<dyn Worker>) -> bool {
+        self.is_current_handle(worker) && worker.status() == WorkerStatus::Ready
+    }
+
+    /// Whether the registry still holds this exact worker Arc for its URL.
+    /// Replacement preserves URL and runtime, so a URL check alone is insufficient.
     fn is_current_handle(&self, worker: &Arc<dyn Worker>) -> bool {
         let Some(worker_id) = self.url_to_id.get(worker.url()).map(|id| id.clone()) else {
             return false;
@@ -1551,6 +1560,8 @@ impl WorkerRegistry {
         // a possibly different model set would leak its counter. The next poll
         // re-derives the verdict for the URL.
         self.set_worker_overloaded(&old_worker, false);
+        self.estimated_wait.worker_added(&new_worker);
+        self.estimated_wait.worker_removed(&old_worker);
 
         if !new_worker.inherit_shared_state_from(&*old_worker) {
             tracing::warn!(
@@ -1967,6 +1978,7 @@ impl WorkerRegistry {
             // registration of the same URL cannot slip in between and have its
             // fresh series retired under it.
             Metrics::remove_worker_metrics(worker.url(), Arc::downgrade(&worker));
+            self.estimated_wait.worker_removed(&worker);
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
@@ -2215,6 +2227,7 @@ impl WorkerRegistry {
         // lands, and a visible worker with no origin would be treated as
         // mesh-imported (peer state could mutate a local worker's status).
         self.worker_origins.insert(worker_id.clone(), origin);
+        self.estimated_wait.worker_added(&worker);
 
         // The membership-order read guard keeps the rebuild scan from
         // interleaving with this write.

@@ -19,6 +19,11 @@ from smg.smg_rs import Router as _Router
 class TestRouterConfigValidation:
     """Test router configuration validation logic."""
 
+    def test_router_from_args_supports_ttft_configuration(self):
+        Router.from_args(
+            RouterArgs(worker_urls=["http://worker:8000"], max_estimated_wait_secs=2.0)
+        )
+
     def test_valid_basic_config(self):
         """Test that a valid basic configuration passes validation."""
         args = RouterArgs(

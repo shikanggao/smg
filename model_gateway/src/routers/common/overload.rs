@@ -29,8 +29,8 @@ use crate::{
     worker::{
         overload::{
             BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_OVERLOADED_SHED,
-            BRANCH_ALL_STALLED_FALLBACK, BRANCH_OVERLOADED_AT_DISPATCH, BRANCH_PD_ADMISSION_SHED,
-            STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION,
+            BRANCH_ALL_STALLED_FALLBACK, BRANCH_ESTIMATED_WAIT_SHED, BRANCH_OVERLOADED_AT_DISPATCH,
+            BRANCH_PD_ADMISSION_SHED, STAGE_DISPATCH, STAGE_PD_ADMISSION, STAGE_SELECTION,
         },
         Worker,
     },
@@ -652,4 +652,45 @@ mod tests {
             "worker_overload_protection_shed"
         );
     }
+
+    #[tokio::test]
+    async fn estimated_wait_uses_the_shared_overload_response_contract() {
+        let response = shed_estimated_wait("m");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "worker_overload_protection_shed"
+        );
+        assert!(response
+            .headers()
+            .get(RETRY_AFTER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .is_ok_and(|secs| secs >= 1));
+        assert!(is_retryable_status(response.status()));
+        assert!(!is_retryable_response(&response));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "worker_overload_protection_shed");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("estimated wait budgets"));
+    }
+}
+
+pub(crate) fn shed_estimated_wait(model_id: &str) -> Response {
+    shed(
+        BRANCH_ESTIMATED_WAIT_SHED,
+        STAGE_SELECTION,
+        "none",
+        format!("All eligible workers for model '{model_id}' are at or above their estimated wait budgets"),
+    )
 }

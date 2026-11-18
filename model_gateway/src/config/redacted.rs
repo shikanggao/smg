@@ -70,6 +70,7 @@ const PLAIN: &[&str] = &[
     "worker_overload_waiting_requests",
     "worker_overload_token_usage",
     "worker_overload_shed",
+    "estimated_wait",
     "engine_metrics",
     "multimodal_tensor_transport",
     "multimodal_shm_min_bytes",
