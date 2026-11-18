@@ -461,7 +461,6 @@ class RouterArgs:
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
     least_load_default_throughput: float = 2000.0
     least_load_kv_pressure_weight: float = 0.15
-    least_load_max_waiting_requests: int = 0
     least_load_mean_prefill_tokens: int = 1024
     load_monitor_interval: int = 10
     log_dir: str | None = None
