@@ -101,7 +101,7 @@ async fn whole(frames: Vec<proto::GenerateResponse>) -> ResponsesIterationResult
             },
             std::sync::Arc::new(request()),
             dispatch(),
-            &[],
+            &Default::default(),
         )
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));
@@ -139,7 +139,7 @@ async fn iterate(
             &tx,
             None,
             None,
-            &[],
+            &Default::default(),
         )
         .await;
         drop(tx);

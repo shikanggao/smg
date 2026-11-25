@@ -66,12 +66,6 @@ impl ProcessStage for HarmonyResponseProcessingStage {
 
         let is_streaming = ctx.streaming;
 
-        // String `stop` sequences the ROUTER must enforce, as reported by the
-        // backend client during request building (its residual obligation:
-        // strings the engine will never match). Empty for engines that match
-        // server-side.
-        let router_stops = ctx.response.router_stop_obligations.clone();
-
         match harmony_spec {
             HarmonyResponseSpec::Chat(chat_request) => {
                 // Get execution result (output tokens from model)
@@ -92,6 +86,8 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                     );
                     error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
                 })?;
+
+                let read_options = ctx.response.take_harmony_read_options();
 
                 // For streaming, delegate to streaming processor and return SSE response
                 if is_streaming {
@@ -117,7 +113,7 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                             execution_result,
                             chat_request,
                             dispatch,
-                            router_stops,
+                            read_options,
                             reservation,
                             ctx.load_guards.take(),
                             source,
@@ -134,7 +130,7 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                         execution_result,
                         chat_request,
                         dispatch,
-                        &router_stops,
+                        &read_options,
                     )
                     .await?;
 
@@ -170,13 +166,14 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                     error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
                 })?;
 
+                let read_options = ctx.response.take_harmony_read_options();
                 let (iteration_result, counts) = self
                     .processor
                     .process_responses_iteration(
                         execution_result,
                         responses_request,
                         dispatch,
-                        &router_stops,
+                        &read_options,
                     )
                     .await?;
 

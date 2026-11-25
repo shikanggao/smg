@@ -140,7 +140,7 @@ async fn streamed_chat_events(
             },
             Arc::new(chat_request(choices, true)),
             dispatch,
-            Vec::new(),
+            Default::default(),
             reservation,
             None,
             source,
@@ -220,7 +220,7 @@ async fn non_streamed_chat(
             },
             Arc::new(chat_request(choices, false)),
             dispatch(),
-            &[],
+            &Default::default(),
         )
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));
@@ -338,7 +338,7 @@ async fn streamed_responses_iteration(
             &tx,
             None,
             None,
-            &[],
+            &Default::default(),
         )
         .await;
         drop(tx);
@@ -366,7 +366,7 @@ async fn whole_responses_iteration(
             },
             Arc::new(request),
             dispatch(),
-            &[],
+            &Default::default(),
         )
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));
