@@ -34,7 +34,6 @@ use crate::{
                 stage_output, AttemptStamp, ClientSelection, EncodeOutputs, ExecutionPlan,
                 RequestContext, RequestType, WorkerSelection,
             },
-            harmony::grammar::VllmHarmonyGrammar,
             multimodal::{
                 assemble_media_refs, assemble_multimodal_data,
                 assemble_multimodal_data_after_encode, assembly_error_response,
@@ -521,8 +520,6 @@ pub(crate) enum ToolConstraintStamp {
     /// stamp, so a retry's worker the table would give one goes without it
     /// too.
     Table(Arc<dyn TagForStart>),
-    /// Re-render a Harmony turn when a retry selects another XGrammar vocabulary.
-    Harmony(VllmHarmonyGrammar),
 }
 
 impl ToolConstraintStamp {
@@ -620,10 +617,6 @@ impl ToolConstraintStamp {
                     request.set_structural_tag(tag);
                 }
                 led || *first_token
-            }
-            Self::Harmony(grammar) => {
-                grammar.apply(request, Some(workers));
-                return Ok(());
             }
             Self::Table(tag) => {
                 let decoding = utils::WorkerDecoding::of(Some(workers));

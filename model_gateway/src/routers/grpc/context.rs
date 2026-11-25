@@ -905,7 +905,7 @@ pub(crate) enum PreparationOutput {
 #[derive(Debug)]
 pub(crate) struct HarmonyConstraint {
     pub tag: String,
-    pub vllm_grammar: Option<super::harmony::grammar::VllmHarmonyGrammar>,
+    pub vllm_first_token_tag: Option<String>,
 }
 
 /// One tokenized completion prompt.
@@ -1241,13 +1241,6 @@ impl LoadGuards {
     }
 }
 
-/// Obligations carried from the Harmony request sent to the engine to its reader.
-#[derive(Default)]
-pub(crate) struct HarmonyReadOptions {
-    pub stop_strings: Vec<String>,
-    pub require_action: bool,
-}
-
 /// Response processing state (Step 6)
 #[derive(Default)]
 pub(crate) struct ResponseState {
@@ -1259,9 +1252,6 @@ pub(crate) struct ResponseState {
     /// Response processing must trim these from output text; empty when the
     /// engine matches stops server-side.
     pub router_stop_obligations: Vec<String>,
-
-    /// The generated vLLM grammar requires an assistant final or a function call.
-    pub harmony_requires_action: bool,
 
     /// Derived skip_special_tokens for streaming (set in preparation, read in response_processing).
     /// Stored here because PreparationOutput is consumed by request_building before
@@ -1299,15 +1289,6 @@ pub(crate) struct ResponseState {
     /// allocator's 2,560-byte class edge on every chat, completion and
     /// Messages request.
     pub responses_iteration_result: Option<Box<super::harmony::ResponsesIterationResult>>,
-}
-
-impl ResponseState {
-    pub(crate) fn take_harmony_read_options(&mut self) -> HarmonyReadOptions {
-        HarmonyReadOptions {
-            stop_strings: std::mem::take(&mut self.router_stop_obligations),
-            require_action: self.harmony_requires_action,
-        }
-    }
 }
 
 impl RequestContext {

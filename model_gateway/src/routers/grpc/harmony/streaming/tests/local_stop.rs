@@ -66,10 +66,7 @@ async fn stopped_turn(end: RequestEnd) -> (Vec<u32>, Vec<Value>) {
             },
             Arc::new(request),
             dispatch,
-            context::HarmonyReadOptions {
-                stop_strings: vec!["STOP".to_string()],
-                ..Default::default()
-            },
+            vec!["STOP".to_string()],
             None,
             None,
             source,

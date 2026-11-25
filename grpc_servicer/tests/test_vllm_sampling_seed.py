@@ -28,7 +28,7 @@ instead of skipping.
 
 import ast
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 from smg_grpc_proto.generated import vllm_engine_pb2 as proto
@@ -68,7 +68,7 @@ def convert():
         "RequestOutputKind": SimpleNamespace(DELTA="delta", FINAL_ONLY="final_only"),
     }
     exec(compile(ast.fix_missing_locations(module), "vllm-servicer", "exec"), namespace)
-    return MethodType(namespace["_sampling_params_from_proto"], SimpleNamespace())
+    return namespace["_sampling_params_from_proto"]
 
 
 def sampling(seed, n):

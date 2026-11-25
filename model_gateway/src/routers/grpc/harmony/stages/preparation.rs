@@ -6,15 +6,13 @@ use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{Function, ResponseFormat, Tool, ToolChoice, ToolChoiceValue, ToolReference},
-    responses::{ResponsesRequest, ResponsesToolChoice, ToolChoiceOptions},
+    common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue},
+    responses::ResponsesRequest,
 };
 use serde_json::{json, Value};
 use tracing::{error, warn};
 
-use super::super::{
-    builder::response_tool_descriptions, grammar::VllmHarmonyGrammar, HarmonyBuilder,
-};
+use super::super::HarmonyBuilder;
 use crate::routers::{
     error,
     grpc::{
@@ -102,16 +100,21 @@ impl HarmonyPreparationStage {
         // Step 2: Build structural tag constraint over the tools the choice may
         // force, wherever the request declares them (`callable_tools`; the
         // request declares some when `declares_tools` says so).
-        let callable_tools = request.callable_tools();
-        let tool_choice = body_ref.tool_choice.as_ref();
         let tool_constraint = if request.declares_tools() {
-            Self::generate_tool_call_constraint(&callable_tools, tool_choice).map_err(|e| *e)?
+            Self::generate_tool_call_constraint(
+                &request.callable_tools(),
+                body_ref.tool_choice.as_ref(),
+            )
+            .map_err(|e| *e)?
         } else {
             None
         };
         let response_format_constraint = Self::generate_response_format_constraint(
             body_ref.response_format.as_ref(),
-            optional_tools(&callable_tools, tool_choice),
+            json_only(
+                request.effective_tools().next().is_some(),
+                request.tool_choice.as_ref(),
+            ),
         )
         .map_err(|e| *e)?;
 
@@ -193,7 +196,18 @@ impl HarmonyPreparationStage {
                 .map_err(|e| *e)?
         };
 
-        let text_constraint = Self::generate_text_format_constraint(request);
+        let text_constraint = request.text.as_ref().and_then(|format| {
+            Self::generate_text_format_constraint(
+                format,
+                json_only(
+                    request
+                        .tools
+                        .as_ref()
+                        .is_some_and(|tools| !tools.is_empty()),
+                    chat_tool_choice.as_ref(),
+                ),
+            )
+        });
 
         if tool_constraint.is_some() && text_constraint.is_some() {
             warn!(
@@ -234,18 +248,18 @@ impl HarmonyPreparationStage {
     ///
     /// Converts text.format to structural tag that constrains the final channel.
     /// Returns None if text.format is not specified or is "text".
-    fn generate_text_format_constraint(request: &ResponsesRequest) -> Option<HarmonyConstraint> {
+    fn generate_text_format_constraint(
+        text_config: &openai_protocol::responses::TextConfig,
+        json_only: bool,
+    ) -> Option<HarmonyConstraint> {
         use openai_protocol::responses::TextFormat;
 
-        let schema = match request.text.as_ref()?.format.as_ref()? {
+        let schema = match text_config.format.as_ref()? {
             TextFormat::Text => return None,
             TextFormat::JsonObject => Cow::Owned(json!({"type": "object"})),
             TextFormat::JsonSchema { schema, .. } => Cow::Borrowed(schema),
         };
-        Some(build_json_constraint(
-            &schema,
-            &optional_response_tools(request),
-        ))
+        Some(build_json_constraint(&schema, json_only))
     }
 
     /// Generate Harmony structural tag for Chat Completions response_format
@@ -256,7 +270,7 @@ impl HarmonyPreparationStage {
     /// Returns None if response_format is not specified or is "text".
     fn generate_response_format_constraint(
         response_format: Option<&ResponseFormat>,
-        auto_tools: &[Tool],
+        json_only: bool,
     ) -> Result<Option<HarmonyConstraint>, Box<Response>> {
         let Some(format) = response_format else {
             return Ok(None);
@@ -277,12 +291,12 @@ impl HarmonyPreparationStage {
                 })?;
                 return Ok(Some(HarmonyConstraint {
                     tag,
-                    vllm_grammar: None,
+                    vllm_first_token_tag: None,
                 }));
             }
         };
 
-        Ok(Some(build_json_constraint(&schema, auto_tools)))
+        Ok(Some(build_json_constraint(&schema, json_only)))
     }
 
     /// Generate Harmony structural tag for tool constraints
@@ -312,6 +326,7 @@ impl HarmonyPreparationStage {
         specific_function: Option<&str>,
     ) -> Result<HarmonyConstraint, Box<Response>> {
         let mut tags = Vec::new();
+        let mut calls = Vec::new();
 
         // Filter tools if specific function requested
         let tools_to_use: Vec<&Tool> = if let Some(func_name) = specific_function {
@@ -340,10 +355,20 @@ impl HarmonyPreparationStage {
         }
 
         // Build tags for each tool - need two patterns per tool for reasoning on/off
-        let vllm_grammar = VllmHarmonyGrammar::new(tools_to_use.iter().copied(), None);
         for tool in tools_to_use {
             let tool_name = &tool.function.name;
             let params_schema = tool.function.parameters_schema();
+            for constrain in ["", "<|constrain|>json"] {
+                calls.push(json!({
+                    "type": "tag",
+                    "begin": format!("<|channel|>commentary to=functions.{tool_name}{constrain}<|message|>"),
+                    "content": {"type": "json_schema", "json_schema": params_schema},
+                    // Some vLLM tokenizers handle <|call|> as a stop, so it
+                    // must also be possible to complete the grammar first.
+                    "end": ["<|call|>", ""],
+                }));
+            }
+
             // Pattern 1: For reasoning-enabled mode (with analysis channel before commentary)
             tags.push(json!({
                 "begin": format!("<|start|>assistant<|channel|>commentary to=functions.{}<|constrain|>json<|message|>", tool_name),
@@ -379,55 +404,57 @@ impl HarmonyPreparationStage {
 
         Ok(HarmonyConstraint {
             tag: structural_tag.to_string(),
-            vllm_grammar: Some(vllm_grammar),
+            vllm_first_token_tag: Some(vllm_harmony_tag(json!({
+                "type": "or",
+                "elements": calls,
+            }))),
         })
     }
 }
 
-/// A JSON answer may follow a lookup when the request leaves tool use optional.
-fn optional_tools<'a>(tools: &'a [Tool], choice: Option<&ToolChoice>) -> &'a [Tool] {
-    match choice {
-        None | Some(ToolChoice::Value(ToolChoiceValue::Auto)) => tools,
-        Some(ToolChoice::AllowedTools { mode, .. }) if mode == "auto" => tools,
-        _ => &[],
-    }
-}
-
-/// Hosted tools dispatched by MCP are exposed as functions. An image generation
-/// declaration without an MCP replacement has its own synthesized function.
-fn optional_response_tools(request: &ResponsesRequest) -> Vec<Tool> {
-    let allowlist = match request.tool_choice.as_ref() {
-        None | Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)) => None,
-        Some(ResponsesToolChoice::AllowedTools { mode, tools, .. }) if mode == "auto" => {
-            Some(tools)
-        }
-        _ => return Vec::new(),
+/// The initial assistant role is supplied by the Harmony prompt. After any
+/// analysis or preamble, require a fresh assistant header before the result.
+fn vllm_harmony_tag(output: Value) -> String {
+    let preamble = |begin: &str| {
+        // The empty alternative is supported by older XGrammar workers too.
+        json!({
+            "type": "or",
+            "elements": [
+                {
+                    "type": "sequence",
+                    "elements": [
+                        {
+                            "type": "tag",
+                            "begin": begin,
+                            "content": {"type": "any_text"},
+                            "end": "<|end|>",
+                        },
+                        {"type": "const_string", "value": "<|start|>assistant"},
+                    ],
+                },
+                {"type": "const_string", "value": ""},
+            ],
+        })
     };
-    response_tool_descriptions(request.tools.as_deref().unwrap_or_default())
-        .into_iter()
-        .filter(|tool| {
-            allowlist.is_none_or(|allowed| {
-                allowed.iter().any(|reference| {
-                    reference.function_name() == Some(tool.name.as_str())
-                        || (matches!(reference, ToolReference::ImageGeneration)
-                            && tool.name == "image_generation")
-                })
-            })
-        })
-        .map(|tool| Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: tool.name,
-                description: Some(tool.description),
-                parameters: tool.parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        })
-        .collect()
+    json!({
+        "format": {
+            "type": "sequence",
+            "elements": [
+                preamble("<|channel|>analysis<|message|>"),
+                preamble("<|channel|>commentary<|message|>"),
+                output,
+            ],
+        },
+    })
+    .to_string()
 }
 
-fn build_json_constraint(schema: &Value, auto_tools: &[Tool]) -> HarmonyConstraint {
+// A whole-turn JSON grammar excludes tool calls. Keep the triggered grammar when a tool is available.
+fn json_only(has_tools: bool, choice: Option<&ToolChoice>) -> bool {
+    !has_tools || matches!(choice, Some(ToolChoice::Value(ToolChoiceValue::None)))
+}
+
+fn build_json_constraint(schema: &Value, json_only: bool) -> HarmonyConstraint {
     let structural_tag = json!({
         "format": {
             "type": "triggered_tags",
@@ -456,7 +483,16 @@ fn build_json_constraint(schema: &Value, auto_tools: &[Tool]) -> HarmonyConstrai
 
     HarmonyConstraint {
         tag: structural_tag.to_string(),
-        vllm_grammar: Some(VllmHarmonyGrammar::new(auto_tools, Some(schema))),
+        vllm_first_token_tag: json_only.then(|| {
+            vllm_harmony_tag(json!({
+                "type": "tag",
+                "begin": "<|channel|>final<|message|>",
+                "content": {"type": "json_schema", "json_schema": schema},
+                // The final return token is a normal engine stop. Let the grammar
+                // complete after the JSON so the matcher can accept that stop.
+                "end": "",
+            }))
+        }),
     }
 }
 
@@ -484,155 +520,23 @@ mod tests {
         .expect("valid tools");
         let constraint = HarmonyPreparationStage::build_tool_call_constraint(&tools, Some("b"))
             .expect("valid tool constraint");
-        let grammar = constraint.vllm_grammar.expect("vLLM grammar");
-        for token_nodes in [false, true] {
-            let tag = grammar.render(token_nodes);
-            let output = &tag["format"]["elements"][2]["elements"];
-            let calls = output.as_array().expect("call formats");
-            assert_eq!(calls.len(), 1);
-            assert_eq!(
-                calls[0]["elements"][1]["value"],
-                "commentary to=functions.b"
-            );
-            let channel = &calls[0]["elements"][0];
-            assert_eq!(
-                channel["type"],
-                if token_nodes { "token" } else { "const_string" }
-            );
-            assert_eq!(
-                channel[if token_nodes { "token" } else { "value" }],
-                "<|channel|>"
-            );
-            assert_eq!(
-                calls[0]["elements"][4]["json_schema"],
-                json!({"type": "object"})
-            );
+        let grammar: Value =
+            serde_json::from_str(&constraint.vllm_first_token_tag.expect("vLLM tag"))
+                .expect("valid grammar JSON");
+        let parts = grammar["format"]["elements"].as_array().expect("sequence");
+        assert_eq!(
+            parts[0]["elements"][0]["elements"][0]["begin"],
+            "<|channel|>analysis<|message|>"
+        );
+        let calls = parts[2]["elements"].as_array().expect("call formats");
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert!(call["begin"]
+                .as_str()
+                .expect("call header")
+                .starts_with("<|channel|>commentary to=functions.b<|"));
+            assert_eq!(call["end"], json!(["<|call|>", ""]));
         }
-    }
-
-    #[test]
-    fn chat_json_answers_keep_only_optional_tool_recipients() {
-        let declared = json!([
-            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
-            {"type": "function", "function": {"name": "other", "parameters": {"type": "object"}}},
-        ]);
-        for (choice, expected) in [
-            (None, vec!["lookup", "other"]),
-            (Some(json!("auto")), vec!["lookup", "other"]),
-            (
-                Some(json!({"type": "allowed_tools", "mode": "auto",
-                "tools": [{"type": "function", "name": "lookup"}]})),
-                vec!["lookup"],
-            ),
-            (Some(json!("none")), vec![]),
-        ] {
-            let request: ChatCompletionRequest = serde_json::from_value(json!({
-                "model": "gpt-oss", "messages": [{"role": "user", "content": "Lookup"}],
-                "tools": declared, "tool_choice": choice, "response_format": {"type": "json_object"}
-            }))
-            .expect("valid chat request");
-            let callable = request.callable_tools();
-            let auto = optional_tools(&callable, request.tool_choice.as_ref());
-            let constraint = HarmonyPreparationStage::generate_response_format_constraint(
-                request.response_format.as_ref(),
-                auto,
-            )
-            .expect("valid response format")
-            .expect("JSON constraint");
-            let tag = constraint
-                .vllm_grammar
-                .expect("vLLM grammar")
-                .render(true)
-                .to_string();
-            for name in ["lookup", "other"] {
-                assert_eq!(
-                    tag.contains(&format!("functions.{name}")),
-                    expected.contains(&name)
-                );
-            }
-            assert!(tag.contains("final"));
-            assert!(
-                !constraint.tag.contains("functions."),
-                "only vLLM gets the alternatives"
-            );
-        }
-    }
-
-    #[test]
-    fn responses_json_keeps_advertised_and_allowlisted_hosted_functions() {
-        let mut request: ResponsesRequest = serde_json::from_value(json!({
-            "model": "gpt-oss", "input": "Lookup", "tools": [
-                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
-                {"type": "image_generation"}
-            ],
-            "text": {"format": {"type": "json_schema", "name":"answer",
-                "schema":{"type":"object","properties":{"answer":{"type":"string"}}}}}
-        }))
-        .expect("valid Responses request");
-        for (choice, lookup, image) in [
-            (None, true, true),
-            (Some(json!("auto")), true, true),
-            (
-                Some(json!({"type": "allowed_tools", "mode": "auto",
-                "tools": [{"type": "image_generation"}]})),
-                false,
-                true,
-            ),
-            (
-                Some(json!({"type": "allowed_tools", "mode": "auto",
-                "tools": [{"type": "function", "name": "lookup"}]})),
-                true,
-                false,
-            ),
-            (Some(json!("none")), false, false),
-        ] {
-            request.tool_choice =
-                choice.map(|value| serde_json::from_value(value).expect("valid tool choice"));
-            let constraint = HarmonyPreparationStage::generate_text_format_constraint(&request)
-                .expect("JSON constraint");
-            let tag = constraint
-                .vllm_grammar
-                .expect("vLLM grammar")
-                .render(true)
-                .to_string();
-            assert_eq!(tag.contains("functions.lookup"), lookup);
-            assert_eq!(tag.contains("functions.image_generation"), image);
-            assert!(tag.contains("final") && tag.contains("answer"));
-            assert!(!constraint.tag.contains("functions."));
-        }
-    }
-
-    #[test]
-    fn responses_json_accepts_a_custom_tool_lifted_from_additional_tools() {
-        use crate::routers::common::responses_compat::lower_responses_request_for_local_backend;
-
-        let mut request: ResponsesRequest = serde_json::from_value(json!({
-            "model": "gpt-oss",
-            "input": [
-                {"type": "additional_tools", "tools": [{
-                    "type": "namespace", "name": "functions", "description": "Editor",
-                    "tools": [{"type": "custom", "name": "edit", "description": "Edit a file"}]
-                }]},
-                {"role": "user", "content": "Edit the file"}
-            ],
-            "text": {"format": {"type": "json_object"}}
-        }))
-        .expect("valid Responses request");
-        // The history loader lowers the request before preparing it for Harmony.
-        lower_responses_request_for_local_backend(&mut request).expect("inline tool is lifted");
-        let tag = HarmonyPreparationStage::generate_text_format_constraint(&request)
-            .expect("JSON constraint")
-            .vllm_grammar
-            .expect("vLLM grammar")
-            .render(true);
-        let outputs = tag["format"]["elements"][2]["elements"]
-            .as_array()
-            .expect("tool and final alternatives");
-        assert_eq!(outputs.len(), 2);
-        let call = &outputs[0]["elements"];
-        assert_eq!(call[1]["value"], "commentary to=functions.edit");
-        assert_eq!(call[4]["json_schema"]["required"], json!(["input"]));
-        assert_eq!(outputs[1]["elements"][1]["value"], "final");
     }
 
     /// A `structural_tag` response format is the engine's constraint as the
@@ -642,7 +546,7 @@ mod tests {
     #[test]
     fn a_structural_tag_response_format_is_the_constraint_as_sent() {
         let constraint = |format: &ResponseFormat| {
-            HarmonyPreparationStage::generate_response_format_constraint(Some(format), &[])
+            HarmonyPreparationStage::generate_response_format_constraint(Some(format), true)
                 .expect("accepted")
         };
         let sent = json!({
@@ -655,7 +559,7 @@ mod tests {
             serde_json::from_str::<Value>(&raw.tag).expect("the tag"),
             sent
         );
-        assert!(raw.vllm_grammar.is_none());
+        assert!(raw.vllm_first_token_tag.is_none());
         let generated = constraint(&ResponseFormat::JsonObject).expect("a constraint");
         let framed: Value = serde_json::from_str(&generated.tag).expect("the tag");
         assert_eq!(
@@ -666,13 +570,59 @@ mod tests {
             framed["format"]["tags"][1]["content"]["json_schema"],
             json!({"type": "object"})
         );
-        let vllm = generated.vllm_grammar.expect("vLLM grammar").render(true);
-        let answer = &vllm["format"]["elements"][2]["elements"][0]["elements"];
-        assert_eq!(answer[0], json!({"type":"token","token":"<|channel|>"}));
-        assert_eq!(answer[1]["value"], "final");
-        assert_eq!(answer[2], json!({"type":"token","token":"<|message|>"}));
-        assert_eq!(answer[3]["json_schema"], json!({"type":"object"}));
+        let vllm: Value = serde_json::from_str(&generated.vllm_first_token_tag.expect("vLLM tag"))
+            .expect("the tag");
+        assert_eq!(vllm["format"]["elements"][0]["elements"][1]["value"], "");
+        let final_format = &vllm["format"]["elements"][2];
+        assert_eq!(final_format["begin"], "<|channel|>final<|message|>");
+        assert_eq!(
+            final_format["content"]["json_schema"],
+            json!({"type": "object"})
+        );
+        assert_eq!(final_format["end"], "");
         assert!(constraint(&ResponseFormat::Text).is_none());
+    }
+
+    #[tokio::test]
+    async fn json_with_available_tools_keeps_the_triggered_grammar() {
+        let stage = HarmonyPreparationStage::new();
+        for choice in [None, Some("none")] {
+            let chat = serde_json::from_value(json!({
+                "model": "gpt-oss", "messages": [{"role": "user", "content": "Weather?"}],
+                "tools": [{"type": "function", "function": {"name": "weather"}}],
+                "tool_choice": choice, "response_format": {"type": "json_object"}
+            }))
+            .expect("valid chat");
+            let responses = serde_json::from_value(json!({
+                "model": "gpt-oss", "input": "Draw a map.", "tools": [{"type": "image_generation"}],
+                "tool_choice": choice, "text": {"format": {"type": "json_object"}}
+            }))
+            .expect("valid Responses request");
+            for mut ctx in [
+                RequestContext::for_chat(Arc::new(chat), None, "gpt-oss".into(), components()),
+                RequestContext::for_responses(
+                    Arc::new(responses),
+                    None,
+                    "gpt-oss".into(),
+                    components(),
+                ),
+            ] {
+                stage.execute(&mut ctx).await.expect("preparation succeeds");
+                let Some(PreparationOutput::Harmony {
+                    tool_constraints: Some(constraint),
+                    ..
+                }) = ctx.state.preparation
+                else {
+                    panic!("expected a JSON constraint");
+                };
+                let tag: Value = serde_json::from_str(&constraint.tag).unwrap();
+                assert_eq!(tag["format"]["type"], "triggered_tags");
+                assert_eq!(
+                    constraint.vllm_first_token_tag.is_some(),
+                    choice == Some("none")
+                );
+            }
+        }
     }
 
     /// A Responses request that forces a tool call and also asks for a JSON text format brings

@@ -31,7 +31,6 @@
 
 pub(crate) mod builder;
 pub(crate) mod detector;
-pub(crate) mod grammar;
 pub(crate) mod parser;
 pub(crate) mod processor;
 pub(crate) mod responses;

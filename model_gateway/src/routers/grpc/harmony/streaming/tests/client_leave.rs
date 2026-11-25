@@ -89,7 +89,6 @@ async fn a_client_that_leaves_while_the_engine_is_parked_ends_the_iteration_at_o
     let mut emitter = emitter();
     let (tx, rx) = sse_channel();
     let started = Instant::now();
-    let read_options = context::HarmonyReadOptions::default();
     let read = HarmonyStreamingProcessor::process_responses_iteration_stream(
         context::ExecutionResult::Single {
             stream,
@@ -99,7 +98,7 @@ async fn a_client_that_leaves_while_the_engine_is_parked_ends_the_iteration_at_o
         &tx,
         None,
         None,
-        &read_options,
+        &[],
         None,
     );
     let (outcome, saw_text) = tokio::time::timeout(Duration::from_secs(5), async {
@@ -140,7 +139,7 @@ async fn a_client_that_left_before_the_first_read_reads_nothing() {
         &tx,
         None,
         None,
-        &Default::default(),
+        &[],
         None,
     )
     .await;
@@ -182,7 +181,7 @@ async fn a_client_that_stays_reads_the_answer_to_its_end() {
             &tx,
             None,
             None,
-            &Default::default(),
+            &[],
             None,
         )
         .await;

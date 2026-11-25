@@ -149,7 +149,7 @@ async fn harmony_chat_reports_the_dispatch_adapter_in_every_response_frame() {
                     execution,
                     request,
                     dispatch,
-                    Default::default(),
+                    Vec::new(),
                     None,
                     None,
                     source,
@@ -171,12 +171,7 @@ async fn harmony_chat_reports_the_dispatch_adapter_in_every_response_frame() {
             }
         } else {
             let (response, _) = HarmonyResponseProcessor::new()
-                .process_non_streaming_chat_response(
-                    execution,
-                    request,
-                    dispatch,
-                    &Default::default(),
-                )
+                .process_non_streaming_chat_response(execution, request, dispatch, &[])
                 .await
                 .unwrap_or_else(|response| panic!("{}", response.status()));
             assert_eq!(
@@ -206,7 +201,7 @@ async fn streamed_chat_events(
             },
             Arc::new(chat_request(choices, true)),
             dispatch,
-            Default::default(),
+            Vec::new(),
             reservation,
             None,
             source,
@@ -286,7 +281,7 @@ async fn non_streamed_chat(
             },
             Arc::new(chat_request(choices, false)),
             dispatch(),
-            &Default::default(),
+            &[],
         )
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));
@@ -404,7 +399,7 @@ async fn streamed_responses_iteration(
             &tx,
             None,
             None,
-            &Default::default(),
+            &[],
             None,
         )
         .await;
@@ -433,7 +428,7 @@ async fn whole_responses_iteration(
             },
             Arc::new(request),
             dispatch(),
-            &Default::default(),
+            &[],
         )
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));

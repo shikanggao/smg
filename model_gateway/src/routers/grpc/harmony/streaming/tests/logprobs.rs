@@ -72,7 +72,7 @@ async fn every_steps_logprobs_reach_the_client_once() {
             },
             Arc::new(request),
             dispatch,
-            Default::default(),
+            Vec::new(),
             None,
             None,
             source,

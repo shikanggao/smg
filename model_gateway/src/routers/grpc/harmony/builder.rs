@@ -253,21 +253,6 @@ trait ToolLike {
     }
 }
 
-/// Function names and schemas the developer message actually advertises.
-pub(super) fn response_tool_descriptions(tools: &[ResponseTool]) -> Vec<ToolDescription> {
-    tool_descriptions(tools)
-}
-
-fn tool_descriptions<T: ToolLike>(tools: &[T]) -> Vec<ToolDescription> {
-    let mut seen_names = HashSet::<String>::new();
-    tools
-        .iter()
-        .filter(|t| t.is_custom())
-        .flat_map(|t| t.to_tool_descriptions())
-        .filter(|td| seen_names.insert(td.name.clone()))
-        .collect()
-}
-
 /// Implement ToolLike for Chat Completion Tool
 impl ToolLike for Tool {
     #[cfg(test)]
@@ -691,7 +676,13 @@ impl HarmonyBuilder {
         // caller's original / synthesized tool) yields a stable
         // developer-message shape even when the MCP loop injects a
         // same-name function tool on a later iteration.
-        let tool_descriptions = tool_descriptions(tools);
+        let mut seen_names = HashSet::<String>::new();
+        let tool_descriptions: Vec<ToolDescription> = tools
+            .iter()
+            .filter(|t| t.is_custom())
+            .flat_map(|t| t.to_tool_descriptions())
+            .filter(|td| seen_names.insert(td.name.clone()))
+            .collect();
 
         // Add function tools to developer content
         if !tool_descriptions.is_empty() {
