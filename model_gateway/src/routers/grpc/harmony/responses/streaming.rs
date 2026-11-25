@@ -259,7 +259,7 @@ async fn execute_mcp_tool_loop_streaming(
         // Execute pipeline and get stream + load guards, under the
         // iteration's tenant rate-limit reservation
         let startup_pending = startup.is_some();
-        let (execution_result, _load_guards, reservation, router_stops) = match ctx
+        let (execution_result, _load_guards, reservation, read_options) = match ctx
             .pipeline
             .execute_harmony_responses_streaming(
                 &current_request,
@@ -295,7 +295,7 @@ async fn execute_mcp_tool_loop_streaming(
             tx,
             Some(&session),
             Some(&ctx.mcp_format_registry),
-            &router_stops,
+            &read_options,
         )
         .await
         {
@@ -549,7 +549,7 @@ async fn execute_without_mcp_streaming(
     // Execute pipeline and get stream + load guards, under the request's
     // tenant rate-limit reservation
     let startup_pending = startup.is_some();
-    let (execution_result, _load_guards, reservation, router_stops) = match ctx
+    let (execution_result, _load_guards, reservation, read_options) = match ctx
         .pipeline
         .execute_harmony_responses_streaming(
             current_request,
@@ -585,7 +585,7 @@ async fn execute_without_mcp_streaming(
         tx,
         None,
         None,
-        &router_stops,
+        &read_options,
     )
     .await
     {

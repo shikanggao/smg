@@ -4509,6 +4509,26 @@ async fn greedy_sampling_with_several_choices_is_refused_before_the_fan_out() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+#[tokio::test]
+async fn out_of_vocabulary_suppressed_token_is_refused_before_engine_admission() {
+    let model = model_info();
+    let invalid_id = model.vocab_size;
+    let mut h = harness(model, None).await;
+    let mut request = generate_request("suppressed-token", false, Vec::new());
+    request
+        .sampling_params
+        .as_mut()
+        .unwrap()
+        .suppressed_token_ids = vec![invalid_id - 1, invalid_id];
+    let status = h.client.generate(request).await.expect_err("invalid token");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(status
+        .message()
+        .contains(&format!("suppressed token ID {invalid_id}")));
+    assert_engine_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// A PD decode side refused past its media stage (here: by the engine wire's
 /// sampling validation) still owes the notice: the engine never held it.
 #[tokio::test]

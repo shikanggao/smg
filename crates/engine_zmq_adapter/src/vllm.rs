@@ -898,6 +898,12 @@ pub(crate) fn translate_sampling(
         logprobs: sp.logprobs,
         prompt_logprobs: sp.prompt_logprobs,
         logit_bias,
+        bad_words_token_ids: (!sp.suppressed_token_ids.is_empty()).then(|| {
+            sp.suppressed_token_ids
+                .into_iter()
+                .map(|id| vec![id])
+                .collect()
+        }),
         structured_outputs: sp
             .constraint
             .and_then(translate_constraint)

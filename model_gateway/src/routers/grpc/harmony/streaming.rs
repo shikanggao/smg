@@ -138,7 +138,7 @@ impl HarmonyStreamingProcessor {
         clippy::unused_async,
         reason = "async for API consistency with the collected-response entry points: the stages await either"
     )]
-    /// `router_stop_strings` is non-empty only when the router must enforce
+    /// `read_options.stop_strings` is non-empty only when the router must enforce
     /// string `stop` sequences itself (direct-ZMQ backends: the engine sees
     /// token ids only).
     pub async fn process_streaming_chat_response(
@@ -146,7 +146,7 @@ impl HarmonyStreamingProcessor {
         execution_result: context::ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: context::DispatchMetadata,
-        router_stop_strings: Vec<String>,
+        read_options: context::HarmonyReadOptions,
         reservation: Option<Arc<SharedReservationHandle>>,
         load_guards: Option<context::LoadGuards>,
         source: utils::StreamSource,
@@ -175,7 +175,7 @@ impl HarmonyStreamingProcessor {
                     dispatch,
                     chat_request,
                     &tx,
-                    router_stop_strings,
+                    read_options,
                     reservation,
                 ))
                 .await
@@ -201,7 +201,7 @@ impl HarmonyStreamingProcessor {
                     dispatch,
                     chat_request,
                     &tx,
-                    router_stop_strings,
+                    read_options,
                     pd_timing,
                     prefill_guards,
                     reservation,
@@ -256,7 +256,7 @@ impl HarmonyStreamingProcessor {
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
         tx: &SseSender,
-        router_stop_strings: Vec<String>,
+        read_options: context::HarmonyReadOptions,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
         let mut prompt_tokens = HashMap::new();
@@ -269,7 +269,7 @@ impl HarmonyStreamingProcessor {
             tx,
             &mut prompt_tokens,
             &mut cached_tokens,
-            &router_stop_strings,
+            &read_options,
             None,
             reservation,
         )
@@ -287,7 +287,7 @@ impl HarmonyStreamingProcessor {
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
         tx: &SseSender,
-        router_stop_strings: Vec<String>,
+        read_options: context::HarmonyReadOptions,
         pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
@@ -313,7 +313,7 @@ impl HarmonyStreamingProcessor {
             tx,
             &mut prompt_tokens,
             &mut cached_tokens,
-            &router_stop_strings,
+            &read_options,
             Some(pd_timing),
             reservation,
         )
@@ -343,7 +343,7 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         prompt_tokens: &mut HashMap<u32, u32>,
         cached_tokens: &mut HashMap<u32, u32>,
-        router_stop_strings: &[String],
+        read_options: &context::HarmonyReadOptions,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
@@ -360,7 +360,7 @@ impl HarmonyStreamingProcessor {
                             dispatch,
                             original_request,
                             tx,
-                            router_stop_strings,
+                            read_options,
                             prompt_tokens,
                             cached_tokens,
                         )
@@ -578,7 +578,7 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
-        router_stop_strings: &[String],
+        read_options: &context::HarmonyReadOptions,
     ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
         match execution_result {
             context::ExecutionResult::Single { stream, .. } => {
@@ -589,7 +589,7 @@ impl HarmonyStreamingProcessor {
                     tx,
                     session,
                     format_registry,
-                    router_stop_strings,
+                    read_options,
                     None,
                 )
                 .await
@@ -609,7 +609,7 @@ impl HarmonyStreamingProcessor {
                     tx,
                     session,
                     format_registry,
-                    router_stop_strings,
+                    read_options,
                     pd_timing,
                     prefill_guards,
                 )
@@ -633,7 +633,7 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
-        router_stop_strings: &[String],
+        read_options: &context::HarmonyReadOptions,
         pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
     ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
@@ -671,7 +671,7 @@ impl HarmonyStreamingProcessor {
             tx,
             session,
             format_registry,
-            router_stop_strings,
+            read_options,
             Some(pd_timing),
         )
         .await;
@@ -689,10 +689,10 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
-        router_stop_strings: &[String],
+        read_options: &context::HarmonyReadOptions,
         pd_timing: Option<context::PdTiming>,
     ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
-        let mut decode = ResponsesDecode::new(pd_timing, router_stop_strings)?;
+        let mut decode = ResponsesDecode::new(pd_timing, read_options)?;
         // A fresh iteration: no finish until its terminal frame names one, so the finish of an
         // earlier turn of the request never reads for this one.
         emitter.set_finish_reason(None);
@@ -816,14 +816,14 @@ struct ResponsesDecode {
 impl ResponsesDecode {
     fn new(
         pd_timing: Option<context::PdTiming>,
-        router_stop_strings: &[String],
+        read_options: &context::HarmonyReadOptions,
     ) -> Result<Self, String> {
         let scanner = || {
-            (!router_stop_strings.is_empty())
-                .then(|| TextStopScanner::new(router_stop_strings.to_vec()))
+            (!read_options.stop_strings.is_empty())
+                .then(|| TextStopScanner::new(read_options.stop_strings.clone()))
         };
         Ok(Self {
-            parser: HarmonyParserAdapter::new()
+            parser: HarmonyParserAdapter::new(read_options.require_action)
                 .map_err(|e| format!("Failed to create parser: {e}"))?,
             frames: 0,
             has_analysis: false,
@@ -1525,7 +1525,7 @@ impl ChatDecode {
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
-        router_stop_strings: &[String],
+        read_options: &context::HarmonyReadOptions,
         prompt_tokens: &mut HashMap<u32, u32>,
         cached_tokens: &mut HashMap<u32, u32>,
     ) -> Result<(), utils::StreamFailure> {
@@ -1546,7 +1546,8 @@ impl ChatDecode {
         // Initialize parser for this index if needed
         if let Vacant(e) = self.parsers.entry(index) {
             e.insert(
-                HarmonyParserAdapter::new().map_err(|e| format!("Failed to create parser: {e}"))?,
+                HarmonyParserAdapter::new(read_options.require_action)
+                    .map_err(|e| format!("Failed to create parser: {e}"))?,
             );
             self.is_firsts.insert(index, true);
         }
@@ -1588,12 +1589,12 @@ impl ChatDecode {
             None => return Ok(()),
         };
         let mut stop_matched: Option<String> = None;
-        if !router_stop_strings.is_empty() {
+        if !read_options.stop_strings.is_empty() {
             if let Some(text) = delta.analysis_delta.take() {
                 let scanner = self
                     .analysis_scanners
                     .entry(index)
-                    .or_insert_with(|| TextStopScanner::new(router_stop_strings.to_vec()));
+                    .or_insert_with(|| TextStopScanner::new(read_options.stop_strings.clone()));
                 let scan = scanner.push(&text);
                 delta.analysis_delta = (!scan.emit.is_empty()).then_some(scan.emit);
                 if scan.stopped {
@@ -1607,7 +1608,7 @@ impl ChatDecode {
                     let scanner = self
                         .final_scanners
                         .entry(index)
-                        .or_insert_with(|| TextStopScanner::new(router_stop_strings.to_vec()));
+                        .or_insert_with(|| TextStopScanner::new(read_options.stop_strings.clone()));
                     let scan = scanner.push(&text);
                     delta.final_delta = (!scan.emit.is_empty()).then_some(scan.emit);
                     if scan.stopped {

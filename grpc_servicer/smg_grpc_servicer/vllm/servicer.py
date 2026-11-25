@@ -18,7 +18,7 @@ import torch
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 from transformers import BatchFeature
-from vllm import PoolingParams, SamplingParams, TokensPrompt
+from vllm import PoolingParams, SamplingParams, TokensPrompt, envs
 from vllm.engine.protocol import EngineClient
 from vllm.inputs.engine import MultiModalInput as VllmMultiModalInput
 from vllm.inputs.engine import mm_input, tokens_input
@@ -78,6 +78,7 @@ from smg_grpc_servicer.vllm.model_info import (
     mm_item_limits,
     model_facts,
     server_facts,
+    vllm_structural_tag_vocabulary,
 )
 from smg_grpc_servicer.vllm.scheduler_loads import build_loads_response, managed_ranks
 from smg_grpc_servicer.vllm.warmup import WARMUP_ENV, start_engine_warmup
@@ -556,8 +557,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     "ec_transfer_params": ec_transfer_params,
                 }
             tokenization_kwargs = self._tokenization_kwargs_from_proto(request.sampling_params)
-            # The parser must start in the same thinking mode as the rendered prompt.
             generate_kwargs = {}
+            # This constraint covers the whole completion, including any reasoning.
+            if (
+                request.sampling_params.grammar_from_first_token
+                and request.sampling_params.WhichOneof("constraint") is not None
+            ):
+                generate_kwargs["reasoning_ended"] = True
+            # The parser must start in the same thinking mode as the rendered prompt.
             if hasattr(request, "chat_template_kwargs_json") and request.HasField(
                 "chat_template_kwargs_json"
             ):
@@ -1036,6 +1043,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if "constrained_decoding_start" in info.DESCRIPTOR.fields_by_name:
             info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
             info.constrained_decoding_start = constrained_decoding_start(self.engine.vllm_config)
+        if "structural_tag_vocabulary" in info.DESCRIPTOR.fields_by_name:
+            info.structural_tag_vocabulary = vllm_structural_tag_vocabulary(self.engine.vllm_config)
         ec_config = getattr(self.engine.vllm_config, "ec_transfer_config", None)
         if "supports_ec_transfer" in info.DESCRIPTOR.fields_by_name:
             info.supports_ec_transfer = ec_config is not None
@@ -1263,8 +1272,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             prompt=tokenized.original_text or None,
         )
 
-    @staticmethod
     def _sampling_params_from_proto(
+        self,
         params: vllm_engine_pb2.SamplingParams,
         stream: bool = True,
         kv_transfer_params: dict | None = None,
@@ -1283,6 +1292,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # Build stop sequences
         stop = list(params.stop) if params.stop else None
         stop_token_ids = list(params.stop_token_ids) if params.stop_token_ids else None
+        # vLLM's bad-word mask works on token sequences. A singleton masks
+        # its ID at every position, including when the grammar permits EOS.
+        suppressed = getattr(params, "suppressed_token_ids", ())
+        if suppressed:
+            if max(suppressed) >= self.engine.model_config.get_vocab_size():
+                raise ValueError("suppressed_token_ids contains an ID outside the model vocabulary")
+            for limit in ("VLLM_MAX_NUM_BAD_WORDS", "VLLM_MAX_BAD_WORDS_TOTAL_TOKENS"):
+                if len(suppressed) > getattr(envs, limit, len(suppressed)):
+                    raise ValueError(f"suppressed_token_ids exceeds {limit}")
 
         # Handle structured outputs constraints
         structured_outputs = None
@@ -1329,6 +1347,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             seed=params.seed if params.HasField("seed") else None,
             include_stop_str_in_output=params.include_stop_str_in_output,
             logit_bias=dict(params.logit_bias) if params.logit_bias else None,
+            _bad_words_token_ids=[[token_id] for token_id in suppressed] or None,
             structured_outputs=structured_outputs,
             extra_args=extra_args,
             # detokenize must be True if stop strings are used

@@ -176,6 +176,13 @@ impl BuildStage for HarmonyRequestBuildingStage {
             }
         }
 
+        let (tool_constraints, vllm_grammar) =
+            tool_constraints.map_or((None, None), |constraint| {
+                (
+                    Some(("structural_tag".to_string(), constraint.tag)),
+                    constraint.vllm_grammar,
+                )
+            });
         let mut proto_request = build_harmony_proto(
             builder_client,
             body,
@@ -191,6 +198,13 @@ impl BuildStage for HarmonyRequestBuildingStage {
                 format!("Invalid request parameters: {e}"),
             )
         })?;
+
+        let vllm_grammar =
+            vllm_grammar.filter(|_| matches!(proto_request, ProtoGenerateRequest::Vllm(_)));
+        ctx.state.response.harmony_requires_action = vllm_grammar.is_some();
+        if let Some(grammar) = &vllm_grammar {
+            grammar.apply(&mut proto_request, ctx.state.workers.as_ref());
+        }
 
         // Inject the Harmony stop ids (<|return|> and <|call|>) so the model
         // cannot generate past a channel boundary.
@@ -230,9 +244,7 @@ impl BuildStage for HarmonyRequestBuildingStage {
                 sampling_mask: None,
                 sampling_baseline: None,
                 inject_pd_metadata: self.settings.inject_pd_metadata,
-                // Harmony's constraint is never shaped per worker; retries
-                // carry it as built.
-                tool_constraint: None,
+                tool_constraint: vllm_grammar.map(helpers::ToolConstraintStamp::Harmony),
             },
         })
     }

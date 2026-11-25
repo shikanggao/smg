@@ -58,7 +58,10 @@ async fn a_router_stop_ends_the_read_and_the_engine_request() {
             },
             Arc::new(request),
             dispatch,
-            vec!["STOP".to_string()],
+            context::HarmonyReadOptions {
+                stop_strings: vec!["STOP".to_string()],
+                ..Default::default()
+            },
             None,
             None,
             source,

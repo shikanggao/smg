@@ -251,6 +251,17 @@ async fn submit(
             "This model does not support generation",
         ));
     }
+    if let Some(id) = req
+        .sampling_params
+        .iter()
+        .flat_map(|p| &p.suppressed_token_ids)
+        .find(|&&id| id >= state.model.vocab_size)
+    {
+        return Err(Status::invalid_argument(format!(
+            "suppressed token ID {id} is outside model vocabulary of size {}",
+            state.model.vocab_size
+        )));
+    }
     // An encode-prefill-decode request (the encoder's with the consumer's
     // destination, or the prefill side's with the encoder's handles) rides
     // the engine's encoder-cache connector, which the launcher reports off
